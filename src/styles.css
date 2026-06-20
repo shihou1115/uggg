@@ -1,0 +1,422 @@
+:root {
+  --ugg-scale: 1.0;
+  color-scheme: light dark;
+  font-family:
+    "Segoe UI",
+    "Hiragino Sans",
+    "Yu Gothic UI",
+    "Meiryo",
+    system-ui,
+    sans-serif;
+  font-size: 14px;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  pointer-events: auto;
+}
+
+#character-layer {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  transform-origin: left bottom;
+  transform: scale(var(--ugg-scale));
+  display: flex;
+  align-items: flex-end;
+  gap: 0;
+}
+
+#ui-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.solid {
+  pointer-events: auto;
+}
+
+#pomodoro-badge {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1.5px solid #6e8db5;
+  border-radius: 999px;
+  font-size: 12px;
+  font-family: "Consolas", monospace;
+  color: #1c1c1c;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+  z-index: 60;
+  display: none;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+#pomodoro-badge.visible {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+#pomodoro-badge.focus {
+  border-color: #c97a4a;
+  background: rgba(255, 245, 230, 0.96);
+}
+
+#pomodoro-badge.break {
+  border-color: #4a9c8d;
+  background: rgba(230, 250, 245, 0.96);
+}
+
+#pomodoro-badge-phase {
+  font-weight: bold;
+  text-transform: uppercase;
+  font-size: 11px;
+}
+
+#pomodoro-badge-round {
+  color: #666;
+}
+
+/* 吹き出し: index.html に静的配置済み。.visible が付くまで非表示。
+   `display: none !important` で確実に隠す (v0.0.3 と同じ方式)。
+   動的 createElement だと WebView2 透過レイヤーで描画されないため
+   要素の追加削除はせず、テキストと .visible クラスだけ書き換える。 */
+.balloon {
+  position: absolute;
+  max-width: 300px;
+  min-width: 80px;
+  padding: 10px 14px;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1.5px solid #555;
+  border-radius: 14px;
+  color: #1c1c1c;
+  font-size: 14px;
+  line-height: 1.55;
+  word-break: break-word;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  z-index: 50;
+  white-space: pre-wrap;
+}
+
+.balloon:not(.visible) {
+  display: none !important;
+}
+
+.balloon::after {
+  content: "";
+  position: absolute;
+  bottom: -8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 8px solid transparent;
+  border-right: 8px solid transparent;
+  border-top: 8px solid #555;
+}
+
+.balloon::before {
+  content: "";
+  position: absolute;
+  bottom: -6px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-top: 7px solid rgba(255, 255, 255, 0.96);
+  z-index: 1;
+}
+
+.balloon-text {
+  white-space: pre-wrap;
+}
+
+#chat-input-wrap {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  display: none;
+  width: min(420px, 92vw);
+  padding: 6px;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1.5px solid #555;
+  border-radius: 999px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+}
+
+#chat-input-wrap.visible {
+  display: block;
+}
+
+#chat-input-wrap input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 14px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  font: inherit;
+  color: #1c1c1c;
+  outline: none;
+}
+
+#chat-input-wrap input::placeholder {
+  color: #888;
+}
+
+/* ===== 設定パネル / コンテキストメニュー =====
+   WebView2 透過バグ対策で index.html に静的配置済。
+   表示制御は .visible クラスのみで行う。 */
+
+.panel {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(560px, 96vw);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0.98);
+  border: 1.5px solid #555;
+  border-radius: 12px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
+  z-index: 200;
+}
+
+.panel:not(.visible) {
+  display: none !important;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid #ddd;
+}
+
+.panel-header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.panel-close {
+  background: transparent;
+  border: none;
+  font-size: 18px;
+  cursor: pointer;
+  color: #555;
+}
+
+.panel-body {
+  padding: 12px 16px;
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.panel-intro {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #444;
+}
+
+.panel-section h3 {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  color: #444;
+  letter-spacing: 0.04em;
+}
+
+.panel-section .checkbox-row {
+  align-items: center;
+}
+
+.panel-section .checkbox-row input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: auto;
+}
+
+.panel-section .checkbox-row > span {
+  width: auto;
+  font-size: 12px;
+  color: #333;
+}
+
+.panel-section .row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.panel-section .row > span:first-child {
+  width: 160px;
+  font-size: 12px;
+  color: #333;
+}
+
+.panel-section input,
+.panel-section select {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid #aaa;
+  border-radius: 6px;
+  font: inherit;
+  background: white;
+  color: #1c1c1c;
+}
+
+.panel-section .key-cell {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.key-state {
+  font-size: 11px;
+  color: #555;
+  padding: 2px 6px;
+  background: #eee;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.key-state.has-key {
+  background: #d6f0d6;
+  color: #1a5d1a;
+}
+
+.panel-message {
+  margin: 0;
+  padding: 6px 10px;
+  background: #fff4d6;
+  border: 1px solid #d8b04a;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #553a00;
+}
+
+.panel-message.error {
+  background: #fde0e0;
+  border-color: #d27575;
+  color: #5d1010;
+}
+
+.panel-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid #ddd;
+}
+
+.panel-footer button {
+  padding: 6px 16px;
+  border-radius: 6px;
+  border: 1px solid #999;
+  background: white;
+  cursor: pointer;
+  font: inherit;
+}
+
+.panel-footer button.primary {
+  background: #4775c4;
+  color: white;
+  border-color: #2a4e90;
+}
+
+.panel-footer button:hover {
+  filter: brightness(1.05);
+}
+
+#context-menu {
+  position: fixed;
+  display: none;
+  min-width: 180px;
+  background: rgba(255, 255, 255, 0.98);
+  border: 1.5px solid #555;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.24);
+  padding: 6px 0;
+  z-index: 250;
+  font-size: 13px;
+}
+
+#context-menu.visible {
+  display: block;
+}
+
+#context-menu .menu-item {
+  padding: 6px 14px;
+  cursor: pointer;
+  user-select: none;
+  color: #1c1c1c;
+}
+
+#context-menu .menu-item:hover {
+  background: #eef2fa;
+}
+
+#context-menu .menu-divider {
+  height: 1px;
+  background: #ddd;
+  margin: 4px 0;
+}
+
+.char-slot {
+  position: relative;
+  display: none;
+}
+
+.char-slot.ready {
+  display: block;
+}
+
+.char-slot img {
+  display: block;
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;
+}
+
+.char-slot img.pose {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+}
+
+.char-slot img.pose.visible {
+  visibility: visible;
+}
+
+#char-main img:first-of-type,
+#char-sub img:first-of-type {
+  position: static;
+}

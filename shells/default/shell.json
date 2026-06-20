@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "default",
+  "name": "デフォルトシェル",
+  "author": "ugga",
+  "characters": {
+    "main": {
+      "base_size": { "width": 280, "height": 420 },
+      "default_pose": "normal",
+      "poses": {
+        "normal": "main/normal.png",
+        "happy": "main/happy.png",
+        "troubled": "main/troubled.png",
+        "surprised": "main/surprised.png"
+      },
+      "poke_regions": { "head_max": 0.45, "chest_max": 0.62 }
+    },
+    "sub": {
+      "base_size": { "width": 240, "height": 360 },
+      "default_pose": "normal",
+      "poses": {
+        "normal": "sub/normal.png",
+        "happy": "sub/happy.png",
+        "troubled": "sub/troubled.png",
+        "surprised": "sub/surprised.png"
+      },
+      "poke_regions": { "head_max": 0.45, "chest_max": 0.62 }
+    }
+  }
+}

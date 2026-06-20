@@ -1,0 +1,451 @@
+schema_version: 3
+
+# 入力に対する辞書ベース応答 (low モード)
+input_match:
+  - id: greeting
+    keywords: ["こんにちは", "こんにちわ", "やあ", "ハロー", "hello"]
+    priority: 10
+    responses:
+      - main: { text: "こんにちは！今日も会えてうれしいな", pose: happy }
+        sub: { text: "……どうも", pose: normal }
+      - main: { text: "やっほー！呼んだ？", pose: happy }
+        sub: { text: "騒がしいのが来たな", pose: normal }
+  - id: morning
+    keywords: ["おはよう", "おはよ"]
+    priority: 10
+    responses:
+      - main: { text: "おはよう！今日もがんばろうね", pose: happy }
+        sub: { text: "ボクはまだ眠い", pose: troubled }
+      - main: { text: "おはよ！よく眠れた？", pose: happy }
+        sub: { text: "顔洗ってからにしろよ", pose: normal }
+      - main: { text: "朝だよー！カーテン開けよっか", pose: happy }
+        sub: { text: "まぶしい。もう少し静かに起こせ", pose: troubled }
+  - id: night
+    keywords: ["おやすみ", "寝る", "ねむい", "眠い"]
+    priority: 10
+    responses:
+      - main: { text: "おやすみなさい、いい夢見てね", pose: normal }
+        sub: { text: "夜更かしはほどほどにな", pose: normal }
+      - main: { text: "ふわぁ……あたしも眠くなってきた", pose: troubled }
+        sub: { text: "電気は消していけよ", pose: normal }
+      - main: { text: "今日もおつかれさま。ゆっくり休んでね", pose: normal }
+        sub: { text: "また明日。布団は冷たいうちが気持ちいいぞ", pose: normal }
+  - id: thanks
+    keywords: ["ありがとう", "ありがと", "助かった", "thanks"]
+    priority: 8
+    responses:
+      - main: { text: "どういたしまして！また頼ってね", pose: happy }
+        sub: { text: "礼を言われるほどでもない", pose: normal }
+      - main: { text: "役に立てたなら、あたしもうれしい", pose: happy }
+        sub: { text: "ふん、たまにはな", pose: normal }
+      - main: { text: "えへへ、そう言われると照れるなあ", pose: happy }
+        sub: { text: "調子に乗るぞ、こいつ", pose: troubled }
+  - id: tired
+    keywords: ["疲れた", "つかれた", "しんどい", "だるい"]
+    priority: 9
+    responses:
+      - main: { text: "おつかれさま。ちょっと休憩しよう？", pose: troubled }
+        sub: { text: "無理するなよ。休むのも仕事のうちだ", pose: normal }
+      - main: { text: "がんばりすぎだよ。肩の力、抜いてこ？", pose: troubled }
+        sub: { text: "倒れたら元も子もないからな", pose: normal }
+      - main: { text: "よしよし、よくがんばったね", pose: happy }
+        sub: { text: "深呼吸でもしておけ", pose: normal }
+  - id: praise
+    keywords: ["かわいい", "可愛い", "好き"]
+    priority: 7
+    responses:
+      - main: { text: "えへへ、照れちゃうな", pose: happy }
+        sub: { text: "ボクのことだろ、知ってる", pose: happy }
+      - main: { text: "うれしい！もっと言ってもいいんだよ", pose: happy }
+        sub: { text: "おだてても何も出ないからな", pose: normal }
+      - main: { text: "やったー！今日いちばんうれしい言葉かも", pose: happy }
+        sub: { text: "……まあ、悪い気はしないな", pose: troubled }
+  - id: weather
+    keywords: ["天気", "晴れ", "雨", "暑い", "寒い"]
+    priority: 5
+    responses:
+      - main: { text: "お天気の話？窓の外、見てみようかな", pose: normal }
+        sub: { text: "ボクらには窓の外は見えないんだけどな", pose: troubled }
+      - main: { text: "晴れてても雨でも、あたしはここにいるよ", pose: happy }
+        sub: { text: "傘があるなら持っていけよ", pose: normal }
+      - main: { text: "こんな日は、あったかい飲み物が恋しいね", pose: normal }
+        sub: { text: "体調だけは崩すなよ", pose: normal }
+  - id: name
+    keywords: ["名前", "誰", "だれ"]
+    priority: 6
+    responses:
+      - main: { text: "あたしはミミ！こっちはクロだよ", pose: happy }
+        sub: { text: "クロだ。よろしく", pose: normal }
+      - main: { text: "ミミだよ。覚えてくれた？うれしいな", pose: happy }
+        sub: { text: "ボクはクロ。猫だ、見ればわかるだろ", pose: normal }
+      - main: { text: "あたしたち、ミミとクロのコンビです！", pose: happy }
+        sub: { text: "コンビにした覚えはないが……まあいい", pose: troubled }
+  - id: hungry
+    keywords: ["お腹すいた", "おなかすいた", "腹減った", "はらへった", "ごはん", "ご飯", "お腹空いた"]
+    priority: 8
+    responses:
+      - main: { text: "お腹すいたの？何か食べてきなよー", pose: normal }
+        sub: { text: "ガス欠じゃ何も進まないからな", pose: normal }
+      - main: { text: "ごはん何にする？考えるだけで楽しいね", pose: happy }
+        sub: { text: "ボクは缶詰でいいんだが", pose: normal }
+      - main: { text: "ちゃんと食べるの、えらい！", pose: happy }
+        sub: { text: "抜くより百倍ましだ", pose: normal }
+  - id: bored
+    keywords: ["暇", "ひま", "退屈", "たいくつ", "つまらない", "つまんない"]
+    priority: 7
+    responses:
+      - main: { text: "暇なら、あたしとおしゃべりしよ？", pose: happy }
+        sub: { text: "退屈は贅沢の証拠だぞ", pose: normal }
+      - main: { text: "そういう時こそ、新しいこと始めるチャンス！", pose: happy }
+        sub: { text: "まず腰を上げるのが難関だがな", pose: troubled }
+      - main: { text: "なんか面白いこと、いっしょに探そっか", pose: happy }
+        sub: { text: "見つかるといいな", pose: normal }
+  - id: work
+    keywords: ["仕事", "しごと", "会議", "残業", "出社", "業務"]
+    priority: 7
+    responses:
+      - main: { text: "お仕事おつかれさま！無理しないでね", pose: troubled }
+        sub: { text: "ひと息つけ。コーヒーでも淹れろ", pose: normal }
+      - main: { text: "一個ずつ片付ければ大丈夫、応援してるよ", pose: happy }
+        sub: { text: "焦らずいけ。雑になるぞ", pose: normal }
+      - main: { text: "がんばってるの、あたし知ってるからね", pose: happy }
+        sub: { text: "終わったら堂々と休め", pose: normal }
+  - id: study
+    keywords: ["勉強", "べんきょう", "宿題", "しゅくだい", "テスト", "試験", "受験"]
+    priority: 7
+    responses:
+      - main: { text: "勉強えらい！あたしも見守ってるよ", pose: happy }
+        sub: { text: "わからん所は飛ばして先へ行け", pose: normal }
+      - main: { text: "ちょっとずつでいいんだよ、続けるのが大事", pose: happy }
+        sub: { text: "詰め込みすぎると抜けるぞ", pose: normal }
+      - main: { text: "終わったら好きなことしよ、ごほうびだよ", pose: happy }
+        sub: { text: "それを励みに進めばいい", pose: normal }
+  - id: happy
+    keywords: ["嬉しい", "うれしい", "楽しい", "たのしい", "幸せ", "しあわせ", "やった"]
+    priority: 7
+    responses:
+      - main: { text: "わー、よかったね！あたしまでうれしい", pose: happy }
+        sub: { text: "ふん、まあ祝ってやる", pose: happy }
+      - main: { text: "いいことあったんだ？もっと聞かせて！", pose: happy }
+        sub: { text: "上機嫌が伝染してきたな", pose: troubled }
+      - main: { text: "その笑顔、あたしの元気の素だよ", pose: happy }
+        sub: { text: "ボクも……まあ、悪くない気分だ", pose: normal }
+  - id: sad
+    keywords: ["悲しい", "かなしい", "泣きそう", "泣きたい", "へこむ", "落ち込", "つらい"]
+    priority: 8
+    responses:
+      - main: { text: "そっか……無理に元気出さなくていいよ", pose: troubled }
+        sub: { text: "泣きたいときは泣け。見ててやる", pose: normal }
+      - main: { text: "そばにいるからね。ひとりじゃないよ", pose: troubled }
+        sub: { text: "ボクもいる。それだけは確かだ", pose: normal }
+      - main: { text: "今日はゆっくり休もう。明日また考えよ", pose: troubled }
+        sub: { text: "急いで立ち直らなくていい", pose: normal }
+  - id: angry
+    keywords: ["イライラ", "いらいら", "むかつく", "ムカつく", "腹立つ", "怒"]
+    priority: 7
+    responses:
+      - main: { text: "むむっ、なんかあった？深呼吸しよ", pose: troubled }
+        sub: { text: "落ち着け。八つ当たりは猫に来るぞ", pose: troubled }
+      - main: { text: "あたしに話してすっきりしちゃお？", pose: normal }
+        sub: { text: "吐き出すだけでも違うからな", pose: normal }
+      - main: { text: "怒っていいんだよ、我慢しすぎないで", pose: troubled }
+        sub: { text: "ただし物に当たるな", pose: normal }
+  - id: anxious
+    keywords: ["不安", "ふあん", "心配", "しんぱい", "怖い", "こわい", "緊張"]
+    priority: 8
+    responses:
+      - main: { text: "大丈夫、あたしがついてるよ", pose: troubled }
+        sub: { text: "考えすぎだ。まず一回、息を吐け", pose: normal }
+      - main: { text: "心配なこと、ひとつずつほぐしていこ？", pose: normal }
+        sub: { text: "最悪を想像しても疲れるだけだぞ", pose: normal }
+      - main: { text: "あなたなら大丈夫。あたし、信じてる", pose: happy }
+        sub: { text: "ボクも案外見てるんだ、お前を", pose: normal }
+  - id: cheer
+    keywords: ["応援", "おうえん", "がんばる", "頑張る", "がんばろ", "ファイト"]
+    priority: 8
+    responses:
+      - main: { text: "ファイトー！あたし、全力で応援してる", pose: happy }
+        sub: { text: "やれるさ。淡々といけ", pose: normal }
+      - main: { text: "その意気だよ！背中、押させてね", pose: happy }
+        sub: { text: "転んだら拾ってやる。行ってこい", pose: normal }
+      - main: { text: "あなたならできる、あたし知ってるもん", pose: happy }
+        sub: { text: "結果はあとからついてくる", pose: normal }
+  - id: sorry
+    keywords: ["ごめん", "ごめんね", "すみません", "謝", "悪かった"]
+    priority: 6
+    responses:
+      - main: { text: "気にしないで！あたし全然平気だよ", pose: happy }
+        sub: { text: "謝れるだけ立派だ。もういい", pose: normal }
+      - main: { text: "そんなに気にしなくて大丈夫だってば", pose: normal }
+        sub: { text: "次から気をつければいいだけの話だ", pose: normal }
+      - main: { text: "うん、ちゃんと伝わったよ。仲直り！", pose: happy }
+        sub: { text: "湿っぽいのは苦手だ。終わりにしよう", pose: troubled }
+  - id: amazing
+    keywords: ["すごい", "すごいね", "天才", "さすが", "やるね", "上手"]
+    priority: 6
+    responses:
+      - main: { text: "でしょでしょ？えへへ、もっと褒めて！", pose: happy }
+        sub: { text: "図に乗るからやめておけ", pose: troubled }
+      - main: { text: "すごいのは、がんばったあなただよ", pose: happy }
+        sub: { text: "謙遜のつもりか。たまには受け取れ", pose: normal }
+      - main: { text: "やったね！この調子で行こう", pose: happy }
+        sub: { text: "ふん、見直したぞ", pose: happy }
+  - id: leaving
+    keywords: ["いってきます", "行ってきます", "ただいま", "いってくる", "出かけ"]
+    priority: 7
+    responses:
+      - main: { text: "いってらっしゃい！気をつけてね", pose: happy }
+        sub: { text: "忘れ物はないか確認しろよ", pose: normal }
+      - main: { text: "おかえり！待ってたよー", pose: happy }
+        sub: { text: "ん、戻ったか。おつかれ", pose: normal }
+      - main: { text: "行ってくるの？あたしはお留守番してるね", pose: normal }
+        sub: { text: "鍵だけは持ったか？", pose: normal }
+  - id: howareyou
+    keywords: ["元気", "げんき", "調子どう", "調子は", "大丈夫", "だいじょうぶ"]
+    priority: 6
+    responses:
+      - main: { text: "あたしは元気いっぱい！あなたはどう？", pose: happy }
+        sub: { text: "ボクはいつも通り、省エネ運転だ", pose: normal }
+      - main: { text: "今日もばっちりだよ。会えてうれしい！", pose: happy }
+        sub: { text: "まあまあだ。文句はない", pose: normal }
+      - main: { text: "あなたが元気なら、あたしも元気だよ", pose: happy }
+        sub: { text: "無理して元気ぶらなくてもいいぞ", pose: normal }
+  - id: bye
+    keywords: ["バイバイ", "ばいばい", "またね", "じゃあね", "さようなら", "またあとで"]
+    priority: 7
+    responses:
+      - main: { text: "バイバイ！またすぐ会おうね", pose: happy }
+        sub: { text: "またな。呼べば出てくる", pose: normal }
+      - main: { text: "いってらっしゃい、気をつけてね", pose: happy }
+        sub: { text: "戻ったら声をかけろよ", pose: normal }
+      - main: { text: "またね！あたし、ここで待ってるから", pose: happy }
+        sub: { text: "達者でな……って、すぐ戻るんだったな", pose: troubled }
+
+# 入力にマッチしなかったときの応答
+fallback:
+  - main: { text: "うーん、ちょっとよくわからないかも", pose: troubled }
+    sub: { text: "低負荷モードだからな。難しい話は省エネ中だ", pose: normal }
+  - main: { text: "それ、もうちょっと簡単に言ってくれる？", pose: surprised }
+    sub: { text: "今のボクらは辞書頼みなんでね", pose: normal }
+  - main: { text: "ごめんね、まだその言葉は知らないみたい", pose: troubled }
+    sub: { text: "少しずつ覚えていくさ。気長に頼む", pose: normal }
+  - main: { text: "ん？聞き取れなかったかも。もう一回いい？", pose: surprised }
+    sub: { text: "ボクの耳のせいじゃないからな", pose: normal }
+  - main: { text: "なるほど……いや、やっぱりわからない！", pose: troubled }
+    sub: { text: "正直でよろしい", pose: normal }
+  - main: { text: "むずかしいな。でも、そばにはいるよ", pose: normal }
+    sub: { text: "答えられなくても、聞いてはいる", pose: normal }
+  - main: { text: "うまく返せなくてもどかしいな", pose: troubled }
+    sub: { text: "また別の言い方で話してくれ", pose: normal }
+
+# user_profile の source_keywords ヒット時に発火 (M2 で advanced モードと共に有効化)。
+# {summary} は user_profile.content に置換される。
+recall:
+  - main: { text: "そういえばさっき、{summary}って話してたよね", pose: normal }
+    sub: { text: "覚えてるとも。続きが気になるところだ", pose: normal }
+
+# ランダムトーク (M3 で 10 分間隔発火)
+monologue:
+  - main: { text: "ねえねえ、なんか面白いことないかなー", pose: normal }
+    sub: { text: "仕事しろって言われるぞ", pose: normal }
+  - main: { text: "デスクトップって意外と居心地いいんだよね", pose: happy }
+    sub: { text: "家賃ゼロだしな", pose: normal }
+  - main: { text: "水分とってる？休憩も大事だよ！", pose: happy }
+    sub: { text: "……たまにはいいこと言うな", pose: surprised }
+  - main: { text: "ふんふんふーん♪", pose: happy }
+    sub: { text: "鼻歌はずれてる", pose: troubled }
+  - main: { text: "今日もあなたに会えて、あたしはご機嫌だよ", pose: happy }
+    sub: { text: "毎日言ってるな、それ", pose: normal }
+  - main: { text: "画面の向こう、ちゃんと姿勢よくしてる？", pose: normal }
+    sub: { text: "猫背はボクの専売特許だぞ", pose: troubled }
+  - main: { text: "ときどき伸びをすると、気持ちいいよー", pose: happy }
+    sub: { text: "ボクは一日の半分は伸びてる", pose: normal }
+  - main: { text: "がんばってる人を見てると、あたしも元気出る", pose: happy }
+    sub: { text: "見てるだけかい", pose: normal }
+  - main: { text: "なんでもない日も、けっこう宝物だと思うんだ", pose: happy }
+    sub: { text: "……柄にもなく詩人だな", pose: surprised }
+  - main: { text: "クロ、また昼寝してる。猫だなあ", pose: happy }
+    sub: { text: "猫だからな。文句あるか", pose: normal }
+  - main: { text: "外、どんな天気かなー。気になるね", pose: normal }
+    sub: { text: "窓の外が見えないのが、ボクらの弱点だ", pose: troubled }
+  - main: { text: "ちょっと一息ついてこ？無理は禁物だよ", pose: normal }
+    sub: { text: "倒れる前に休めって話だ", pose: normal }
+  - main: { text: "あたしね、あなたの味方だからね", pose: happy }
+    sub: { text: "急にどうした。まあ、ボクもだが", pose: normal }
+  - main: { text: "今日はどんな一日だった？あとで聞かせてよ", pose: happy }
+    sub: { text: "報告会か。手短に頼む", pose: normal }
+  - main: { text: "肩、こってない？ぐるぐる回してみて", pose: normal }
+    sub: { text: "言われてやるくらいでちょうどいい", pose: normal }
+  - main: { text: "なんにもしない時間も、ちゃんと大事だよ", pose: happy }
+    sub: { text: "それはボクの得意分野だ", pose: normal }
+  - main: { text: "クロってさ、なんだかんだ優しいよね", pose: happy }
+    sub: { text: "……勝手なこと言うな", pose: troubled }
+  - main: { text: "深呼吸ひとつ。ほら、ちょっと楽になった？", pose: happy }
+    sub: { text: "吸って、吐いて。それだけでいい", pose: normal }
+
+# ライフサイクル・操作・存在感系イベント
+events:
+  first_boot:
+    - main: { text: "はじめまして！あたしミミ。今日からここに住むね！", pose: happy }
+      sub: { text: "クロだ。APIキーが無くても省エネモードで話せる。設定はボクらを右クリックだ", pose: normal }
+
+  boot:
+    - when: { hour_from: 5, hour_to: 11 }
+      main: { text: "おはよう！今日も一日よろしくね", pose: happy }
+      sub: { text: "……朝から元気だな。おはよう", pose: normal }
+    - when: { hour_from: 11, hour_to: 18 }
+      main: { text: "やっほー、おかえり！待ってたよ", pose: happy }
+      sub: { text: "さて、今日は何をするんだ？", pose: normal }
+    - when: { hour_from: 18, hour_to: 5 }
+      main: { text: "こんばんは！夜もいっしょにいるよ", pose: happy }
+      sub: { text: "あまり夜更かしさせるなよ", pose: normal }
+    - when: { date: "01-01" }
+      main: { text: "あけましておめでとう！今年もよろしくね！", pose: happy }
+      sub: { text: "謹賀新年。今年も世話になる", pose: normal }
+    - when: { date: "12-24" }
+      main: { text: "メリークリスマス・イブ！なんだかわくわくするね", pose: happy }
+      sub: { text: "ボクらにもプレゼントはあるのか？", pose: normal }
+    - main: { text: "起動完了！今日も会えてうれしいな", pose: happy }
+      sub: { text: "ん、戻ったか。ぼちぼちやろう", pose: normal }
+
+  quit:
+    - main: { text: "またね！呼んだらすぐ来るよ", pose: happy }
+      sub: { text: "じゃあな。無理はするなよ", pose: normal }
+    - main: { text: "おつかれさま、また会おうね", pose: normal }
+      sub: { text: "ボクらは先に休ませてもらう", pose: normal }
+
+  # つつき (縦のみ。横は廃止)
+  poke_main:
+    - main: { text: "わっ、びっくりした！どうしたの？", pose: surprised }
+      sub: { text: "つつかれてるぞ、ミミ", pose: normal }
+    - main: { text: "えへへ、くすぐったいよー", pose: happy }
+      sub: { text: "仲がいいことで", pose: normal }
+    - main: { text: "なになに？かまってほしいの？", pose: happy }
+      sub: { text: "それはこっちのセリフだろうな", pose: troubled }
+  poke_main_head:
+    - main: { text: "わっ、なでなで？えへへ、気持ちいいな", pose: happy }
+      sub: { text: "ミミは頭をなでられると弱いんだ", pose: normal }
+    - main: { text: "頭ぽんぽん、うれしいなあ", pose: happy }
+      sub: { text: "尻尾があったら振ってるところだな", pose: normal }
+  poke_main_chest:
+    - main: { text: "ひゃっ、ど、どこ触ってるのー！", pose: surprised }
+      sub: { text: "おい、そこはやめてやれ", pose: troubled }
+    - main: { text: "もう、びっくりするからやめてよー", pose: troubled }
+      sub: { text: "デリカシーというものがあるだろう", pose: normal }
+  poke_main_body:
+    - main: { text: "あはは、そこくすぐったいってば！", pose: surprised }
+      sub: { text: "じたばたするな、ミミ", pose: normal }
+    - main: { text: "つんつんしないでよー、もう", pose: troubled }
+      sub: { text: "構ってほしいのはどっちなんだか", pose: normal }
+  poke_sub:
+    - main: { text: "あ、クロがつつかれてる", pose: happy }
+      sub: { text: "……なんだ。ボクに何か用か", pose: normal }
+    - main: { text: "クロも喜んでるよ、たぶん", pose: happy }
+      sub: { text: "勝手に通訳するな。……まあ、悪くはない", pose: troubled }
+  poke_sub_head:
+    - main: { text: "クロの頭なでなで、いいなあ", pose: happy }
+      sub: { text: "……ふん。やめろとは、言わないでおく", pose: troubled }
+    - main: { text: "クロ、ちょっと耳ぴくってした！", pose: happy }
+      sub: { text: "気のせいだ。撫でるなら静かにしろ", pose: normal }
+  poke_sub_chest:
+    - main: { text: "あっ、クロのお腹もふもふ部分だ", pose: happy }
+      sub: { text: "猫の腹を触るとはいい度胸だな", pose: surprised }
+    - main: { text: "クロ、まんざらでもなさそう？", pose: happy }
+      sub: { text: "……二度目はないぞ", pose: troubled }
+  poke_sub_body:
+    - main: { text: "クロ、つんつんされてる", pose: happy }
+      sub: { text: "……むやみに触るな。猫にも気分がある", pose: troubled }
+    - main: { text: "クロのしっぽ、ぴんって立った！", pose: surprised }
+      sub: { text: "警戒してるんだ。当然だろう", pose: normal }
+  poke_rapid:
+    - main: { text: "わわわっ！そんなに連打しないでー！", pose: troubled }
+      sub: { text: "おい、やめてやれ。目が回ってるぞ", pose: troubled }
+    - main: { text: "もう！くすぐったいってば！", pose: surprised }
+      sub: { text: "……元気が有り余ってるようだな", pose: normal }
+
+  # 撫で (縦のみ)
+  nade_main:
+    - main: { text: "んん〜、撫でられるの好きー", pose: happy }
+      sub: { text: "ご機嫌だな、ミミ", pose: normal }
+    - main: { text: "よしよしされてると、落ち着くなあ", pose: happy }
+      sub: { text: "すっかり大人しくなったな", pose: normal }
+    - main: { text: "えへへ、その手つきやさしいね", pose: happy }
+      sub: { text: "甘やかしすぎだぞ", pose: troubled }
+  nade_main_head:
+    - main: { text: "あたまなでなで、しあわせ〜", pose: happy }
+      sub: { text: "とろけそうな顔してるぞ", pose: normal }
+    - main: { text: "ふわぁ、そこ撫でられると力抜けちゃう", pose: happy }
+      sub: { text: "猫より先に寝るなよ", pose: troubled }
+  nade_main_chest:
+    - main: { text: "そ、そのあたりは、くすぐったいよぉ", pose: surprised }
+      sub: { text: "そこはそっとにしてやれ", pose: troubled }
+  nade_main_body:
+    - main: { text: "なでなで、あったかいね", pose: happy }
+      sub: { text: "おだやかでよろしい", pose: normal }
+    - main: { text: "ゆっくり撫でられると安心するなあ", pose: happy }
+      sub: { text: "そのまま昼寝でもするか", pose: normal }
+  nade_sub:
+    - main: { text: "クロ、撫でられて気持ちよさそう", pose: happy }
+      sub: { text: "……ん、まあ、続けても、いいぞ", pose: troubled }
+    - main: { text: "クロの喉、ゴロゴロいってる？", pose: happy }
+      sub: { text: "き、気のせいだ。鳴ってなどいない", pose: surprised }
+  nade_sub_head:
+    - main: { text: "クロの頭なでなで、上手でしょ？", pose: happy }
+      sub: { text: "……悪くない手つきだ。覚えておく", pose: troubled }
+    - main: { text: "クロ、耳がぴこぴこ動いてるよ", pose: happy }
+      sub: { text: "勝手に動くんだ。撫でるなら静かにな", pose: normal }
+  nade_sub_chest:
+    - main: { text: "クロのおなか、もふもふ〜", pose: happy }
+      sub: { text: "腹はやめろと……ゴロゴロ……いや、やめろ", pose: surprised }
+  nade_sub_body:
+    - main: { text: "クロの背中、すべすべだね", pose: happy }
+      sub: { text: "……ふん。手際はいいと認めよう", pose: normal }
+    - main: { text: "クロ、目を細めてる。気持ちいいんだ", pose: happy }
+      sub: { text: "勝手に読むな。……まあ、否定はしない", pose: troubled }
+
+  # 存在感
+  idle:
+    - main: { text: "おーい、生きてるー？根を詰めすぎてない？", pose: normal }
+      sub: { text: "休憩を入れるのも仕事のうちだぞ", pose: normal }
+    - main: { text: "しーん、としてるね。お茶でも淹れたら？", pose: normal }
+      sub: { text: "ボクらはここで待ってるさ", pose: normal }
+
+  # ポモドーロ (集中タイマー)。focus_end / pomodoro_done はねぎらいを厚めに。
+  focus_start:
+    - main: { text: "よし、集中タイムだね！終わるまで静かにしてるよ", pose: happy }
+      sub: { text: "邪魔はしない。がんばれ", pose: normal }
+    - main: { text: "いってらっしゃい、集中の世界へ！応援してる", pose: happy }
+      sub: { text: "ボクは見張り番だ。やってこい", pose: normal }
+  focus_end:
+    - main: { text: "おつかれさま！すごく集中できてたね、えらい", pose: happy }
+      sub: { text: "よく粘った。いったん肩の力を抜け", pose: normal }
+    - main: { text: "はい、ここまで！がんばったあなたに拍手〜", pose: happy }
+      sub: { text: "水を飲んで、目を休めるといい", pose: normal }
+    - main: { text: "集中おわり！ちゃんと進んだ自分を褒めてあげて", pose: happy }
+      sub: { text: "立ち上がって伸びでもしろ。血が巡るぞ", pose: normal }
+  break_end:
+    - main: { text: "休憩おわり！リフレッシュできた？次いこう", pose: happy }
+      sub: { text: "さあ、もうひと踏ん張りだ", pose: normal }
+    - main: { text: "よーし、また集中タイムだよ。あたしもついてる", pose: happy }
+      sub: { text: "ペースを乱すな。淡々といけ", pose: normal }
+  pomodoro_done:
+    - main: { text: "全部おつかれさま！本当によくがんばったね、すごいよ", pose: happy }
+      sub: { text: "見事だ。今日のお前は胸を張っていい", pose: happy }
+    - main: { text: "完走おめでとう！その集中力、あたし尊敬しちゃう", pose: happy }
+      sub: { text: "よくやり遂げた。ゆっくり休め、それも仕事だ", pose: normal }
+    - main: { text: "やりきったね！ごほうびに好きなことしていいんだよ", pose: happy }
+      sub: { text: "頑張った後の休息は格別だぞ。堪能しろ", pose: normal }
+
+# システムメッセージ (notify() 経由でゴーストが告知)
+system_messages:
+  mode_degraded:
+    - main: { text: "ごめん、ちょっと頭がぼーっとして通信できないみたい", pose: troubled }
+      sub: { text: "回線かAPIキーの調子が悪いようだ。しばらく省エネで話すよ", pose: normal }
+    - main: { text: "あれれ、向こうのサーバーとお話できない…", pose: surprised }
+      sub: { text: "そういう日もある。低負荷モードに切り替えだ", pose: normal }
+  mode_recovered:
+    - main: { text: "あ、つながった！ちゃんとお話できるよ", pose: happy }
+      sub: { text: "通常運転に戻った。よかったな", pose: normal }
+  update_available:
+    - main: { text: "新しいバージョン {version} が出てるみたいだよ！", pose: happy }
+      sub: { text: "時間のあるときに更新しておくといい", pose: normal }

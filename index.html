@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ugg</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="stage">
+      <div id="character-layer">
+        <div id="char-main" class="char-slot"></div>
+        <div id="char-sub" class="char-slot"></div>
+      </div>
+      <!-- 吹き出しは index.html に静的配置する。動的 createElement だと
+           WebView2 透過レイヤーで描画されないバグがあるため。表示制御は
+           .visible クラスの付与のみで行う。 -->
+      <div id="balloon-main" class="balloon solid">
+        <div class="balloon-text"></div>
+      </div>
+      <div id="balloon-sub" class="balloon solid">
+        <div class="balloon-text"></div>
+      </div>
+      <!-- ポモドーロバッジ (静的配置、phase=idle 以外で .visible) -->
+      <div id="pomodoro-badge" class="solid" title="クリックで停止">
+        <span id="pomodoro-badge-phase">--</span>
+        <span id="pomodoro-badge-time">00:00</span>
+        <span id="pomodoro-badge-round"></span>
+      </div>
+      <!-- 設定パネルとコンテキストメニューも静的配置 (WebView2 透過バグ対策)。
+           初期は .visible 無しで隠す。 -->
+      <div id="context-menu" class="solid"></div>
+      <div id="settings-panel" class="solid panel">
+        <header class="panel-header">
+          <h2>設定</h2>
+          <button type="button" id="settings-close" class="panel-close" aria-label="閉じる">×</button>
+        </header>
+        <div class="panel-body">
+          <section class="panel-section">
+            <h3>対話モード</h3>
+            <label class="row">
+              <span>モード</span>
+              <select id="settings-mode">
+                <option value="low">low (辞書のみ・無料・オフライン)</option>
+                <option value="advanced">advanced (LLM)</option>
+              </select>
+            </label>
+          </section>
+          <section class="panel-section">
+            <h3>LLM (advanced モード用)</h3>
+            <label class="row">
+              <span>プロバイダ名</span>
+              <input type="text" id="settings-llm-provider" placeholder="openai / lmstudio / ollama 等" />
+            </label>
+            <label class="row">
+              <span>モデル</span>
+              <input type="text" id="settings-llm-model" placeholder="gpt-4o-mini 等" />
+            </label>
+            <label class="row">
+              <span>base URL (省略可)</span>
+              <input type="text" id="settings-llm-base-url" placeholder="https://api.openai.com/v1 (空欄=公式)" />
+            </label>
+            <label class="row">
+              <span>月次上限 (USD, 0=無制限)</span>
+              <input type="number" id="settings-cost-limit" min="0" step="0.1" />
+            </label>
+            <div class="row">
+              <span>API キー</span>
+              <div class="key-cell">
+                <span id="settings-key-state" class="key-state">未確認</span>
+                <input type="password" id="settings-llm-key" placeholder="新しい API キー (空欄で保持)" />
+                <button type="button" id="settings-key-delete">削除</button>
+              </div>
+            </div>
+          </section>
+          <section class="panel-section">
+            <h3>表示</h3>
+            <label class="row">
+              <span>表示スケール</span>
+              <input type="number" id="settings-display-scale" min="0.5" max="2.0" step="0.05" />
+            </label>
+            <label class="row">
+              <span>タイプライター速度</span>
+              <select id="settings-talk-speed">
+                <option value="slow">遅い</option>
+                <option value="normal">普通</option>
+                <option value="fast">速い</option>
+                <option value="instant">一気に</option>
+              </select>
+            </label>
+          </section>
+          <section class="panel-section">
+            <h3>存在感</h3>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-quiet-mode" />
+              <span>静音モード (自発発話を停止)</span>
+            </label>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-auto-quiet-fullscreen" />
+              <span>フルスクリーンアプリ前面で自動静音</span>
+            </label>
+            <label class="row">
+              <span>独り言間隔 (分、0=無効)</span>
+              <input type="number" id="settings-monologue-interval" min="0" max="1440" step="1" />
+            </label>
+          </section>
+          <section class="panel-section">
+            <h3>ポモドーロ</h3>
+            <label class="row">
+              <span>集中 (分)</span>
+              <input type="number" id="settings-pomodoro-work" min="1" max="180" step="1" />
+            </label>
+            <label class="row">
+              <span>休憩 (分)</span>
+              <input type="number" id="settings-pomodoro-break" min="1" max="60" step="1" />
+            </label>
+            <label class="row">
+              <span>ラウンド数</span>
+              <input type="number" id="settings-pomodoro-rounds" min="1" max="20" step="1" />
+            </label>
+          </section>
+          <p id="settings-message" class="panel-message" hidden></p>
+        </div>
+        <footer class="panel-footer">
+          <button type="button" id="settings-cancel">キャンセル</button>
+          <button type="button" id="settings-save" class="primary">保存</button>
+        </footer>
+      </div>
+      <div id="onboarding-panel" class="solid panel">
+        <header class="panel-header">
+          <h2>はじめまして</h2>
+        </header>
+        <div class="panel-body">
+          <p class="panel-intro">
+            あなたのことを少しだけ教えてください。あとから設定でいつでも変えられます。
+          </p>
+          <section class="panel-section">
+            <label class="row">
+              <span>呼び名 (任意)</span>
+              <input type="text" id="onboarding-nickname" placeholder="例: しほ" />
+            </label>
+            <label class="row">
+              <span>話し方の希望 (任意)</span>
+              <input type="text" id="onboarding-talk-style" placeholder="例: フランクに / 敬語で" />
+            </label>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="onboarding-topics" />
+              <span>ネットの話題を会話に取り入れる (advanced モード時)</span>
+            </label>
+          </section>
+        </div>
+        <footer class="panel-footer">
+          <button type="button" id="onboarding-skip">スキップ</button>
+          <button type="button" id="onboarding-start" class="primary">はじめる</button>
+        </footer>
+      </div>
+      <div id="ui-layer"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
