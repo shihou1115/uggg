@@ -9,6 +9,8 @@ import { mountContextMenu } from "./menu/context-menu";
 import { showOnboarding } from "./panels/onboarding";
 import { mountPomodoroBadge } from "./panels/pomodoro";
 import { mountSettingsPanel, registerSavedListener } from "./panels/settings";
+import { mountCredit, refreshCredit } from "./tts/credit";
+import { createSpeaker, setTtsParams } from "./tts/speaker";
 import { installAlphaMaskHooks, scheduleMaskUpdate } from "./stage/alphamask";
 import { mountSlot, unmountSlot } from "./stage/character";
 import { applyDisplayScale } from "./stage/scale";
@@ -29,6 +31,11 @@ async function boot(): Promise<void> {
   currentSettings = payload.settings;
   applyDisplayScale(payload.settings.display_scale);
   setTalkSpeed(payload.settings.talk_speed);
+  setTtsParams({
+    enabled: payload.settings.tts_enabled,
+    speed: payload.settings.tts_speed,
+    volume: payload.settings.tts_volume,
+  });
 
   mountSlot("main", payload.characters.main);
   if (payload.characters.sub) {
@@ -51,10 +58,22 @@ async function boot(): Promise<void> {
 
   await mountSettingsPanel();
   await mountPomodoroBadge();
+  mountCredit();
+  // TTS スピーカーを ghost-speech に渡す
+  const speaker = createSpeaker();
+  const { setSpeaker } = await import("./system/ghost-speech");
+  setSpeaker(speaker);
+  await refreshCredit(
+    payload.settings.tts_enabled,
+    payload.settings.tts_speaker_main,
+    payload.settings.tts_speaker_sub,
+  );
   registerSavedListener((s) => {
     currentSettings = s;
     applyDisplayScale(s.display_scale);
     setTalkSpeed(s.talk_speed);
+    setTtsParams({ enabled: s.tts_enabled, speed: s.tts_speed, volume: s.tts_volume });
+    void refreshCredit(s.tts_enabled, s.tts_speaker_main, s.tts_speaker_sub);
   });
   mountContextMenu({
     current: () => currentSettings,

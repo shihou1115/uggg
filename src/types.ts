@@ -19,6 +19,12 @@ export interface Settings {
   pomodoro_work_min: number;
   pomodoro_break_min: number;
   pomodoro_rounds: number;
+  tts_enabled: boolean;
+  tts_engine: string;
+  tts_speaker_main: number;
+  tts_speaker_sub: number;
+  tts_speed: number;
+  tts_volume: number;
 }
 
 export interface SpeechTurn {

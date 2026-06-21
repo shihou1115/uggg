@@ -449,3 +449,9 @@ system_messages:
   update_available:
     - main: { text: "新しいバージョン {version} が出てるみたいだよ！", pose: happy }
       sub: { text: "時間のあるときに更新しておくといい", pose: normal }
+  voicevox_dl_complete:
+    - main: { text: "声の準備ができたよ！これからは喋れるね", pose: happy }
+      sub: { text: "音声合成の資産がそろった。あとは設定で有効にすればいい", pose: normal }
+  voicevox_dl_failed:
+    - main: { text: "あれ、声のダウンロードがうまくいかなかったみたい…", pose: troubled }
+      sub: { text: "回線かレート制限の問題かもな。少し待って再試行してくれ", pose: normal }

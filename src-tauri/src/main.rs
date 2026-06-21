@@ -8,6 +8,7 @@ mod presence;
 mod state;
 mod system;
 mod tasks;
+mod tts;
 mod window;
 
 use std::sync::Arc;
@@ -33,6 +34,13 @@ fn main() {
             if let Err(err) = window::tray::install(app.handle(), state.clone()) {
                 eprintln!("[tray] install failed: {err:#}");
             }
+            // TTS が有効 & 資産あり なら背景で voicevox engine を事前 init (初発話のラグ解消)
+            {
+                let s = state.settings.lock().expect("settings poisoned").clone();
+                if s.tts_enabled {
+                    commands::tts::spawn_preinit(state.clone());
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -56,6 +64,13 @@ fn main() {
             commands::secrets::delete_api_key,
             commands::settings::get_settings,
             commands::settings::set_settings,
+            commands::tts::voicevox_assets_ready,
+            commands::tts::download_voicevox_assets,
+            commands::tts::list_voices,
+            commands::tts::synthesize_voice,
+            commands::tts::set_github_token,
+            commands::tts::has_github_token,
+            commands::tts::delete_github_token,
             commands::window::update_alpha_mask,
         ])
         .run(tauri::generate_context!())

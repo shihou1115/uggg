@@ -81,6 +81,25 @@ pub struct Settings {
     /// ポモドーロのラウンド数。
     #[serde(default = "default_pomodoro_rounds")]
     pub pomodoro_rounds: u32,
+    // === TTS (M4) ===
+    /// TTS 有効化 (既定 false; 資産 DL 前は声なしで動く)。
+    #[serde(default)]
+    pub tts_enabled: bool,
+    /// TTS エンジン種別 (現状 "voicevox_core" のみ。M4c で "irodori" を追加予定)。
+    #[serde(default = "default_tts_engine")]
+    pub tts_engine: String,
+    /// メインキャラの話者(style)ID。
+    #[serde(default = "default_tts_speaker_main")]
+    pub tts_speaker_main: u32,
+    /// サブキャラの話者(style)ID。
+    #[serde(default = "default_tts_speaker_sub")]
+    pub tts_speaker_sub: u32,
+    /// 話速 (voicevox の speedScale 相当。0.5〜2.0 clamp)。
+    #[serde(default = "default_tts_speed")]
+    pub tts_speed: f64,
+    /// 音量 (voicevox の volumeScale 相当。0.0〜2.0 clamp)。
+    #[serde(default = "default_tts_volume")]
+    pub tts_volume: f64,
 }
 
 fn default_llm_provider() -> String {
@@ -115,6 +134,26 @@ fn default_pomodoro_rounds() -> u32 {
     4
 }
 
+fn default_tts_engine() -> String {
+    "voicevox_core".to_string()
+}
+
+fn default_tts_speaker_main() -> u32 {
+    2
+}
+
+fn default_tts_speaker_sub() -> u32 {
+    3
+}
+
+fn default_tts_speed() -> f64 {
+    1.0
+}
+
+fn default_tts_volume() -> f64 {
+    1.0
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -134,6 +173,12 @@ impl Default for Settings {
             pomodoro_work_min: default_pomodoro_work_min(),
             pomodoro_break_min: default_pomodoro_break_min(),
             pomodoro_rounds: default_pomodoro_rounds(),
+            tts_enabled: false,
+            tts_engine: default_tts_engine(),
+            tts_speaker_main: default_tts_speaker_main(),
+            tts_speaker_sub: default_tts_speaker_sub(),
+            tts_speed: default_tts_speed(),
+            tts_volume: default_tts_volume(),
         }
     }
 }
@@ -178,6 +223,22 @@ impl Settings {
         if self.monologue_interval_min > 1440 {
             self.monologue_interval_min = 1440;
         }
+        // TTS パラメータ clamp
+        if !self.tts_speed.is_finite() || self.tts_speed < 0.5 {
+            self.tts_speed = 0.5;
+        }
+        if self.tts_speed > 2.0 {
+            self.tts_speed = 2.0;
+        }
+        if !self.tts_volume.is_finite() || self.tts_volume < 0.0 {
+            self.tts_volume = 0.0;
+        }
+        if self.tts_volume > 2.0 {
+            self.tts_volume = 2.0;
+        }
+        if self.tts_engine.trim().is_empty() {
+            self.tts_engine = default_tts_engine();
+        }
     }
 }
 
@@ -191,6 +252,14 @@ pub struct AppState {
     pub dialogue: DialogueState,
     pub presence: PresenceState,
     pub pomodoro: PomodoroState,
+    pub tts: TtsState,
+}
+
+/// TTS エンジンの遅延初期化を抱えるサブ状態。
+/// VoicevoxEngine は init が重い (数秒) ので AppState に保持して使い回す。
+#[derive(Default)]
+pub struct TtsState {
+    pub voicevox: Mutex<Option<crate::tts::voicevox::VoicevoxEngine>>,
 }
 
 /// 存在感系サブ状態 (放置反応・ウインドウ位置)。
@@ -289,7 +358,7 @@ pub struct DecodedMask {
 
 impl AppState {
     pub fn initialize(app: &AppHandle) -> Result<Self> {
-        let data_dir = resolve_app_data_dir(app)?;
+        let data_dir = resolve_app_data_dir()?;
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("create app data dir: {}", data_dir.display()))?;
 
@@ -311,17 +380,23 @@ impl AppState {
             dialogue: DialogueState::default(),
             presence: PresenceState::default(),
             pomodoro: PomodoroState::default(),
+            tts: TtsState::default(),
         })
     }
 }
 
-fn resolve_app_data_dir(_app: &AppHandle) -> Result<PathBuf> {
+pub fn resolve_app_data_dir() -> Result<PathBuf> {
     // architecture.md §2.4: ファイル資産は `%APPDATA%\ugg\` 配下。
     // Tauri 既定の app_data_dir はバンドル識別子（io.ugg.app）を使うので使わず、
     // %APPDATA% を直接参照する（本アプリは Windows 専用）。
     let appdata = std::env::var_os("APPDATA")
         .ok_or_else(|| anyhow!("環境変数 APPDATA が設定されていません"))?;
     Ok(PathBuf::from(appdata).join("ugg"))
+}
+
+/// voicevox_core の資産ディレクトリ (`%APPDATA%\ugg\voicevox`)。
+pub fn voicevox_asset_dir() -> Result<PathBuf> {
+    Ok(resolve_app_data_dir()?.join("voicevox"))
 }
 
 fn resolve_assets_dir(app: &AppHandle) -> Result<PathBuf> {

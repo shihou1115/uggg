@@ -21,6 +21,8 @@
       <div id="balloon-sub" class="balloon solid">
         <div class="balloon-text"></div>
       </div>
+      <!-- VOICEVOX クレジット (TTS 有効時に常時表示、.solid) -->
+      <div id="tts-credit" class="solid" title="VOICEVOX 利用規約に基づくクレジット表記"></div>
       <!-- ポモドーロバッジ (静的配置、phase=idle 以外で .visible) -->
       <div id="pomodoro-badge" class="solid" title="クリックで停止">
         <span id="pomodoro-badge-phase">--</span>
@@ -118,6 +120,50 @@
               <span>ラウンド数</span>
               <input type="number" id="settings-pomodoro-rounds" min="1" max="20" step="1" />
             </label>
+          </section>
+          <section class="panel-section">
+            <h3>音声 (VOICEVOX)</h3>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-tts-enabled" />
+              <span>声で話す (TTS 有効化)</span>
+            </label>
+            <label class="row">
+              <span>メインの声 (style ID)</span>
+              <select id="settings-tts-speaker-main"></select>
+            </label>
+            <label class="row">
+              <span>サブの声 (style ID)</span>
+              <select id="settings-tts-speaker-sub"></select>
+            </label>
+            <label class="row">
+              <span>速度 (0.5〜2.0)</span>
+              <input type="number" id="settings-tts-speed" min="0.5" max="2.0" step="0.05" />
+            </label>
+            <label class="row">
+              <span>音量 (0〜2.0)</span>
+              <input type="number" id="settings-tts-volume" min="0" max="2.0" step="0.05" />
+            </label>
+            <div class="row">
+              <span>音声資産</span>
+              <div class="key-cell">
+                <span id="settings-tts-assets-state" class="key-state">未確認</span>
+                <button type="button" id="settings-tts-download">資産をダウンロード</button>
+              </div>
+            </div>
+            <div class="row">
+              <span>GitHub PAT (任意)</span>
+              <div class="key-cell">
+                <span id="settings-gh-token-state" class="key-state">未確認</span>
+                <input type="password" id="settings-gh-token" placeholder="DL レート制限緩和用 (空欄で保持)" />
+                <button type="button" id="settings-gh-token-delete">削除</button>
+              </div>
+            </div>
+            <p class="panel-hint">
+              ダウンロードを実行すると <a href="https://voicevox.hiroshiba.jp/term/" target="_blank" rel="noopener">VOICEVOX 利用規約</a>
+              および <a href="https://www.microsoft.com/web/webcomponents/license-terms" target="_blank" rel="noopener">ONNX Runtime ライセンス</a>
+              に同意したものとみなします。
+            </p>
+            <p id="settings-tts-progress" class="panel-message" hidden></p>
           </section>
           <p id="settings-message" class="panel-message" hidden></p>
         </div>

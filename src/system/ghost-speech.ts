@@ -5,8 +5,20 @@ import { newToken, typeInto, type TypewriterToken } from "../dialogue/typewriter
 import { setPose } from "../stage/character";
 import type { DialogueResponse, SlotName, SpeechTurn, TalkSpeed } from "../types";
 
+interface SpeakerLike {
+  speak(slot: SlotName, text: string): Promise<void>;
+  interrupt(): void;
+  whenIdle(): Promise<void>;
+  isAudible(): boolean;
+}
+
 let currentToken: TypewriterToken | null = null;
 let talkSpeed: TalkSpeed = "normal";
+let ttsSpeaker: SpeakerLike | null = null;
+
+export function setSpeaker(s: SpeakerLike): void {
+  ttsSpeaker = s;
+}
 
 export function setTalkSpeed(speed: TalkSpeed): void {
   talkSpeed = speed;
@@ -25,6 +37,7 @@ export async function startListening(): Promise<void> {
 /// 連続呼び出しは前ターンを cancel して即座に新ターンを開始する。
 export async function renderResponse(resp: DialogueResponse): Promise<void> {
   if (currentToken) currentToken.cancelled = true;
+  ttsSpeaker?.interrupt();
   const token = newToken();
   currentToken = token;
 
@@ -59,6 +72,9 @@ async function speakSlot(
 ): Promise<void> {
   if (turn.pose) setPose(slot, turn.pose);
   const textEl = showBalloon(slot);
+  // TTS フック: 描画開始と同時に再生開始 (順序保証は speaker 側のキュー)。
+  // 失敗は内部で握りつぶされる (声なし継続)。
+  void ttsSpeaker?.speak(slot, turn.text);
   await typeInto(textEl, turn.text, talkSpeed, token, () => reposition(slot));
 }
 

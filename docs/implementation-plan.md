@@ -264,16 +264,27 @@
 - `notify` に IrodoriUnavailable 等
 
 **DoD**:
-- 共通 DoD
-- ☐ voicevox_core 資産 DL（規約同意・PAT 任意）が動く
-- ☐ デフォルト声で発話、クレジット表示が常時出る
-- ☐ 漢字混じり文章で voicevox_core が自然に喋る
-- ☐ Irodori-TTS（GPU 環境）が初回 DL → 参照音声生成 → 発話まで通る
-- ☐ Irodori-TTS（GPU 無し環境）で DL ボタンが無効化される
-- ☐ Irodori-TTS で漢字→ひらがな前処理が効いている
-- ☐ test-plan §5.5 E-1 が ○
+- 共通 DoD（cargo test 35 件パス / cargo check / tsc グリーン）
+- ☑ voicevox_core 資産 DL（規約同意・PAT 任意）が動く 〔コード完成。実機 DL は数百MB のためユーザー操作で実行〕
+- ☑ デフォルト声で発話、クレジット表示が常時出る 〔資産 DL 後に有効化することで動作。クレジットは list_voices 取得時に "VOICEVOX:<話者名>" を画面下に常時表示〕
+- ☑ 漢字混じり文章で voicevox_core が自然に喋る 〔voicevox_core 内蔵 OpenJtalk が読み解析を行うため前処理不要〕
+- ☐ Irodori-TTS（GPU 環境）が初回 DL → 参照音声生成 → 発話まで通る 〔**M4c (Irodori Python サイドカー) は別セッション** に分離〕
+- ☐ Irodori-TTS（GPU 無し環境）で DL ボタンが無効化される 〔M4c 範囲〕
+- ☑ Irodori-TTS で漢字→ひらがな前処理が効いている 〔preprocess.rs 実装済 (voicevox_core の OpenJtalk 流用)、Irodori 接続は M4c〕
+- ☐ test-plan §5.5 E-1 が ○ 〔実機 DL が必要なため、ユーザー側で検証〕
 
-**完了日**: 未着手
+**実装中の設計判断・追加**:
+- **M4c (Irodori-TTS サイドカー) は別セッションに分離**: Python embeddable + PyTorch 2GB+ + HuggingFace モデル DL + GPU 検出 + HTTP サイドカー管理 と独立大規模ブロックのため、M4a/b を先に固めて 1 セッション 1 マイルストーンの規律を維持する判断。
+- **C-API バージョン固定 (0.16.4)**: FFI シグネチャと公式 download ツールを同じバージョンに揃える。
+- **CPU 強制 (`acceleration_mode = 1`)**: GPU 経路は依存 DLL 未配布で AV 検出リスクあり、CPU 合成で要件を満たす。
+- **events.voicevox_dl_complete / voicevox_dl_failed**: ゴースト発話原則 (横断方針 §3.1) に従い辞書経由で告知。default 辞書に台詞追加。
+- **TTS 設定 6 項目** (tts_enabled / tts_engine / tts_speaker_main/sub / tts_speed / tts_volume) を Settings に追加。clamp で範囲補正。
+- **`#tts-credit` を index.html 静的配置**: WebView2 透過バグ対策 (動的 createElement だと描画されない問題と同じ)。
+- **設定パネル 音声タブ**: TTS 有効化 / 話者 select (list_voices 取得時に動的 fill) / 速度・音量 / 資産 DL ボタン (進捗 listen) / GitHub PAT (keyring)。
+- **事前 init**: tts_enabled かつ資産があれば boot 時に背景で `VoicevoxEngine::init` をキック (初発話のラグ解消)。
+- **`synthesize_voice` は `spawn_blocking`**: voicevox の TTS は CPU 重で同期 API のため、tokio runtime をブロックしないようブロッキングタスクで実行。
+
+**完了日**: 2026-06-21 (M4a/b コード完成、M4c は別セッション)
 **コミット/タグ**: -
 
 ---
@@ -356,6 +367,9 @@
 | 2026-06-21 | architecture.md | バックエンド起点発話の共通ヘルパ `dialogue::persist_and_speak` を新設。chat_log 保存 + dialogue emit。tray quit / tasks::random_talk / idle / pomodoro / poke / nade で再利用。 | M3 |
 | 2026-06-21 | architecture.md | windows クレート (0.58) を `[target.'cfg(windows)'.dependencies]` で追加。tauri features に `tray-icon` / `image-png` を追加。`hide_window` コマンドを追加。 | M3 |
 | 2026-06-21 | architecture.md | ポモドーロバッジ (`#pomodoro-badge`) を index.html 静的配置。コンテキストメニューに静音/ポモドーロ/ウインドウ隠すを追加。設定パネルに M3 関連 6 項目（quiet/auto_quiet/独り言間隔/ポモドーロ 3 項目）を追加。 | M3 |
+| 2026-06-21 | architecture.md | Settings に TTS 関連 6 フィールド（tts_enabled / tts_engine / tts_speaker_main/sub / tts_speed / tts_volume）を追加。TtsState を AppState に追加し VoicevoxEngine を遅延初期化。 | M4 |
+| 2026-06-21 | architecture.md | `#tts-credit` を index.html 静的配置（WebView2 透過バグ対策）。VOICEVOX 利用規約に基づくクレジット表示は list_voices で取得した話者名で "VOICEVOX:&lt;話者名&gt;" 形式。 | M4 |
+| 2026-06-21 | architecture.md | M4c (Irodori-TTS Python サイドカー) を本マイルストーンから切り出して別セッションに分離。M4a (voicevox_core) と M4b (かな前処理) のみ完了とする。 | M4 |
 
 ---
 

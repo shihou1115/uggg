@@ -21,6 +21,17 @@ interface Inputs {
   pomoWork: HTMLInputElement;
   pomoBreak: HTMLInputElement;
   pomoRounds: HTMLInputElement;
+  ttsEnabled: HTMLInputElement;
+  ttsSpeakerMain: HTMLSelectElement;
+  ttsSpeakerSub: HTMLSelectElement;
+  ttsSpeed: HTMLInputElement;
+  ttsVolume: HTMLInputElement;
+  ttsAssetsState: HTMLElement;
+  ttsDownloadBtn: HTMLButtonElement;
+  ghTokenState: HTMLElement;
+  ghTokenInput: HTMLInputElement;
+  ghTokenDeleteBtn: HTMLButtonElement;
+  ttsProgress: HTMLElement;
   saveBtn: HTMLButtonElement;
   cancelBtn: HTMLButtonElement;
   closeBtn: HTMLButtonElement;
@@ -56,8 +67,10 @@ export async function openSettingsPanel(): Promise<void> {
   }
   applySettingsToForm(current);
   await refreshKeyState(current.llm_provider);
+  await refreshTtsState();
   inputs.panel.classList.add("visible");
   inputs.msg.hidden = true;
+  inputs.ttsProgress.hidden = true;
   inputs.keyInput.value = "";
   setTimeout(() => inputs?.mode.focus(), 0);
 }
@@ -89,6 +102,17 @@ function collectInputs(): Inputs {
     pomoWork: byId<HTMLInputElement>("settings-pomodoro-work"),
     pomoBreak: byId<HTMLInputElement>("settings-pomodoro-break"),
     pomoRounds: byId<HTMLInputElement>("settings-pomodoro-rounds"),
+    ttsEnabled: byId<HTMLInputElement>("settings-tts-enabled"),
+    ttsSpeakerMain: byId<HTMLSelectElement>("settings-tts-speaker-main"),
+    ttsSpeakerSub: byId<HTMLSelectElement>("settings-tts-speaker-sub"),
+    ttsSpeed: byId<HTMLInputElement>("settings-tts-speed"),
+    ttsVolume: byId<HTMLInputElement>("settings-tts-volume"),
+    ttsAssetsState: byId("settings-tts-assets-state"),
+    ttsDownloadBtn: byId<HTMLButtonElement>("settings-tts-download"),
+    ghTokenState: byId("settings-gh-token-state"),
+    ghTokenInput: byId<HTMLInputElement>("settings-gh-token"),
+    ghTokenDeleteBtn: byId<HTMLButtonElement>("settings-gh-token-delete"),
+    ttsProgress: byId("settings-tts-progress"),
     saveBtn: byId<HTMLButtonElement>("settings-save"),
     cancelBtn: byId<HTMLButtonElement>("settings-cancel"),
     closeBtn: byId<HTMLButtonElement>("settings-close"),
@@ -104,12 +128,111 @@ function attachHandlers(i: Inputs): void {
   i.provider.addEventListener("change", () => {
     void refreshKeyState(i.provider.value);
   });
+  i.ttsDownloadBtn.addEventListener("click", () => void onTtsDownload());
+  i.ghTokenDeleteBtn.addEventListener("click", () => void onDeleteGhToken());
   i.panel.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") {
       ev.preventDefault();
       closeSettingsPanel();
     }
   });
+}
+
+async function refreshTtsState(): Promise<void> {
+  if (!inputs) return;
+  try {
+    const ready = await invoke<boolean>("voicevox_assets_ready");
+    inputs.ttsAssetsState.textContent = ready ? "ダウンロード済み" : "未ダウンロード";
+    inputs.ttsAssetsState.classList.toggle("has-key", ready);
+    if (ready) {
+      // 話者一覧を取得して select に流し込む
+      const voices = await invoke<Array<{ id: number; name: string }>>("list_voices");
+      const currentMain = inputs.ttsSpeakerMain.value || (current?.tts_speaker_main ?? 2).toString();
+      const currentSub = inputs.ttsSpeakerSub.value || (current?.tts_speaker_sub ?? 3).toString();
+      fillSpeakerSelect(inputs.ttsSpeakerMain, voices, currentMain);
+      fillSpeakerSelect(inputs.ttsSpeakerSub, voices, currentSub);
+    }
+  } catch (err) {
+    console.warn("voicevox_assets_ready/list_voices failed", err);
+  }
+  try {
+    const hasToken = await invoke<boolean>("has_github_token");
+    inputs.ghTokenState.textContent = hasToken ? "保存済み" : "未保存";
+    inputs.ghTokenState.classList.toggle("has-key", hasToken);
+  } catch (err) {
+    console.warn("has_github_token failed", err);
+  }
+}
+
+function fillSpeakerSelect(
+  select: HTMLSelectElement,
+  voices: Array<{ id: number; name: string }>,
+  selectedId: string,
+): void {
+  select.innerHTML = "";
+  for (const v of voices) {
+    const opt = document.createElement("option");
+    opt.value = String(v.id);
+    opt.textContent = `${v.name} (#${v.id})`;
+    select.appendChild(opt);
+  }
+  if (!voices.some((v) => String(v.id) === selectedId)) {
+    const opt = document.createElement("option");
+    opt.value = selectedId;
+    opt.textContent = `#${selectedId} (現在の設定)`;
+    select.insertBefore(opt, select.firstChild);
+  }
+  select.value = selectedId;
+}
+
+async function onTtsDownload(): Promise<void> {
+  if (!inputs) return;
+  // 規約同意ダイアログ。シンプルに confirm で済ませる (パネル既出のリンクで規約は提示済み)。
+  const ok = window.confirm(
+    "VOICEVOX 音声モデルおよび ONNX Runtime のライセンス・規約に同意してダウンロードしますか?\n（数百 MB の通信が発生します）",
+  );
+  if (!ok) return;
+  showProgress("ダウンローダ取得中…", false);
+  inputs.ttsDownloadBtn.disabled = true;
+
+  // 進捗 listen を貼る (毎回貼り直して done で外す)
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<string>("voicevox-download", (ev) => {
+    if (ev.payload === "__done__") {
+      return;
+    }
+    showProgress(ev.payload, false);
+  });
+
+  try {
+    await invoke("download_voicevox_assets", { agreed: true, ghToken: null });
+    showProgress("ダウンロード完了。話者リストを更新します…", false);
+    await refreshTtsState();
+    showProgress("完了しました。", false);
+  } catch (err) {
+    showProgress(`ダウンロード失敗: ${formatErr(err)}`, true);
+  } finally {
+    unlisten();
+    inputs.ttsDownloadBtn.disabled = false;
+  }
+}
+
+async function onDeleteGhToken(): Promise<void> {
+  if (!inputs) return;
+  try {
+    await invoke("delete_github_token");
+    await refreshTtsState();
+    showMessage("GitHub PAT を削除しました", false);
+  } catch (err) {
+    showMessage(`PAT 削除失敗: ${formatErr(err)}`, true);
+  }
+}
+
+function showProgress(msg: string, isError: boolean): void {
+  if (!inputs) return;
+  inputs.ttsProgress.textContent = msg;
+  inputs.ttsProgress.classList.toggle("error", isError);
+  inputs.ttsProgress.hidden = false;
 }
 
 function applySettingsToForm(s: Settings): void {
@@ -127,6 +250,26 @@ function applySettingsToForm(s: Settings): void {
   inputs.pomoWork.value = String(s.pomodoro_work_min);
   inputs.pomoBreak.value = String(s.pomodoro_break_min);
   inputs.pomoRounds.value = String(s.pomodoro_rounds);
+  inputs.ttsEnabled.checked = s.tts_enabled;
+  inputs.ttsSpeed.value = String(s.tts_speed);
+  inputs.ttsVolume.value = String(s.tts_volume);
+  // 話者 select は資産 DL 済みのときだけ list_voices で埋められる。値は文字列で保持。
+  ensureSpeakerSelection(inputs.ttsSpeakerMain, s.tts_speaker_main);
+  ensureSpeakerSelection(inputs.ttsSpeakerSub, s.tts_speaker_sub);
+}
+
+/// 話者 select に id が無ければ「#<id> (未取得)」項目を作って current を保つ。
+function ensureSpeakerSelection(select: HTMLSelectElement, id: number): void {
+  const value = String(id);
+  if (Array.from(select.options).some((o) => o.value === value)) {
+    select.value = value;
+    return;
+  }
+  const opt = document.createElement("option");
+  opt.value = value;
+  opt.textContent = `#${id} (未取得)`;
+  select.appendChild(opt);
+  select.value = value;
 }
 
 async function refreshKeyState(provider: string): Promise<void> {
@@ -166,7 +309,24 @@ async function onSave(): Promise<void> {
     pomodoro_work_min: Number(inputs.pomoWork.value) || current.pomodoro_work_min,
     pomodoro_break_min: Number(inputs.pomoBreak.value) || current.pomodoro_break_min,
     pomodoro_rounds: Number(inputs.pomoRounds.value) || current.pomodoro_rounds,
+    tts_enabled: inputs.ttsEnabled.checked,
+    tts_speaker_main: Number(inputs.ttsSpeakerMain.value) || current.tts_speaker_main,
+    tts_speaker_sub: Number(inputs.ttsSpeakerSub.value) || current.tts_speaker_sub,
+    tts_speed: Number(inputs.ttsSpeed.value) || current.tts_speed,
+    tts_volume: Number(inputs.ttsVolume.value) || current.tts_volume,
   };
+
+  // GitHub PAT 入力があれば先に keyring へ
+  const ghToken = inputs.ghTokenInput.value;
+  if (ghToken.trim()) {
+    try {
+      await invoke("set_github_token", { token: ghToken });
+      inputs.ghTokenInput.value = "";
+    } catch (err) {
+      showMessage(`PAT 保存失敗: ${formatErr(err)}`, true);
+      return;
+    }
+  }
 
   // API キー入力があれば先に保存 (settings 保存より前)
   const keyVal = inputs.keyInput.value;

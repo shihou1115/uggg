@@ -23,6 +23,12 @@ pub enum NoticeKind {
         reason: DegradeReason,
     },
     ModeRecovered,
+    /// voicevox_core 資産 DL 完了。
+    VoicevoxDlComplete,
+    /// voicevox_core 資産 DL 失敗 (詳細は reason)。
+    VoicevoxDlFailed {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +44,8 @@ impl NoticeKind {
             NoticeKind::CostLimitExceeded { .. } => "cost_limit_exceeded",
             NoticeKind::ModeDegraded { .. } => "mode_degraded",
             NoticeKind::ModeRecovered => "mode_recovered",
+            NoticeKind::VoicevoxDlComplete => "voicevox_dl_complete",
+            NoticeKind::VoicevoxDlFailed { .. } => "voicevox_dl_failed",
         }
     }
 
@@ -54,6 +62,10 @@ impl NoticeKind {
                 DegradeReason::CostLimit => "コスト上限超過により低負荷モードへ降格しました".to_string(),
             },
             NoticeKind::ModeRecovered => "通常モードに復帰しました".to_string(),
+            NoticeKind::VoicevoxDlComplete => "VOICEVOX の音声資産ダウンロードが完了しました".to_string(),
+            NoticeKind::VoicevoxDlFailed { reason } => {
+                format!("VOICEVOX 音声資産のダウンロードに失敗しました: {reason}")
+            }
         }
     }
 }
