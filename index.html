@@ -32,6 +32,17 @@
       <!-- 設定パネルとコンテキストメニューも静的配置 (WebView2 透過バグ対策)。
            初期は .visible 無しで隠す。 -->
       <div id="context-menu" class="solid"></div>
+      <!-- M5-G: チャットログパネル -->
+      <div id="chatlog-panel" class="solid panel">
+        <header class="panel-header">
+          <h2>チャットログ</h2>
+          <button type="button" id="chatlog-close" class="panel-close" aria-label="閉じる">×</button>
+        </header>
+        <div class="panel-body">
+          <div id="chatlog-list" class="chatlog-list"></div>
+          <p id="chatlog-message" class="panel-message" hidden></p>
+        </div>
+      </div>
       <div id="settings-panel" class="solid panel">
         <header class="panel-header">
           <h2>設定</h2>
@@ -122,10 +133,17 @@
             </label>
           </section>
           <section class="panel-section">
-            <h3>音声 (VOICEVOX)</h3>
+            <h3>音声</h3>
             <label class="row checkbox-row">
               <input type="checkbox" id="settings-tts-enabled" />
               <span>声で話す (TTS 有効化)</span>
+            </label>
+            <label class="row">
+              <span>エンジン</span>
+              <select id="settings-tts-engine">
+                <option value="voicevox_core">VOICEVOX (CPU・無料・推奨)</option>
+                <option value="irodori">Irodori-TTS (GPU 必須・M4c 開発中)</option>
+              </select>
             </label>
             <label class="row">
               <span>メインの声 (style ID)</span>
@@ -164,6 +182,137 @@
               に同意したものとみなします。
             </p>
             <p id="settings-tts-progress" class="panel-message" hidden></p>
+          </section>
+          <section class="panel-section">
+            <h3>音声 (Irodori-TTS / 高品質モード)</h3>
+            <div class="row">
+              <span>GPU 検出</span>
+              <span id="settings-irodori-gpu-state" class="key-state">未確認</span>
+            </div>
+            <div class="row">
+              <span>Python ランタイム</span>
+              <div class="key-cell">
+                <span id="settings-irodori-assets-state" class="key-state">未確認</span>
+                <button type="button" id="settings-irodori-download" disabled>ランタイムをダウンロード</button>
+              </div>
+            </div>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-irodori-use-real-model" />
+              <span>実モデルを使う (β / 実機検証中)</span>
+            </label>
+            <p class="panel-hint">
+              ダウンロードには 1〜2 GB の通信と GPU (NVIDIA / CUDA 12.x) が必要です。
+              Python (3.11.9 embeddable) と PyTorch、関連ライブラリを <code>%APPDATA%\ugg\irodori\</code> に配置します。
+            </p>
+            <p id="settings-irodori-progress" class="panel-message" hidden></p>
+            <div class="row">
+              <span>メインキャラの参照音声</span>
+              <span id="settings-voiceref-main-state" class="key-state">未生成</span>
+            </div>
+            <label class="row">
+              <span>キャプション (メイン)</span>
+              <input type="text" id="settings-voiceref-main-caption" placeholder="例: 明るく元気な若い女性の声" />
+            </label>
+            <div class="row">
+              <span></span>
+              <div class="key-cell">
+                <button type="button" id="settings-voiceref-main-generate">生成 / 再生成</button>
+                <button type="button" id="settings-voiceref-main-preview">プレビュー</button>
+                <button type="button" id="settings-voiceref-main-delete">削除</button>
+              </div>
+            </div>
+            <div class="row">
+              <span>サブキャラの参照音声</span>
+              <span id="settings-voiceref-sub-state" class="key-state">未生成</span>
+            </div>
+            <label class="row">
+              <span>キャプション (サブ)</span>
+              <input type="text" id="settings-voiceref-sub-caption" placeholder="例: 落ち着いた大人の男性の声" />
+            </label>
+            <div class="row">
+              <span></span>
+              <div class="key-cell">
+                <button type="button" id="settings-voiceref-sub-generate">生成 / 再生成</button>
+                <button type="button" id="settings-voiceref-sub-preview">プレビュー</button>
+                <button type="button" id="settings-voiceref-sub-delete">削除</button>
+              </div>
+            </div>
+            <p id="settings-voiceref-progress" class="panel-message" hidden></p>
+          </section>
+          <section class="panel-section">
+            <h3>キャラクター</h3>
+            <label class="row">
+              <span>ゴースト</span>
+              <select id="settings-ghost-id"></select>
+            </label>
+            <label class="row">
+              <span>シェル</span>
+              <select id="settings-shell-id"></select>
+            </label>
+            <p class="panel-hint">変更を保存した後、アプリの再起動で反映されます。</p>
+          </section>
+          <section class="panel-section">
+            <h3>OS</h3>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-autostart" />
+              <span>OS ログイン時に ugg を自動起動する</span>
+            </label>
+          </section>
+          <section class="panel-section">
+            <h3>興味分野 (時事ネタ)</h3>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-topics-enabled" />
+              <span>advanced モードで時事ネタを話す (1 時間おきに RSS 取得)</span>
+            </label>
+            <label class="row">
+              <span>キーワード (カンマ区切り、最大 20)</span>
+              <input type="text" id="settings-topics-interests" placeholder="例: アニメ, Rust, 宇宙開発" />
+            </label>
+            <div class="row">
+              <span></span>
+              <div class="key-cell">
+                <button type="button" id="settings-topics-fetch">いますぐ取得</button>
+              </div>
+            </div>
+            <p class="panel-hint">
+              Google News (日本語) の RSS から取得します。明らかに重い見出し (訃報・事件・災害・戦争) は自動でフィルタされます。
+            </p>
+            <p id="settings-topics-message" class="panel-message" hidden></p>
+          </section>
+          <section class="panel-section">
+            <h3>更新通知</h3>
+            <label class="row">
+              <span>フィード URL</span>
+              <input type="url" id="settings-update-feed-url" placeholder="https://example.com/ugg-feed.json" />
+            </label>
+            <div class="row">
+              <span></span>
+              <div class="key-cell">
+                <button type="button" id="settings-update-check">いますぐチェック</button>
+              </div>
+            </div>
+            <p id="settings-update-message" class="panel-message" hidden></p>
+          </section>
+          <section class="panel-section">
+            <h3>データ管理</h3>
+            <div class="row">
+              <span>チャットログ</span>
+              <div class="key-cell">
+                <button type="button" id="settings-open-chatlog">ログを開く</button>
+              </div>
+            </div>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-data-include-profile" />
+              <span>エクスポート / クリアに記憶 (user_profile) も含める</span>
+            </label>
+            <div class="row">
+              <span></span>
+              <div class="key-cell">
+                <button type="button" id="settings-data-export">JSON エクスポート</button>
+                <button type="button" id="settings-data-clear">履歴クリア</button>
+              </div>
+            </div>
+            <p id="settings-data-message" class="panel-message" hidden></p>
           </section>
           <p id="settings-message" class="panel-message" hidden></p>
         </div>

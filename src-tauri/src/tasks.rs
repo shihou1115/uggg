@@ -2,10 +2,10 @@
 //!
 //! - ランダムトーク: monologue_interval_min 分ごとに独り言。0 で無効。
 //! - 放置監視: 60 秒チェック、最終操作から 30 分で 1 回 idle。
+//! - Irodori サイドカーのアイドル監視: 60 秒チェック、最終使用から 5 分で自動 shutdown (M4c Phase E)。
 //!
-//! いずれも busy / 静音 (quiet) のときは発火を持ち越す。
+//! いずれも busy / 静音 (quiet) のときは発火を持ち越す (idle 監視除く)。
 //! advanced モードの LLM 生成 + キャッシュは M2 のスコープ外として、M3 では low 辞書選択のみ。
-//! (advanced キャッシュ補充は将来課題。advanced モードでも当面は辞書 monologue を使う。)
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -115,4 +115,93 @@ fn speak_idle(app: &AppHandle, state: &Arc<AppState>) -> bool {
         }
         None => false,
     }
+}
+
+/// Irodori サイドカーのアイドル監視 (M4c Phase E, architecture §8.4)。
+/// 60 秒ごとに `IrodoriClient` の `last_used` を確認し、5 分以上未使用なら shutdown する。
+/// メモリ常駐の Python + torch + モデルが大きいので、放置中は積極的に解放する。
+pub fn spawn_irodori_idle_watcher(state: Arc<AppState>) {
+    const CHECK_INTERVAL_SECS: u64 = 60;
+    const IDLE_THRESHOLD_SECS: i64 = 5 * 60;
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+            let now = Utc::now().timestamp();
+            // 失敗は無視 (次のティックで再試行)
+            let _ = state
+                .tts
+                .irodori
+                .shutdown_if_idle(now, IDLE_THRESHOLD_SECS)
+                .await;
+        }
+    });
+}
+
+/// M5-C: `topics_enabled` が ON の間、1 時間おきに enabled な interest_topics の RSS を取得して
+/// topics_cache に蓄積する。topics_enabled=false の周期は何もしない (キャッシュ取得しない)。
+pub fn spawn_topics_watcher(state: Arc<AppState>) {
+    const PERIOD_SECS: u64 = 60 * 60;
+    const FIRST_DELAY_SECS: u64 = 60;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(FIRST_DELAY_SECS)).await;
+        loop {
+            let enabled = state.settings.lock().expect("settings poisoned").topics_enabled;
+            if enabled {
+                if let Err(err) = crate::system::topics::fetch_all_into_cache(&state).await {
+                    eprintln!("[topics] fetch failed: {err:#}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(PERIOD_SECS)).await;
+        }
+    });
+}
+
+/// M5-D: 起動時に 1 回 + 24 時間ごとに更新フィードを確認する。
+/// `update_feed_url` が未設定なら check 内で no-op。
+pub fn spawn_update_watcher(app: AppHandle, state: Arc<AppState>) {
+    const ONCE_DELAY_SECS: u64 = 30;
+    const PERIOD_SECS: u64 = 24 * 60 * 60;
+    tauri::async_runtime::spawn(async move {
+        // 起動直後は他の boot 処理と被らせないため少し待つ
+        tokio::time::sleep(Duration::from_secs(ONCE_DELAY_SECS)).await;
+        loop {
+            if let Err(err) = crate::system::update::check_update_once(&app, &state).await {
+                eprintln!("[update] check failed: {err:#}");
+            }
+            tokio::time::sleep(Duration::from_secs(PERIOD_SECS)).await;
+        }
+    });
+}
+
+/// Irodori サイドカーのヘルスチェック (M4c Phase G)。
+/// 30 秒ごとに `/health` を ping し、3 回連続失敗で `IrodoriUnavailable` を通知 + サイドカー shutdown。
+/// 次回 `ensure_sidecar_running` で再起動される。サイドカー未起動なら no-op。
+pub fn spawn_irodori_health_watcher(app: AppHandle, state: Arc<AppState>) {
+    const CHECK_INTERVAL_SECS: u64 = 30;
+    const FAIL_THRESHOLD: u32 = 3;
+    tauri::async_runtime::spawn(async move {
+        let mut fails: u32 = 0;
+        loop {
+            tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+            if state.tts.irodori.health_ping().await {
+                fails = 0;
+                continue;
+            }
+            fails += 1;
+            if fails < FAIL_THRESHOLD {
+                continue;
+            }
+            // 3 回連続失敗: shutdown + 通知
+            let _ = state.tts.irodori.shutdown().await;
+            crate::system::notify::notify(
+                &app,
+                &state,
+                crate::system::notify::NoticeKind::IrodoriUnavailable {
+                    reason: format!("ヘルスチェックが {FAIL_THRESHOLD} 回連続失敗"),
+                },
+            )
+            .await;
+            fails = 0;
+        }
+    });
 }

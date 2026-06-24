@@ -8,6 +8,7 @@ import { firePoke } from "./interaction/poke";
 import { mountContextMenu } from "./menu/context-menu";
 import { showOnboarding } from "./panels/onboarding";
 import { mountPomodoroBadge } from "./panels/pomodoro";
+import { mountChatLog } from "./panels/chatlog";
 import { mountSettingsPanel, registerSavedListener } from "./panels/settings";
 import { mountCredit, refreshCredit } from "./tts/credit";
 import { createSpeaker, setTtsParams } from "./tts/speaker";
@@ -59,12 +60,14 @@ async function boot(): Promise<void> {
   await mountSettingsPanel();
   await mountPomodoroBadge();
   mountCredit();
+  mountChatLog();
   // TTS スピーカーを ghost-speech に渡す
   const speaker = createSpeaker();
   const { setSpeaker } = await import("./system/ghost-speech");
   setSpeaker(speaker);
   await refreshCredit(
     payload.settings.tts_enabled,
+    payload.settings.tts_engine,
     payload.settings.tts_speaker_main,
     payload.settings.tts_speaker_sub,
   );
@@ -73,7 +76,7 @@ async function boot(): Promise<void> {
     applyDisplayScale(s.display_scale);
     setTalkSpeed(s.talk_speed);
     setTtsParams({ enabled: s.tts_enabled, speed: s.tts_speed, volume: s.tts_volume });
-    void refreshCredit(s.tts_enabled, s.tts_speaker_main, s.tts_speaker_sub);
+    void refreshCredit(s.tts_enabled, s.tts_engine, s.tts_speaker_main, s.tts_speaker_sub);
   });
   mountContextMenu({
     current: () => currentSettings,

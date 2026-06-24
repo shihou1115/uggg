@@ -100,6 +100,22 @@ pub struct Settings {
     /// 音量 (voicevox の volumeScale 相当。0.0〜2.0 clamp)。
     #[serde(default = "default_tts_volume")]
     pub tts_volume: f64,
+    /// Irodori-TTS で実モデル推論を使うか (false ならモック wav)。
+    /// M4c Phase G 時点では既定 false (実 Aratako/Irodori-TTS モデルの結線は実機検証で確定する)。
+    #[serde(default)]
+    pub tts_irodori_use_real_model: bool,
+    /// M5-H: OS ログイン時の自動起動 (既定 false、spec §4.5.4)。
+    /// 値変更時にフロントから `set_autostart` を呼んでプラグイン側の状態と同期する。
+    #[serde(default)]
+    pub autostart: bool,
+    /// M5-D: 更新情報の取得元 URL (JSON フィード、`{ latest, url, notes }` 形式)。
+    /// 未設定なら更新チェックを行わない (spec §4.5.6)。
+    #[serde(default)]
+    pub update_feed_url: Option<String>,
+    /// M5-C: 時事ネタを advanced 独り言に混ぜるか (既定 false、spec §4.5)。
+    /// オンボーディングで同意済みのときに true になる想定だが、設定パネルからも切替可能。
+    #[serde(default)]
+    pub topics_enabled: bool,
 }
 
 fn default_llm_provider() -> String {
@@ -179,6 +195,10 @@ impl Default for Settings {
             tts_speaker_sub: default_tts_speaker_sub(),
             tts_speed: default_tts_speed(),
             tts_volume: default_tts_volume(),
+            tts_irodori_use_real_model: false,
+            autostart: false,
+            update_feed_url: None,
+            topics_enabled: false,
         }
     }
 }
@@ -207,6 +227,11 @@ impl Settings {
         if let Some(url) = &self.llm_base_url {
             if url.trim().is_empty() {
                 self.llm_base_url = None;
+            }
+        }
+        if let Some(url) = &self.update_feed_url {
+            if url.trim().is_empty() {
+                self.update_feed_url = None;
             }
         }
         // ポモドーロは 1 分以上、ラウンドは 1 以上
@@ -256,10 +281,21 @@ pub struct AppState {
 }
 
 /// TTS エンジンの遅延初期化を抱えるサブ状態。
-/// VoicevoxEngine は init が重い (数秒) ので AppState に保持して使い回す。
-#[derive(Default)]
+/// - voicevox: 初期化が重い (数秒) ので Mutex<Option<...>> で AppState に保持して使い回す。
+/// - irodori: HTTP クライアント本体は軽量で &self メソッドのみ。サイドカープロセスや
+///   ベース URL のような可変状態は IrodoriClient 内部の Mutex で隔離する (M4c 以降)。
 pub struct TtsState {
     pub voicevox: Mutex<Option<crate::tts::voicevox::VoicevoxEngine>>,
+    pub irodori: crate::tts::irodori::IrodoriClient,
+}
+
+impl Default for TtsState {
+    fn default() -> Self {
+        Self {
+            voicevox: Mutex::new(None),
+            irodori: crate::tts::irodori::IrodoriClient::new(),
+        }
+    }
 }
 
 /// 存在感系サブ状態 (放置反応・ウインドウ位置)。
@@ -399,7 +435,7 @@ pub fn voicevox_asset_dir() -> Result<PathBuf> {
     Ok(resolve_app_data_dir()?.join("voicevox"))
 }
 
-fn resolve_assets_dir(app: &AppHandle) -> Result<PathBuf> {
+pub fn resolve_assets_dir(app: &AppHandle) -> Result<PathBuf> {
     // 1) dev: workspace root (tauri.conf.json's parent's parent).
     // 2) prod: alongside the executable.
     // For M0 we look beside the resource dir first, then walk up.

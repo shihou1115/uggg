@@ -29,6 +29,22 @@ pub enum NoticeKind {
     VoicevoxDlFailed {
         reason: String,
     },
+    /// Irodori-TTS が利用できない (GPU 不可 / サイドカー起動失敗 / ヘルスチェック失敗 等)。
+    /// architecture §11.2: severity = Important (現状は dialogue 経路のみ、トースト二段は将来)。
+    /// M4c Phase G の `tasks::spawn_irodori_health_watcher` から発火する。
+    IrodoriUnavailable {
+        reason: String,
+    },
+    /// Irodori Python ランタイム + 共通依存 DL が完了 (M4c Phase C 以降)。
+    IrodoriDlComplete,
+    /// Irodori 資産 DL が失敗 (Python embeddable / pip / torch / 依存のいずれかで失敗)。
+    IrodoriDlFailed {
+        reason: String,
+    },
+    /// M5-D: 新バージョン検出 (`update_feed_url` からの応答に基づく告知)。
+    UpdateAvailable {
+        version: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +62,10 @@ impl NoticeKind {
             NoticeKind::ModeRecovered => "mode_recovered",
             NoticeKind::VoicevoxDlComplete => "voicevox_dl_complete",
             NoticeKind::VoicevoxDlFailed { .. } => "voicevox_dl_failed",
+            NoticeKind::IrodoriUnavailable { .. } => "irodori_unavailable",
+            NoticeKind::IrodoriDlComplete => "irodori_dl_complete",
+            NoticeKind::IrodoriDlFailed { .. } => "irodori_dl_failed",
+            NoticeKind::UpdateAvailable { .. } => "update_available",
         }
     }
 
@@ -65,6 +85,18 @@ impl NoticeKind {
             NoticeKind::VoicevoxDlComplete => "VOICEVOX の音声資産ダウンロードが完了しました".to_string(),
             NoticeKind::VoicevoxDlFailed { reason } => {
                 format!("VOICEVOX 音声資産のダウンロードに失敗しました: {reason}")
+            }
+            NoticeKind::IrodoriUnavailable { reason } => {
+                format!("Irodori-TTS が利用できません: {reason}。VOICEVOX 経路で発話します")
+            }
+            NoticeKind::IrodoriDlComplete => {
+                "Irodori-TTS の Python ランタイム導入が完了しました".to_string()
+            }
+            NoticeKind::IrodoriDlFailed { reason } => {
+                format!("Irodori-TTS の導入に失敗しました: {reason}")
+            }
+            NoticeKind::UpdateAvailable { version } => {
+                format!("ugg の新しいバージョン {version} が出ています")
             }
         }
     }

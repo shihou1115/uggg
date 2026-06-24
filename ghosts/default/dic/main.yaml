@@ -455,3 +455,12 @@ system_messages:
   voicevox_dl_failed:
     - main: { text: "あれ、声のダウンロードがうまくいかなかったみたい…", pose: troubled }
       sub: { text: "回線かレート制限の問題かもな。少し待って再試行してくれ", pose: normal }
+  irodori_dl_complete:
+    - main: { text: "高品質モードの準備もできたよ！", pose: happy }
+      sub: { text: "Irodori の Python ランタイムが整った。設定でエンジン切替できる", pose: normal }
+  irodori_dl_failed:
+    - main: { text: "高品質モードの準備でつまずいちゃった…", pose: troubled }
+      sub: { text: "ネット接続か GitHub レート制限の問題かもしれない", pose: normal }
+  irodori_unavailable:
+    - main: { text: "高品質モードが使えないから、いつもの声で話すね", pose: normal }
+      sub: { text: "GPU 環境が整っていないようだ。VOICEVOX で代用する", pose: normal }

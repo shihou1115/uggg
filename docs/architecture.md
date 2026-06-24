@@ -282,7 +282,11 @@ CREATE TABLE voice_refs (
 
 - DB スキーマバージョンを `app_settings` の `"db_schema_version"` キーで管理
 - 起動時に値を読み、必要なら up マイグレーションを順次適用
-- **MVP は v1 のみ**（v0.0.3 からの DB 移行は提供しない、本開発は新規 DB を使う）
+- **MVP は v3 まで実装**（v0.0.3 からの DB 移行は提供しない、本開発は新規 DB を使う）
+  - v1: `app_settings` のみ (M0)
+  - v2: `chat_log` / `user_profile` / `api_usage` を追加 (M2)
+  - v3: `voice_refs` を追加 (M4c Phase A)
+- 参照音声 .wav の配置は `%APPDATA%\ugg\irodori\refs\<slot>_<id>.wav` (architecture §2.4)。`voice_refs.file_path` には絶対パスを保存
 
 ### 2.4 ファイル資産（DB 外）
 

@@ -96,6 +96,26 @@ async function playOne(item: QueueItem): Promise<void> {
   }
 }
 
+/// 設定パネルからの参照音声プレビュー用。speaker キューを通さず即時再生する。
+/// 既存のキャラ発話を止めずに重ねて鳴らすため `currentSource` は触らない。
+export async function previewWavBase64(b64: string): Promise<void> {
+  try {
+    const bytes = base64ToBytes(b64);
+    const ctx = ensureAudioCtx();
+    const ab = new ArrayBuffer(bytes.byteLength);
+    new Uint8Array(ab).set(bytes);
+    const buffer = await ctx.decodeAudioData(ab);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    const gain = ctx.createGain();
+    gain.gain.value = ttsVolume;
+    source.connect(gain).connect(ctx.destination);
+    source.start();
+  } catch (err) {
+    console.warn("[tts] preview decode/play failed", err);
+  }
+}
+
 async function playBase64Wav(b64: string): Promise<void> {
   try {
     const bytes = base64ToBytes(b64);

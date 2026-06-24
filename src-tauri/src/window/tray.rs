@@ -182,6 +182,8 @@ fn quit_with_farewell(app: AppHandle, state: Arc<AppState>) {
         // greeted は ATOMIC 操作で先に下ろしておく (短期間で再起動した場合の重複挨拶を防ぐ ―
         // ただし frontend_ready が greeted を見るのは初回のみなので影響軽微)
         state.dialogue.greeted.store(false, Ordering::SeqCst);
+        // M4c Phase E: Irodori サイドカーも best-effort で shutdown (未起動なら即 return)
+        let _ = state.tts.irodori.shutdown().await;
         app.exit(0);
     });
 }

@@ -263,18 +263,28 @@
 - `voice_refs` テーブル + ファイル管理
 - `notify` に IrodoriUnavailable 等
 
+M4c は規模が大きいので **Phase A〜G** に分割して進める:
+- **Phase A**: Rust 骨格 (DB v3 / TtsState 拡張 / IrodoriClient スタブ / synthesize_voice 分岐 / 新規 6 コマンドのスタブ / `IrodoriUnavailable` 追加) — **完了 (2026-06-21)**
+- **Phase B**: GPU 検出 (Windows DXGI で NVIDIA 物理 GPU を判定) — **完了 (2026-06-21)**
+- **Phase C**: Irodori 資産 DL (Python 3.11.9 embeddable + pip + torch CUDA 12.1 + fastapi/uvicorn/huggingface_hub/numpy/soundfile) — **完了 (2026-06-21)**。HF モデル本体の DL は Phase D/G に統合
+- **Phase D**: Python サイドカースクリプト (sidecar.py FastAPI + 動的ポート + ready.json + モック推論) + Rust 配線 (start_sidecar/shutdown_sidecar / IrodoriClient::synthesize / voice_ref_generate) — **完了 (2026-06-22)**。実 Irodori モデルとの結線・HF モデル DL は Phase G の実機調整に分離
+- **Phase E**: サイドカープロセス管理 (アイドル 5 分で自動 shutdown + lifecycle::quit_app / tray quit に shutdown フック) — **完了 (2026-06-22)**。ヘルスチェック (10 秒 /health ping) は Phase G で必要時に追加
+- **Phase F**: フロント設定 UI 拡張 + 参照音声管理 UI (Irodori セクション静的配置 / GPU 状態 / 資産 DL / 進捗 / main・sub の参照音声生成・プレビュー・削除 / プレビュー用 previewWavBase64 / default 辞書に irodori_dl_* と irodori_unavailable 追加) — **完了 (2026-06-22)**
+- **Phase G**: 実モデル準備 (sidecar.py に download_models + RealModelBackend スタブ + --no-download) / Settings.tts_irodori_use_real_model / health watcher (30秒間隔、3 連続失敗で IrodoriUnavailable + 再起動) / 「実モデルを使う (β)」UI / docs/quality_checklist.md 新設 — **コード完成 (2026-06-22)**。実 Aratako/Irodori-TTS 推論コードの結線は実機 GPU 環境で TODO
+
 **DoD**:
 - 共通 DoD（cargo test 35 件パス / cargo check / tsc グリーン）
 - ☑ voicevox_core 資産 DL（規約同意・PAT 任意）が動く 〔コード完成。実機 DL は数百MB のためユーザー操作で実行〕
 - ☑ デフォルト声で発話、クレジット表示が常時出る 〔資産 DL 後に有効化することで動作。クレジットは list_voices 取得時に "VOICEVOX:<話者名>" を画面下に常時表示〕
 - ☑ 漢字混じり文章で voicevox_core が自然に喋る 〔voicevox_core 内蔵 OpenJtalk が読み解析を行うため前処理不要〕
-- ☐ Irodori-TTS（GPU 環境）が初回 DL → 参照音声生成 → 発話まで通る 〔**M4c (Irodori Python サイドカー) は別セッション** に分離〕
-- ☐ Irodori-TTS（GPU 無し環境）で DL ボタンが無効化される 〔M4c 範囲〕
-- ☑ Irodori-TTS で漢字→ひらがな前処理が効いている 〔preprocess.rs 実装済 (voicevox_core の OpenJtalk 流用)、Irodori 接続は M4c〕
-- ☐ test-plan §5.5 E-1 が ○ 〔実機 DL が必要なため、ユーザー側で検証〕
+- ☐ Irodori-TTS（GPU 環境）が初回 DL → 参照音声生成 → 発話まで通る 〔Phase C 完了 (Python ランタイム + 共通依存 + torch CUDA 12.1 DL)。モデル DL/サイドカー本体は Phase D〕
+- ☑ Irodori-TTS（GPU 無し環境）で DL ボタンが無効化される 〔Phase B + F 完了: `irodori_check_gpu` の `available=false` で `#settings-irodori-download` を disabled、reason を `#settings-irodori-gpu-state` に表示〕
+- ☑ Irodori-TTS で漢字→ひらがな前処理が効いている 〔preprocess.rs 実装済 + synthesize_irodori が呼び出し済 (NotImplemented スタブ手前で適用)〕
+- ☐ test-plan §5.5 E-1 が ○ 〔Phase G の実機検証で実施。docs/quality_checklist.md §M4c Irodori-TTS 実機検証 を消化する〕
 
 **実装中の設計判断・追加**:
-- **M4c (Irodori-TTS サイドカー) は別セッションに分離**: Python embeddable + PyTorch 2GB+ + HuggingFace モデル DL + GPU 検出 + HTTP サイドカー管理 と独立大規模ブロックのため、M4a/b を先に固めて 1 セッション 1 マイルストーンの規律を維持する判断。
+- **M4c Phase A は骨格のみ・既存 voicevox 経路に回帰なし**: `synthesize_voice` を `settings.tts_engine` で voicevox / irodori に分岐し、irodori 経路は `IrodoriClient::synthesize` が `TtsError::NotImplemented` を返すスタブ。Phase B 以降の実装で同 client を順次拡張する。DB v3 で `voice_refs` テーブルを新設 (UNIQUE(slot) で各 slot 最新 1 件)。
+- **M4c (Irodori-TTS サイドカー) は別セッションに分離**: Python embeddable + PyTorch 2GB+ + HuggingFace モデル DL + GPU 検出 + HTTP サイドカー管理 と独立大規模ブロックのため、M4a/b を先に固めて 1 セッション 1 マイルストーンの規律を維持する判断。さらに M4c 内も Phase A〜G に分割。
 - **C-API バージョン固定 (0.16.4)**: FFI シグネチャと公式 download ツールを同じバージョンに揃える。
 - **CPU 強制 (`acceleration_mode = 1`)**: GPU 経路は依存 DLL 未配布で AV 検出リスクあり、CPU 合成で要件を満たす。
 - **events.voicevox_dl_complete / voicevox_dl_failed**: ゴースト発話原則 (横断方針 §3.1) に従い辞書経由で告知。default 辞書に台詞追加。
@@ -284,7 +294,7 @@
 - **事前 init**: tts_enabled かつ資産があれば boot 時に背景で `VoicevoxEngine::init` をキック (初発話のラグ解消)。
 - **`synthesize_voice` は `spawn_blocking`**: voicevox の TTS は CPU 重で同期 API のため、tokio runtime をブロックしないようブロッキングタスクで実行。
 
-**完了日**: 2026-06-21 (M4a/b コード完成、M4c は別セッション)
+**完了日**: 2026-06-22 (M4a/b + M4c Phase A〜G コード完成。実 Aratako/Irodori-TTS 推論結線は実機 GPU 環境で TODO)
 **コミット/タグ**: -
 
 ---
@@ -314,7 +324,16 @@
 - ☐ エクスポート / 履歴クリアが正しく動く
 - ☐ test-plan §5.5 E-3 〜 E-7 が ○
 
-**完了日**: 未着手
+**進捗 (2026-06-22)**:
+- ✅ M5-G チャットログパネル (`#chatlog-panel` 静的配置、`get_chat_log(limit)` で新しい順 N 件取得、設定パネル「データ管理」から開閉)
+- ✅ M5-E データエクスポート + 履歴クリア (`export_data(include_profile)` → ダウンロードフォルダに JSON、`clear_history(include_profile)` で chat_log + (option で) user_profile 削除、確認ダイアログ付き)
+- ✅ M5-F ゴースト/シェル切替 UI (`list_ghosts` / `list_shells` で ghosts/ shells/ を scan、設定パネル「キャラクター」セクションで select、切替時は再起動案内)
+- ✅ M5-H 自動起動 (`tauri-plugin-autostart` 統合、`set_autostart(enabled)` コマンド、Settings.autostart で UI 同期)
+- ✅ M5-D 更新通知 (`Settings.update_feed_url`、`system/update.rs` で feed JSON 比較、起動 30 秒後 + 24h おきに `spawn_update_watcher` で発火、`check_update_now` で即時チェック、`update_notice_seen:<ver>` で重複防止)
+- ✅ M5-C 時事ネタ RSS (DB v4 で `interest_topics` + `topics_cache`、`Settings.topics_enabled`、`system/topics.rs` で Google News RSS 取得 + 暗い見出しフィルタ、`tasks::spawn_topics_watcher` で 1 時間おき、`commands::topics::{get_interests, set_interests, fetch_topics_now}`、設定パネル「興味分野」セクション。advanced 独り言混入は将来課題)
+- ⏳ M5-A DnD ゴースト展開 / M5-B ツール は重量機能のため次セッション以降
+
+**完了日**: 2026-06-22 (軽量グループ G/E/F/H/D + 中量 M5-C コード完成、残 M5-A/B は次セッション)
 **コミット/タグ**: -
 
 ---
@@ -370,6 +389,39 @@
 | 2026-06-21 | architecture.md | Settings に TTS 関連 6 フィールド（tts_enabled / tts_engine / tts_speaker_main/sub / tts_speed / tts_volume）を追加。TtsState を AppState に追加し VoicevoxEngine を遅延初期化。 | M4 |
 | 2026-06-21 | architecture.md | `#tts-credit` を index.html 静的配置（WebView2 透過バグ対策）。VOICEVOX 利用規約に基づくクレジット表示は list_voices で取得した話者名で "VOICEVOX:&lt;話者名&gt;" 形式。 | M4 |
 | 2026-06-21 | architecture.md | M4c (Irodori-TTS Python サイドカー) を本マイルストーンから切り出して別セッションに分離。M4a (voicevox_core) と M4b (かな前処理) のみ完了とする。 | M4 |
+| 2026-06-21 | architecture.md | DB スキーマ v3 を追加: `voice_refs(id, slot, caption, file_path, created_ts)` + `UNIQUE(slot)`。`upsert_voice_ref` / `get_voice_ref` / `list_voice_refs` / `delete_voice_ref` を `Db` に追加。 | M4c-A |
+| 2026-06-21 | architecture.md | `TtsState.irodori: IrodoriClient` を追加 (Mutex なし、内部状態の Mutex は `IrodoriClient` 側で隔離)。`tts/irodori.rs` 新設 (HTTP クライアント骨組み + `TtsError` enum)、`tts/voice_ref.rs` 新設 (refs ディレクトリ管理)。 | M4c-A |
+| 2026-06-21 | architecture.md | `synthesize_voice` を `settings.tts_engine` で voicevox / irodori 分岐。irodori 経路は Phase A 時点で `IrodoriClient::synthesize` が `TtsError::NotImplemented` を返すスタブ。preprocess は呼び出し済 (voicevox 資産未 init/失敗時はフォールバック)。 | M4c-A |
+| 2026-06-21 | architecture.md | コマンド 7 件追加 (Phase A はスタブ含む): `irodori_check_gpu` / `irodori_assets_ready` / `download_irodori_assets` / `voice_ref_list` / `voice_ref_delete` (動作可) / `voice_ref_generate` / `voice_ref_preview`。`notify::NoticeKind::IrodoriUnavailable` を追加 (dict_key=`irodori_unavailable`)。 | M4c-A |
+| 2026-06-21 | architecture.md | フロント `refreshCredit(enabled, engine, main, sub)` に engine 引数追加。engine !== "voicevox_core" のとき非表示 (Irodori は規約上の帰属表示義務なし)。設定パネルにエンジン選択セレクト (`#settings-tts-engine`) 追加、`tts_engine` フィールドを Settings ↔ UI 往復に配線。 | M4c-A |
+| 2026-06-21 | architecture.md | `tts/gpu.rs` 新設: Windows DXGI で物理 GPU を列挙し VendorId=0x10DE (NVIDIA) を判定。`pick_irodori_gpu` を pure 関数に切り出してテスト 4 件追加。`commands::tts::irodori_check_gpu` を実 DXGI 判定に置換。`Cargo.toml` の windows features に `Win32_Graphics_Dxgi` / `Win32_Graphics_Dxgi_Common` を追加。 | M4c-B |
+| 2026-06-21 | architecture.md | `tts/irodori_download.rs` 新設: Python 3.11.9 embeddable 取得 → `Expand-Archive` 展開 → `python._pth` 編集 (`patch_pth` pure 関数) → `get-pip.py` ブートストラップ → 共通依存 + torch CUDA 12.1 pip install。`commands::tts::irodori_assets_ready` / `download_irodori_assets` を実装に置換。進捗イベント `irodori-download` (voicevox-download と同様の `__done__` センチネル)。 | M4c-C |
+| 2026-06-21 | architecture.md | `notify::NoticeKind` に `IrodoriDlComplete` / `IrodoriDlFailed { reason }` を追加 (dict_key=`irodori_dl_complete` / `irodori_dl_failed`)。voicevox 同様の DL 結果告知パターンを Irodori にも適用。 | M4c-C |
+| 2026-06-21 | architecture.md | Phase C のスコープ調整: 当初 Phase C 一括で扱う想定だった HF モデル本体 DL は、配置先 / 取得スクリプト / 必要な追加依存が Phase D の sidecar.py 設計に強く依存するため Phase D へ統合。Phase C は「Python + pip + 共通依存」止まり。 | M4c-C |
+| 2026-06-22 | architecture.md | `src-tauri/python/sidecar.py` 新設 (FastAPI 単一ファイル / 動的ポート割当 / `ready.json` 書き出し / モック推論モード `--mock` で正弦波・無音 wav 返却 / `POST /shutdown` で 100ms 後に `os._exit(0)`)。`tauri.conf.json` の `bundle.resources` に `python/sidecar.py` を追加し、boot 時に `%APPDATA%\ugg\irodori\sidecar.py` へ best-effort コピー。 | M4c-D |
+| 2026-06-22 | architecture.md | `src-tauri/src/tts/sidecar.rs` 新設: `SidecarHandle { port, pid, child }`、`start_sidecar` (Python を tokio::process::Child で起動 → ready.json polling 最大 30 秒)、`shutdown_sidecar` (`POST /shutdown` → 1 秒待って kill フォールバック)、`install_sidecar_script` (リソースから %APPDATA% へコピー)。 | M4c-D |
+| 2026-06-22 | architecture.md | `IrodoriClient` 拡張: `sidecar: std::sync::Mutex<Option<SidecarHandle>>` を内部に持ち、`ensure_sidecar_running` で起動済確認 → 未起動なら `start_sidecar`。`synthesize` を実装 (参照音声パスを `voice` で渡し `POST /v1/audio/speech` → WAV)、`generate_voice_ref` を実装 (キャプション → `POST /v1/voice_ref/generate` → 指定パスに wav 保存)。`shutdown` を `lifecycle::quit_app` 用に追加 (Phase E で配線)。 | M4c-D |
+| 2026-06-22 | architecture.md | `commands::tts::voice_ref_generate(slot, caption, state)` を実装に置換: `voice_ref::ref_path_in_dir` で `<slot>_<unix_ts>.wav` を決め、`IrodoriClient::generate_voice_ref` 呼び出し → 成功時 `Db::upsert_voice_ref` で DB upsert (`UNIQUE(slot)` で更新)、古いファイルは差分があれば削除。`voice_ref_preview(slot, text, state)` は `synthesize_irodori` を呼んで WAV(base64) を返す薄いラッパ。 | M4c-D |
+| 2026-06-22 | architecture.md | `commands::tts::synthesize_voice` の Irodori 分岐: `Db::get_voice_ref(slot)` を取り、未登録なら `TtsError::VoiceRefMissing(slot)` を文字列で返却。preprocess は voicevox 未 init/失敗時にフォールバック (元テキストをそのまま IrodoriClient へ)。 | M4c-D |
+| 2026-06-22 | architecture.md | `IrodoriClient` に `last_used: AtomicI64` 追加。`synthesize` / `generate_voice_ref` 冒頭で `touch_last_used()` を呼ぶ。`shutdown_if_idle(now, idle_secs)` を追加し、起動済みかつ最終使用から `idle_secs` 経過なら `shutdown()`。`tasks::spawn_irodori_idle_watcher` 新設 (60 秒チェック、5 分閾値) — `main.rs` setup で spawn。 | M4c-E |
+| 2026-06-22 | architecture.md | `commands::lifecycle::quit_app` を async 化し `state.tts.irodori.shutdown().await` を best-effort で実行 (失敗無視で即 `app.exit(0)`)。`window::tray::quit_with_farewell` の `app.exit(0)` 直前にも同じ shutdown を挿入 (両方の終了経路でサイドカー残骸を防止)。 | M4c-E |
+| 2026-06-22 | architecture.md | 設定パネルに「音声 (Irodori-TTS / 高品質モード)」セクションを `index.html` 静的配置で追加 (#settings-irodori-gpu-state / #settings-irodori-assets-state / #settings-irodori-download / #settings-irodori-progress / #settings-voiceref-{main,sub}-{state,caption,generate,preview,delete} / #settings-voiceref-progress)。`refreshIrodoriState` で open 時に `irodori_check_gpu` / `irodori_assets_ready` / `voice_ref_list` を呼んで状態同期、`irodori_check_gpu.available=false` で DL ボタン disabled。 | M4c-F |
+| 2026-06-22 | architecture.md | `onIrodoriDownload` / `onVoiceRefGenerate(slot)` / `onVoiceRefPreview(slot)` / `onVoiceRefDelete(slot)` を実装 (それぞれ `download_irodori_assets` + `irodori-download` listen / `voice_ref_generate` / `voice_ref_preview` → `previewWavBase64` / `voice_ref_delete`)。`src/tts/speaker.ts` に `previewWavBase64` を export (キューを通さず即時再生、currentSource は触らない)。 | M4c-F |
+| 2026-06-22 | architecture.md | default 辞書 (`ghosts/default/dic/main.yaml`) の `system_messages` に `irodori_dl_complete` / `irodori_dl_failed` / `irodori_unavailable` を追加 (notify::NoticeKind 側は Phase A/C で既に追加済)。 | M4c-F |
+| 2026-06-22 | architecture.md | `Settings.tts_irodori_use_real_model: bool` (既定 false) 追加。`IrodoriClient::synthesize` / `generate_voice_ref` の `mock` 引数を呼び出し側 (commands::tts) から `!use_real` で渡す形に。`IrodoriClient::health_ping` 追加 (3 秒タイムアウトの `GET /health`)。 | M4c-G |
+| 2026-06-22 | architecture.md | `tasks::spawn_irodori_health_watcher` 追加 (30 秒間隔で `health_ping`、3 連続失敗で `shutdown()` + `notify(IrodoriUnavailable)` を発火)。`main.rs` setup で `spawn_irodori_idle_watcher` の隣で spawn。 | M4c-G |
+| 2026-06-22 | architecture.md | `sidecar.py` に `download_models(asset_dir)` 追加 (`huggingface_hub.snapshot_download` で `Aratako/Irodori-TTS-500M-v3` / `-v2-VoiceDesign` / `Semantic-DACVAE-Japanese-32dim` を `asset_dir/model/<repo>` に取得、stderr で進捗報告)。`--no-download` フラグ追加。`RealModelBackend` クラス追加 (実推論は TODO 擬似コード)。`build_app(asset_dir, mock, backend)` 拡張で実モデル経路 / モック経路を切替。 | M4c-G |
+| 2026-06-22 | architecture.md | 設定パネルに「実モデルを使う (β / 実機検証中)」チェックボックス追加 (`#settings-irodori-use-real-model`)。GPU + 資産両方が揃っていなければ disabled。 | M4c-G |
+| 2026-06-22 | docs/quality_checklist.md | 新設。M4c Irodori-TTS 実機検証チェックリスト (G1〜G6: セットアップ / Python DL / モック起動 / ヘルスチェック / 実モデル結線 / フォールバック) を収録。 | M4c-G |
+| 2026-06-22 | architecture.md | DB に `ChatLogRow` 型と `Db::list_recent_chat_log(limit) -> Vec<ChatLogRow>` 追加 (新しい順)。`Db::list_api_usage()` (上限 10000 行) と `Db::clear_user_profile() -> u64` も追加。 | M5-G/E |
+| 2026-06-22 | architecture.md | `commands::data` モジュール新設 (`get_chat_log` / `export_data(include_profile)` / `clear_history(include_profile)` / `check_update_now`)。`export_data` は `dirs::download_dir()` に `ugg-export-<unix_ts>.json` を保存し絶対パスを返す。`clear_history` は `ClearResult { chat_cleared, profile_cleared_count }` を返す。 | M5-G/E/D |
+| 2026-06-22 | architecture.md | `commands::assets` モジュール新設 (`list_ghosts` / `list_shells`): `state::resolve_assets_dir` を `pub` 化し、`ghosts/<id>/ghost.json` / `shells/<id>/shell.json` を scan して `AssetEntry { id, name }` を返却。parse 失敗エントリは skip。 | M5-F |
+| 2026-06-22 | architecture.md | `tauri-plugin-autostart` 追加 (Cargo.toml + `tauri::Builder::plugin(...)`)。`commands::lifecycle::set_autostart(enabled)` で `app.autolaunch().enable()` / `.disable()`。`Settings.autostart: bool` (既定 false) を `Settings` に追加し、設定保存時に差分を見て set_autostart を呼ぶ。 | M5-H |
+| 2026-06-22 | architecture.md | `system/update.rs` 新設: `check_update_once(app, state)` で `update_feed_url` の JSON (`{latest, url, notes}`) を fetch → `parse_version("a.b.c")` で major.minor.patch 比較 → 新版なら `notify(UpdateAvailable { version })` を 1 度だけ発火、`app_settings."update_notice_seen:<ver>"` で重複防止。`tasks::spawn_update_watcher` (起動 30 秒後 + 24h ごと)。`Settings.update_feed_url: Option<String>` 追加 + `Settings::clamp` で空文字を None に正規化。`notify::NoticeKind::UpdateAvailable { version }` 追加。 | M5-D |
+| 2026-06-22 | index.html / settings.ts | 設定パネルに 4 セクション追加 (キャラクター / OS / 更新通知 / データ管理)、`#chatlog-panel` を `index.html` 静的配置。`src/panels/chatlog.ts` 新規 (`mountChatLog` / `openChatLog`)。`src/types.ts` に `ChatLogRow` / `AssetEntry` / `ClearResult` 追加と `Settings.autostart` / `update_feed_url` 追加。`Cargo.toml` に `dirs = "5"` 追加。 | M5-G/E/F/H/D |
+| 2026-06-22 | architecture.md | DB v4: `interest_topics(id, topic UNIQUE, enabled)` と `topics_cache(id, topic, headline, link, fetched_ts, UNIQUE(topic, headline))` を追加。`Db::{list_interests, replace_interests, list_enabled_topics, insert_topic_cache, list_recent_topics, prune_topics_cache}` を追加。`InterestTopic` / `TopicCacheRow` 型を追加。 | M5-C |
+| 2026-06-22 | architecture.md | `system/topics.rs` 新設: `build_google_news_rss_url(query)` で日本語 Google News RSS URL を組み立て、`fetch_topic(query, limit)` で取得 → `quick-xml` で `<item>` パース → `is_dark_headline` で暗い見出し (訃報/事件/災害/戦争) を除外。`fetch_all_into_cache(state)` で enabled な interest_topics を順次取得し `topics_cache` に INSERT OR IGNORE 蓄積、7 日 prune。 | M5-C |
+| 2026-06-22 | architecture.md | `commands::topics` 新設 (`get_interests` / `set_interests(topics)` / `fetch_topics_now`)。`tasks::spawn_topics_watcher` 追加 (1 時間おき、`topics_enabled` 時のみ)。`Settings.topics_enabled: bool` (既定 false) を追加。設定パネルに「興味分野 (時事ネタ)」セクション追加 (チェックボックス + カンマ区切り入力 + 即時取得ボタン)。advanced 独り言への混入は将来課題。`Cargo.toml` に `quick-xml = "0.36"` 追加。 | M5-C |
 
 ---
 

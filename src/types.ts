@@ -25,6 +25,29 @@ export interface Settings {
   tts_speaker_sub: number;
   tts_speed: number;
   tts_volume: number;
+  tts_irodori_use_real_model: boolean;
+  autostart: boolean;
+  update_feed_url: string | null;
+  topics_enabled: boolean;
+}
+
+/// M5-F: ghosts / shells リストエントリ。
+export interface AssetEntry {
+  id: string;
+  name: string;
+}
+
+/// M5-C: 興味分野 1 件。
+export interface InterestTopic {
+  id: number;
+  topic: string;
+  enabled: boolean;
+}
+
+/// M5-E: clear_history の戻り値。
+export interface ClearResult {
+  chat_cleared: boolean;
+  profile_cleared_count: number;
 }
 
 export interface SpeechTurn {
@@ -76,4 +99,31 @@ export interface BootPayload {
   characters: BootCharacters;
   pose_names: string[];
   onboarded: boolean;
+}
+
+/// M5-G: チャットログ 1 件 (バックエンド `Db::list_recent_chat_log` の戻り値)。
+export interface ChatLogRow {
+  id: number;
+  ts: number;
+  mode: string;
+  role: "user" | "main" | "sub";
+  text: string;
+  pose: string | null;
+}
+
+// === Irodori-TTS (M4c) ===
+
+/// `irodori_check_gpu` の戻り値。Phase A はスタブで常に available=false。
+export interface IrodoriGpuInfo {
+  available: boolean;
+  name: string | null;
+  reason: string | null;
+}
+
+/// 参照音声 1 件分のフロント向けメタ。`voice_ref_list` / `voice_ref_delete` が返す。
+/// バックの DB 行は file_path も持つが、フロントへは露出しない。
+export interface VoiceRef {
+  slot: SlotName;
+  caption: string;
+  created_ts: number;
 }

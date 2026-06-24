@@ -19,6 +19,11 @@ use crate::state::AppState;
 
 fn main() {
     tauri::Builder::default()
+        // M5-H: 自動起動プラグイン。引数 `--minimized` で起動時にウインドウを隠す動線も将来追加可能。
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             let state = Arc::new(AppState::initialize(app.handle())?);
             app.manage(state.clone());
@@ -30,6 +35,14 @@ fn main() {
             // 自発挙動: ランダムトーク + 放置監視
             tasks::spawn_random_talk(app.handle().clone(), state.clone());
             tasks::spawn_idle_watcher(app.handle().clone(), state.clone());
+            // M4c Phase E: Irodori サイドカーのアイドル監視 (5 分未使用で自動 shutdown)
+            tasks::spawn_irodori_idle_watcher(state.clone());
+            // M4c Phase G: Irodori サイドカーのヘルスチェック (30 秒間隔、3 連続失敗で再起動)
+            tasks::spawn_irodori_health_watcher(app.handle().clone(), state.clone());
+            // M5-D: 起動 30 秒後 + 24 時間毎に update フィードをチェック
+            tasks::spawn_update_watcher(app.handle().clone(), state.clone());
+            // M5-C: topics_enabled が ON の間、1 時間おきに RSS を取得して topics_cache に蓄積
+            tasks::spawn_topics_watcher(state.clone());
             // タスクトレイ
             if let Err(err) = window::tray::install(app.handle(), state.clone()) {
                 eprintln!("[tray] install failed: {err:#}");
@@ -41,21 +54,38 @@ fn main() {
                     commands::tts::spawn_preinit(state.clone());
                 }
             }
+            // Irodori sidecar.py をリソースから %APPDATA%\ugg\irodori\ にコピー (best-effort)。
+            // dev 起動でリソース未配置の場合は黙って skip (実害なし)。
+            if let Ok(asset_root) = crate::tts::voice_ref::irodori_root() {
+                if let Ok(resource_dir) = app.path().resource_dir() {
+                    let _ = crate::tts::sidecar::install_sidecar_script(&resource_dir, &asset_root);
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::assets::list_ghosts,
+            commands::assets::list_shells,
             commands::boot::get_boot_payload,
+            commands::data::get_chat_log,
+            commands::data::export_data,
+            commands::data::clear_history,
+            commands::data::check_update_now,
             commands::dialogue::send_user_message,
             commands::interaction::poke,
             commands::interaction::nade,
             commands::lifecycle::frontend_ready,
             commands::lifecycle::quit_app,
             commands::lifecycle::hide_window,
+            commands::lifecycle::set_autostart,
             commands::onboarding::complete_onboarding,
             commands::onboarding::skip_onboarding,
             commands::pomodoro::start_pomodoro,
             commands::pomodoro::stop_pomodoro,
             commands::pomodoro::get_pomodoro_status,
+            commands::topics::get_interests,
+            commands::topics::set_interests,
+            commands::topics::fetch_topics_now,
             commands::profile::get_profile,
             commands::profile::add_profile,
             commands::profile::delete_profile,
@@ -71,6 +101,13 @@ fn main() {
             commands::tts::set_github_token,
             commands::tts::has_github_token,
             commands::tts::delete_github_token,
+            commands::tts::irodori_check_gpu,
+            commands::tts::irodori_assets_ready,
+            commands::tts::download_irodori_assets,
+            commands::tts::voice_ref_list,
+            commands::tts::voice_ref_delete,
+            commands::tts::voice_ref_generate,
+            commands::tts::voice_ref_preview,
             commands::window::update_alpha_mask,
         ])
         .run(tauri::generate_context!())

@@ -1,4 +1,6 @@
+pub mod assets;
 pub mod boot;
+pub mod data;
 pub mod dialogue;
 pub mod interaction;
 pub mod lifecycle;
@@ -7,5 +9,6 @@ pub mod pomodoro;
 pub mod profile;
 pub mod secrets;
 pub mod settings;
+pub mod topics;
 pub mod tts;
 pub mod window;

@@ -24,14 +24,15 @@ export function mountCredit(): void {
 }
 
 /// TTS が有効になった or 話者が変わったときに呼ぶ。
-/// 引数の speakerIds は主にメインキャラの style_id (サブと違う場合は併記)。
+/// engine が "voicevox_core" 以外 (Irodori 等) のときは規約上の帰属表示義務がないので非表示。
 export async function refreshCredit(
   enabled: boolean,
+  engine: string,
   speakerMain: number,
   speakerSub: number,
 ): Promise<void> {
   if (!state) return;
-  if (!enabled) {
+  if (!enabled || engine !== "voicevox_core") {
     state.el.classList.remove("visible");
     state.el.textContent = "";
     return;
