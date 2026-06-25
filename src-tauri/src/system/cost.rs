@@ -10,10 +10,16 @@ use crate::db::Db;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CostStatus {
+    /// 当月の累計コスト (USD)。設定 UI で表示する想定で保持。
+    #[allow(dead_code)]
     pub current_usd: f64,
+    /// 当月上限 (USD)。Settings.monthly_limit_usd と同期。
+    #[allow(dead_code)]
     pub limit_usd: f64,
     /// 上限が 0 なら無制限扱い。
     pub unlimited: bool,
+    /// 現在の使用率 (0.0..1.0+)。UI 表示用。
+    #[allow(dead_code)]
     pub ratio: f64,
     pub reached_80: bool,
     pub exceeded: bool,

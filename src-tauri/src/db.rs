@@ -73,6 +73,8 @@ pub struct ApiUsageRow {
     pub ts: i64,
 }
 
+/// API 使用量サマリ。M6 でリリースノート/設定パネルの使用状況表示に使う想定で残す。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct UsageSummary {
     pub month_usd: f64,

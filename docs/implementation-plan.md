@@ -335,6 +335,22 @@ M4c は規模が大きいので **Phase A〜G** に分割して進める:
 - ✅ M5-B ツール (DB v5 `reminders` テーブル / `Settings.tools_enabled` / `tools::{clock,reminder,clipboard}` / advanced system prompt に時刻 + 保留中リマインダー 24h 注入 / 「N 分後」「N 時間後」「N 秒後」parse_request 前置 / `tasks::spawn_reminder_watcher` 10 秒間隔・静音中も鳴る特例 / `commands::tools` 4 件 / `tauri-plugin-clipboard-manager` 統合 / 入力欄 📋 ボタン / 設定パネル「ツール」セクション)
 
 **完了日**: 2026-06-22 (M5 全機能 G/E/F/H/D/C/A/B コード完成)
+
+### 3.6.x 品質改善 (M5 後の整地、2026-06-22)
+- `cargo check` の dead_code 警告 8 件をすべて `#[allow(dead_code)]` + 理由コメントに置換 (UsageSummary / ReplyUsage / ChatMessage::assistant / Dictionary.{schema_version,recall} / CostStatus.{current_usd,limit_usd,ratio} / VoicevoxEngine.loaded_models)。実コード削除はせず将来用に温存。
+- 警告 0 件で cargo check グリーン、`cargo test` 80 件パス維持。
+
+### 3.7 M6 リリース準備 (進行中)
+
+- ✅ README.md を本開発版に整備 (機能一覧 / ビルド方法 / Windows 専用 / ディレクトリ構成 / データ配置 / ライセンス方針)
+- ✅ docs/release-notes/v0.1.0.md ドラフト (機能要約 M0〜M5、既知の制限 6 項目、検証ステータステーブル、TBD は SHA-256 / FileVersion / 実機検証完了印)
+- ✅ バージョン三点セットを `0.1.0-rc.0` に (`package.json` / `Cargo.toml` / `tauri.conf.json`)
+- ☐ `npm run tauri build` 実機ビルド (ユーザー側)
+- ☐ test-plan §5 手動テスト全項目消化 (ユーザー側)
+- ☐ クリーン Windows 環境でのインストール検証 (ユーザー側)
+- ☐ docs/quality_checklist.md §M4c G1〜G6 消化 (GPU 環境、ユーザー側)
+- ☐ インストーラ SHA-256 / FileVersion を release-notes に追記
+- ☐ Git タグ `v0.1.0` (実機検証完了後)
 **コミット/タグ**: -
 
 ---

@@ -17,11 +17,15 @@ use crate::ghost::GhostBundle;
 use crate::state::Settings;
 
 /// 1 ターン分のユーザー入力 → DialogueResponse。
+/// `usage` は記録目的で AdvancedReply に同梱するが、現状は cost.rs 側で `api_usage` テーブルへ
+/// 直接書き込む経路があり、構造体としては未使用。デバッグ計装・将来の UI 計測用に残す。
 pub struct AdvancedReply {
     pub response: DialogueResponse,
+    #[allow(dead_code)]
     pub usage: ReplyUsage,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct ReplyUsage {
     pub prompt_tokens: u64,

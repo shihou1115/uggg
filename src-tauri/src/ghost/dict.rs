@@ -18,9 +18,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct Dictionary {
+    /// 辞書フォーマット版 (v3 のみ受理)。バージョン管理目的で保持、ロード時に検証する。
+    #[allow(dead_code)]
     pub schema_version: u32,
     pub input_match: Vec<InputMatchRule>,
     pub fallback: Vec<Line>,
+    /// `recall` キー (記憶想起。M2+ で発火、現状は仕様確定のみ)。
+    #[allow(dead_code)]
     pub recall: Vec<Line>,
     pub monologue: Vec<Line>,
     pub events: HashMap<String, Vec<EventLine>>,

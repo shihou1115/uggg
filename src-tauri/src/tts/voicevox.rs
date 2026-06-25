@@ -100,6 +100,8 @@ pub struct VoicevoxEngine {
     lib: Library,
     synthesizer: SynthesizerPtr,
     open_jtalk: OpenJtalkPtr,
+    /// ロード済み .vvm モデル数 (デバッグ表示用に保持)。
+    #[allow(dead_code)]
     loaded_models: usize,
 }
 
@@ -213,6 +215,7 @@ impl VoicevoxEngine {
         }
     }
 
+    #[allow(dead_code)]
     pub fn loaded_models(&self) -> usize {
         self.loaded_models
     }

@@ -43,6 +43,8 @@ impl ChatMessage {
             content: content.into(),
         }
     }
+    /// Few-shot 例や履歴をプロンプトに混ぜたいときの公開コンストラクタ。現状未使用。
+    #[allow(dead_code)]
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".to_string(),
