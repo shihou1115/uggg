@@ -460,22 +460,33 @@ pub async fn voice_ref_preview(
 
 const GH_TOKEN_KEY: &str = "github_token";
 
+// GitHub PAT も keyring 経由なので、API キーと同じく blocking pool に逃がす。
 #[tauri::command]
-pub fn set_github_token(token: String) -> Result<(), String> {
+pub async fn set_github_token(token: String) -> Result<(), String> {
     if token.trim().is_empty() {
         return Err("トークンが空です".to_string());
     }
-    secrets::set_api_key(GH_TOKEN_KEY, token.trim()).map_err(|e| format!("{e:#}"))
+    let t = token.trim().to_string();
+    tauri::async_runtime::spawn_blocking(move || secrets::set_api_key(GH_TOKEN_KEY, &t))
+        .await
+        .map_err(|e| format!("keyring task 起動失敗: {e}"))?
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
-pub fn has_github_token() -> Result<bool, String> {
-    secrets::has_api_key(GH_TOKEN_KEY).map_err(|e| format!("{e:#}"))
+pub async fn has_github_token() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(|| secrets::has_api_key(GH_TOKEN_KEY))
+        .await
+        .map_err(|e| format!("keyring task 起動失敗: {e}"))?
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
-pub fn delete_github_token() -> Result<(), String> {
-    secrets::delete_api_key(GH_TOKEN_KEY).map_err(|e| format!("{e:#}"))
+pub async fn delete_github_token() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| secrets::delete_api_key(GH_TOKEN_KEY))
+        .await
+        .map_err(|e| format!("keyring task 起動失敗: {e}"))?
+        .map_err(|e| format!("{e:#}"))
 }
 
 // === 内部: engine 初期化 + speakers JSON のパース ===

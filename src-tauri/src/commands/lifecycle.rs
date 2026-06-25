@@ -31,7 +31,6 @@ pub fn hide_window(app: AppHandle) {
 }
 
 /// M5-H: 自動起動の有効/無効切替 (`tauri-plugin-autostart` 経由)。
-/// Settings.autostart の値変更時にフロントから呼ぶ。OS 状態と Settings を揃える役割。
 #[tauri::command]
 pub fn set_autostart(enabled: bool, app: AppHandle) -> Result<(), String> {
     let manager = app.autolaunch();

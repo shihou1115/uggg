@@ -20,6 +20,15 @@ export default defineConfig({
     },
   },
   envPrefix: ["VITE_", "TAURI_"],
+  // M4c/M5 で新規 import した tauri API を起動後 reload で再最適化しないよう事前列挙
+  // (WebView2 が reload 中に dom 状態を維持できず exit 0xcfffffff になる回避策)
+  optimizeDeps: {
+    include: [
+      "@tauri-apps/api/core",
+      "@tauri-apps/api/event",
+      "@tauri-apps/api/webviewWindow",
+    ],
+  },
   build: {
     target: "esnext",
     minify: "esbuild",

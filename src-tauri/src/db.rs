@@ -583,23 +583,27 @@ impl Db {
     /// 一括置換: 引数の topic 文字列リストに揃える (既存はクリアして再作成)。
     /// enabled は常に true で挿入。空文字列とトリム後の重複は除外する。
     pub fn replace_interests(&self, topics: &[String]) -> Result<Vec<InterestTopic>> {
-        let mut guard = self.conn.lock().expect("db poisoned");
-        let tx = guard.transaction().context("begin replace_interests")?;
-        tx.execute("DELETE FROM interest_topics", [])
-            .context("delete interest_topics")?;
-        let mut seen = std::collections::HashSet::<String>::new();
-        for t in topics {
-            let trimmed = t.trim();
-            if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
-                continue;
+        {
+            let mut guard = self.conn.lock().expect("db poisoned");
+            let tx = guard.transaction().context("begin replace_interests")?;
+            tx.execute("DELETE FROM interest_topics", [])
+                .context("delete interest_topics")?;
+            let mut seen = std::collections::HashSet::<String>::new();
+            for t in topics {
+                let trimmed = t.trim();
+                if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO interest_topics (topic, enabled) VALUES (?1, 1)",
+                    params![trimmed],
+                )
+                .context("insert interest_topics")?;
             }
-            tx.execute(
-                "INSERT INTO interest_topics (topic, enabled) VALUES (?1, 1)",
-                params![trimmed],
-            )
-            .context("insert interest_topics")?;
+            tx.commit().context("commit replace_interests")?;
+            // guard はここで drop される。次の self.list_interests() が再 lock するため、
+            // std::sync::Mutex (non-reentrant) で自己デッドロックさせないこと。
         }
-        tx.commit().context("commit replace_interests")?;
         self.list_interests()
     }
 

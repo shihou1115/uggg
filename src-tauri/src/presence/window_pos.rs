@@ -35,12 +35,16 @@ pub fn restore(app: &AppHandle, state: &Arc<AppState>) {
         _ => None,
     };
     let Some(pos) = stored else {
+        center_on_primary(&window);
         return;
     };
 
-    if is_visible_on_some_monitor(&window, pos) {
+    // 暫定: ウインドウ全体が完全に画面内かチェック (左上隅だけだとサイズ次第で外に出る)
+    if is_fully_visible_on_some_monitor(&window, pos) {
         let _ = window.set_position(PhysicalPosition::new(pos.x, pos.y));
     } else {
+        // 画面外の保存値は捨てて中央へ + DB も上書き保存しておく
+        let _ = state.db.set_setting(WINDOW_POS_KEY, "");
         center_on_primary(&window);
     }
 }
@@ -100,20 +104,26 @@ fn persist(state: &Arc<AppState>, pos: StoredPos) {
     }
 }
 
-fn is_visible_on_some_monitor(
+/// ウインドウ全体 (左上隅 + サイズ) がいずれかのモニタの矩形に完全に収まっているか。
+/// 左上隅だけだとサイズ次第で大半が画面外に出てキャラが見えないため、厳しめに判定する。
+fn is_fully_visible_on_some_monitor(
     window: &tauri::WebviewWindow,
     pos: StoredPos,
 ) -> bool {
     let Ok(monitors) = window.available_monitors() else {
         return true; // 取得失敗時は復元を試みる
     };
+    let Ok(size) = window.outer_size() else {
+        return true;
+    };
+    let win_right = pos.x + size.width as i32;
+    let win_bottom = pos.y + size.height as i32;
     for m in monitors {
         let mp = m.position();
         let ms = m.size();
         let (left, top) = (mp.x, mp.y);
         let (right, bottom) = (mp.x + ms.width as i32, mp.y + ms.height as i32);
-        // 左上隅がいずれかのモニタ内にあれば可視とみなす
-        if pos.x >= left && pos.x < right && pos.y >= top && pos.y < bottom {
+        if pos.x >= left && win_right <= right && pos.y >= top && win_bottom <= bottom {
             return true;
         }
     }

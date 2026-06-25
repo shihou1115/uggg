@@ -20,13 +20,14 @@ use crate::state::AppState;
 
 fn main() {
     tauri::Builder::default()
-        // M5-H: 自動起動プラグイン。引数 `--minimized` で起動時にウインドウを隠す動線も将来追加可能。
+        // M5-H: 自動起動 (Windows ではレジストリ HKCU\...\Run に登録される)
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        // M5-B: クリップボード補助プラグイン (📋 ボタン押下時のみ呼ぶ)。
-        .plugin(tauri_plugin_clipboard_manager::init())
+        // M5-B クリップボード補助は `tauri-plugin-clipboard-manager` が Windows で
+        // 起動時 hang する問題があったため、`arboard` crate を tools/clipboard.rs から
+        // 直接呼ぶ実装に切り替え (plugin は使わない)。
         .setup(|app| {
             let state = Arc::new(AppState::initialize(app.handle())?);
             app.manage(state.clone());
