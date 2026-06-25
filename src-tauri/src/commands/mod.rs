@@ -9,6 +9,7 @@ pub mod pomodoro;
 pub mod profile;
 pub mod secrets;
 pub mod settings;
+pub mod tools;
 pub mod topics;
 pub mod tts;
 pub mod window;

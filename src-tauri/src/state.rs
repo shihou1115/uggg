@@ -116,6 +116,10 @@ pub struct Settings {
     /// オンボーディングで同意済みのときに true になる想定だが、設定パネルからも切替可能。
     #[serde(default)]
     pub topics_enabled: bool,
+    /// M5-B: ツール (時刻 / リマインダー / クリップボード) を 3 つまとめて有効化 (既定 false、spec §4.5.3)。
+    /// 個別切替は持たない。advanced モード前提。
+    #[serde(default)]
+    pub tools_enabled: bool,
 }
 
 fn default_llm_provider() -> String {
@@ -199,6 +203,7 @@ impl Default for Settings {
             autostart: false,
             update_feed_url: None,
             topics_enabled: false,
+            tools_enabled: false,
         }
     }
 }

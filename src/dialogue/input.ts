@@ -8,6 +8,7 @@ let view: InputView | null = null;
 interface InputView {
   root: HTMLElement;
   input: HTMLInputElement;
+  pasteBtn: HTMLButtonElement;
   busy: boolean;
 }
 
@@ -27,8 +28,16 @@ export function mountInput(
   input.autocomplete = "off";
   input.spellcheck = false;
   root.appendChild(input);
+  // M5-B: クリップボード貼り付けボタン (📋)。tools_enabled=true のときだけ呼び出しが通る。
+  const pasteBtn = document.createElement("button");
+  pasteBtn.type = "button";
+  pasteBtn.id = "chat-paste-clipboard";
+  pasteBtn.title = "クリップボードを末尾に貼り付け (tools_enabled 必須)";
+  pasteBtn.textContent = "📋";
+  pasteBtn.addEventListener("click", () => void onPasteClipboard());
+  root.appendChild(pasteBtn);
   layer.appendChild(root);
-  view = { root, input, busy: false };
+  view = { root, input, pasteBtn, busy: false };
 
   input.addEventListener("keydown", (ev) => {
     if (ev.isComposing) return;
@@ -65,6 +74,20 @@ export function toggleInput(): void {
 
 export function isInputOpen(): boolean {
   return !!view?.root.classList.contains("visible");
+}
+
+async function onPasteClipboard(): Promise<void> {
+  if (!view) return;
+  try {
+    const txt = await invoke<string>("read_clipboard_text");
+    if (!txt) return;
+    // 既存テキストの末尾に貼り付け (前後にスペースを入れて区切り)
+    const sep = view.input.value.length > 0 && !view.input.value.endsWith(" ") ? " " : "";
+    view.input.value = view.input.value + sep + txt;
+    view.input.focus();
+  } catch (err) {
+    console.warn("read_clipboard_text failed", err);
+  }
 }
 
 async function submit(): Promise<void> {

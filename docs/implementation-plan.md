@@ -331,9 +331,10 @@ M4c は規模が大きいので **Phase A〜G** に分割して進める:
 - ✅ M5-H 自動起動 (`tauri-plugin-autostart` 統合、`set_autostart(enabled)` コマンド、Settings.autostart で UI 同期)
 - ✅ M5-D 更新通知 (`Settings.update_feed_url`、`system/update.rs` で feed JSON 比較、起動 30 秒後 + 24h おきに `spawn_update_watcher` で発火、`check_update_now` で即時チェック、`update_notice_seen:<ver>` で重複防止)
 - ✅ M5-C 時事ネタ RSS (DB v4 で `interest_topics` + `topics_cache`、`Settings.topics_enabled`、`system/topics.rs` で Google News RSS 取得 + 暗い見出しフィルタ、`tasks::spawn_topics_watcher` で 1 時間おき、`commands::topics::{get_interests, set_interests, fetch_topics_now}`、設定パネル「興味分野」セクション。advanced 独り言混入は将来課題)
-- ⏳ M5-A DnD ゴースト展開 / M5-B ツール は重量機能のため次セッション以降
+- ✅ M5-A DnD ゴースト/シェル展開 (`zip` crate 追加、`ghost/dnd.rs` で zip slip / サイズ 1GB / 拡張子フィルタ / 再帰深さ 10 / strip_prefix / 再帰コピー、`commands::assets::dnd_install` で installed/conflicts/errors 振り分け、`src/dnd.ts` で `onDragDropEvent` listen、conflict 時 confirm 再呼び出し、設定パネルへ結果通知)
+- ✅ M5-B ツール (DB v5 `reminders` テーブル / `Settings.tools_enabled` / `tools::{clock,reminder,clipboard}` / advanced system prompt に時刻 + 保留中リマインダー 24h 注入 / 「N 分後」「N 時間後」「N 秒後」parse_request 前置 / `tasks::spawn_reminder_watcher` 10 秒間隔・静音中も鳴る特例 / `commands::tools` 4 件 / `tauri-plugin-clipboard-manager` 統合 / 入力欄 📋 ボタン / 設定パネル「ツール」セクション)
 
-**完了日**: 2026-06-22 (軽量グループ G/E/F/H/D + 中量 M5-C コード完成、残 M5-A/B は次セッション)
+**完了日**: 2026-06-22 (M5 全機能 G/E/F/H/D/C/A/B コード完成)
 **コミット/タグ**: -
 
 ---
@@ -422,6 +423,14 @@ M4c は規模が大きいので **Phase A〜G** に分割して進める:
 | 2026-06-22 | architecture.md | DB v4: `interest_topics(id, topic UNIQUE, enabled)` と `topics_cache(id, topic, headline, link, fetched_ts, UNIQUE(topic, headline))` を追加。`Db::{list_interests, replace_interests, list_enabled_topics, insert_topic_cache, list_recent_topics, prune_topics_cache}` を追加。`InterestTopic` / `TopicCacheRow` 型を追加。 | M5-C |
 | 2026-06-22 | architecture.md | `system/topics.rs` 新設: `build_google_news_rss_url(query)` で日本語 Google News RSS URL を組み立て、`fetch_topic(query, limit)` で取得 → `quick-xml` で `<item>` パース → `is_dark_headline` で暗い見出し (訃報/事件/災害/戦争) を除外。`fetch_all_into_cache(state)` で enabled な interest_topics を順次取得し `topics_cache` に INSERT OR IGNORE 蓄積、7 日 prune。 | M5-C |
 | 2026-06-22 | architecture.md | `commands::topics` 新設 (`get_interests` / `set_interests(topics)` / `fetch_topics_now`)。`tasks::spawn_topics_watcher` 追加 (1 時間おき、`topics_enabled` 時のみ)。`Settings.topics_enabled: bool` (既定 false) を追加。設定パネルに「興味分野 (時事ネタ)」セクション追加 (チェックボックス + カンマ区切り入力 + 即時取得ボタン)。advanced 独り言への混入は将来課題。`Cargo.toml` に `quick-xml = "0.36"` 追加。 | M5-C |
+| 2026-06-22 | architecture.md | `ghost/dnd.rs` 新設 (architecture §12 通り): `DndError` + `detect_asset_kind` (zip / フォルダ、1 階層下までは fallback で peek) + `peek_manifest` + `install_zip` + `install_folder`。`zip = "2"` crate 追加 (default-features off + deflate のみ)。zip slip 対策は `normalize_path(target)` と `sanitize_zip_path`、サイズ上限 1GB、拡張子フィルタ (ghost = yaml/yml/json/md、shell = png/jpg/jpeg/json)、深さ上限 10、`strip_prefix` で `<id>/ghost.json` 形式の zip も `ghosts/<id>/` 直下に展開可能。 | M5-A |
+| 2026-06-22 | architecture.md | `commands::assets::dnd_install(paths, overwrite)` 追加。戻り値 `DndResult { installed: DndInstalled[], conflicts: DndConflict[], errors: DndItemError[] }`。conflict (既存 id と重複) はフロント側で confirm → `overwrite=true` で再呼び出し。`src/dnd.ts` 新設 (`mountDnd` で `WebviewWindow.onDragDropEvent` listen → `dnd_install` 呼び出し → conflict confirm → `window.dispatchEvent("ugg-dnd-result")` で配信)。settings.ts で受け取り、設定パネルを自動で開いて結果サマリを表示 + asset select を refresh。 | M5-A |
+| 2026-06-22 | architecture.md | DB v5: `reminders(id, due_ts, text, created_ts)` テーブル + `Db::{insert_reminder, list_reminders, due_reminders, delete_reminder}` 追加。`ReminderRow` 型を追加。`Settings.tools_enabled: bool` (既定 false) 追加。 | M5-B |
+| 2026-06-22 | architecture.md | `tools` モジュール新設: `clock::now_jp_label` (現在時刻の「YYYY-MM-DD (曜日) HH:MM」)、`reminder::parse_request(text)` (「N 分後/時間後/秒後」の pure 抽出、テスト 7 件)、`clipboard::read_text(app)` (tauri-plugin-clipboard-manager 経由)。 | M5-B |
+| 2026-06-22 | architecture.md | `dialogue::run_dispatch` の冒頭で `tools_enabled && parse_request(...)` が成立すれば `handle_reminder_request` を呼び LLM を介さず即時返事 (「N 分後に『X』を覚えておくね」)。chat_log にも user+main を保存。 | M5-B |
+| 2026-06-22 | architecture.md | `dialogue::advanced::system_prompt` シグネチャに `tools_block: &str` 追加。`build_messages` が `tools_enabled` のとき `render_tools_block(db)` で現在時刻 + 24 時間以内の保留中リマインダーを system prompt に注入。 | M5-B |
+| 2026-06-22 | architecture.md | `tasks::spawn_reminder_watcher` 追加 (10 秒間隔、`due_reminders(now)` を消費して `persist_and_speak` で発話 + DB 削除)。**静音中も鳴らす特例** (`quiet::should_stay_quiet` を見ない)。`notify::ReminderFired { text }` を将来用に追加。 | M5-B |
+| 2026-06-22 | architecture.md | `commands::tools` 新設: `list_reminders` / `add_reminder` / `delete_reminder` / `read_clipboard_text`。`tauri-plugin-clipboard-manager` を Cargo.toml + main.rs に統合。chat 入力欄 (`src/dialogue/input.ts`) に 📋 ボタンを追加し、`read_clipboard_text` で末尾追加。設定パネルに「ツール」セクション (tools_enabled + 保留中リマインダー一覧 + 削除ボタン)。 | M5-B |
 
 ---
 

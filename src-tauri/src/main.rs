@@ -8,6 +8,7 @@ mod presence;
 mod state;
 mod system;
 mod tasks;
+mod tools;
 mod tts;
 mod window;
 
@@ -24,6 +25,8 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        // M5-B: クリップボード補助プラグイン (📋 ボタン押下時のみ呼ぶ)。
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let state = Arc::new(AppState::initialize(app.handle())?);
             app.manage(state.clone());
@@ -43,6 +46,8 @@ fn main() {
             tasks::spawn_update_watcher(app.handle().clone(), state.clone());
             // M5-C: topics_enabled が ON の間、1 時間おきに RSS を取得して topics_cache に蓄積
             tasks::spawn_topics_watcher(state.clone());
+            // M5-B: リマインダー watcher (10 秒間隔、due_ts 到達で persist_and_speak)
+            tasks::spawn_reminder_watcher(app.handle().clone(), state.clone());
             // タスクトレイ
             if let Err(err) = window::tray::install(app.handle(), state.clone()) {
                 eprintln!("[tray] install failed: {err:#}");
@@ -66,6 +71,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::assets::list_ghosts,
             commands::assets::list_shells,
+            commands::assets::dnd_install,
             commands::boot::get_boot_payload,
             commands::data::get_chat_log,
             commands::data::export_data,
@@ -86,6 +92,10 @@ fn main() {
             commands::topics::get_interests,
             commands::topics::set_interests,
             commands::topics::fetch_topics_now,
+            commands::tools::list_reminders,
+            commands::tools::add_reminder,
+            commands::tools::delete_reminder,
+            commands::tools::read_clipboard_text,
             commands::profile::get_profile,
             commands::profile::add_profile,
             commands::profile::delete_profile,

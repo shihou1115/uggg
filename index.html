@@ -249,7 +249,10 @@
               <span>シェル</span>
               <select id="settings-shell-id"></select>
             </label>
-            <p class="panel-hint">変更を保存した後、アプリの再起動で反映されます。</p>
+            <p class="panel-hint">
+              変更を保存した後、アプリの再起動で反映されます。<br />
+              新規ゴースト/シェルは zip / フォルダを ugg のウインドウにドラッグ&ドロップでも導入できます (zip slip / サイズ 1GB / 拡張子チェック付き)。
+            </p>
           </section>
           <section class="panel-section">
             <h3>OS</h3>
@@ -257,6 +260,21 @@
               <input type="checkbox" id="settings-autostart" />
               <span>OS ログイン時に ugg を自動起動する</span>
             </label>
+          </section>
+          <section class="panel-section">
+            <h3>ツール (時刻 / リマインダー / クリップボード)</h3>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-tools-enabled" />
+              <span>ツールを有効化 (advanced モードで時刻補強、入力欄の 📋 ボタン、「N 分後に...」でリマインダー登録)</span>
+            </label>
+            <div class="row">
+              <span>保留中のリマインダー</span>
+              <div id="settings-reminders-list" class="key-state">—</div>
+            </div>
+            <p class="panel-hint">
+              「3分後にお茶」「1時間後に休憩」のように発話すると LLM を介さず即座に登録されます。発火時刻になると静音中でも告知します。
+            </p>
+            <p id="settings-tools-message" class="panel-message" hidden></p>
           </section>
           <section class="panel-section">
             <h3>興味分野 (時事ネタ)</h3>

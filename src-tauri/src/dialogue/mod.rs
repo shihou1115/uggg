@@ -53,6 +53,52 @@ pub fn persist_and_speak(app: &AppHandle, state: &Arc<AppState>, resp: &Dialogue
 // send_user_message から呼ばれる: モード判定・降格チェック・busy ゲート・
 // 失敗時 fallback ・ chat_log 永続化を 1 か所に集約する。
 
+/// M5-B: 「N 分後に X」を `tools::reminder::parse_request` で抽出済の req を受け取り、
+/// DB へ登録し、確認台詞 (`〇分後に「X」を覚えておくね`) を main 単独の発話として返す。
+/// chat_log にも user と main を保存し、LLM は呼ばないので advanced cost を消費しない。
+fn handle_reminder_request(
+    state: &Arc<AppState>,
+    user_text: &str,
+    req: &crate::tools::reminder::ReminderRequest,
+) -> Result<DialogueResponse, String> {
+    let body = if req.body.is_empty() {
+        // 本文が省略された場合は元の発話をそのまま使う (例「5分後」)
+        format!("「{user_text}」より")
+    } else {
+        req.body.clone()
+    };
+    crate::tools::reminder::add(state, &body, req.offset_secs)
+        .map_err(|e| format!("リマインダー登録に失敗: {e:#}"))?;
+
+    let confirm_text = format_confirmation(req.offset_secs, &body);
+    let now = Utc::now().timestamp();
+    let _ = state.db.append_chat(now, "low", ChatRole::User, user_text, None);
+    let _ = state
+        .db
+        .append_chat(now, "low", ChatRole::Main, &confirm_text, None);
+    Ok(DialogueResponse {
+        kind: "reply",
+        mode: "low",
+        pattern: 1,
+        main: SpeechTurn {
+            text: confirm_text,
+            pose: None,
+        },
+        sub: None,
+    })
+}
+
+fn format_confirmation(offset_secs: i64, body: &str) -> String {
+    let (n, unit) = if offset_secs >= 3600 && offset_secs % 3600 == 0 {
+        (offset_secs / 3600, "時間")
+    } else if offset_secs >= 60 {
+        (offset_secs / 60, "分")
+    } else {
+        (offset_secs, "秒")
+    };
+    format!("{n}{unit}後に「{body}」を覚えておくね")
+}
+
 /// 連続 API エラーがこの回数に達したら一時降格する。
 const ERROR_STREAK_THRESHOLD: i64 = 3;
 /// 一時降格の保持時間 (秒)。経過後に再度 advanced を試みる。
@@ -96,6 +142,15 @@ async fn run_dispatch(
     user_text: &str,
 ) -> Result<DialogueResponse, String> {
     let settings = state.settings.lock().expect("settings poisoned").clone();
+
+    // M5-B: tools_enabled なら「N 分後に...」をパースしてリマインダー登録を試みる。
+    // LLM は呼ばずに即時返事するので高速・低コスト。
+    if settings.tools_enabled {
+        if let Some(req) = crate::tools::reminder::parse_request(user_text) {
+            return handle_reminder_request(state, user_text, &req);
+        }
+    }
+
     let want_advanced = matches!(settings.mode, DialogueMode::Advanced)
         && !is_degraded(&state.dialogue);
 

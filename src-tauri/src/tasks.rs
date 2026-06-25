@@ -137,6 +137,52 @@ pub fn spawn_irodori_idle_watcher(state: Arc<AppState>) {
     });
 }
 
+/// M5-B: リマインダー watcher (10 秒間隔で `due_reminders(now)` をポーリング → 発火 → 削除)。
+/// **静音中も鳴らす特例** (spec §4.5.3): `quiet::should_stay_quiet` を見ない。
+pub fn spawn_reminder_watcher(app: AppHandle, state: Arc<AppState>) {
+    const CHECK_INTERVAL_SECS: u64 = 10;
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+            let now = Utc::now().timestamp();
+            let due = match state.db.due_reminders(now) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("[reminder] due_reminders failed: {err:#}");
+                    continue;
+                }
+            };
+            for r in due {
+                fire_reminder(&app, &state, &r);
+                if let Err(err) = state.db.delete_reminder(r.id) {
+                    eprintln!("[reminder] delete_reminder({}) failed: {err:#}", r.id);
+                }
+            }
+        }
+    });
+}
+
+fn fire_reminder(app: &AppHandle, state: &Arc<AppState>, r: &crate::db::ReminderRow) {
+    use crate::dialogue::{self, DialogueResponse};
+    use crate::ghost::dict::SpeechTurn;
+    let body = if r.text.is_empty() {
+        "リマインダーの時間だよ".to_string()
+    } else {
+        format!("リマインダー: {}", r.text)
+    };
+    let resp = DialogueResponse {
+        kind: "system_message",
+        mode: "low",
+        pattern: 1,
+        main: SpeechTurn {
+            text: body,
+            pose: None,
+        },
+        sub: None,
+    };
+    dialogue::persist_and_speak(app, state, &resp);
+}
+
 /// M5-C: `topics_enabled` が ON の間、1 時間おきに enabled な interest_topics の RSS を取得して
 /// topics_cache に蓄積する。topics_enabled=false の周期は何もしない (キャッシュ取得しない)。
 pub fn spawn_topics_watcher(state: Arc<AppState>) {

@@ -80,6 +80,15 @@ pub struct UsageSummary {
     pub limited: bool,
 }
 
+/// リマインダー 1 件 (M5-B)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReminderRow {
+    pub id: i64,
+    pub due_ts: i64,
+    pub text: String,
+    pub created_ts: i64,
+}
+
 /// 興味分野 1 件 (M5-C, architecture §2.2)。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InterestTopic {
@@ -247,6 +256,22 @@ impl Db {
                 INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_schema_version', '4');",
             )
             .context("migrate to schema v4")?;
+        }
+
+        if current < 5 {
+            // M5-B: リマインダー。due_ts に達した行を watcher が消費する。
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS reminders (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    due_ts     INTEGER NOT NULL,
+                    text       TEXT NOT NULL,
+                    created_ts INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(due_ts);
+
+                INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_schema_version', '5');",
+            )
+            .context("migrate to schema v5")?;
         }
 
         tx.commit().context("commit migration tx")?;
@@ -458,6 +483,75 @@ impl Db {
             )
             .context("sum_cost_since")?;
         Ok(total)
+    }
+
+    // ===== reminders (M5-B) =====
+
+    pub fn insert_reminder(&self, due_ts: i64, text: &str, created_ts: i64) -> Result<i64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "INSERT INTO reminders (due_ts, text, created_ts) VALUES (?1, ?2, ?3)",
+            params![due_ts, text, created_ts],
+        )
+        .context("insert_reminder")?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_reminders(&self) -> Result<Vec<ReminderRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, due_ts, text, created_ts FROM reminders ORDER BY due_ts ASC",
+            )
+            .context("prepare list_reminders")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ReminderRow {
+                    id: row.get(0)?,
+                    due_ts: row.get(1)?,
+                    text: row.get(2)?,
+                    created_ts: row.get(3)?,
+                })
+            })
+            .context("query_map list_reminders")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("row list_reminders")?);
+        }
+        Ok(out)
+    }
+
+    /// `due_ts <= now` のリマインダーを返す (発火対象)。
+    pub fn due_reminders(&self, now_ts: i64) -> Result<Vec<ReminderRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, due_ts, text, created_ts FROM reminders
+                 WHERE due_ts <= ?1 ORDER BY due_ts ASC",
+            )
+            .context("prepare due_reminders")?;
+        let rows = stmt
+            .query_map(params![now_ts], |row| {
+                Ok(ReminderRow {
+                    id: row.get(0)?,
+                    due_ts: row.get(1)?,
+                    text: row.get(2)?,
+                    created_ts: row.get(3)?,
+                })
+            })
+            .context("query_map due_reminders")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("row due_reminders")?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_reminder(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute("DELETE FROM reminders WHERE id = ?1", params![id])
+            .context("delete_reminder")?;
+        Ok(())
     }
 
     // ===== interest_topics (M5-C) =====

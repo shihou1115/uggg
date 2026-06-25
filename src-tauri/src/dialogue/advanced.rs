@@ -37,7 +37,7 @@ pub async fn reply(
     user_text: &str,
 ) -> Result<AdvancedReply> {
     let client = LlmClient::new(settings.llm_base_url.clone(), api_key);
-    let messages = build_messages(bundle, db, user_text)?;
+    let messages = build_messages(bundle, db, user_text, settings.tools_enabled)?;
     let response = client.chat(&settings.llm_model, messages).await?;
     parse_and_record(response, bundle, db, settings, user_text).await
 }
@@ -138,10 +138,20 @@ fn build_messages(
     bundle: &GhostBundle,
     db: &Db,
     user_text: &str,
+    tools_enabled: bool,
 ) -> Result<Vec<ChatMessage>> {
     let mut out = Vec::new();
     let profile_block = render_profile_block(db)?;
-    out.push(ChatMessage::system(system_prompt(bundle, &profile_block)));
+    let tools_block = if tools_enabled {
+        render_tools_block(db)
+    } else {
+        String::new()
+    };
+    out.push(ChatMessage::system(system_prompt(
+        bundle,
+        &profile_block,
+        &tools_block,
+    )));
 
     // M2 初期: 履歴注入は最小限。中長期記憶は user_profile (system prompt) でカバー。
     for hist in load_recent_history(db, 8)? {
@@ -170,7 +180,27 @@ fn render_profile_block(db: &Db) -> Result<String> {
     Ok(out)
 }
 
-fn system_prompt(bundle: &GhostBundle, profile_block: &str) -> String {
+/// M5-B: tools_enabled のときに system prompt に注入する補助情報。
+fn render_tools_block(db: &Db) -> String {
+    let now_label = crate::tools::clock::now_jp_label();
+    let now_ts = chrono::Utc::now().timestamp();
+    let mut out = format!("\n[現在] {now_label}\n");
+    let pending = db.list_reminders().unwrap_or_default();
+    let upcoming: Vec<_> = pending
+        .into_iter()
+        .filter(|r| r.due_ts > now_ts && r.due_ts - now_ts < 24 * 3600)
+        .collect();
+    if !upcoming.is_empty() {
+        out.push_str("[保留中のリマインダー (24 時間以内)]\n");
+        for r in upcoming {
+            let mins = (r.due_ts - now_ts).max(0) / 60;
+            out.push_str(&format!("- 約 {mins} 分後: {}\n", r.text));
+        }
+    }
+    out
+}
+
+fn system_prompt(bundle: &GhostBundle, profile_block: &str, tools_block: &str) -> String {
     let main_name = bundle.ghost.characters.main.name.as_str();
     let sub_block = match &bundle.ghost.characters.sub {
         Some(sub) => format!(
@@ -200,7 +230,7 @@ fn system_prompt(bundle: &GhostBundle, profile_block: &str) -> String {
 登場人物:
 - 「{main}」(main): メインキャラ。
 {sub_block}
-{profile_block}
+{profile_block}{tools_block}
 応答ルール:
 - 1 ターンは短く: main は 1-2 行、sub は 1 行程度。
 - 2 人で掛け合うように自然な会話にする。説教くさい長文は禁止。
@@ -220,6 +250,7 @@ fn system_prompt(bundle: &GhostBundle, profile_block: &str) -> String {
         main = main_name,
         sub_block = sub_block,
         profile_block = profile_block,
+        tools_block = tools_block,
         sub_required_line = sub_required_line,
         available_poses = available_poses,
     )

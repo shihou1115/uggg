@@ -29,6 +29,15 @@ export interface Settings {
   autostart: boolean;
   update_feed_url: string | null;
   topics_enabled: boolean;
+  tools_enabled: boolean;
+}
+
+/// M5-B: リマインダー 1 件。
+export interface ReminderEntry {
+  id: number;
+  due_ts: number;
+  text: string;
+  created_ts: number;
 }
 
 /// M5-F: ghosts / shells リストエントリ。
@@ -42,6 +51,33 @@ export interface InterestTopic {
   id: number;
   topic: string;
   enabled: boolean;
+}
+
+/// M5-A: DnD インストールの内訳。
+export type AssetKind = "ghost" | "shell";
+
+export interface DndInstalled {
+  id: string;
+  name: string;
+  kind: AssetKind;
+}
+
+export interface DndConflict {
+  id: string;
+  name: string;
+  kind: AssetKind;
+  source: string;
+}
+
+export interface DndItemError {
+  source: string;
+  message: string;
+}
+
+export interface DndResult {
+  installed: DndInstalled[];
+  conflicts: DndConflict[];
+  errors: DndItemError[];
 }
 
 /// M5-E: clear_history の戻り値。

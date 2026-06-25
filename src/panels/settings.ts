@@ -7,8 +7,10 @@ import type {
   AssetEntry,
   ClearResult,
   DialogueMode,
+  DndResult,
   InterestTopic,
   IrodoriGpuInfo,
+  ReminderEntry,
   Settings,
   SlotName,
   TalkSpeed,
@@ -78,6 +80,9 @@ interface Inputs {
   topicsInterests: HTMLInputElement;
   topicsFetchBtn: HTMLButtonElement;
   topicsMessage: HTMLElement;
+  toolsEnabled: HTMLInputElement;
+  remindersList: HTMLElement;
+  toolsMessage: HTMLElement;
   saveBtn: HTMLButtonElement;
   cancelBtn: HTMLButtonElement;
   closeBtn: HTMLButtonElement;
@@ -100,6 +105,33 @@ export async function mountSettingsPanel(): Promise<void> {
   await listen("open-settings", () => {
     void openSettingsPanel();
   });
+  // M5-A: DnD インストール完了の通知 (window 経由) を受けて、パネルを開いて結果表示
+  window.addEventListener("ugg-dnd-result", (ev) => {
+    const detail = (ev as CustomEvent<DndResult>).detail;
+    void onDndResult(detail);
+  });
+}
+
+async function onDndResult(result: DndResult): Promise<void> {
+  const parts: string[] = [];
+  if (result.installed.length > 0) parts.push(`導入 ${result.installed.length} 件`);
+  if (result.conflicts.length > 0) parts.push(`未上書き ${result.conflicts.length} 件`);
+  if (result.errors.length > 0) parts.push(`エラー ${result.errors.length} 件`);
+  const isError = result.errors.length > 0 && result.installed.length === 0;
+  const summary =
+    parts.length > 0
+      ? `DnD 結果: ${parts.join(" / ")}${
+          result.installed.length > 0
+            ? "。アプリを再起動すると反映されます"
+            : ""
+        }`
+      : "DnD: 何も処理されませんでした";
+  if (!isOpen()) {
+    await openSettingsPanel();
+  }
+  showMessage(summary, isError);
+  // 一覧 select を更新
+  if (current) await refreshAssetLists(current);
 }
 
 export function registerSavedListener(cb: (s: Settings) => void): void {
@@ -117,6 +149,7 @@ export async function openSettingsPanel(): Promise<void> {
   await refreshIrodoriState();
   await refreshAssetLists(current);
   await refreshInterests();
+  await refreshReminders();
   inputs.panel.classList.add("visible");
   inputs.msg.hidden = true;
   inputs.ttsProgress.hidden = true;
@@ -199,6 +232,9 @@ function collectInputs(): Inputs {
     topicsInterests: byId<HTMLInputElement>("settings-topics-interests"),
     topicsFetchBtn: byId<HTMLButtonElement>("settings-topics-fetch"),
     topicsMessage: byId("settings-topics-message"),
+    toolsEnabled: byId<HTMLInputElement>("settings-tools-enabled"),
+    remindersList: byId("settings-reminders-list"),
+    toolsMessage: byId("settings-tools-message"),
     saveBtn: byId<HTMLButtonElement>("settings-save"),
     cancelBtn: byId<HTMLButtonElement>("settings-cancel"),
     closeBtn: byId<HTMLButtonElement>("settings-close"),
@@ -674,6 +710,68 @@ function showTopicsMessage(msg: string, isError: boolean): void {
   inputs.topicsMessage.hidden = false;
 }
 
+// === M5-B: リマインダー一覧表示 + 削除 ====================================
+
+async function refreshReminders(): Promise<void> {
+  if (!inputs) return;
+  try {
+    const list = await invoke<ReminderEntry[]>("list_reminders");
+    renderReminders(list);
+  } catch (err) {
+    inputs.remindersList.textContent = "取得失敗";
+    console.warn("[tools] list_reminders failed", err);
+  }
+}
+
+function renderReminders(list: ReminderEntry[]): void {
+  if (!inputs) return;
+  inputs.remindersList.innerHTML = "";
+  if (list.length === 0) {
+    inputs.remindersList.textContent = "なし";
+    return;
+  }
+  const nowMs = Date.now();
+  for (const r of list) {
+    const item = document.createElement("div");
+    item.className = "row";
+    const due = new Date(r.due_ts * 1000);
+    const dueLabel = due.toLocaleString("ja-JP", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    const remaining = Math.max(0, Math.floor((r.due_ts * 1000 - nowMs) / 60000));
+    const label = document.createElement("span");
+    label.textContent = `${dueLabel} (約 ${remaining} 分後): ${r.text}`;
+    const del = document.createElement("button");
+    del.type = "button";
+    del.textContent = "削除";
+    del.addEventListener("click", () => void onDeleteReminder(r.id));
+    item.appendChild(label);
+    item.appendChild(del);
+    inputs.remindersList.appendChild(item);
+  }
+}
+
+async function onDeleteReminder(id: number): Promise<void> {
+  if (!inputs) return;
+  try {
+    const list = await invoke<ReminderEntry[]>("delete_reminder", { id });
+    renderReminders(list);
+    showToolsMessage("リマインダーを削除しました", false);
+  } catch (err) {
+    showToolsMessage(`削除失敗: ${formatErr(err)}`, true);
+  }
+}
+
+function showToolsMessage(msg: string, isError: boolean): void {
+  if (!inputs) return;
+  inputs.toolsMessage.textContent = msg;
+  inputs.toolsMessage.classList.toggle("error", isError);
+  inputs.toolsMessage.hidden = false;
+}
+
 function showProgress(msg: string, isError: boolean): void {
   if (!inputs) return;
   inputs.ttsProgress.textContent = msg;
@@ -704,6 +802,7 @@ function applySettingsToForm(s: Settings): void {
   inputs.autostart.checked = s.autostart;
   inputs.updateFeedUrl.value = s.update_feed_url ?? "";
   inputs.topicsEnabled.checked = s.topics_enabled;
+  inputs.toolsEnabled.checked = s.tools_enabled;
   inputs.ttsSpeed.value = String(s.tts_speed);
   inputs.ttsVolume.value = String(s.tts_volume);
   // 話者 select は資産 DL 済みのときだけ list_voices で埋められる。値は文字列で保持。
@@ -772,6 +871,7 @@ async function onSave(): Promise<void> {
     autostart: inputs.autostart.checked,
     update_feed_url: inputs.updateFeedUrl.value.trim() || null,
     topics_enabled: inputs.topicsEnabled.checked,
+    tools_enabled: inputs.toolsEnabled.checked,
     ghost_id: inputs.ghostId.value || current.ghost_id,
     shell_id: inputs.shellId.value || current.shell_id,
   };
