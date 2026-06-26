@@ -11,6 +11,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
+import { uggConfirm } from "./confirm";
 import type { DndResult } from "./types";
 
 type DropHandler = (result: DndResult) => void;
@@ -43,8 +44,9 @@ async function handleDnd(paths: string[]): Promise<void> {
   // conflict があれば confirm して再投入
   if (result.conflicts.length > 0) {
     const ids = result.conflicts.map((c) => `${c.kind}:${c.id}`).join(", ");
-    const ok = window.confirm(
+    const ok = await uggConfirm(
       `次の項目は既存と重複しています。上書きしますか?\n${ids}`,
+      "上書き確認",
     );
     if (ok) {
       const retryPaths = result.conflicts.map((c) => c.source);

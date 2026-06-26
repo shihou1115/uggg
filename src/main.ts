@@ -8,6 +8,7 @@ import { firePoke } from "./interaction/poke";
 import { mountContextMenu } from "./menu/context-menu";
 import { showOnboarding } from "./panels/onboarding";
 import { mountPomodoroBadge } from "./panels/pomodoro";
+import { mountConfirm } from "./confirm";
 import { mountDnd } from "./dnd";
 import { mountChatLog } from "./panels/chatlog";
 import { mountSettingsPanel, registerSavedListener } from "./panels/settings";
@@ -62,6 +63,7 @@ async function boot(): Promise<void> {
   await mountPomodoroBadge();
   mountCredit();
   mountChatLog();
+  mountConfirm();
   await mountDnd();
   // TTS スピーカーを ghost-speech に渡す
   const speaker = createSpeaker();

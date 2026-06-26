@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import { openChatLog } from "./chatlog";
+import { uggConfirm } from "../confirm";
 import { previewWavBase64 } from "../tts/speaker";
 import type {
   AssetEntry,
@@ -321,9 +322,10 @@ function fillSpeakerSelect(
 
 async function onTtsDownload(): Promise<void> {
   if (!inputs) return;
-  // 規約同意ダイアログ。シンプルに confirm で済ませる (パネル既出のリンクで規約は提示済み)。
-  const ok = window.confirm(
+  // 規約同意ダイアログ (パネル既出のリンクで規約は提示済み)。
+  const ok = await uggConfirm(
     "VOICEVOX 音声モデルおよび ONNX Runtime のライセンス・規約に同意してダウンロードしますか?\n（数百 MB の通信が発生します）",
+    "ダウンロード確認",
   );
   if (!ok) return;
   showProgress("ダウンローダ取得中…", false);
@@ -440,9 +442,10 @@ function applyVoiceRefState(refs: VoiceRef[]): void {
 
 async function onIrodoriDownload(): Promise<void> {
   if (!inputs) return;
-  const ok = window.confirm(
+  const ok = await uggConfirm(
     "Irodori-TTS (高品質モード) の Python ランタイム + PyTorch (CUDA 12.1) を" +
       "ダウンロードします。\n約 1〜2 GB の通信が発生し、数分〜十数分かかります。続行しますか?",
+    "ダウンロード確認",
   );
   if (!ok) return;
   showIrodoriProgress("ダウンロードを開始しています…", false);
@@ -512,7 +515,7 @@ async function onVoiceRefPreview(slot: SlotName): Promise<void> {
 
 async function onVoiceRefDelete(slot: SlotName): Promise<void> {
   if (!inputs) return;
-  if (!window.confirm(`${slot} の参照音声を削除しますか?`)) return;
+  if (!(await uggConfirm(`${slot} の参照音声を削除しますか?`, "削除確認"))) return;
   try {
     const refs = await invoke<VoiceRef[]>("voice_ref_delete", { slot });
     applyVoiceRefState(refs);
@@ -601,7 +604,7 @@ async function onDataClear(): Promise<void> {
   const confirmMsg = includeProfile
     ? "会話ログと記憶 (user_profile) を全て削除します。続行しますか?"
     : "会話ログを全て削除します (記憶は残します)。続行しますか?";
-  if (!window.confirm(confirmMsg)) return;
+  if (!(await uggConfirm(confirmMsg, "履歴クリア"))) return;
   inputs.dataClearBtn.disabled = true;
   try {
     const res = await invoke<ClearResult>("clear_history", {

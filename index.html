@@ -32,6 +32,20 @@
       <!-- 設定パネルとコンテキストメニューも静的配置 (WebView2 透過バグ対策)。
            初期は .visible 無しで隠す。 -->
       <div id="context-menu" class="solid"></div>
+      <!-- 汎用確認ダイアログ。alwaysOnTop + 透過の組み合わせで `window.confirm` が
+           固まる問題があったため、独自モーダルに置換 (M6 動作確認時に判明)。 -->
+      <div id="ugg-confirm-panel" class="solid panel">
+        <header class="panel-header">
+          <h2 id="ugg-confirm-title">確認</h2>
+        </header>
+        <div class="panel-body">
+          <p id="ugg-confirm-msg"></p>
+        </div>
+        <footer class="panel-footer">
+          <button type="button" id="ugg-confirm-cancel">キャンセル</button>
+          <button type="button" id="ugg-confirm-ok" class="primary">OK</button>
+        </footer>
+      </div>
       <!-- M5-G: チャットログパネル -->
       <div id="chatlog-panel" class="solid panel">
         <header class="panel-header">

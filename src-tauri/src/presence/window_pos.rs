@@ -39,11 +39,11 @@ pub fn restore(app: &AppHandle, state: &Arc<AppState>) {
         return;
     };
 
-    // 暫定: ウインドウ全体が完全に画面内かチェック (左上隅だけだとサイズ次第で外に出る)
     if is_fully_visible_on_some_monitor(&window, pos) {
         let _ = window.set_position(PhysicalPosition::new(pos.x, pos.y));
     } else {
-        // 画面外の保存値は捨てて中央へ + DB も上書き保存しておく
+        // 保存値が画面外 (モニタ構成変更等) なら DB の値を空にしてフォールバック中央化。
+        // 次回起動時に「stored=None」経路に乗って center_on_primary が走る。
         let _ = state.db.set_setting(WINDOW_POS_KEY, "");
         center_on_primary(&window);
     }
@@ -104,8 +104,9 @@ fn persist(state: &Arc<AppState>, pos: StoredPos) {
     }
 }
 
-/// ウインドウ全体 (左上隅 + サイズ) がいずれかのモニタの矩形に完全に収まっているか。
-/// 左上隅だけだとサイズ次第で大半が画面外に出てキャラが見えないため、厳しめに判定する。
+/// ウインドウの中心点がいずれかのモニタ内にあるか (= 半分以上が見える)。
+/// 「ウインドウ全体が完全内」だと数ピクセルのはみ出しでも off-screen 扱いになるため緩めの判定。
+/// 「左上隅のみ」だと逆にウインドウ大半が画面外でも復元してしまう。中心点判定がちょうど良い妥協。
 fn is_fully_visible_on_some_monitor(
     window: &tauri::WebviewWindow,
     pos: StoredPos,
@@ -116,14 +117,14 @@ fn is_fully_visible_on_some_monitor(
     let Ok(size) = window.outer_size() else {
         return true;
     };
-    let win_right = pos.x + size.width as i32;
-    let win_bottom = pos.y + size.height as i32;
+    let cx = pos.x + (size.width as i32) / 2;
+    let cy = pos.y + (size.height as i32) / 2;
     for m in monitors {
         let mp = m.position();
         let ms = m.size();
         let (left, top) = (mp.x, mp.y);
         let (right, bottom) = (mp.x + ms.width as i32, mp.y + ms.height as i32);
-        if pos.x >= left && win_right <= right && pos.y >= top && win_bottom <= bottom {
+        if cx >= left && cx < right && cy >= top && cy < bottom {
             return true;
         }
     }
