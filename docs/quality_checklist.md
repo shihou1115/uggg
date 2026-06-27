@@ -36,9 +36,9 @@
 - [x] トレイ「終了」/コンテキストメニュー「終了」で python.exe の残骸が出ない (実測: 終了操作から 29 秒で消失。POST /shutdown 経路成功)
 
 ### G4. ヘルスチェック (Phase G)
-- [ ] サイドカー起動中に Task Manager から手動 kill → **90 秒以内**にゴーストが `irodori_unavailable` を発話 (30 秒間隔 × 3 回連続失敗で発火、最悪 60〜90 秒)
-- [ ] 次回 `synthesize_voice` 呼び出しで自動再起動される
-- [ ] 実モデル経路 (`tts_irodori_use_real_model=true`) でサイドカー起動したが GPU が取れなかった場合 (`/health` が `gpu: null` を返す)、次回 `health_ping` で即 `irodori_unavailable` が発火する
+- [x] サイドカー起動中に Task Manager から手動 kill → **90 秒以内**にゴーストが `irodori_unavailable` を発話 (30 秒間隔 × 3 回連続失敗で発火、最悪 60〜90 秒) — 2026-06-28 実機検証 ✅
+- [x] 次回 `synthesize_voice` 呼び出しで **disable_until (20 分) に従い voicevox 経路へ自動 fallback** される (0ee4c80 で実装、auto-restart は GPU 永続不在環境での 90 秒 churn 防止のため抑制) ✅
+- [ ] (任意・GPU 必須環境) 実モデル経路 (`tts_irodori_use_real_model=true`) でサイドカー起動したが GPU が取れなかった場合 (`/health` が 503) 、次回 `health_ping` で即 `irodori_unavailable` が発火する
 
 ### G5. 実モデル結線 (Phase G + 実機調整)
 - [ ] 「実モデルを使う (β)」を ON に切替 (GPU + 資産 (`irodori_tts` パッケージ込み) が揃っているときのみ有効化される)

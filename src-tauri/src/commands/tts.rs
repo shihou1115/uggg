@@ -634,9 +634,12 @@ fn parse_speakers_to_voice_options(json: &str) -> Result<Vec<VoiceOption>, Strin
 }
 
 /// 設定変更時など、必要なら背景 init をキックする (起動時の事前 init 用)。
+/// `tauri::async_runtime::spawn_blocking` を使うこと: Tauri 2 の setup コールバックは
+/// tokio ランタイムが thread-local に見えていないケースがあり、生の `tokio::task::spawn_blocking`
+/// は "there is no reactor running" で panic することがある。
 #[allow(dead_code)]
 pub fn spawn_preinit(state: Arc<AppState>) {
-    tokio::task::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         let _ = ensure_engine(&state);
     });
 }
