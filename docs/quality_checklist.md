@@ -41,13 +41,13 @@
 - [ ] (任意・GPU 必須環境) 実モデル経路 (`tts_irodori_use_real_model=true`) でサイドカー起動したが GPU が取れなかった場合 (`/health` が 503) 、次回 `health_ping` で即 `irodori_unavailable` が発火する
 
 ### G5. 実モデル結線 (Phase G + 実機調整)
-- [ ] 「実モデルを使う (β)」を ON に切替 (GPU + 資産 (`irodori_tts` パッケージ込み) が揃っているときのみ有効化される)
-- [ ] 次回 `synthesize_voice` / `voice_ref_generate` 呼び出しでサイドカーが実モデル経路で起動
-- [ ] 初回起動時に Aratako/Irodori-TTS 系モデル (約 2-4 GB) が `%APPDATA%\ugg\irodori\model\` に DL される (進捗は `[hf-download] ...` 行が `irodori-download` イベント経由で設定パネル進捗欄に流れる)
-- [ ] 参照音声生成: キャプションから自然な音声 (キャラクター性が反映された短い wav) が生成される
-- [ ] 通常合成: 上記参照音声を使った合成で、音声がキャプションに沿った声質で読み上げられる
-- [ ] 漢字混じり文章で発話 → preprocess (voicevox OpenJtalk) が効いていることを確認 (聞き取りやすさ)
-- [ ] ※ `RealModelBackend.synthesize` / `generate_voice_ref` は upstream `irodori_tts.inference_runtime.InferenceRuntime` API で結線済 (commit 9118205)。`InferenceRuntime` 初期化や `SamplingRequest` のデフォルト引数が upstream の最新コードと整合しなければ実機でチューニングする
+- [x] 「実モデルを使う (β)」を ON に切替 (GPU + 資産 (`irodori_tts` パッケージ込み) が揃っているときのみ有効化される) — 2026-06-28 実機検証 ✅
+- [x] 次回 `synthesize_voice` / `voice_ref_generate` 呼び出しでサイドカーが実モデル経路で起動 (`--no-download --mock なし`、~2GB メモリ確保)
+- [x] HF モデルは G2 step 6 (`install_irodori_models`) で事前 DL 済 (約 4.3 GB)
+- [x] 参照音声生成 (VoiceDesign): キャプションから自然なキャラ音声 wav が生成される
+- [x] 通常合成: 参照音声のキャラ声で読み上げ
+- [x] 漢字混じり文章で発話 → preprocess (voicevox OpenJtalk) で漢字→かな変換が効き、自然な読み上げ
+- [x] ※ G5-2 実機検証時に 2 件のバグ発見・修正済 (commit c3dffe0): (1) `_audio_to_wav_bytes` が torch.Tensor `(channels, samples)` を soundfile に渡せなかった、(2) `dacvae` の transitive 依存 `descript-audiotools` が未 install
 
 ### G6. フォールバック
 - [ ] GPU 不可環境で `tts_engine = irodori` を選んでも、明示エラーで voicevox 経路に切替えるよう案内される
