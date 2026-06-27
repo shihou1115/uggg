@@ -219,37 +219,108 @@ pub fn spawn_update_watcher(app: AppHandle, state: Arc<AppState>) {
     });
 }
 
+/// `spawn_irodori_health_watcher` の連続失敗カウンタ判定 (pure)。
+/// off-by-one バグの温床なので、UI 経路と分離してテスト可能な形に切り出している。
+#[derive(Debug, PartialEq)]
+pub(crate) struct HealthTick {
+    pub fails_after: u32,
+    pub should_trigger: bool,
+}
+
+pub(crate) fn next_health_tick(prev_fails: u32, ok: bool, threshold: u32) -> HealthTick {
+    if ok {
+        return HealthTick {
+            fails_after: 0,
+            should_trigger: false,
+        };
+    }
+    let f = prev_fails.saturating_add(1);
+    if f >= threshold {
+        HealthTick {
+            fails_after: 0, // 通知発火後はリセット
+            should_trigger: true,
+        }
+    } else {
+        HealthTick {
+            fails_after: f,
+            should_trigger: false,
+        }
+    }
+}
+
 /// Irodori サイドカーのヘルスチェック (M4c Phase G)。
 /// 30 秒ごとに `/health` を ping し、3 回連続失敗で `IrodoriUnavailable` を通知 + サイドカー shutdown。
 /// 次回 `ensure_sidecar_running` で再起動される。サイドカー未起動なら no-op。
 pub fn spawn_irodori_health_watcher(app: AppHandle, state: Arc<AppState>) {
     const CHECK_INTERVAL_SECS: u64 = 30;
     const FAIL_THRESHOLD: u32 = 3;
+    const DISABLE_SECS: i64 = 20 * 60;
     tauri::async_runtime::spawn(async move {
         let mut fails: u32 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
-            if state.tts.irodori.health_ping().await {
-                fails = 0;
+            let ok = state.tts.irodori.health_ping().await;
+            let tick = next_health_tick(fails, ok, FAIL_THRESHOLD);
+            fails = tick.fails_after;
+            if !tick.should_trigger {
                 continue;
             }
-            fails += 1;
-            if fails < FAIL_THRESHOLD {
-                continue;
-            }
-            // 3 回連続失敗: shutdown + 通知 (5 分クールダウンで連続発話を防ぐ)。
+            // 3 回連続失敗: shutdown + 20 分の sticky cooldown + 通知 (5 分クールダウン)。
+            // disable_for() で次の synthesize_voice が ensure_sidecar_running を即エラー化し、
+            // GPU 永続不在環境での 90 秒 churn を止める。voicevox 経路は引き続き動く。
             let _ = state.tts.irodori.shutdown().await;
+            state.tts.irodori.disable_for(DISABLE_SECS);
             if state.tts.irodori.should_notify_unavailable() {
                 crate::system::notify::notify(
                     &app,
                     &state,
                     crate::system::notify::NoticeKind::IrodoriUnavailable {
-                        reason: format!("ヘルスチェックが {FAIL_THRESHOLD} 回連続失敗"),
+                        reason: format!(
+                            "ヘルスチェックが {FAIL_THRESHOLD} 回連続失敗。{} 分は再起動を抑制します",
+                            DISABLE_SECS / 60
+                        ),
                     },
                 )
                 .await;
             }
-            fails = 0;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_health_tick_resets_on_success() {
+        let t = next_health_tick(2, true, 3);
+        assert_eq!(t, HealthTick { fails_after: 0, should_trigger: false });
+    }
+
+    #[test]
+    fn next_health_tick_three_failures_trigger_and_reset() {
+        let t1 = next_health_tick(0, false, 3);
+        assert_eq!(t1, HealthTick { fails_after: 1, should_trigger: false });
+        let t2 = next_health_tick(t1.fails_after, false, 3);
+        assert_eq!(t2, HealthTick { fails_after: 2, should_trigger: false });
+        let t3 = next_health_tick(t2.fails_after, false, 3);
+        assert_eq!(t3, HealthTick { fails_after: 0, should_trigger: true });
+    }
+
+    #[test]
+    fn next_health_tick_intermittent_failures_dont_trigger() {
+        let mut fails: u32 = 0;
+        for ok in [false, true, false, true, false] {
+            let t = next_health_tick(fails, ok, 3);
+            assert!(!t.should_trigger);
+            fails = t.fails_after;
+        }
+    }
+
+    #[test]
+    fn next_health_tick_threshold_one_triggers_immediately() {
+        let t = next_health_tick(0, false, 1);
+        assert!(t.should_trigger);
+        assert_eq!(t.fails_after, 0);
+    }
 }

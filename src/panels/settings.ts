@@ -406,7 +406,40 @@ async function refreshIrodoriState(): Promise<void> {
   }
   // ボタン disabled 制御 (GPU が無ければ DL も意味なし、実モデルチェックも不可)
   inputs.irodoriDownloadBtn.disabled = !gpuOk;
-  inputs.irodoriUseRealModel.disabled = !(gpuOk && assetsOk);
+  const canUseReal = gpuOk && assetsOk;
+  inputs.irodoriUseRealModel.disabled = !canUseReal;
+  // 実モデルが使えない状態なら checked も false に倒し、settings.json に永続化された
+  // 古い true 値を引きずらないよう同期する (GPU を抜いた / 資産を削除した直後の churn 防止)。
+  if (!canUseReal && inputs.irodoriUseRealModel.checked) {
+    inputs.irodoriUseRealModel.checked = false;
+    if (current) {
+      current.tts_irodori_use_real_model = false;
+      try {
+        await invoke("set_settings", { settings: current });
+      } catch (err) {
+        console.warn("[irodori] failed to clear stale use_real_model", err);
+      }
+    }
+  }
+  // tts_engine select の Irodori option も gpu/資産未準備のときは disabled にし、
+  // 既に選択中なら voicevox_core に倒して保存する (毎発話で 90 秒 churn を踏まないため)。
+  const irodoriOption = inputs.ttsEngine.querySelector<HTMLOptionElement>(
+    'option[value="irodori"]',
+  );
+  if (irodoriOption) {
+    irodoriOption.disabled = !canUseReal;
+  }
+  if (!canUseReal && inputs.ttsEngine.value === "irodori") {
+    inputs.ttsEngine.value = "voicevox_core";
+    if (current) {
+      current.tts_engine = "voicevox_core";
+      try {
+        await invoke("set_settings", { settings: current });
+      } catch (err) {
+        console.warn("[irodori] failed to flip tts_engine to voicevox_core", err);
+      }
+    }
+  }
   // 参照音声一覧
   try {
     const refs = await invoke<VoiceRef[]>("voice_ref_list");

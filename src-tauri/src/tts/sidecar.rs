@@ -105,12 +105,20 @@ where
         .arg("0")
         .arg("--log-level")
         .arg("warning")
+        // HF モデル DL は起動 hot path から外し、download_irodori_assets ステップ 6
+        // (irodori_download::install_irodori_models) で先に取得する。ここでは常に --no-download。
+        // モデル不在のまま実モード起動した場合は RealModelBackend.synth が FileNotFoundError を
+        // 投げて 500 を返し、Rust 側 fallback で voicevox に流れる。
+        .arg("--no-download")
         // stderr を piped にして HF DL 進捗を行単位で吸い上げる
         .stderr(Stdio::piped());
     if mock {
         cmd.arg("--mock");
     }
-    cmd.kill_on_drop(false); // shutdown_sidecar で明示的に倒す
+    // 起動中にコケた / ready_file の deadline を超えた場合、明示 kill しないと python が
+    // バックグラウンドで HF モデル DL を続けるゾンビ化する。下の wait_for_ready_file が Err
+    // を返す経路で `child.start_kill()` を呼ぶ。
+    cmd.kill_on_drop(false); // shutdown_sidecar / Err 経路で明示的に倒す
 
     let mut child = cmd
         .spawn()
@@ -122,14 +130,21 @@ where
         tokio::spawn(spawn_stderr_pump(stderr, on_stderr_line));
     }
 
-    let port = wait_for_ready_file(&ready_file, Duration::from_secs(30))
-        .await
-        .with_context(|| {
-            format!(
-                "サイドカーの起動待ちでタイムアウトしました (ready.json: {})",
-                ready_file.display()
-            )
-        })?;
+    let port = match wait_for_ready_file(&ready_file, Duration::from_secs(30)).await {
+        Ok(p) => p,
+        Err(err) => {
+            // ready.json が来ない = 起動失敗 or 長時間 HF DL 中。
+            // 明示 kill して python orphan を防ぐ (kill_on_drop=false のため)。
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(err).with_context(|| {
+                format!(
+                    "サイドカーの起動待ちでタイムアウトしました (ready.json: {})",
+                    ready_file.display()
+                )
+            });
+        }
+    };
 
     Ok(SidecarHandle { port, pid, child })
 }

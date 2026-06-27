@@ -446,8 +446,11 @@ system_messages:
   mode_recovered:
     - main: { text: "あ、つながった！ちゃんとお話できるよ", pose: happy }
       sub: { text: "通常運転に戻った。よかったな", pose: normal }
+  # 注: yaml 側の {placeholder} は pick_system_message では置換されない (system_messages 経路は
+  # 静的文字列に固定)。バージョン番号などの動的値はトースト fallback (NoticeKind::fallback_text)
+  # で見せる設計。
   update_available:
-    - main: { text: "新しいバージョン {version} が出てるみたいだよ！", pose: happy }
+    - main: { text: "新しいバージョンが出てるみたいだよ！", pose: happy }
       sub: { text: "時間のあるときに更新しておくといい", pose: normal }
   voicevox_dl_complete:
     - main: { text: "声の準備ができたよ！これからは喋れるね", pose: happy }

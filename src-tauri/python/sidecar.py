@@ -301,16 +301,18 @@ class RealModelBackend:
         )
 
     def synthesize(self, text: str, voice_ref_path: Path, speed: float) -> bytes:
+        # speed 引数は OpenAI 互換 / API 拡張性のためにシグネチャに残してあるが、
+        # 速度補正は Web Audio 側 (playbackRate) で一律に行う設計に揃えるため、
+        # 合成側 duration_scale は 1.0 固定。voicevox 経路 (voicevox_core も speed は未渡し、
+        # フロントの playbackRate で補正) との挙動対称性を保つ。
+        _ = speed
         runtime = self._load_synth()
-        # Irodori SamplingRequest に speed パラメタはなく、duration_scale (>1=長く / <1=速く)
-        # でおおまかに調整する近似 (再生側でも tts_speed をかけているので過剰補正注意)。
-        duration_scale = max(0.5, 1.0 / max(0.5, speed))
         request = self._make_request(
             text=text,
             caption=None,
             ref_wav=str(voice_ref_path),
             no_ref=False,
-            duration_scale=duration_scale,
+            duration_scale=1.0,
         )
         result = runtime.synthesize(request, log_fn=None)
         return _audio_to_wav_bytes(result.audio, int(result.sample_rate))
@@ -449,7 +451,12 @@ def write_ready_file(path: Path, port: int) -> None:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="ugg Irodori-TTS sidecar")
     parser.add_argument("--asset-dir", required=True, type=Path)
-    parser.add_argument("--ready-file", required=True, type=Path)
+    parser.add_argument(
+        "--ready-file",
+        type=Path,
+        default=None,
+        help="起動完了時に port/pid を書き出す JSON。--download-only モードでは未使用",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0, help="0 で動的割当")
     parser.add_argument("--mock", action="store_true", help="実モデルを使わず正弦波 wav を返す")
@@ -458,6 +465,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="起動時の HF モデル DL を skip する (デバッグ / 事前 DL 済 用)",
     )
+    parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help="HF モデルを DL したら即終了 (download_irodori_assets ステップ 6 用)。"
+        " uvicorn は立てない。",
+    )
     parser.add_argument("--log-level", default="warning")
     args = parser.parse_args(argv)
 
@@ -465,16 +478,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     asset_dir: Path = args.asset_dir
     asset_dir.mkdir(parents=True, exist_ok=True)
 
+    # --download-only モード: HF モデルだけ DL して即終了。ready.json も書かない。
+    # Rust 側 (irodori_download::install_irodori_models) が wait() で待つ。
+    if args.download_only:
+        try:
+            download_models(asset_dir)
+        except Exception as exc:
+            sys.stderr.write(f"[hf-download] モデル DL 失敗: {exc}\n")
+            return 1
+        sys.stderr.write("[hf-download] モデル DL 完了\n")
+        return 0
+
     port = args.port if args.port and args.port > 0 else pick_free_port(args.host)
     LOG.info("sidecar binding to %s:%d (mock=%s)", args.host, port, args.mock)
 
     backend: Optional[RealModelBackend] = None
     if not args.mock:
+        # 通常の sidecar 起動経路では HF DL は走らせない (Rust 側で別ステップとして
+        # 走らせる: irodori_download::install_irodori_models)。--no-download が無く
+        # かつモデル不在の場合は RealModelBackend の synth が FileNotFoundError を投げて
+        # 500 を返し、Rust 側で voicevox にフォールバックされる。
         if not args.no_download:
             try:
                 download_models(asset_dir)
             except Exception as exc:
-                sys.stderr.write(f"sidecar.py: モデル DL 失敗: {exc}\n")
+                sys.stderr.write(f"[hf-download] モデル DL 失敗: {exc}\n")
                 return 1
         try:
             backend = RealModelBackend(asset_dir)
@@ -484,6 +512,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     app = build_app(asset_dir=asset_dir, mock=args.mock, backend=backend)
 
+    if args.ready_file is None:
+        sys.stderr.write("sidecar.py: --ready-file が必要です (--download-only を除く)\n")
+        return 1
     try:
         write_ready_file(args.ready_file, port)
     except OSError as exc:

@@ -14,7 +14,26 @@ use crate::db::VoiceRefRow;
 use crate::state::{AppState, Settings};
 use crate::system::notify::{self, NoticeKind};
 use crate::system::secrets;
+use crate::tts::irodori::TtsError;
 use crate::tts::{download, gpu, irodori_download, preprocess, voice_ref, voicevox};
+
+/// Irodori 経路の合成エラーを「明示エラー (return)」と「voicevox にフォールバック」に振り分ける。
+/// VoiceRefMissing は user setup の問題 (参照音声未生成) なので fallback せず、それ以外
+/// (SidecarStart / Http / NotImplemented) は voicevox 経路で再合成を試みる (architecture §8.6)。
+#[derive(Debug, PartialEq)]
+pub(crate) enum FallbackAction {
+    ReturnError,
+    FallbackToVoicevox,
+}
+
+pub(crate) fn decide_fallback(err: &TtsError) -> FallbackAction {
+    match err {
+        TtsError::VoiceRefMissing(_) => FallbackAction::ReturnError,
+        TtsError::NotImplemented
+        | TtsError::SidecarStart(_)
+        | TtsError::Http(_) => FallbackAction::FallbackToVoicevox,
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceOption {
@@ -68,34 +87,44 @@ pub async fn synthesize_voice(
             synthesize_voicevox(state_arc.clone(), &settings, &slot, &text).await?
         }
         "irodori" => {
-            match synthesize_irodori(state_arc.clone(), &slot, &text, Some(app.clone())).await {
+            let irodori_result =
+                synthesize_irodori(state_arc.clone(), &slot, &text, Some(app.clone())).await;
+            match irodori_result {
                 Ok(wav) => wav,
-                Err(crate::tts::irodori::TtsError::VoiceRefMissing(s)) => {
-                    // user setup の問題 (参照音声未生成) なので fallback せず明示エラー
-                    return Err(format!(
-                        "{}",
-                        crate::tts::irodori::TtsError::VoiceRefMissing(s)
-                    ));
-                }
-                Err(other) => {
-                    let reason = format!("{other}");
-                    // notify は `dialogue` event → frontend → `synthesize_voice` の再 invoke
-                    // を引き起こすので、5 分クールダウンで再帰を断つ (irodori.rs::should_notify_unavailable)。
-                    if state_arc.tts.irodori.should_notify_unavailable() {
-                        notify::notify(
-                            &app,
-                            &state_arc,
-                            NoticeKind::IrodoriUnavailable {
-                                reason: reason.clone(),
-                            },
-                        )
-                        .await;
+                Err(err) => match decide_fallback(&err) {
+                    FallbackAction::ReturnError => return Err(format!("{err}")),
+                    FallbackAction::FallbackToVoicevox => {
+                        let reason = format!("{err}");
+                        // voicevox を先に試して、成功/失敗で notify の文面を出し分ける。
+                        // (順序を逆にすると、voicevox 未 DL のとき『VOICEVOX 経路で発話します』を
+                        //  音/吹き出しで案内したのに実際は両方無音、という嘘 UX に陥る)
+                        match synthesize_voicevox(state_arc.clone(), &settings, &slot, &text)
+                            .await
+                        {
+                            Ok(wav) => {
+                                // 5 分クールダウン + dialogue 再帰防止: irodori.rs::should_notify_unavailable
+                                if state_arc.tts.irodori.should_notify_unavailable() {
+                                    notify::notify(
+                                        &app,
+                                        &state_arc,
+                                        NoticeKind::IrodoriUnavailable {
+                                            reason: reason.clone(),
+                                        },
+                                    )
+                                    .await;
+                                }
+                                wav
+                            }
+                            Err(voicevox_err) => {
+                                // 両方失敗: notify はキャラ発話を呼ぶ → やはり両方失敗するだけなので skip。
+                                // フロント側 (speaker.ts) が console.warn して括る。reason は両方の理由をマージ。
+                                return Err(format!(
+                                    "{reason} (voicevox fallback も失敗: {voicevox_err})"
+                                ));
+                            }
+                        }
                     }
-                    match synthesize_voicevox(state_arc.clone(), &settings, &slot, &text).await {
-                        Ok(wav) => wav,
-                        Err(_voicevox_err) => return Err(reason),
-                    }
-                }
+                },
             }
         }
         other => return Err(format!("未知の TTS エンジン: {other}")),
@@ -152,7 +181,13 @@ async fn synthesize_irodori(
         .map_err(|e| TtsError::Http(format!("voice_refs lookup: {e:#}")))?
         .ok_or_else(|| TtsError::VoiceRefMissing(slot.to_string()))?;
 
-    let preprocessed = preprocess_for_irodori(&state, text).unwrap_or_else(|_| text.to_string());
+    // 漢字→かな前処理 (voicevox の OpenJtalk を流用) は spec §4.5.1 で Irodori 経路には必須。
+    // voicevox 資産が未 DL 等で前処理ができない場合は warning ログを出して raw text を渡す。
+    // (Irodori は漢字の発話精度が不安定だが、合成失敗より「読みが多少不自然」のほうがマシ)。
+    let preprocessed = preprocess_for_irodori(&state, text).unwrap_or_else(|err| {
+        eprintln!("[irodori] kana preprocess fell back to raw text: {err}");
+        text.to_string()
+    });
     let (speed, use_real) = {
         let s = state.settings.lock().expect("settings poisoned");
         (s.tts_speed, s.tts_irodori_use_real_model)
@@ -321,7 +356,8 @@ pub async fn irodori_assets_ready() -> bool {
     irodori_download::assets_ready(&root)
 }
 
-/// Irodori 用 Python ランタイム + 共通依存 + 実モデルランタイムの初回 DL (architecture §8.2-8.3, M4c Phase C/G)。
+/// Irodori 用 Python ランタイム + 共通依存 + 実モデルランタイム + HF モデル本体の初回 DL
+/// (architecture §8.2-8.3, M4c Phase C/G)。
 /// 進捗は `irodori-download` イベントで 1 行ずつ emit、完了時に `"__done__"`。
 ///
 /// 段取り:
@@ -331,6 +367,8 @@ pub async fn irodori_assets_ready() -> bool {
 ///   4. torch + torchaudio (CUDA 12.8) を pip install (1〜2GB)
 ///   5. Irodori-TTS ランタイム本体 + 追加 pip 依存 (transformers / peft / accelerate / silentcipher /
 ///      dacvae / irodori-tts) を pip install (~数百MB) — 実モデル経路で必要 (Phase G)
+///   6. HF モデル本体 (Aratako/Irodori-TTS-500M-v3 + VoiceDesign + DACVAE Codec) を取得 (2〜4GB) —
+///      サイドカー起動 hot path から切り離すため、ここで先に DL しておく
 #[tauri::command]
 pub async fn download_irodori_assets(
     agreed: bool,
@@ -350,6 +388,7 @@ pub async fn download_irodori_assets(
         }
     };
 
+    let sidecar_py = asset_root.join("sidecar.py");
     let result: Result<(), String> = async {
         irodori_download::ensure_python_embeddable(&asset_root, &emit)
             .await
@@ -364,6 +403,9 @@ pub async fn download_irodori_assets(
             .await
             .map_err(|e| format!("{e:#}"))?;
         irodori_download::install_irodori_runtime(&asset_root, &emit)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        irodori_download::install_irodori_models(&asset_root, &sidecar_py, &emit)
             .await
             .map_err(|e| format!("{e:#}"))?;
         Ok(())
@@ -608,6 +650,30 @@ pub fn tts_params(settings: &Settings) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decide_fallback_voice_ref_missing_returns_error() {
+        let err = TtsError::VoiceRefMissing("main".into());
+        assert_eq!(decide_fallback(&err), FallbackAction::ReturnError);
+    }
+
+    #[test]
+    fn decide_fallback_sidecar_start_falls_back() {
+        let err = TtsError::SidecarStart("python.exe not found".into());
+        assert_eq!(decide_fallback(&err), FallbackAction::FallbackToVoicevox);
+    }
+
+    #[test]
+    fn decide_fallback_http_falls_back() {
+        let err = TtsError::Http("503".into());
+        assert_eq!(decide_fallback(&err), FallbackAction::FallbackToVoicevox);
+    }
+
+    #[test]
+    fn decide_fallback_not_implemented_falls_back() {
+        let err = TtsError::NotImplemented;
+        assert_eq!(decide_fallback(&err), FallbackAction::FallbackToVoicevox);
+    }
 
     #[test]
     fn parse_speakers_basic() {

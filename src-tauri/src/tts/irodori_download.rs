@@ -242,6 +242,8 @@ where
 /// silentcipher/dacvae は irodori-tts の git+ 依存なので、irodori-tts を `--no-deps` で入れる前に
 /// 別個に install しておく。dacvae リポジトリの公開状況や upstream API は実機 GPU で初回検証して
 /// 必要に応じて URL/コミットを pin する想定 (本セッションは upstream pyproject 通りに繋ぐ)。
+///
+/// 全ステップに `--upgrade` を付け、過去に旧版が入っていた場合でも要件レンジに揃え直す。
 pub async fn install_irodori_runtime<F>(asset_root: &Path, mut on_line: F) -> Result<()>
 where
     F: FnMut(&str),
@@ -258,7 +260,13 @@ where
         "Irodori-TTS の追加 pip 依存をインストールしています ({} パッケージ、~数百MB)…",
         IRODORI_EXTRA_REQUIREMENTS.len()
     ));
-    let mut args: Vec<&str> = vec!["-m", "pip", "install", "--no-warn-script-location"];
+    let mut args: Vec<&str> = vec![
+        "-m",
+        "pip",
+        "install",
+        "--no-warn-script-location",
+        "--upgrade",
+    ];
     args.extend(IRODORI_EXTRA_REQUIREMENTS);
     run_python(&py_exe, &args, |l| on_line(l))?;
 
@@ -305,6 +313,46 @@ where
     )?;
 
     on_line("Irodori-TTS ランタイムのインストールが完了しました");
+    Ok(())
+}
+
+/// 6) HF モデル本体を sidecar.py の `--download-only` モードで取得する (M4c Phase G)。
+///
+/// 通常のサイドカー起動経路 (`--no-download`) では DL を skip するように切り替えたため、
+/// マルチGBのモデル取得は本ステップで完了させておく。`--download-only` モードは uvicorn を
+/// 起動せず、download_models 完了で即終了する。stderr の `[hf-download] ...` 行は run_python
+/// が on_line に流すので、`download_irodori_assets` の `irodori-download` event に伝わる。
+pub async fn install_irodori_models<F>(
+    asset_root: &Path,
+    sidecar_py: &Path,
+    mut on_line: F,
+) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    let py_exe = asset_root.join("python").join("python.exe");
+    if !py_exe.is_file() {
+        return Err(anyhow!(
+            "python.exe が見つかりません: {}",
+            py_exe.display()
+        ));
+    }
+    if !sidecar_py.is_file() {
+        return Err(anyhow!(
+            "sidecar.py が配置されていません: {}",
+            sidecar_py.display()
+        ));
+    }
+    on_line("Aratako/Irodori-TTS の HF モデル (約 2〜4GB) を取得しています…");
+    let asset_root_str = asset_root.to_string_lossy().into_owned();
+    let sidecar_py_str = sidecar_py.to_string_lossy().into_owned();
+    let args: Vec<&str> = vec![
+        sidecar_py_str.as_str(),
+        "--asset-dir",
+        asset_root_str.as_str(),
+        "--download-only",
+    ];
+    run_python(&py_exe, &args, |l| on_line(l))?;
     Ok(())
 }
 

@@ -24,6 +24,35 @@ use thiserror::Error;
 
 use crate::tts::sidecar::{self, SidecarHandle};
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// サイドカー stderr の 1 行を `irodori-download` event へ転送すべきかを判定する pure 関数。
+/// `[hf-download]` で始まる行だけ通し、uvicorn の INFO ログや warning は捨てる。
+pub(crate) fn is_hf_progress_line(line: &str) -> bool {
+    line.starts_with("[hf-download]")
+}
+
+/// `shutdown_if_idle` の核ロジック (pure)。port 有 + last_used != 0 + 経過 >= idle_secs で true。
+pub(crate) fn should_shutdown_for_idle(
+    has_port: bool,
+    last_used: i64,
+    now: i64,
+    idle_secs: i64,
+) -> bool {
+    if !has_port {
+        return false;
+    }
+    if last_used == 0 {
+        return false;
+    }
+    now.saturating_sub(last_used) >= idle_secs
+}
+
 /// Irodori サイドカーへの HTTP クライアント。
 pub struct IrodoriClient {
     client: reqwest::Client,
@@ -41,6 +70,11 @@ pub struct IrodoriClient {
     /// を再 invoke する。irodori が落ちている状態で notify を打つと再帰的に同じ failure が
     /// trigger され、フォールバック経路の voicevox 合成が際限なくキューに積まれる。
     last_notified_unavailable: AtomicI64,
+    /// この unix 秒までは `ensure_sidecar_running` を skip して即 `SidecarStart` を返す。
+    /// 0 = 制限なし。GPU が永続的に取れない環境で health watcher が 3 連続失敗 → shutdown
+    /// → 次 synth で再起動 → 90 秒 churn を繰り返すのを防ぐため、health watcher 経路から
+    /// 20 分の sticky cooldown を設定する。voicevox fallback は引き続き動く。
+    disable_until: AtomicI64,
 }
 
 impl IrodoriClient {
@@ -54,32 +88,66 @@ impl IrodoriClient {
             sidecar: StdMutex::new(None),
             last_used: AtomicI64::new(0),
             last_notified_unavailable: AtomicI64::new(0),
+            disable_until: AtomicI64::new(0),
         }
+    }
+
+    /// `secs` 秒間、`ensure_sidecar_running` を即エラーで弾く sticky cooldown を設定する。
+    /// 既存の disable_until より新しい場合のみ更新 (短い方には縮めない)。
+    pub fn disable_for(&self, secs: i64) {
+        let until = now_secs().saturating_add(secs);
+        let mut current = self.disable_until.load(Ordering::Acquire);
+        while until > current {
+            match self.disable_until.compare_exchange(
+                current,
+                until,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn currently_disabled(&self) -> bool {
+        let until = self.disable_until.load(Ordering::Acquire);
+        until > 0 && now_secs() < until
     }
 
     fn touch_last_used(&self) {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        self.last_used.store(ts, Ordering::Relaxed);
+        self.last_used.store(now_secs(), Ordering::Relaxed);
     }
 
-    /// 5 分のクールダウンを介した `notify(IrodoriUnavailable)` の `compare_exchange`-style ゲート。
+    /// 5 分のクールダウンを介した `notify(IrodoriUnavailable)` のゲート。
     /// 直近 5 分以内に発火していれば false を返して呼び出し側 (synthesize_voice / health_watcher) は
-    /// notify を skip する。true を返した場合は now を新しい `last_notified_unavailable` として確定する。
+    /// notify を skip する。`compare_exchange` で並行呼び出しでも一度しか true を返さない。
+    /// 時計が後ろに巻き戻った (NTP 補正) 場合は last を now に同期して継続。
     pub fn should_notify_unavailable(&self) -> bool {
+        self.should_notify_unavailable_at(now_secs())
+    }
+
+    /// `should_notify_unavailable` の純粋部分 (テスト用に `now` を外から差し込める)。
+    pub fn should_notify_unavailable_at(&self, now: i64) -> bool {
         const COOLDOWN_SECS: i64 = 5 * 60;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let last = self.last_notified_unavailable.load(Ordering::Relaxed);
-        if last != 0 && now.saturating_sub(last) < COOLDOWN_SECS {
-            return false;
+        loop {
+            let last = self.last_notified_unavailable.load(Ordering::Acquire);
+            // last==0 sentinel は「未発火」、cooldown 内なら譲る。
+            // 時計が後ろに飛んで last > now になった場合は cooldown 計算が壊れるので強制発火させて last を同期。
+            if last != 0 && last <= now && (now - last) < COOLDOWN_SECS {
+                return false;
+            }
+            match self.last_notified_unavailable.compare_exchange(
+                last,
+                now,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                // 他スレッドが先に更新 → 自分は譲り、次のループで再判定 (たいてい cooldown 内で false に落ちる)
+                Err(_) => continue,
+            }
         }
-        self.last_notified_unavailable.store(now, Ordering::Relaxed);
-        true
     }
 
     /// 起動済みサイドカーの `/health` を 1 回 ping して true/false を返す (未起動なら true 扱い = no-op)。
@@ -105,12 +173,9 @@ impl IrodoriClient {
     /// `tasks::spawn_irodori_idle_watcher` が定期的に呼ぶ。
     /// 戻り値: shutdown を実行したら `true`、対象なしまたはアイドル未到達なら `false`。
     pub async fn shutdown_if_idle(&self, now_secs: i64, idle_secs: i64) -> Result<bool, TtsError> {
-        // 未起動なら何もしない
-        if self.current_port().is_none() {
-            return Ok(false);
-        }
+        let has_port = self.current_port().is_some();
         let last = self.last_used.load(Ordering::Relaxed);
-        if last == 0 || (now_secs - last) < idle_secs {
+        if !should_shutdown_for_idle(has_port, last, now_secs, idle_secs) {
             return Ok(false);
         }
         self.shutdown().await?;
@@ -121,6 +186,9 @@ impl IrodoriClient {
     /// `mock=true` で sidecar.py を `--mock` で起動 (Phase D 検証用)。
     /// `app` を渡すとサイドカー stderr の `[hf-download]` 行が `irodori-download` イベント
     /// に転送される (M4c Phase G、実モデル初回起動時の HF DL 進捗表示用)。テスト等は None で可。
+    ///
+    /// `disable_for()` で sticky cooldown が立っている間は即 `SidecarStart` で弾く。
+    /// GPU 永続不在環境で 90 秒 churn を繰り返すのを防ぐ。
     pub async fn ensure_sidecar_running(
         &self,
         asset_root: &Path,
@@ -130,12 +198,18 @@ impl IrodoriClient {
         if let Some(port) = self.current_port() {
             return Ok(port);
         }
+        if self.currently_disabled() {
+            return Err(TtsError::SidecarStart(
+                "直近の失敗により一時停止中です (cooldown)。voicevox 経路で発話します".to_string(),
+            ));
+        }
         let script = asset_root.join("sidecar.py");
         // [hf-download] 接頭辞の行のみ irodori-download イベントへ転送する。
         // 他の uvicorn / sidecar.py 標準ログは捨てる (ノイズ抑制 + 機密漏洩防止)。
+        // 接頭辞判定は is_hf_progress_line (pure 関数) に切り出してテストでカバー。
         let on_stderr = move |line: &str| {
             if let Some(app) = &app {
-                if line.starts_with("[hf-download]") {
+                if is_hf_progress_line(line) {
                     let _ = app.emit("irodori-download", line);
                 }
             }
@@ -345,6 +419,78 @@ mod tests {
         assert!(client.should_notify_unavailable());
         // 直後の再呼び出しは cooldown 内なので false
         assert!(!client.should_notify_unavailable());
+    }
+
+    #[test]
+    fn should_notify_unavailable_re_fires_after_300s() {
+        let client = IrodoriClient::new();
+        assert!(client.should_notify_unavailable_at(1_000));
+        // 直後 / 299s 経過は cooldown 内 → false
+        assert!(!client.should_notify_unavailable_at(1_000));
+        assert!(!client.should_notify_unavailable_at(1_299));
+        // 300s ぴったり (>= cooldown) は再発火
+        assert!(client.should_notify_unavailable_at(1_300));
+    }
+
+    #[test]
+    fn should_notify_unavailable_handles_clock_skew_backward() {
+        let client = IrodoriClient::new();
+        assert!(client.should_notify_unavailable_at(2_000));
+        // 時計が後ろに巻き戻った: last (2000) > now (1500) → cooldown 計算が壊れないように発火 + last を 1500 に同期
+        assert!(client.should_notify_unavailable_at(1_500));
+        // その直後の同時刻呼び出しは cooldown で false
+        assert!(!client.should_notify_unavailable_at(1_500));
+    }
+
+    #[test]
+    fn should_notify_unavailable_only_one_caller_wins_under_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        use std::sync::Arc;
+        // CAS 化したので、同時刻で 16 並列に呼んでも 1 度だけ true を返す
+        let client = Arc::new(IrodoriClient::new());
+        let true_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+        for _ in 0..16 {
+            let c = client.clone();
+            let cnt = true_count.clone();
+            handles.push(std::thread::spawn(move || {
+                if c.should_notify_unavailable_at(10_000) {
+                    cnt.fetch_add(1, O::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(true_count.load(O::Relaxed), 1);
+    }
+
+    #[test]
+    fn is_hf_progress_line_matches_only_prefix() {
+        assert!(is_hf_progress_line("[hf-download] Aratako/X をダウンロード中…"));
+        assert!(is_hf_progress_line("[hf-download] 完了"));
+        assert!(!is_hf_progress_line(" [hf-download] leading space"));
+        assert!(!is_hf_progress_line(""));
+        assert!(!is_hf_progress_line(
+            "INFO:     127.0.0.1:54321 - GET /health HTTP/1.1 200 OK"
+        ));
+        assert!(!is_hf_progress_line("sidecar.py: backend 初期化失敗"));
+    }
+
+    #[test]
+    fn should_shutdown_for_idle_handles_all_branches() {
+        // 起動なし → 何もしない
+        assert!(!should_shutdown_for_idle(false, 1_000, 999_999, 300));
+        // 起動あり + last_used=0 sentinel → 何もしない
+        assert!(!should_shutdown_for_idle(true, 0, 999_999, 300));
+        // 経過 0 (起動直後) → 何もしない
+        assert!(!should_shutdown_for_idle(true, 1_000, 1_000, 300));
+        // 経過 299 秒 (threshold 未満) → 何もしない
+        assert!(!should_shutdown_for_idle(true, 1_000, 1_299, 300));
+        // 経過 300 秒 (threshold 到達) → shutdown
+        assert!(should_shutdown_for_idle(true, 1_000, 1_300, 300));
+        // 経過 600 秒 (threshold 超え) → shutdown
+        assert!(should_shutdown_for_idle(true, 1_000, 1_600, 300));
     }
 
     #[test]
