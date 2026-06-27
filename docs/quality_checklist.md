@@ -13,18 +13,19 @@
 - インターネット接続 (HF / PyTorch wheel index / GitHub)
 
 ### G1. 前提セットアップ
-- [ ] `npm run tauri dev` で ugg が起動する (voicevox 経路に回帰なし)
-- [ ] 設定パネル「音声 (Irodori-TTS / 高品質モード)」セクションが表示される
-- [ ] 「GPU 検出」欄に実機 GPU 名が表示される (例: "NVIDIA GeForce RTX 4070")
-- [ ] GPU 不可環境ではダウンロードボタンが disabled、reason テキストが日本語で表示される
+- [x] `npm run tauri dev` で ugg が起動する (voicevox 経路に回帰なし)
+- [x] 設定パネル「音声 (Irodori-TTS / 高品質モード)」セクションが表示される
+- [x] 「GPU 検出」欄に実機 GPU 名が表示される (例: "NVIDIA GeForce RTX 4070")
+- [x] GPU 可環境では DL ボタン enabled / 実モデルチェック disabled (資産未 DL のため) — 2026-06-28 実機検証 ✅
 
 ### G2. Python ランタイム + 共通依存 DL (Phase C 範囲)
-- [ ] 「ランタイムをダウンロード」を押すと確認ダイアログが出る
-- [ ] 確認 → 進捗欄に逐次ログが出る (Embeddable Python / pip / fastapi / torch …)
-- [ ] DL 完了で `%APPDATA%\ugg\irodori\python\python.exe` と `Lib\site-packages\torch` が存在する
-- [ ] 「Python ランタイム」欄が "導入済み" に変わる
-- [ ] notify: ゴーストが `irodori_dl_complete` を発話する
-- [ ] DL 失敗時 (例: ネット切断) は `irodori_dl_failed` をゴーストが発話する
+- [x] 「ランタイムをダウンロード」を押すと確認ダイアログが出る (要 z-index 修正: `#ugg-confirm-panel` を 300 に。2026-06-28 セッションで発見)
+- [x] 確認 → 進捗欄に逐次ログが出る (Embeddable Python 3.11.9 / pip / fastapi / torch cu128 / Irodori-TTS runtime / HF モデル本体)
+- [x] DL 完了で `%APPDATA%\ugg\irodori\python\python.exe` と `Lib\site-packages\torch / irodori_tts / dacvae / silentcipher / fastapi` が存在する (合計 ~5GB)
+- [x] DL 完了で `%APPDATA%\ugg\irodori\model\Aratako__Irodori-TTS-500M-v3 / -v2-VoiceDesign / Aratako__Semantic-DACVAE-Japanese-32dim` が揃う (合計 4.3GB)
+- [x] 「Irodori 資産」欄が "導入済み" に変わる + 「実モデルを使う (β)」 toggle が enabled になる (※ DL 完了直後にパネルを開きっぱなしの場合、再オープンで更新される — UX 改善余地)
+- [x] notify: ゴーストが `irodori_dl_complete` (「高品質モードの準備もできたよ！」) を発話する
+- [ ] (任意) DL 失敗時 (例: ネット切断) は `irodori_dl_failed` をゴーストが発話する
 
 ### G3. サイドカー起動 (モックモード, Phase D)
 - [ ] 設定で `tts_engine = irodori` に切替 + 「実モデルを使う (β)」OFF

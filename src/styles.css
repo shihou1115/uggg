@@ -231,6 +231,12 @@ body {
   display: none !important;
 }
 
+/* 確認ダイアログは他のパネル (#settings-panel など) より上に出す。
+   DOM 順で settings-panel が後ろにあるため、同 z-index だと裏に隠れて見えない。 */
+#ugg-confirm-panel {
+  z-index: 300;
+}
+
 .panel-header {
   display: flex;
   align-items: center;
