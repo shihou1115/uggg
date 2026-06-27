@@ -35,17 +35,18 @@
 - [ ] トレイ「終了」/コンテキストメニュー「終了」で python.exe の残骸が出ない
 
 ### G4. ヘルスチェック (Phase G)
-- [ ] サイドカー起動中に Task Manager から手動 kill → 30 秒以内にゴーストが `irodori_unavailable` を発話 (3 回連続失敗で発火)
+- [ ] サイドカー起動中に Task Manager から手動 kill → **90 秒以内**にゴーストが `irodori_unavailable` を発話 (30 秒間隔 × 3 回連続失敗で発火、最悪 60〜90 秒)
 - [ ] 次回 `synthesize_voice` 呼び出しで自動再起動される
+- [ ] 実モデル経路 (`tts_irodori_use_real_model=true`) でサイドカー起動したが GPU が取れなかった場合 (`/health` が `gpu: null` を返す)、次回 `health_ping` で即 `irodori_unavailable` が発火する
 
 ### G5. 実モデル結線 (Phase G + 実機調整)
-- [ ] 「実モデルを使う (β)」を ON に切替 (GPU + 資産が揃っているときのみ有効化される)
+- [ ] 「実モデルを使う (β)」を ON に切替 (GPU + 資産 (`irodori_tts` パッケージ込み) が揃っているときのみ有効化される)
 - [ ] 次回 `synthesize_voice` / `voice_ref_generate` 呼び出しでサイドカーが実モデル経路で起動
-- [ ] 初回起動時に Aratako/Irodori-TTS 系モデル (約 2-4 GB) が `%APPDATA%\ugg\irodori\model\` に DL される
+- [ ] 初回起動時に Aratako/Irodori-TTS 系モデル (約 2-4 GB) が `%APPDATA%\ugg\irodori\model\` に DL される (進捗は `[hf-download] ...` 行が `irodori-download` イベント経由で設定パネル進捗欄に流れる)
 - [ ] 参照音声生成: キャプションから自然な音声 (キャラクター性が反映された短い wav) が生成される
 - [ ] 通常合成: 上記参照音声を使った合成で、音声がキャプションに沿った声質で読み上げられる
 - [ ] 漢字混じり文章で発話 → preprocess (voicevox OpenJtalk) が効いていることを確認 (聞き取りやすさ)
-- [ ] ※ 実推論コード (`sidecar.py::RealModelBackend.synthesize` / `generate_voice_ref`) は TODO のままなので、501 が返る場合は実機で Aratako/Irodori-TTS の最新サンプルを見ながら実装
+- [ ] ※ `RealModelBackend.synthesize` / `generate_voice_ref` は upstream `irodori_tts.inference_runtime.InferenceRuntime` API で結線済 (commit 9118205)。`InferenceRuntime` 初期化や `SamplingRequest` のデフォルト引数が upstream の最新コードと整合しなければ実機でチューニングする
 
 ### G6. フォールバック
 - [ ] GPU 不可環境で `tts_engine = irodori` を選んでも、明示エラーで voicevox 経路に切替えるよう案内される

@@ -43,6 +43,10 @@ pub fn list_voices(state: State<'_, Arc<AppState>>) -> Result<Vec<VoiceOption>, 
 
 /// メインキャラ・サブキャラの slot に応じて合成。speed/volume は WAV 化後にフロント側で適用。
 /// `settings.tts_engine` で voicevox / irodori を振り分ける。
+///
+/// Irodori 経路で **`VoiceRefMissing` 以外**のエラー (サイドカー起動失敗 / HTTP 失敗 / 501 等) が
+/// 出たら `notify(IrodoriUnavailable)` を発火 + voicevox_core で再合成して可能なら音声を返す。
+/// voicevox も使えない場合は元の irodori エラーを返す (architecture.md §8.6 / §13.4)。
 #[tauri::command]
 pub async fn synthesize_voice(
     text: String,
@@ -57,11 +61,38 @@ pub async fn synthesize_voice(
     if !matches!(slot.as_str(), "main" | "sub") {
         return Err(format!("未知の slot: {slot}"));
     }
+    let state_arc = state.inner().clone();
 
     let wav = match settings.tts_engine.as_str() {
-        "voicevox_core" | "" => synthesize_voicevox(state.inner().clone(), &settings, &slot, &text).await?,
+        "voicevox_core" | "" => {
+            synthesize_voicevox(state_arc.clone(), &settings, &slot, &text).await?
+        }
         "irodori" => {
-            synthesize_irodori(state.inner().clone(), &slot, &text, Some(app)).await?
+            match synthesize_irodori(state_arc.clone(), &slot, &text, Some(app.clone())).await {
+                Ok(wav) => wav,
+                Err(crate::tts::irodori::TtsError::VoiceRefMissing(s)) => {
+                    // user setup の問題 (参照音声未生成) なので fallback せず明示エラー
+                    return Err(format!(
+                        "{}",
+                        crate::tts::irodori::TtsError::VoiceRefMissing(s)
+                    ));
+                }
+                Err(other) => {
+                    let reason = format!("{other}");
+                    notify::notify(
+                        &app,
+                        &state_arc,
+                        NoticeKind::IrodoriUnavailable {
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await;
+                    match synthesize_voicevox(state_arc.clone(), &settings, &slot, &text).await {
+                        Ok(wav) => wav,
+                        Err(_voicevox_err) => return Err(reason),
+                    }
+                }
+            }
         }
         other => return Err(format!("未知の TTS エンジン: {other}")),
     };
@@ -96,25 +127,26 @@ async fn synthesize_voicevox(
 
 /// Irodori 経路 (M4c Phase D 以降): サイドカーを起動し HTTP 経由で合成。
 /// 漢字→ひらがな前処理は voicevox engine の OpenJtalk を流用 (architecture §7.5)。
+///
+/// `synthesize_voice` で `TtsError` variant 単位の fallback 判定をするため、エラーは型のまま返す。
+/// 呼び出し側 (voice_ref_preview など) はこの戻りを `format!("{e}")` で String に変換できる。
 async fn synthesize_irodori(
     state: Arc<AppState>,
     slot: &str,
     text: &str,
     app: Option<AppHandle>,
-) -> Result<Vec<u8>, String> {
-    let asset_root = voice_ref::irodori_root().map_err(|e| format!("{e:#}"))?;
+) -> Result<Vec<u8>, crate::tts::irodori::TtsError> {
+    use crate::tts::irodori::TtsError;
 
-    // 参照音声を DB から取得 (slot 未登録なら明示エラー)。
+    let asset_root = voice_ref::irodori_root()
+        .map_err(|e| TtsError::SidecarStart(format!("{e:#}")))?;
+
+    // 参照音声を DB から取得 (slot 未登録なら VoiceRefMissing で明示エラー)。
     let voice_ref_row = state
         .db
         .get_voice_ref(slot)
-        .map_err(|e| format!("{e:#}"))?
-        .ok_or_else(|| {
-            format!(
-                "{}",
-                crate::tts::irodori::TtsError::VoiceRefMissing(slot.to_string())
-            )
-        })?;
+        .map_err(|e| TtsError::Http(format!("voice_refs lookup: {e:#}")))?
+        .ok_or_else(|| TtsError::VoiceRefMissing(slot.to_string()))?;
 
     let preprocessed = preprocess_for_irodori(&state, text).unwrap_or_else(|_| text.to_string());
     let (speed, use_real) = {
@@ -134,7 +166,6 @@ async fn synthesize_irodori(
             app,
         )
         .await
-        .map_err(|e| format!("{e}"))
 }
 
 /// voicevox の OpenJtalk を使った漢字→ひらがな変換を試みる。
@@ -464,7 +495,9 @@ pub async fn voice_ref_preview(
         return Err("プレビュー文字列が空です".to_string());
     }
     let state_arc = state.inner().clone();
-    let wav = synthesize_irodori(state_arc, &slot, &text, Some(app)).await?;
+    let wav = synthesize_irodori(state_arc, &slot, &text, Some(app))
+        .await
+        .map_err(|e| format!("{e}"))?;
     Ok(base64::engine::general_purpose::STANDARD.encode(wav))
 }
 

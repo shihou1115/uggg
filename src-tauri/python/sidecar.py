@@ -362,6 +362,14 @@ def build_app(asset_dir: Path, mock: bool, backend: Optional[RealModelBackend]) 
                     gpu_name = torch.cuda.get_device_name(0)
             except Exception:
                 gpu_name = None
+            # 実モデルモードで GPU が無いと InferenceRuntime のロード/合成は実用にならない。
+            # 503 を返して Rust 側 (`IrodoriClient::health_ping`) に「異常」と認識させ、
+            # `spawn_irodori_health_watcher` の 3 連続失敗カウンタに乗せる (architecture §8.6)。
+            if gpu_name is None:
+                return JSONResponse(
+                    {"status": "no_gpu", "gpu": None, "mock": False},
+                    status_code=503,
+                )
         return JSONResponse(
             {"status": "ok", "gpu": gpu_name, "mock": mock}
         )

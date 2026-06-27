@@ -111,6 +111,15 @@ export async function mountSettingsPanel(): Promise<void> {
     const detail = (ev as CustomEvent<DndResult>).detail;
     void onDndResult(detail);
   });
+  // M4c Phase G: サイドカー起動時の HF モデル DL 進捗 (`[hf-download] ...` 行) は
+  // `download_irodori_assets` の中ではなく、`synthesize_voice` / `voice_ref_generate`
+  // から実モデル初回起動時に流れてくる。`onIrodoriDownload` の一時 listener では
+  // 拾えないため、ページ寿命の長期 listener を別途貼って Irodori 進捗欄に流す。
+  await listen<string>("irodori-download", (ev) => {
+    if (ev.payload === "__done__") return;
+    if (!ev.payload.startsWith("[hf-download]")) return;
+    showIrodoriProgress(ev.payload, false);
+  });
 }
 
 async function onDndResult(result: DndResult): Promise<void> {
@@ -443,8 +452,9 @@ function applyVoiceRefState(refs: VoiceRef[]): void {
 async function onIrodoriDownload(): Promise<void> {
   if (!inputs) return;
   const ok = await uggConfirm(
-    "Irodori-TTS (高品質モード) の Python ランタイム + PyTorch (CUDA 12.1) を" +
-      "ダウンロードします。\n約 1〜2 GB の通信が発生し、数分〜十数分かかります。続行しますか?",
+    "Irodori-TTS (高品質モード) の Python ランタイム + PyTorch (CUDA 12.8) + " +
+      "実モデル実行時ランタイム (irodori-tts / dacvae / silentcipher など) をダウンロードします。\n" +
+      "約 2〜3 GB の通信が発生し、10〜20 分かかります。続行しますか?",
     "ダウンロード確認",
   );
   if (!ok) return;
