@@ -48,6 +48,7 @@ pub async fn synthesize_voice(
     text: String,
     slot: String,
     state: State<'_, Arc<AppState>>,
+    app: AppHandle,
 ) -> Result<String, String> {
     let settings = state.settings.lock().expect("settings poisoned").clone();
     if !settings.tts_enabled {
@@ -59,7 +60,9 @@ pub async fn synthesize_voice(
 
     let wav = match settings.tts_engine.as_str() {
         "voicevox_core" | "" => synthesize_voicevox(state.inner().clone(), &settings, &slot, &text).await?,
-        "irodori" => synthesize_irodori(state.inner().clone(), &slot, &text).await?,
+        "irodori" => {
+            synthesize_irodori(state.inner().clone(), &slot, &text, Some(app)).await?
+        }
         other => return Err(format!("未知の TTS エンジン: {other}")),
     };
 
@@ -97,6 +100,7 @@ async fn synthesize_irodori(
     state: Arc<AppState>,
     slot: &str,
     text: &str,
+    app: Option<AppHandle>,
 ) -> Result<Vec<u8>, String> {
     let asset_root = voice_ref::irodori_root().map_err(|e| format!("{e:#}"))?;
 
@@ -127,6 +131,7 @@ async fn synthesize_irodori(
             std::path::Path::new(&voice_ref_row.file_path),
             speed,
             !use_real,
+            app,
         )
         .await
         .map_err(|e| format!("{e}"))
@@ -383,6 +388,7 @@ pub async fn voice_ref_generate(
     slot: String,
     caption: String,
     state: State<'_, Arc<AppState>>,
+    app: AppHandle,
 ) -> Result<Vec<VoiceRef>, String> {
     if !matches!(slot.as_str(), "main" | "sub") {
         return Err(format!("未知の slot: {slot}"));
@@ -417,7 +423,7 @@ pub async fn voice_ref_generate(
     state
         .tts
         .irodori
-        .generate_voice_ref(&asset_root, &caption_trimmed, &out_path, !use_real)
+        .generate_voice_ref(&asset_root, &caption_trimmed, &out_path, !use_real, Some(app))
         .await
         .map_err(|e| format!("{e}"))?;
 
@@ -444,6 +450,7 @@ pub async fn voice_ref_preview(
     slot: String,
     text: String,
     state: State<'_, Arc<AppState>>,
+    app: AppHandle,
 ) -> Result<String, String> {
     if !matches!(slot.as_str(), "main" | "sub") {
         return Err(format!("未知の slot: {slot}"));
@@ -452,7 +459,7 @@ pub async fn voice_ref_preview(
         return Err("プレビュー文字列が空です".to_string());
     }
     let state_arc = state.inner().clone();
-    let wav = synthesize_irodori(state_arc, &slot, &text).await?;
+    let wav = synthesize_irodori(state_arc, &slot, &text, Some(app)).await?;
     Ok(base64::engine::general_purpose::STANDARD.encode(wav))
 }
 

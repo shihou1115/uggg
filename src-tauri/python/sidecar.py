@@ -127,64 +127,224 @@ def make_mock_voice_ref_wav() -> bytes:
 def download_models(asset_dir: Path) -> None:
     """Aratako/Irodori-TTS 系モデルを `asset_dir/model/<repo>` に取得する。
 
-    既に揃っていれば何もしない。stderr に進捗を出力し、Rust 側 (sidecar の child stderr) で listen 可能。
-    実機検証 (Phase G の DoD) で完了確認する。
+    既に揃っていれば何もしない。stderr に進捗を出力し、Rust 側 (sidecar の child stderr)
+    が `[hf-download] ...` 行を pick して `irodori-download` イベントへ転送する。
     """
     try:
-        from huggingface_hub import snapshot_download  # type: ignore
+        from huggingface_hub import hf_hub_download, snapshot_download  # type: ignore
     except ImportError:
         sys.stderr.write(
-            "sidecar.py: huggingface_hub が見つかりません。Irodori 資産 DL を実行してください\n"
+            "[hf-download] huggingface_hub が見つかりません。Irodori 資産 DL を実行してください\n"
         )
         raise
     target_root = asset_dir / "model"
     target_root.mkdir(parents=True, exist_ok=True)
-    repos = [MODEL_REPO_SYNTH, MODEL_REPO_VOICE_DESIGN, MODEL_REPO_CODEC]
-    for repo in repos:
+
+    # 合成 / VoiceDesign 本体は upstream infer.py と同じく `model.safetensors` 1 ファイルでよい
+    # (config 情報は safetensors のメタデータに埋め込まれている)。
+    weight_repos = [MODEL_REPO_SYNTH, MODEL_REPO_VOICE_DESIGN]
+    for repo in weight_repos:
         local_dir = target_root / repo.replace("/", "__")
-        if local_dir.is_dir() and any(local_dir.iterdir()):
-            sys.stderr.write(f"sidecar.py: {repo} は既に取得済み (skip)\n")
+        weight_file = local_dir / "model.safetensors"
+        if weight_file.is_file() and weight_file.stat().st_size > 0:
+            sys.stderr.write(f"[hf-download] {repo} は既に取得済み (skip)\n")
             continue
-        sys.stderr.write(f"sidecar.py: {repo} をダウンロード中…\n")
-        snapshot_download(
+        sys.stderr.write(f"[hf-download] {repo}/model.safetensors をダウンロード中…\n")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        hf_hub_download(
             repo_id=repo,
+            filename="model.safetensors",
             local_dir=str(local_dir),
             local_dir_use_symlinks=False,
         )
-        sys.stderr.write(f"sidecar.py: {repo} ダウンロード完了\n")
+        sys.stderr.write(f"[hf-download] {repo} ダウンロード完了\n")
+
+    # コーデック (DACVAE) は InferenceRuntime が repo_id 文字列でロードするので
+    # HF cache に snapshot しておけば codec_repo 経由で読まれる。
+    codec_dir = target_root / MODEL_REPO_CODEC.replace("/", "__")
+    if codec_dir.is_dir() and any(codec_dir.iterdir()):
+        sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} は既に取得済み (skip)\n")
+    else:
+        sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} をダウンロード中…\n")
+        snapshot_download(
+            repo_id=MODEL_REPO_CODEC,
+            local_dir=str(codec_dir),
+            local_dir_use_symlinks=False,
+        )
+        sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} ダウンロード完了\n")
 
 
 class RealModelBackend:
-    """実 Aratako/Irodori-TTS を用いた推論の薄いラッパ (Phase G の TODO)。
+    """実 Aratako/Irodori-TTS を用いた推論の薄いラッパ。
 
-    実機検証時に Aratako/Irodori-TTS リポジトリの最新サンプルを参照しながら
-    `from_pretrained` / `synthesize(text, reference_audio)` / VoiceDesign の API を確定する。
-    本クラスは現状「未実装」を返すスタブで、サイドカー起動経路だけを通す。
+    upstream `infer.py` (https://github.com/Aratako/Irodori-TTS/blob/main/infer.py) と
+    同じ `irodori_tts.inference_runtime` API (`InferenceRuntime` / `SamplingRequest`) を
+    利用する。モデルロードは初回 synthesize/generate_voice_ref まで遅延 (VRAM を起動時に
+    取らない方針)。
+
+    依存パッケージ (Phase C で導入される irodori-tts + dacvae + silentcipher + transformers
+    系) が揃っていない環境で `RealModelBackend` を初期化しても問題ないよう、import は
+    各メソッド内で行う。
     """
+
+    # 合成テキストは preprocess (voicevox OpenJtalk) で読みやすい仮名列が渡される想定。
+    # VoiceDesign の参照音声には固定の短いキャプション読みを使う。
+    VOICE_REF_READING_TEXT = "こんにちは、これは参照音声です。"
 
     def __init__(self, asset_dir: Path) -> None:
         self.asset_dir = asset_dir
-        self.synth = None
-        self.voice_design = None
-        # TODO(Phase G 実機): 例えば下記のような実装になる見込み:
-        #   from irodori_tts import IrodoriSynth, VoiceDesigner
-        #   self.synth = IrodoriSynth.from_pretrained(asset_dir / "model" / MODEL_REPO_SYNTH.replace("/", "__"))
-        #   self.voice_design = VoiceDesigner.from_pretrained(
-        #       asset_dir / "model" / MODEL_REPO_VOICE_DESIGN.replace("/", "__"))
-        # ※ 実 API は Aratako/Irodori-TTS の README / examples を参照して確定する。
+        self._synth_runtime = None
+        self._voice_design_runtime = None
+
+    @staticmethod
+    def _resolve_device() -> str:
+        try:
+            import torch  # type: ignore
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+
+    def _checkpoint_path(self, repo: str) -> Path:
+        return self.asset_dir / "model" / repo.replace("/", "__") / "model.safetensors"
+
+    def _build_runtime(self, repo: str):
+        """upstream infer.py の InferenceRuntime.from_key(RuntimeKey(...)) と同じ構成。"""
+        from irodori_tts.inference_runtime import (  # type: ignore
+            InferenceRuntime,
+            RuntimeKey,
+        )
+
+        ckpt = self._checkpoint_path(repo)
+        if not ckpt.is_file():
+            raise FileNotFoundError(
+                f"model.safetensors が見つかりません: {ckpt}. download_models を先に実行してください"
+            )
+        device = self._resolve_device()
+        return InferenceRuntime.from_key(
+            RuntimeKey(
+                checkpoint=str(ckpt),
+                model_device=device,
+                codec_repo=MODEL_REPO_CODEC,
+                model_precision="fp32",
+                codec_device=device,
+                codec_precision="fp32",
+                codec_deterministic_encode=True,
+                codec_deterministic_decode=True,
+                compile_model=False,
+                compile_dynamic=False,
+            )
+        )
+
+    def _load_synth(self):
+        if self._synth_runtime is None:
+            self._synth_runtime = self._build_runtime(MODEL_REPO_SYNTH)
+        return self._synth_runtime
+
+    def _load_voice_design(self):
+        if self._voice_design_runtime is None:
+            self._voice_design_runtime = self._build_runtime(MODEL_REPO_VOICE_DESIGN)
+        return self._voice_design_runtime
+
+    @staticmethod
+    def _make_request(
+        *,
+        text: str,
+        caption: Optional[str],
+        ref_wav: Optional[str],
+        no_ref: bool,
+        duration_scale: float,
+    ):
+        """upstream infer.py のデフォルト引数群を写し取った SamplingRequest を組み立てる。"""
+        from irodori_tts.inference_runtime import SamplingRequest  # type: ignore
+
+        return SamplingRequest(
+            text=text,
+            caption=caption,
+            ref_wav=ref_wav,
+            ref_latent=None,
+            ref_embed=None,
+            no_ref=no_ref,
+            ref_normalize_db=None if no_ref else -16.0,
+            ref_ensure_max=True,
+            num_candidates=1,
+            decode_mode="sequential",
+            seconds=None,
+            duration_scale=duration_scale,
+            max_ref_seconds=30.0,
+            max_text_len=None,
+            max_caption_len=None,
+            num_steps=40,
+            cfg_scale_text=3.0,
+            cfg_scale_caption=3.0,
+            cfg_scale_speaker=5.0,
+            cfg_guidance_mode="independent",
+            cfg_scale=None,
+            cfg_min_t=0.5,
+            cfg_max_t=1.0,
+            truncation_factor=None,
+            rescale_k=None,
+            rescale_sigma=None,
+            context_kv_cache=True,
+            speaker_kv_scale=None,
+            speaker_kv_min_t=None,
+            speaker_kv_max_layers=None,
+            speaker_uncond_mode="mask",
+            seed=None,
+            t_schedule_mode="linear",
+            sway_coeff=-1.0,
+            trim_tail=True,
+            tail_window_size=20,
+            tail_std_threshold=0.05,
+            tail_mean_threshold=0.1,
+            lora_adapter=None,
+        )
 
     def synthesize(self, text: str, voice_ref_path: Path, speed: float) -> bytes:
-        # TODO(Phase G 実機): self.synth(text=text, reference_audio=str(voice_ref_path), speed=speed)
-        #   → 返り値の numpy array (sr=...) を soundfile.write で wav バイト列に変換
-        raise NotImplementedError(
-            "実 Irodori 推論は M4c Phase G の実機検証で実装します"
+        runtime = self._load_synth()
+        # Irodori SamplingRequest に speed パラメタはなく、duration_scale (>1=長く / <1=速く)
+        # でおおまかに調整する近似 (再生側でも tts_speed をかけているので過剰補正注意)。
+        duration_scale = max(0.5, 1.0 / max(0.5, speed))
+        request = self._make_request(
+            text=text,
+            caption=None,
+            ref_wav=str(voice_ref_path),
+            no_ref=False,
+            duration_scale=duration_scale,
         )
+        result = runtime.synthesize(request, log_fn=None)
+        return _audio_to_wav_bytes(result.audio, int(result.sample_rate))
 
     def generate_voice_ref(self, caption: str, out_path: Path) -> None:
-        # TODO(Phase G 実機): self.voice_design(caption=caption) → wav → out_path
-        raise NotImplementedError(
-            "実 VoiceDesign は M4c Phase G の実機検証で実装します"
+        runtime = self._load_voice_design()
+        request = self._make_request(
+            text=self.VOICE_REF_READING_TEXT,
+            caption=caption,
+            ref_wav=None,
+            no_ref=True,
+            duration_scale=1.0,
         )
+        result = runtime.synthesize(request, log_fn=None)
+
+        # upstream は save_wav ヘルパを提供しているのでそれを使う。soundfile への
+        # 直接書き込みでも可だが、サンプルレート整数化など細かい挙動を任せる。
+        from irodori_tts.inference_runtime import save_wav  # type: ignore
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        save_wav(str(out_path), result.audio, int(result.sample_rate))
+
+
+def _audio_to_wav_bytes(audio, sample_rate: int) -> bytes:
+    """numpy float32 array → 16-bit PCM mono wav バイト列。
+
+    upstream `save_wav` はファイル出力専用。HTTP body 用にバイト列が欲しいので
+    soundfile (BytesIO) で同等のフォーマットに書き出す。
+    """
+    import soundfile as sf  # type: ignore
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, sample_rate, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
 
 
 # --- FastAPI アプリ --------------------------------------------------------

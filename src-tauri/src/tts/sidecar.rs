@@ -9,10 +9,12 @@
 //! 最小機能のみ提供する。
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
@@ -63,11 +65,19 @@ pub fn install_sidecar_script(resource_dir: &Path, asset_root: &Path) -> Result<
 ///
 /// `mock=true` の場合、Aratako モデルを使わずモック wav を返すモードで起動。
 /// `mock=false` でも Phase D 時点では sidecar.py 内で 501 が返るが、起動経路の検証は可能。
-pub async fn start_sidecar(
+///
+/// `on_stderr_line` は子プロセス stderr の各行を受ける callback。HF モデル DL の進捗
+/// (`[hf-download] ...` 行) を `irodori-download` イベントへ転送するために呼び出し側で
+/// AppHandle を closure に閉じ込めて渡す (M4c Phase G)。テスト/内部利用は no-op で渡してよい。
+pub async fn start_sidecar<F>(
     asset_root: &Path,
     sidecar_py: &Path,
     mock: bool,
-) -> Result<SidecarHandle> {
+    on_stderr_line: F,
+) -> Result<SidecarHandle>
+where
+    F: FnMut(&str) + Send + 'static,
+{
     let python = irodori_download::python_exe()?;
     if !python.is_file() {
         return Err(anyhow!(
@@ -94,16 +104,23 @@ pub async fn start_sidecar(
         .arg("--port")
         .arg("0")
         .arg("--log-level")
-        .arg("warning");
+        .arg("warning")
+        // stderr を piped にして HF DL 進捗を行単位で吸い上げる
+        .stderr(Stdio::piped());
     if mock {
         cmd.arg("--mock");
     }
     cmd.kill_on_drop(false); // shutdown_sidecar で明示的に倒す
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("python サイドカー起動失敗: {}", python.display()))?;
     let pid = child.id().unwrap_or(0);
+
+    // stderr を別タスクで非同期 read。サイドカー終了で EOF → タスクも終わる。
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(spawn_stderr_pump(stderr, on_stderr_line));
+    }
 
     let port = wait_for_ready_file(&ready_file, Duration::from_secs(30))
         .await
@@ -115,6 +132,19 @@ pub async fn start_sidecar(
         })?;
 
     Ok(SidecarHandle { port, pid, child })
+}
+
+/// 子プロセス stderr を行単位で読み、each line を callback に流す。
+/// stderr EOF (サイドカー終了) で自然終了。
+async fn spawn_stderr_pump<R, F>(stderr: R, mut on_line: F)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    F: FnMut(&str) + Send + 'static,
+{
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        on_line(&line);
+    }
 }
 
 /// `POST /shutdown` を打って 1 秒待ち、ダメなら `child.kill()` する。

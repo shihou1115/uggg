@@ -19,6 +19,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
 use thiserror::Error;
 
 use crate::tts::sidecar::{self, SidecarHandle};
@@ -93,12 +94,28 @@ impl IrodoriClient {
 
     /// サイドカーが起動済みか確認し、未起動なら立ち上げる。port を返す。
     /// `mock=true` で sidecar.py を `--mock` で起動 (Phase D 検証用)。
-    pub async fn ensure_sidecar_running(&self, asset_root: &Path, mock: bool) -> Result<u16, TtsError> {
+    /// `app` を渡すとサイドカー stderr の `[hf-download]` 行が `irodori-download` イベント
+    /// に転送される (M4c Phase G、実モデル初回起動時の HF DL 進捗表示用)。テスト等は None で可。
+    pub async fn ensure_sidecar_running(
+        &self,
+        asset_root: &Path,
+        mock: bool,
+        app: Option<AppHandle>,
+    ) -> Result<u16, TtsError> {
         if let Some(port) = self.current_port() {
             return Ok(port);
         }
         let script = asset_root.join("sidecar.py");
-        let handle = sidecar::start_sidecar(asset_root, &script, mock)
+        // [hf-download] 接頭辞の行のみ irodori-download イベントへ転送する。
+        // 他の uvicorn / sidecar.py 標準ログは捨てる (ノイズ抑制 + 機密漏洩防止)。
+        let on_stderr = move |line: &str| {
+            if let Some(app) = &app {
+                if line.starts_with("[hf-download]") {
+                    let _ = app.emit("irodori-download", line);
+                }
+            }
+        };
+        let handle = sidecar::start_sidecar(asset_root, &script, mock, on_stderr)
             .await
             .map_err(|e| TtsError::SidecarStart(format!("{e:#}")))?;
         let port = handle.port;
@@ -157,8 +174,9 @@ impl IrodoriClient {
         voice_ref_path: &Path,
         speed: f64,
         mock: bool,
+        app: Option<AppHandle>,
     ) -> Result<Vec<u8>, TtsError> {
-        let port = self.ensure_sidecar_running(asset_root, mock).await?;
+        let port = self.ensure_sidecar_running(asset_root, mock, app).await?;
         self.touch_last_used();
         let url = format!("http://127.0.0.1:{port}/v1/audio/speech");
         let body = SpeechRequest {
@@ -194,8 +212,9 @@ impl IrodoriClient {
         caption: &str,
         out_path: &Path,
         mock: bool,
+        app: Option<AppHandle>,
     ) -> Result<PathBuf, TtsError> {
-        let port = self.ensure_sidecar_running(asset_root, mock).await?;
+        let port = self.ensure_sidecar_running(asset_root, mock, app).await?;
         self.touch_last_used();
         let url = format!("http://127.0.0.1:{port}/v1/voice_ref/generate");
         let body = VoiceRefRequest {
