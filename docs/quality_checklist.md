@@ -50,8 +50,8 @@
 - [x] ※ G5-2 実機検証時に 2 件のバグ発見・修正済 (commit c3dffe0): (1) `_audio_to_wav_bytes` が torch.Tensor `(channels, samples)` を soundfile に渡せなかった、(2) `dacvae` の transitive 依存 `descript-audiotools` が未 install
 
 ### G6. フォールバック
-- [ ] GPU 不可環境で `tts_engine = irodori` を選んでも、明示エラーで voicevox 経路に切替えるよう案内される
-- [ ] サイドカー起動失敗時に notify(`irodori_unavailable`) が発火し、voicevox に手動切替で復旧できる
+- [x] GPU 不可環境で `tts_engine = irodori` を選んでも、UI gate (G1-4 で確認済) + 0ee4c80 の二段 gate (irodori option 自体を disabled、選択中なら自動で voicevox_core に倒す) により事前抑制
+- [x] サイドカー起動失敗時に notify(`irodori_unavailable`) が発火 (G4-1 で確認済)、その後は auto fallback で voicevox 経路 (G4-2 で確認済) + 設定の手動切替でも voicevox に即時復旧可 (2026-06-28 実機 ✅)
 
 ---
 
