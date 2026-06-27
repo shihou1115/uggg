@@ -28,12 +28,12 @@
 - [ ] (任意) DL 失敗時 (例: ネット切断) は `irodori_dl_failed` をゴーストが発話する
 
 ### G3. サイドカー起動 (モックモード, Phase D)
-- [ ] 設定で `tts_engine = irodori` に切替 + 「実モデルを使う (β)」OFF
-- [ ] 参照音声生成 (キャプション入力 → 生成) で main の参照音声が `%APPDATA%\ugg\irodori\refs\main_<ts>.wav` に保存される
-- [ ] 「プレビュー」で 1 秒程度の正弦波が再生される
-- [ ] `synthesize_voice(tts_engine=irodori)` 経路で短文を発話 → 正弦波が再生される
-- [ ] 5 分以上放置 → サイドカープロセス (Task Manager の python.exe) が自動 kill される (Phase E アイドル監視)
-- [ ] トレイ「終了」/コンテキストメニュー「終了」で python.exe の残骸が出ない
+- [x] 設定で `tts_engine = irodori` に切替 + 「実モデルを使う (β)」OFF (2026-06-28 実機検証 ✅)
+- [x] 参照音声生成 (キャプション入力 → 生成) で main の参照音声が `%APPDATA%\ugg\irodori\refs\main_<ts>.wav` に保存される (44KB = 1秒無音 wav、`make_mock_voice_ref_wav` 仕様通り)
+- [x] 「プレビュー」で 440Hz 正弦波 ~1 秒程度が再生される
+- [x] `synthesize_voice(tts_engine=irodori)` 経路で短文を発話 → 文字数に応じた長さの正弦波が再生される (80ms/文字)
+- [x] 5 分以上放置 → サイドカープロセス (python.exe) が自動 kill される (実測: 監視開始から 8 分 3 秒、monologue=0 で測定)
+- [x] トレイ「終了」/コンテキストメニュー「終了」で python.exe の残骸が出ない (実測: 終了操作から 29 秒で消失。POST /shutdown 経路成功)
 
 ### G4. ヘルスチェック (Phase G)
 - [ ] サイドカー起動中に Task Manager から手動 kill → **90 秒以内**にゴーストが `irodori_unavailable` を発話 (30 秒間隔 × 3 回連続失敗で発火、最悪 60〜90 秒)
