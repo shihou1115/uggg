@@ -79,14 +79,18 @@ pub async fn synthesize_voice(
                 }
                 Err(other) => {
                     let reason = format!("{other}");
-                    notify::notify(
-                        &app,
-                        &state_arc,
-                        NoticeKind::IrodoriUnavailable {
-                            reason: reason.clone(),
-                        },
-                    )
-                    .await;
+                    // notify は `dialogue` event → frontend → `synthesize_voice` の再 invoke
+                    // を引き起こすので、5 分クールダウンで再帰を断つ (irodori.rs::should_notify_unavailable)。
+                    if state_arc.tts.irodori.should_notify_unavailable() {
+                        notify::notify(
+                            &app,
+                            &state_arc,
+                            NoticeKind::IrodoriUnavailable {
+                                reason: reason.clone(),
+                            },
+                        )
+                        .await;
+                    }
                     match synthesize_voicevox(state_arc.clone(), &settings, &slot, &text).await {
                         Ok(wav) => wav,
                         Err(_voicevox_err) => return Err(reason),

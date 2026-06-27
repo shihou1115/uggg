@@ -34,6 +34,13 @@ pub struct IrodoriClient {
     /// アイドル監視 (`tasks::spawn_irodori_idle_watcher`) がこれを見て 5 分未使用なら shutdown する。
     /// 起動直後を「使用中」扱いにするため 0 は「起動なし」を表す sentinel。
     last_used: AtomicI64,
+    /// 最後に `notify(IrodoriUnavailable)` を発火した unix 秒 (0 = 一度も発火していない)。
+    /// `synthesize_voice` のフォールバック経路と `spawn_irodori_health_watcher` は両方とも
+    /// `should_notify_unavailable` で 5 分クールダウンを共有し、無限ループ + 連続発話を防ぐ。
+    /// 経緯: notify は `app.emit("dialogue", ...)` でフロントへ流れ、フロントは `synthesize_voice`
+    /// を再 invoke する。irodori が落ちている状態で notify を打つと再帰的に同じ failure が
+    /// trigger され、フォールバック経路の voicevox 合成が際限なくキューに積まれる。
+    last_notified_unavailable: AtomicI64,
 }
 
 impl IrodoriClient {
@@ -46,6 +53,7 @@ impl IrodoriClient {
             client,
             sidecar: StdMutex::new(None),
             last_used: AtomicI64::new(0),
+            last_notified_unavailable: AtomicI64::new(0),
         }
     }
 
@@ -55,6 +63,23 @@ impl IrodoriClient {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         self.last_used.store(ts, Ordering::Relaxed);
+    }
+
+    /// 5 分のクールダウンを介した `notify(IrodoriUnavailable)` の `compare_exchange`-style ゲート。
+    /// 直近 5 分以内に発火していれば false を返して呼び出し側 (synthesize_voice / health_watcher) は
+    /// notify を skip する。true を返した場合は now を新しい `last_notified_unavailable` として確定する。
+    pub fn should_notify_unavailable(&self) -> bool {
+        const COOLDOWN_SECS: i64 = 5 * 60;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let last = self.last_notified_unavailable.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < COOLDOWN_SECS {
+            return false;
+        }
+        self.last_notified_unavailable.store(now, Ordering::Relaxed);
+        true
     }
 
     /// 起動済みサイドカーの `/health` を 1 回 ping して true/false を返す (未起動なら true 扱い = no-op)。
@@ -311,6 +336,15 @@ mod tests {
         // 未起動状態 (port=None, last_used=0) では何もしないで false を返す
         let acted = client.shutdown_if_idle(1_000_000, 60).await.unwrap();
         assert!(!acted);
+    }
+
+    #[test]
+    fn should_notify_unavailable_gates_within_cooldown() {
+        let client = IrodoriClient::new();
+        // 初回は true (last=0 sentinel → 即発火)
+        assert!(client.should_notify_unavailable());
+        // 直後の再呼び出しは cooldown 内なので false
+        assert!(!client.should_notify_unavailable());
     }
 
     #[test]

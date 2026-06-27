@@ -237,16 +237,18 @@ pub fn spawn_irodori_health_watcher(app: AppHandle, state: Arc<AppState>) {
             if fails < FAIL_THRESHOLD {
                 continue;
             }
-            // 3 回連続失敗: shutdown + 通知
+            // 3 回連続失敗: shutdown + 通知 (5 分クールダウンで連続発話を防ぐ)。
             let _ = state.tts.irodori.shutdown().await;
-            crate::system::notify::notify(
-                &app,
-                &state,
-                crate::system::notify::NoticeKind::IrodoriUnavailable {
-                    reason: format!("ヘルスチェックが {FAIL_THRESHOLD} 回連続失敗"),
-                },
-            )
-            .await;
+            if state.tts.irodori.should_notify_unavailable() {
+                crate::system::notify::notify(
+                    &app,
+                    &state,
+                    crate::system::notify::NoticeKind::IrodoriUnavailable {
+                        reason: format!("ヘルスチェックが {FAIL_THRESHOLD} 回連続失敗"),
+                    },
+                )
+                .await;
+            }
             fails = 0;
         }
     });
