@@ -1,14 +1,22 @@
-//! Irodori-TTS の Python ランタイム + 共通依存の初回 DL (architecture §8.2-8.3, M4c Phase C)。
+//! Irodori-TTS の Python ランタイム + 共通依存の初回 DL (architecture §8.2-8.3, M4c Phase C/G)。
 //!
 //! 配置は `%APPDATA%\ugg\irodori\python\` 配下。
 //! - `python.exe` / `python311.dll` 等: 公式 Embeddable Python (Windows x64) を ZIP で取得
-//! - `Lib\site-packages\`: pip ブートストラップで作成、torch / fastapi / uvicorn / huggingface_hub 等を導入
+//! - `Lib\site-packages\`: pip ブートストラップで作成、torch / fastapi / uvicorn / huggingface_hub
+//!   + Phase G 追加で transformers / peft / accelerate / safetensors / librosa / numba / 等 +
+//!   irodori-tts / dacvae / silentcipher を GitHub アーカイブから取得
 //!
-//! HF モデル本体 (Aratako/Irodori-TTS-*) の DL は Phase D で `sidecar.py` と一緒に実装する。
-//! 本モジュールは「Python が起動して `import torch` できる状態」までを担う。
+//! HF モデル本体 (Aratako/Irodori-TTS-*) の DL は `sidecar.py::download_models` が担う (Phase G)。
+//! 本モジュールは「Python が起動して `from irodori_tts.inference_runtime import InferenceRuntime`
+//! できる状態」までを担う。
 //!
 //! 設計判断:
 //! - Python 3.11.x: torch CUDA wheel が最も安定して提供されている系列 (3.13 はまだ部分対応)
+//! - torch >=2.10 / cu128: Irodori-TTS upstream pyproject の要求に合わせる (cu121 から更新)
+//! - GitHub アーカイブ URL での pip install: embeddable Python に git CLI が無いため `git+` URL は
+//!   使えない。代わりに `https://github.com/.../archive/<ref>.zip` でアーカイブを取得し pip に渡す
+//! - `--no-deps`: irodori-tts pyproject の `dacvae` / `silentcipher` git+ 依存をスキップし
+//!   別 step で明示的に install (順序: silentcipher → dacvae → irodori-tts)
 //! - zip 展開は PowerShell の `Expand-Archive` 呼び出し: 追加 crate なし
 //! - run_python は wait → 全 stdout/stderr 一括読み: シンプル優先。リアルタイム進捗が必要になれば
 //!   spawn_blocking + thread + channel に拡張する (現状は各 step 開始時に on_line でステージを emit)
@@ -25,8 +33,9 @@ pub const PYTHON_VERSION: &str = "3.11.9";
 const PYTHON_URL: &str = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip";
 /// pip ブートストラップ用スクリプト。
 const GET_PIP_URL: &str = "https://bootstrap.pypa.io/get-pip.py";
-/// torch CUDA 12.1 wheel の追加 index URL。
-const TORCH_CUDA_INDEX_URL: &str = "https://download.pytorch.org/whl/cu121";
+/// torch CUDA 12.8 wheel の追加 index URL。
+/// Irodori-TTS upstream pyproject が `torch>=2.10.0` を要求するため Phase G で cu121→cu128 に更新。
+const TORCH_CUDA_INDEX_URL: &str = "https://download.pytorch.org/whl/cu128";
 
 /// Phase C で確実にインストールする共通依存。バージョン固定で再現性を担保。
 /// torch 系は CUDA index 経由で別途インストールする (`install_torch_cuda`)。
@@ -38,8 +47,43 @@ const COMMON_REQUIREMENTS: &[&str] = &[
     "soundfile==0.12.1",
 ];
 
-/// torch / torchaudio バージョン (CUDA 12.1)。
-const TORCH_PACKAGES: &[&str] = &["torch==2.5.1", "torchaudio==2.5.1"];
+/// torch / torchaudio バージョン (CUDA 12.8)。
+/// Irodori-TTS upstream pyproject の `torch>=2.10.0,<2.11.0` レンジに合わせる。
+const TORCH_PACKAGES: &[&str] = &["torch>=2.10.0,<2.11.0", "torchaudio>=2.10.0,<2.11.0"];
+
+/// Irodori-TTS が要求する追加 pip パッケージ (Phase G)。
+/// upstream pyproject の dependencies と Phase G で実 InferenceRuntime に必要な周辺ライブラリを
+/// 過不足なく揃える (`dacvae` / `silentcipher` / `irodori-tts` 本体は GitHub アーカイブで別途)。
+const IRODORI_EXTRA_REQUIREMENTS: &[&str] = &[
+    "torchcodec>=0.10.0,<0.11.0",
+    "transformers<5",
+    "accelerate>=1.0.0",
+    "peft>=0.18.0",
+    "safetensors>=0.7.0",
+    "datasets>=3.0.0",
+    "librosa",
+    "numba>=0.57.0",
+    "llvmlite>=0.40.0",
+    "sentencepiece>=0.1.99,<0.2",
+    "pyyaml>=6.0",
+    "tqdm>=4.67.3",
+    "einops",
+];
+
+/// silentcipher (Sesame AI Labs) の固定 commit zipball。upstream Irodori-TTS pyproject の
+/// `silentcipher @ git+https://github.com/SesameAILabs/silentcipher.git@<hash>` と同じ hash。
+const SILENTCIPHER_ZIPBALL: &str =
+    "https://github.com/SesameAILabs/silentcipher/archive/d46d7d0893a583d8968ab3a6626e2289faec9152.zip";
+
+/// dacvae (facebookresearch) の main ブランチ zipball。upstream Irodori-TTS pyproject の
+/// `dacvae = { git = "https://github.com/facebookresearch/dacvae" }` と同じリポジトリ。
+const DACVAE_ZIPBALL: &str =
+    "https://github.com/facebookresearch/dacvae/archive/refs/heads/main.zip";
+
+/// Irodori-TTS 本体 (Aratako) の main ブランチ zipball。`infer.py` / `irodori_tts.inference_runtime`
+/// を提供する。最新コードを追うため main ブランチを採用 (将来 release タグが切られたら pin する)。
+const IRODORI_TTS_ZIPBALL: &str =
+    "https://github.com/Aratako/Irodori-TTS/archive/refs/heads/main.zip";
 
 /// Python 配置ディレクトリ (`%APPDATA%\ugg\irodori\python\`)。
 /// Phase D 以降の `sidecar.py` 起動で使う。
@@ -54,7 +98,9 @@ pub fn python_exe() -> Result<PathBuf> {
     Ok(python_dir()?.join("python.exe"))
 }
 
-/// Phase C 完了済みか (python.exe + torch + fastapi + uvicorn + huggingface_hub が揃っている)。
+/// Irodori 資産が「実モデル可」レベルまで揃っているか。
+/// Phase C (python.exe + torch + fastapi + uvicorn + huggingface_hub) + Phase G (irodori_tts) を要求。
+/// この判定が true のときのみ設定パネルの「実モデルを使う (β)」トグルが enable される。
 pub fn assets_ready(asset_root: &Path) -> bool {
     let py = asset_root.join("python").join("python.exe");
     if !py.is_file() {
@@ -68,6 +114,7 @@ pub fn assets_ready(asset_root: &Path) -> bool {
         && has_package(&site, "fastapi")
         && has_package(&site, "uvicorn")
         && has_package(&site, "huggingface_hub")
+        && has_package(&site, "irodori_tts")
 }
 
 fn has_package(site_packages: &Path, name: &str) -> bool {
@@ -168,23 +215,96 @@ where
     Ok(())
 }
 
-/// 4) torch + torchaudio (CUDA 12.1) を pip install。サイズが大きい (1〜2GB)。
+/// 4) torch + torchaudio (CUDA 12.8) を pip install。サイズが大きい (1〜2GB)。
 pub async fn install_torch_cuda<F>(asset_root: &Path, mut on_line: F) -> Result<()>
 where
     F: FnMut(&str),
 {
     let py_exe = asset_root.join("python").join("python.exe");
-    on_line("PyTorch (CUDA 12.1) をインストールしています… (1〜2GB ダウンロードします)");
+    on_line("PyTorch (CUDA 12.8) をインストールしています… (1〜2GB ダウンロードします)");
     let mut args: Vec<&str> = vec![
         "-m",
         "pip",
         "install",
         "--no-warn-script-location",
+        "--upgrade",
         "--index-url",
         TORCH_CUDA_INDEX_URL,
     ];
     args.extend(TORCH_PACKAGES);
     run_python(&py_exe, &args, |l| on_line(l))?;
+    Ok(())
+}
+
+/// 5) Irodori-TTS ランタイム本体 + 追加 pip 依存 (M4c Phase G)。
+///
+/// 順序: 追加 pip 依存 (transformers / peft / accelerate …) → silentcipher → dacvae → irodori-tts。
+/// silentcipher/dacvae は irodori-tts の git+ 依存なので、irodori-tts を `--no-deps` で入れる前に
+/// 別個に install しておく。dacvae リポジトリの公開状況や upstream API は実機 GPU で初回検証して
+/// 必要に応じて URL/コミットを pin する想定 (本セッションは upstream pyproject 通りに繋ぐ)。
+pub async fn install_irodori_runtime<F>(asset_root: &Path, mut on_line: F) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    let py_exe = asset_root.join("python").join("python.exe");
+    if !py_exe.is_file() {
+        return Err(anyhow!(
+            "python.exe が見つかりません: {}",
+            py_exe.display()
+        ));
+    }
+
+    on_line(&format!(
+        "Irodori-TTS の追加 pip 依存をインストールしています ({} パッケージ、~数百MB)…",
+        IRODORI_EXTRA_REQUIREMENTS.len()
+    ));
+    let mut args: Vec<&str> = vec!["-m", "pip", "install", "--no-warn-script-location"];
+    args.extend(IRODORI_EXTRA_REQUIREMENTS);
+    run_python(&py_exe, &args, |l| on_line(l))?;
+
+    on_line("silentcipher を GitHub アーカイブから取得しています…");
+    run_python(
+        &py_exe,
+        &[
+            "-m",
+            "pip",
+            "install",
+            "--no-warn-script-location",
+            "--no-deps",
+            SILENTCIPHER_ZIPBALL,
+        ],
+        |l| on_line(l),
+    )?;
+
+    on_line("dacvae を GitHub アーカイブから取得しています…");
+    run_python(
+        &py_exe,
+        &[
+            "-m",
+            "pip",
+            "install",
+            "--no-warn-script-location",
+            "--no-deps",
+            DACVAE_ZIPBALL,
+        ],
+        |l| on_line(l),
+    )?;
+
+    on_line("Irodori-TTS 本体を GitHub アーカイブから取得しています…");
+    run_python(
+        &py_exe,
+        &[
+            "-m",
+            "pip",
+            "install",
+            "--no-warn-script-location",
+            "--no-deps",
+            IRODORI_TTS_ZIPBALL,
+        ],
+        |l| on_line(l),
+    )?;
+
+    on_line("Irodori-TTS ランタイムのインストールが完了しました");
     Ok(())
 }
 

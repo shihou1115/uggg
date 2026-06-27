@@ -286,14 +286,16 @@ pub async fn irodori_assets_ready() -> bool {
     irodori_download::assets_ready(&root)
 }
 
-/// Irodori 用 Python ランタイム + 共通依存の初回 DL (architecture §8.2-8.3, M4c Phase C)。
+/// Irodori 用 Python ランタイム + 共通依存 + 実モデルランタイムの初回 DL (architecture §8.2-8.3, M4c Phase C/G)。
 /// 進捗は `irodori-download` イベントで 1 行ずつ emit、完了時に `"__done__"`。
 ///
 /// 段取り:
 ///   1. Embeddable Python (Windows x64, 約 25MB) を DL → 展開 → `python._pth` 編集
 ///   2. `get-pip.py` で pip ブートストラップ
 ///   3. 共通依存 (fastapi / uvicorn / huggingface_hub / numpy / soundfile) を pip install
-///   4. torch + torchaudio (CUDA 12.1) を pip install (1〜2GB)
+///   4. torch + torchaudio (CUDA 12.8) を pip install (1〜2GB)
+///   5. Irodori-TTS ランタイム本体 + 追加 pip 依存 (transformers / peft / accelerate / silentcipher /
+///      dacvae / irodori-tts) を pip install (~数百MB) — 実モデル経路で必要 (Phase G)
 #[tauri::command]
 pub async fn download_irodori_assets(
     agreed: bool,
@@ -324,6 +326,9 @@ pub async fn download_irodori_assets(
             .await
             .map_err(|e| format!("{e:#}"))?;
         irodori_download::install_torch_cuda(&asset_root, &emit)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        irodori_download::install_irodori_runtime(&asset_root, &emit)
             .await
             .map_err(|e| format!("{e:#}"))?;
         Ok(())
