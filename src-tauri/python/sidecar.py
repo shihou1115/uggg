@@ -337,12 +337,33 @@ class RealModelBackend:
 
 
 def _audio_to_wav_bytes(audio, sample_rate: int) -> bytes:
-    """numpy float32 array → 16-bit PCM mono wav バイト列。
+    """torch.Tensor / numpy array → 16-bit PCM mono wav バイト列。
 
     upstream `save_wav` はファイル出力専用。HTTP body 用にバイト列が欲しいので
     soundfile (BytesIO) で同等のフォーマットに書き出す。
+
+    InferenceRuntime.synthesize は `torch.Tensor` (shape `(channels, samples)`) を返すので、
+    numpy 変換と (samples, channels) への transpose を行ってから書き込む (soundfile は
+    `(samples,)` か `(samples, channels)` を受ける。 `(channels, samples)` だと 'Format
+    not recognised' で失敗する)。
     """
     import soundfile as sf  # type: ignore
+
+    try:
+        import torch  # type: ignore
+
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu().numpy()
+    except ImportError:
+        pass
+
+    # shape 整形: (1, N) → (N,) mono / (channels, N) → (N, channels)
+    if hasattr(audio, "ndim") and audio.ndim == 2:
+        if audio.shape[0] == 1:
+            audio = audio[0]
+        elif audio.shape[0] < audio.shape[1]:
+            # 一般的に samples > channels なので、(channels, samples) と推定して転置
+            audio = audio.T
 
     buf = io.BytesIO()
     sf.write(buf, audio, sample_rate, format="WAV", subtype="PCM_16")

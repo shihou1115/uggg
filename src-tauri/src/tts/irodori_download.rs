@@ -68,6 +68,11 @@ const IRODORI_EXTRA_REQUIREMENTS: &[&str] = &[
     "pyyaml>=6.0",
     "tqdm>=4.67.3",
     "einops",
+    // dacvae の transitive 依存 (PyPI 名は descript-audiotools、import 名は audiotools)。
+    // upstream Irodori-TTS pyproject では dacvae の git+ 依存だけ宣言されているが、それ自体は
+    // descript-audiotools を要件として書いておらず、実合成 (DAC codec encode/decode) で
+    // `No module named 'audiotools'` が発生する。明示的に追加。
+    "descript-audiotools>=0.7.2",
 ];
 
 /// silentcipher (Sesame AI Labs) の固定 commit zipball。upstream Irodori-TTS pyproject の
