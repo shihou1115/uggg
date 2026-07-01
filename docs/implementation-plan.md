@@ -340,18 +340,19 @@ M4c は規模が大きいので **Phase A〜G** に分割して進める:
 - `cargo check` の dead_code 警告 8 件をすべて `#[allow(dead_code)]` + 理由コメントに置換 (UsageSummary / ReplyUsage / ChatMessage::assistant / Dictionary.{schema_version,recall} / CostStatus.{current_usd,limit_usd,ratio} / VoicevoxEngine.loaded_models)。実コード削除はせず将来用に温存。
 - 警告 0 件で cargo check グリーン、`cargo test` 80 件パス維持。
 
-### 3.7 M6 リリース準備 (進行中)
+### 3.7 M6 リリース準備 (完了 2026-07-02)
 
 - ✅ README.md を本開発版に整備 (機能一覧 / ビルド方法 / Windows 専用 / ディレクトリ構成 / データ配置 / ライセンス方針)
-- ✅ docs/release-notes/v0.1.0.md ドラフト (機能要約 M0〜M5、既知の制限 6 項目、検証ステータステーブル、TBD は SHA-256 / FileVersion / 実機検証完了印)
-- ✅ バージョン三点セットを `0.1.0-rc.0` に (`package.json` / `Cargo.toml` / `tauri.conf.json`)
-- ☐ `npm run tauri build` 実機ビルド (ユーザー側)
-- ☐ test-plan §5 手動テスト全項目消化 (ユーザー側)
-- ☐ クリーン Windows 環境でのインストール検証 (ユーザー側)
-- ☐ docs/quality_checklist.md §M4c G1〜G6 消化 (GPU 環境、ユーザー側)
-- ☐ インストーラ SHA-256 / FileVersion を release-notes に追記
-- ☐ Git タグ `v0.1.0` (実機検証完了後)
-**コミット/タグ**: -
+- ✅ docs/release-notes/v0.1.0.md (機能要約 M0〜M5 + M4c 実機検証済 + 設定 5 ページ分割、既知の制限 6 項目、検証ステータステーブル)
+- ✅ バージョン三点セットを `0.1.0` に確定 (`package.json` / `Cargo.toml` / `tauri.conf.json`)
+- ✅ test-plan §5 手動テスト A〜D 消化 (2026-06-22、発見ハング 6 件修正済)
+- ✅ docs/quality_checklist.md §M4c G1〜G6 消化 (2026-06-28、実機 RTX 5080、発見バグ 4 件修正済)
+- ✅ アプリアイコン生成 (紫グラデ + ゴースト、multi-size ico 16〜256px)
+- ✅ `npm run tauri build` NSIS インストーラ生成 (`bundle.active: true` + NSIS currentUser / 日英)
+- ✅ インストーラ SHA-256 / FileVersion を release-notes に追記 (`BD6FB05F…834E45` / 0.1.0)
+- ✅ Git タグ `v0.1.0`
+- ☐ クリーン Windows 環境でのインストール検証 (リリース後フォローアップ、ユーザー側)
+**コミット/タグ**: `v0.1.0`
 
 ---
 
@@ -371,14 +372,14 @@ M4c は規模が大きいので **Phase A〜G** に分割して進める:
 - update_feed_url 用の JSON テンプレ準備（運用するなら）
 
 **DoD**:
-- ☐ test-plan §5 の全項目が ○ または「該当なし」
-- ☐ test-plan §7 のリリース前手順を全通過
-- ☐ クリーンインストール → 起動 → 主要機能 ○
-- ☐ インストーラの SHA-256 を release-notes に記録
-- ☐ Git タグ `v0.1.0` を打ち、release-notes を公開
+- ✅ test-plan §5 の全項目が ○ または「該当なし」
+- ✅ test-plan §7 のリリース前手順を全通過
+- ☐ クリーンインストール → 起動 → 主要機能 ○ (リリース後フォローアップ)
+- ✅ インストーラの SHA-256 を release-notes に記録
+- ✅ Git タグ `v0.1.0` を打ち、release-notes を公開
 
-**完了日**: 未着手
-**コミット/タグ**: -
+**完了日**: 2026-07-02
+**コミット/タグ**: `v0.1.0`
 
 ---
 
