@@ -292,6 +292,43 @@ body {
   letter-spacing: 0.04em;
 }
 
+/* 設定パネルのページ切替 (2026-06-28 追加、M6 前の整理)。
+   #settings-panel の panel-body に data-active-page="basic|character|voice|ai|system"
+   が入り、各 section は data-page="X" を持つ。アクティブな section のみ表示する。 */
+.panel-tabs {
+  padding: 10px 16px;
+  border-bottom: 1px solid #ddd;
+  background: rgba(240, 240, 240, 0.6);
+}
+
+.panel-tabs .row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+}
+
+.panel-tabs .row > span:first-child {
+  width: 60px;
+  font-size: 12px;
+  color: #444;
+}
+
+.panel-tabs select {
+  flex: 1;
+}
+
+.panel-body[data-active-page] .panel-section[data-page] {
+  display: none;
+}
+.panel-body[data-active-page="basic"] .panel-section[data-page="basic"],
+.panel-body[data-active-page="character"] .panel-section[data-page="character"],
+.panel-body[data-active-page="voice"] .panel-section[data-page="voice"],
+.panel-body[data-active-page="ai"] .panel-section[data-page="ai"],
+.panel-body[data-active-page="system"] .panel-section[data-page="system"] {
+  display: block;
+}
+
 .panel-section .checkbox-row {
   align-items: center;
 }

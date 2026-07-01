@@ -88,6 +88,9 @@ interface Inputs {
   cancelBtn: HTMLButtonElement;
   closeBtn: HTMLButtonElement;
   msg: HTMLElement;
+  // 2026-06-28: ページ切替 (M6 前の設定パネル整理)
+  pageSelector: HTMLSelectElement;
+  panelBody: HTMLElement;
 }
 
 let inputs: Inputs | null = null;
@@ -180,6 +183,19 @@ export function isOpen(): boolean {
   return !!inputs?.panel.classList.contains("visible");
 }
 
+/// 設定パネルのページ切替 (2026-06-28 追加、M6 前の整理)。
+/// panel-body の `data-active-page` を書き換えるだけで CSS が section 表示を制御する。
+function setActivePage(page: string): void {
+  if (!inputs) return;
+  inputs.panelBody.dataset.activePage = page;
+  // select 側もプログラム的な呼び出しで同期させる (openSettingsPanel 起点等)
+  if (inputs.pageSelector.value !== page) {
+    inputs.pageSelector.value = page;
+  }
+  // スクロール位置をリセット (別ページを開いた時に以前のスクロールが残らないよう)
+  inputs.panelBody.scrollTop = 0;
+}
+
 function collectInputs(): Inputs {
   return {
     panel: byId("settings-panel"),
@@ -249,6 +265,12 @@ function collectInputs(): Inputs {
     cancelBtn: byId<HTMLButtonElement>("settings-cancel"),
     closeBtn: byId<HTMLButtonElement>("settings-close"),
     msg: byId("settings-message"),
+    pageSelector: byId<HTMLSelectElement>("settings-page-selector"),
+    panelBody: (() => {
+      const el = byId("settings-panel").querySelector<HTMLElement>(".panel-body");
+      if (!el) throw new Error("設定パネルの .panel-body が見つかりません");
+      return el;
+    })(),
   };
 }
 
@@ -256,6 +278,7 @@ function attachHandlers(i: Inputs): void {
   i.closeBtn.addEventListener("click", () => closeSettingsPanel());
   i.cancelBtn.addEventListener("click", () => closeSettingsPanel());
   i.saveBtn.addEventListener("click", () => void onSave());
+  i.pageSelector.addEventListener("change", () => setActivePage(i.pageSelector.value));
   i.keyDelete.addEventListener("click", () => void onDeleteKey());
   i.provider.addEventListener("change", () => {
     void refreshKeyState(i.provider.value);

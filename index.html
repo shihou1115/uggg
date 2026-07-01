@@ -62,8 +62,20 @@
           <h2>設定</h2>
           <button type="button" id="settings-close" class="panel-close" aria-label="閉じる">×</button>
         </header>
-        <div class="panel-body">
-          <section class="panel-section">
+        <nav class="panel-tabs">
+          <label class="row">
+            <span>ページ</span>
+            <select id="settings-page-selector">
+              <option value="basic">基本 (対話モード / 表示 / OS)</option>
+              <option value="character">キャラクター (キャラ / 存在感)</option>
+              <option value="voice">音声 (VOICEVOX / Irodori-TTS)</option>
+              <option value="ai">AI・拡張 (LLM / ツール / 興味分野 / ポモドーロ)</option>
+              <option value="system">システム (更新通知 / データ管理)</option>
+            </select>
+          </label>
+        </nav>
+        <div class="panel-body" data-active-page="basic">
+          <section class="panel-section" data-page="basic">
             <h3>対話モード</h3>
             <label class="row">
               <span>モード</span>
@@ -73,7 +85,7 @@
               </select>
             </label>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="ai">
             <h3>LLM (advanced モード用)</h3>
             <label class="row">
               <span>プロバイダ名</span>
@@ -100,7 +112,7 @@
               </div>
             </div>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="basic">
             <h3>表示</h3>
             <label class="row">
               <span>表示スケール</span>
@@ -116,7 +128,7 @@
               </select>
             </label>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="character">
             <h3>存在感</h3>
             <label class="row checkbox-row">
               <input type="checkbox" id="settings-quiet-mode" />
@@ -131,7 +143,7 @@
               <input type="number" id="settings-monologue-interval" min="0" max="1440" step="1" />
             </label>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="ai">
             <h3>ポモドーロ</h3>
             <label class="row">
               <span>集中 (分)</span>
@@ -146,7 +158,7 @@
               <input type="number" id="settings-pomodoro-rounds" min="1" max="20" step="1" />
             </label>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="voice">
             <h3>音声</h3>
             <label class="row checkbox-row">
               <input type="checkbox" id="settings-tts-enabled" />
@@ -197,7 +209,7 @@
             </p>
             <p id="settings-tts-progress" class="panel-message" hidden></p>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="voice">
             <h3>音声 (Irodori-TTS / 高品質モード)</h3>
             <div class="row">
               <span>GPU 検出</span>
@@ -253,7 +265,7 @@
             </div>
             <p id="settings-voiceref-progress" class="panel-message" hidden></p>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="character">
             <h3>キャラクター</h3>
             <label class="row">
               <span>ゴースト</span>
@@ -268,14 +280,14 @@
               新規ゴースト/シェルは zip / フォルダを ugg のウインドウにドラッグ&ドロップでも導入できます (zip slip / サイズ 1GB / 拡張子チェック付き)。
             </p>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="basic">
             <h3>OS</h3>
             <label class="row checkbox-row">
               <input type="checkbox" id="settings-autostart" />
               <span>OS ログイン時に ugg を自動起動する</span>
             </label>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="ai">
             <h3>ツール (時刻 / リマインダー / クリップボード)</h3>
             <label class="row checkbox-row">
               <input type="checkbox" id="settings-tools-enabled" />
@@ -290,7 +302,7 @@
             </p>
             <p id="settings-tools-message" class="panel-message" hidden></p>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="ai">
             <h3>興味分野 (時事ネタ)</h3>
             <label class="row checkbox-row">
               <input type="checkbox" id="settings-topics-enabled" />
@@ -311,7 +323,7 @@
             </p>
             <p id="settings-topics-message" class="panel-message" hidden></p>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="system">
             <h3>更新通知</h3>
             <label class="row">
               <span>フィード URL</span>
@@ -325,7 +337,7 @@
             </div>
             <p id="settings-update-message" class="panel-message" hidden></p>
           </section>
-          <section class="panel-section">
+          <section class="panel-section" data-page="system">
             <h3>データ管理</h3>
             <div class="row">
               <span>チャットログ</span>
