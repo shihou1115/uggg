@@ -583,19 +583,28 @@ pub async fn delete_github_token() -> Result<(), String> {
 
 // === 内部: engine 初期化 + speakers JSON のパース ===
 
+/// voicevox engine の遅延初期化。**lock を保持したまま init する** (二重 init 防止)。
+///
+/// 旧実装は「check (lock) → unlock → init → 再 lock で代入」の TOCTOU を抱えていた:
+/// spawn_preinit と発話 (synthesize_voicevox / preprocess_for_irodori) が並行すると
+/// `VoicevoxEngine::init` が二重に走り、後勝ち代入で負けた側の engine が drop される。
+/// drop は libloading::Library の解放 = voicevox DLL のアンロードを伴うため、勝った側の
+/// synthesizer が解放済みコードを指して onnxruntime.dll 内 0xc0000005 でプロセスごと落ちる
+/// (実機で再現、起動直後に GPU 検出ログが 2 回出るのが二重 init の痕跡)。
+///
+/// init は数秒ブロックするが、待つ側もどうせ engine 完成までは合成できないので、
+/// Mutex で直列化するのが正しい。本関数は常に blocking コンテキスト (spawn_blocking /
+/// 同期 command) から呼ばれる前提。
 fn ensure_engine(state: &Arc<AppState>) -> Result<(), String> {
-    {
-        let guard = state.tts.voicevox.lock().expect("tts poisoned");
-        if guard.is_some() {
-            return Ok(());
-        }
+    let mut guard = state.tts.voicevox.lock().expect("tts poisoned");
+    if guard.is_some() {
+        return Ok(());
     }
     let asset_dir = crate::state::voicevox_asset_dir().map_err(|e| format!("{e:#}"))?;
     if !voicevox::assets_ready(&asset_dir) {
         return Err("voicevox 資産が未ダウンロードです".to_string());
     }
     let engine = voicevox::VoicevoxEngine::init(&asset_dir)?;
-    let mut guard = state.tts.voicevox.lock().expect("tts poisoned");
     *guard = Some(engine);
     Ok(())
 }
