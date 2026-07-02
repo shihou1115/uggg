@@ -27,7 +27,7 @@ v0.0.3 で得た主な負債:
 | 1 | 仕様再定義（機能の取捨選択・コアコンセプト言語化） | docs/spec.md | ✅ |
 | 2 | アーキテクチャ設計（TTS再設計・状態管理再設計・DB再設計） | docs/architecture.md | ✅ |
 | 3 | テスト計画 | docs/test-plan.md | ✅ |
-| **4** | **実装着手**（垂直スライス・M0〜M6） | src/, src-tauri/src/ | 進行中（M0 ✅ / M1〜M6 未着手） |
+| **4** | **実装着手**（垂直スライス・M0〜M6） | src/, src-tauri/src/ | ✅ M0〜M6 完了、**v0.1.0 リリース済**（2026-07-02、タグ `v0.1.0`） |
 
 ## 採用済みの技術選定（Phase 1〜2 で再調査しない）
 
@@ -45,7 +45,7 @@ v0.0.3 で得た主な負債:
 - `npm run tauri dev` — 開発起動
 - `cargo check`（src-tauri/ 内で実行）— Rust 型検査
 - `npx tsc --noEmit` — TypeScript 型検査
-- `npm run tauri build` — リリースビルド（NSIS インストーラ生成）
+- `npm run tauri build` — リリースビルド（NSIS インストーラ生成）。**リリース作業時は `.claude/skills/releasing-ugg` の手順に従うこと**（dev で動いても配布版が壊れる罠の再発防止）
 
 ## Model Routing / Token ROI
 - Fable 5（最大推論）= オーケストレーター、設計・判断・監査・レビュー・最終品質確認
