@@ -208,6 +208,7 @@ async fn synthesize_irodori(
 }
 
 /// voicevox の OpenJtalk を使った漢字→ひらがな変換を試みる。
+/// Irodori-TTS V3 の絵文字アノテーション (感情・スタイル制御) は位置を保って残す。
 /// voicevox 未 init / 失敗時は元テキストをそのまま使うフォールバック (呼び出し側で吸収)。
 fn preprocess_for_irodori(state: &Arc<AppState>, text: &str) -> Result<String, String> {
     ensure_engine(state).map_err(|e| format!("preprocess 用 voicevox 未 init: {e}"))?;
@@ -215,7 +216,7 @@ fn preprocess_for_irodori(state: &Arc<AppState>, text: &str) -> Result<String, S
     let engine = guard
         .as_ref()
         .ok_or_else(|| "voicevox engine が初期化されていません".to_string())?;
-    preprocess::to_hiragana(engine, text).map_err(|e| format!("preprocess: {e}"))
+    preprocess::to_hiragana_preserving_emoji(engine, text).map_err(|e| format!("preprocess: {e}"))
 }
 
 /// 資産 DL。`agreed=true` 必須 (UI で利用規約に同意確認済み)。

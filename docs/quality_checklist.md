@@ -49,6 +49,13 @@
 - [x] 漢字混じり文章で発話 → preprocess (voicevox OpenJtalk) で漢字→かな変換が効き、自然な読み上げ
 - [x] ※ G5-2 実機検証時に 2 件のバグ発見・修正済 (commit c3dffe0): (1) `_audio_to_wav_bytes` が torch.Tensor `(channels, samples)` を soundfile に渡せなかった、(2) `dacvae` の transitive 依存 `descript-audiotools` が未 install
 
+### G5+. 絵文字アノテーション (Irodori-TTS V3 感情制御)
+- [ ] 実モデル経路で「😊今日はいい天気だね」を発話 → 楽しげなトーンが乗る (絵文字自体は読み上げられない)
+- [ ] 「うぅ…😭ひどいよ…😭」→ 悲しげ/嗚咽調になる
+- [ ] 同一絵文字の連続 (「🤧🤧ごめん、風邪引いちゃって」) で効果が強調される
+- [ ] 非対応絵文字 (🍕 等) を含めても発話が壊れない (従来通り無視される)
+- [ ] voicevox 経路では絵文字入りテキストでも従来挙動のまま (回帰なし)
+
 ### G6. フォールバック
 - [x] GPU 不可環境で `tts_engine = irodori` を選んでも、UI gate (G1-4 で確認済) + 0ee4c80 の二段 gate (irodori option 自体を disabled、選択中なら自動で voicevox_core に倒す) により事前抑制
 - [x] サイドカー起動失敗時に notify(`irodori_unavailable`) が発火 (G4-1 で確認済)、その後は auto fallback で voicevox 経路 (G4-2 で確認済) + 設定の手動切替でも voicevox に即時復旧可 (2026-06-28 実機 ✅)
