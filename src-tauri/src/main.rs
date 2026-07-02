@@ -18,7 +18,44 @@ use tauri::Manager;
 
 use crate::state::AppState;
 
+/// リリース版 (`windows_subsystem = "windows"`) はコンソールが無く、起動時 panic が
+/// 「タスクバーに一瞬出て消える」だけで原因が全く見えない。panic hook で MessageBox を
+/// 出して、ユーザー / 開発者がエラー本文を読めるようにする (v0.1.0 初回インストール検証で
+/// ghosts/shells リソース欠落による無言クラッシュが発生した教訓)。
+fn install_panic_dialog_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // 先に既定 hook (stderr 出力) を呼んでおく (dev 実行時のログ用)
+        default_hook(info);
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        let location = info
+            .location()
+            .map(|l| format!("\n\n({}:{})", l.file(), l.line()))
+            .unwrap_or_default();
+        let text: Vec<u16> = format!("ugg の起動または実行中にエラーが発生しました:\n\n{msg}{location}\0")
+            .encode_utf16()
+            .collect();
+        let caption: Vec<u16> = "ugg エラー\0".encode_utf16().collect();
+        unsafe {
+            use windows::core::PCWSTR;
+            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+            MessageBoxW(
+                None,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(caption.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }));
+}
+
 fn main() {
+    install_panic_dialog_hook();
     tauri::Builder::default()
         // M5-H: 自動起動 (Windows ではレジストリ HKCU\...\Run に登録される)
         .plugin(tauri_plugin_autostart::init(

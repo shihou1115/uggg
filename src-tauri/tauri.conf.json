@@ -34,7 +34,11 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico", "icons/icon.png"],
-    "resources": ["python/sidecar.py"],
+    "resources": {
+      "python/sidecar.py": "python/sidecar.py",
+      "../ghosts/": "ghosts/",
+      "../shells/": "shells/"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",
