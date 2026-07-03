@@ -47,6 +47,13 @@ function onMove(ev: MouseEvent): void {
     reset();
     return;
   }
+  // パネル (設定・読み上げ・チャットログ・確認・オンボーディング) 表示中は撫でを無効化。
+  // パネル操作でカーソルが背後のキャラ上を往復し、意図しない撫で発話が出るため
+  // (実機テストで発生)。全パネルは .panel + .visible で表示制御されている。
+  if (document.querySelector(".panel.visible")) {
+    reset();
+    return;
+  }
   const now = performance.now();
   if (now - lastSampleAt < SAMPLE_INTERVAL_MS) return;
   lastSampleAt = now;

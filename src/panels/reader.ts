@@ -26,6 +26,9 @@ interface ReadToken {
   cancelled: boolean;
 }
 
+/// チャンク間のポーズ (ms)。文章の切れ目で一息つかせる (text-reader-spec.md §2.3)。
+const CHUNK_PAUSE_MS = 500;
+
 let inputs: Inputs | null = null;
 let activeToken: ReadToken | null = null;
 let audioCtx: AudioContext | null = null;
@@ -124,6 +127,11 @@ export async function startReading(path: string): Promise<void> {
         continue;
       }
       await playWav(wav, token, speed, volume);
+      // チャンク間ポーズ: 文章の切れ目で一息つく。ポーズ無しだと改行を跨いだ瞬間に
+      // 次の文が始まって不自然 (実機テストで確認)。最終チャンクの後には入れない。
+      if (i + 1 < chunks.length) {
+        await sleepCancellable(CHUNK_PAUSE_MS, token);
+      }
     }
     if (!token.cancelled) {
       inputs.progress.textContent = `完了 (${chunks.length} チャンク)`;
@@ -209,6 +217,21 @@ function playWav(
         resolve();
       }
     })();
+  });
+}
+
+/// キャンセル可能な sleep。50ms 刻みで token を確認し、停止時は即座に抜ける。
+function sleepCancellable(ms: number, token: ReadToken): Promise<void> {
+  return new Promise((resolve) => {
+    const start = performance.now();
+    const tick = () => {
+      if (token.cancelled || performance.now() - start >= ms) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, 50);
+    };
+    tick();
   });
 }
 
