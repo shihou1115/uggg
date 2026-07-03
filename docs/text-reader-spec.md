@@ -189,3 +189,49 @@ src/panels/reader.ts             -- パネル UI + 逐次再生ループ (先読
 | 失敗チャンク | スキップ + 件数表示 | リトライ 1 回 / 中断 |
 | ユーザー発話との同時発声 | 許容 (自発発話のみ抑制) | 読み上げ中は全 TTS を排他 |
 | エンコーディング | UTF-8 / SJIS のみ | UTF-16 対応 |
+| 複数 .txt の同時 DnD | 先頭 1 件のみ読む | キュー化して連続読み上げ |
+
+---
+
+## 7. 将来対応: 台本形式 (Script 形式) — 本リリースでは対象外
+
+upstream Irodori-TTS が採用する台本形式 (Markdown 内に 3 つの JSON コードブロック:
+`defaults` / `speakers` / `lines`) への対応を将来課題として記録する。プレーン .txt では
+表現できない、対話・朗読劇レベルの演出制御が目的。
+
+### 7.1 形式の概要 (実サンプルより)
+
+```
+```json defaults
+{ "default_pause_seconds": 0.05, "speed": -0.1, ... }
+```
+```json speakers
+{ "A": { "ref_wav": "voices/host_a.wav" }, "B": { "ref_wav": "voices/host_b.wav" } }
+```
+```json lines
+[
+  { "speaker": "host",  "text": "ねえ！…", "speed": 0.1 },
+  { "speaker": "guest", "text": "知ってるわ。…", "pause_after": 0.25, "speed": -0.15 },
+  { "speaker": "host",  "text": "えええ！！", "caption": "驚いて大声で" },
+  ...
+]
+```
+```
+
+### 7.2 ugg に取り込む場合の対応方針
+
+| 要素 | 対応方針 |
+|---|---|
+| **話者指定** (`speaker` / `speakers`) | 台本の話者 ID を ugg の参照音声 (main / sub / 将来の追加スロット) にマッピングする UI または `speakers` ブロック内で ugg 登録名を参照する規約を設ける。行ごとに `synthesize_voice(slot=...)` を切替 |
+| **行ごとの速度** (`speed`, `defaults.speed`) | 現在 `SpeechRequest.speed` は送っているが sidecar 側で無視 (duration_scale=1.0 固定、再生側 playbackRate 一律)。台本対応時は sidecar の `SamplingRequest.duration_scale` に行ごとの speed を反映する配線を追加 (upstream の speed は加算オフセット形式である点に注意) |
+| **行ごとの caption** (`caption`) | 現在 `RealModelBackend.synthesize` は `caption=None` 固定。`SpeechRequest` に `caption: Option<String>` を追加し、`SamplingRequest.caption` + `cfg_scale_caption` へ通す。VoiceDesign モデルではなく合成モデル (500M-v3) 側の caption 条件付けを使う |
+| **行間ポーズ** (`pause_after`, `default_pause_seconds`) | チャンク再生ループのチャンク間 sleep に反映 (フロント側で実装可能、sidecar 変更不要) |
+| **ファイル判別** | 拡張子 `.md` + 3 コードブロック構造のパース、または専用拡張子 (`.script.md` 等)。読み上げパネルの DnD 受理対象を拡張 |
+
+### 7.3 前提となる本リリースの設計互換性
+
+- チャンク再生ループは「テキスト列を順に合成して逐次再生」する構造なので、台本の
+  lines 配列 (行=チャンク、行内は長ければさらに分割) にそのまま拡張できる。
+- `reader_load_text` の戻り値を `Vec<String>` から「チャンク構造体 (text + 演出パラメタ)」の
+  配列に拡張する余地を、フロントの再生ループがチャンクを不透明に扱う形で残しておく。
+- caption / speed の sidecar 配線は §7.2 の通り追加改修が必要 (本リリースでは見送り)。

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import { openReaderPanel } from "../panels/reader";
 import { openSettingsPanel } from "../panels/settings";
 import type { Settings } from "../types";
 
@@ -102,6 +103,10 @@ function buildItems(): Array<MenuItem | { divider: true }> {
     {
       label: "ポモドーロ停止",
       onClick: () => invoke("stop_pomodoro").catch((e) => console.error(e)),
+    },
+    {
+      label: "テキスト読み上げ",
+      onClick: () => openReaderPanel(),
     },
     { divider: true },
     {

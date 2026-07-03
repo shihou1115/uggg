@@ -99,13 +99,14 @@ src-tauri/src/
 │   ├── voicevox.rs          -- voicevox_core 埋め込み（libloading + プリビルド C API）
 │   ├── irodori.rs           -- Irodori サイドカー HTTP クライアント
 │   ├── preprocess.rs        -- 漢字→ひらがな変換（voicevox_core の OpenJtalk を流用）
+│   ├── reader.rs            -- テキスト読み上げ: .txt 読込 + チャンク分割（text-reader-spec.md）
 │   ├── download.rs          -- 公式ダウンローダ起動（既定 voicevox_core 資産）
 │   └── voice_ref.rs         -- ★ Irodori 参照音声管理（生成・保存・削除）
 │
 ├── presence/                -- 存在感系
 │   ├── mod.rs
 │   ├── idle.rs              -- 30 分無操作 → events.idle
-│   ├── quiet.rs             -- 静音モード判定（quiet_mode / フルスクリーン / ポモドーロ集中）
+│   ├── quiet.rs             -- 静音モード判定（quiet_mode / フルスクリーン / ポモドーロ集中 / 読み上げ中）
 │   └── window_pos.rs        -- ウインドウ位置永続化（3秒デバウンス）
 │
 ├── window/                  -- ウインドウ管理

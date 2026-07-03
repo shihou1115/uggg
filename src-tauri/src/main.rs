@@ -137,6 +137,8 @@ fn main() {
             commands::profile::get_profile,
             commands::profile::add_profile,
             commands::profile::delete_profile,
+            commands::reader::reader_load_text,
+            commands::reader::set_reading_active,
             commands::secrets::set_api_key,
             commands::secrets::has_api_key,
             commands::secrets::delete_api_key,

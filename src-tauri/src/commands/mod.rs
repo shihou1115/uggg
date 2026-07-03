@@ -7,6 +7,7 @@ pub mod lifecycle;
 pub mod onboarding;
 pub mod pomodoro;
 pub mod profile;
+pub mod reader;
 pub mod secrets;
 pub mod settings;
 pub mod tools;

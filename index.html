@@ -365,6 +365,37 @@
           <button type="button" id="settings-save" class="primary">保存</button>
         </footer>
       </div>
+      <!-- テキスト読み上げパネル (docs/text-reader-spec.md)。静的配置 (WebView2 透過バグ対策) -->
+      <div id="reader-panel" class="solid panel">
+        <header class="panel-header">
+          <h2>テキスト読み上げ</h2>
+          <button type="button" id="reader-close" class="panel-close" aria-label="閉じる">×</button>
+        </header>
+        <div class="panel-body">
+          <p class="panel-hint">
+            このパネルを開いたまま、.txt ファイルを ugg のウインドウにドラッグ&ドロップすると、
+            メインキャラの声で読み上げます (UTF-8 / Shift_JIS、最大 1MB)。<br />
+            エンジンや速度・音量は設定の「音声」ページに従います。Irodori-TTS (実モデル) では
+            絵文字による演出も有効です。
+          </p>
+          <div class="row">
+            <span>ファイル</span>
+            <span id="reader-file" class="key-state">—</span>
+          </div>
+          <div class="row">
+            <span>進捗</span>
+            <span id="reader-progress" class="key-state">—</span>
+          </div>
+          <p id="reader-current" class="panel-message" hidden></p>
+          <div class="row">
+            <span></span>
+            <div class="key-cell">
+              <button type="button" id="reader-stop" disabled>停止</button>
+            </div>
+          </div>
+          <p id="reader-message" class="panel-message" hidden></p>
+        </div>
+      </div>
       <div id="onboarding-panel" class="solid panel">
         <header class="panel-header">
           <h2>はじめまして</h2>

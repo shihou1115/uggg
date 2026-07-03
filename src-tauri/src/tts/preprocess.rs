@@ -94,9 +94,10 @@ fn match_irodori_emoji(s: &str) -> Option<&'static str> {
         .copied()
 }
 
-/// 分割結果のセグメント (pure ロジックのテスト用に公開構造)。
+/// 分割結果のセグメント。`tts::reader` のチャンク分割 (絵文字を分断しない強制分割) でも
+/// 再利用するため crate 内公開。
 #[derive(Debug, PartialEq)]
-enum Segment {
+pub(crate) enum Segment {
     /// かな化対象の通常テキスト (対応外の絵文字・記号もここに含まれ、解析で自然に落ちる)。
     Text(String),
     /// Irodori 対応絵文字。無変換で合成テキストへ残す。連続使用 (強調) は連続セグメントになる。
@@ -105,7 +106,7 @@ enum Segment {
 
 /// テキストを Irodori 対応絵文字と通常テキストのセグメント列に分割する (pure)。
 /// 分割セグメントを順に連結すると、対応絵文字と通常テキストの範囲では元テキストに一致する。
-fn split_emoji_segments(text: &str) -> Vec<Segment> {
+pub(crate) fn split_emoji_segments(text: &str) -> Vec<Segment> {
     let mut segments: Vec<Segment> = Vec::new();
     let mut buf = String::new();
     let mut rest = text;

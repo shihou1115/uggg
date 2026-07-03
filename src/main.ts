@@ -11,6 +11,7 @@ import { mountPomodoroBadge } from "./panels/pomodoro";
 import { mountConfirm } from "./confirm";
 import { mountDnd } from "./dnd";
 import { mountChatLog } from "./panels/chatlog";
+import { mountReaderPanel } from "./panels/reader";
 import { mountSettingsPanel, registerSavedListener } from "./panels/settings";
 import { mountCredit, refreshCredit } from "./tts/credit";
 import { createSpeaker, setTtsParams } from "./tts/speaker";
@@ -63,6 +64,7 @@ async function boot(): Promise<void> {
   await mountPomodoroBadge();
   mountCredit();
   mountChatLog();
+  mountReaderPanel();
   mountConfirm();
   await mountDnd();
   // TTS スピーカーを ghost-speech に渡す

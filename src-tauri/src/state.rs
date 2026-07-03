@@ -309,6 +309,9 @@ pub struct PresenceState {
     pub idle_fired: AtomicBool,
     /// 最後にウインドウ位置が変わった unix 秒 (3 秒デバウンス保存用)。
     pub pos_dirty_since: AtomicI64,
+    /// テキスト読み上げ中フラグ (docs/text-reader-spec.md K6)。
+    /// true の間は自発発話 (独り言・放置反応) を抑制する。永続化しない一時状態。
+    pub reading: AtomicBool,
 }
 
 impl Default for PresenceState {
@@ -316,6 +319,7 @@ impl Default for PresenceState {
         Self {
             idle_fired: AtomicBool::new(false),
             pos_dirty_since: AtomicI64::new(0),
+            reading: AtomicBool::new(false),
         }
     }
 }

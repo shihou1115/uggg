@@ -12,6 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 import { uggConfirm } from "./confirm";
+import { isReaderOpen, startReading } from "./panels/reader";
 import type { DndResult } from "./types";
 
 type DropHandler = (result: DndResult) => void;
@@ -34,6 +35,17 @@ export function registerDndResultListener(handler: DropHandler | null): void {
 }
 
 async function handleDnd(paths: string[]): Promise<void> {
+  // テキスト読み上げ (docs/text-reader-spec.md K2/K3): .txt は読み上げ経路へ分岐。
+  // パネル表示中のみ受理し、複数あれば先頭 1 件を読む。非表示時は無視 (仕様)。
+  // ghost/shell 導入経路 (zip/フォルダ) には .txt を流さない。
+  const txtPaths = paths.filter((p) => p.toLowerCase().endsWith(".txt"));
+  const rest = paths.filter((p) => !p.toLowerCase().endsWith(".txt"));
+  if (txtPaths.length > 0 && isReaderOpen()) {
+    void startReading(txtPaths[0]);
+  }
+  if (rest.length === 0) return;
+  paths = rest;
+
   let result: DndResult;
   try {
     result = await invoke<DndResult>("dnd_install", { paths, overwrite: false });

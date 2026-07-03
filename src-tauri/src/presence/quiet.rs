@@ -5,6 +5,7 @@
 //!   - quiet_mode 設定 ON
 //!   - ポモドーロ集中中
 //!   - auto_quiet_fullscreen ON かつ前面ウインドウがモニタ全面
+//!   - テキスト読み上げ中 (docs/text-reader-spec.md K6)
 //!
 //! ユーザー操作への応答・起動/終了挨拶・リマインダーはこの判定を無視する (呼び出し側の責務)。
 
@@ -16,6 +17,10 @@ use crate::state::AppState;
 pub fn should_stay_quiet(state: &Arc<AppState>) -> bool {
     // ポモドーロ集中中
     if state.pomodoro.focus.load(Ordering::SeqCst) {
+        return true;
+    }
+    // テキスト読み上げ中 (朗読に独り言が被らないように)
+    if state.presence.reading.load(Ordering::SeqCst) {
         return true;
     }
     let settings = state.settings.lock().expect("settings poisoned");
