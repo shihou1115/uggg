@@ -531,25 +531,47 @@ def main(argv: Optional[list[str]] = None) -> int:
             sys.stderr.write(f"sidecar.py: backend 初期化失敗: {exc}\n")
             return 1
 
-    app = build_app(asset_dir=asset_dir, mock=args.mock, backend=backend)
-
     if args.ready_file is None:
         sys.stderr.write("sidecar.py: --ready-file が必要です (--download-only を除く)\n")
         return 1
-    try:
-        write_ready_file(args.ready_file, port)
-    except OSError as exc:
-        sys.stderr.write(f"sidecar.py: ready file 書き出し失敗: {exc}\n")
-        return 1
+
+    app = build_app(asset_dir=asset_dir, mock=args.mock, backend=backend)
+
+    # ready.json は **uvicorn が実際に listen を開始してから** 書く。
+    # uvicorn.run を呼ぶ前や lifespan startup イベントで書くと、その時点ではまだ socket が
+    # bind+listen されておらず、ugg が ready.json を検出して POST した瞬間に接続できず
+    # reqwest が "error sending request" で失敗するレースになる。実機では実モデル初回発話が
+    # これで irodori 失敗 → voicevox フォールバック → onnxruntime クラッシュに連鎖していた。
+    # uvicorn.Server.started は listen 開始後に True になるので、別スレッドでそれを待って書く。
+    config = uvicorn.Config(
+        app,
+        host=args.host,
+        port=port,
+        log_level=args.log_level,
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+
+    def _write_ready_when_listening() -> None:
+        import time
+
+        for _ in range(600):  # 最大 30 秒
+            if server.started:
+                try:
+                    write_ready_file(args.ready_file, port)
+                except OSError as exc:
+                    sys.stderr.write(f"sidecar.py: ready file 書き出し失敗: {exc}\n")
+                return
+            time.sleep(0.05)
+        sys.stderr.write("sidecar.py: uvicorn の listen 開始待ちでタイムアウト\n")
+
+    import threading
+
+    watcher = threading.Thread(target=_write_ready_when_listening, daemon=True)
+    watcher.start()
 
     try:
-        uvicorn.run(
-            app,
-            host=args.host,
-            port=port,
-            log_level=args.log_level,
-            access_log=False,
-        )
+        server.run()
     except SystemExit:
         raise
     except Exception as exc:  # pragma: no cover
