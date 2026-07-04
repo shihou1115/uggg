@@ -14,10 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::tts::reader::{ReadingChunk, VoiceSlot};
-
-/// 行の後に何も指定が無いときの既定の間 (秒)。
-const DEFAULT_PAUSE_SECONDS: f64 = 0.5;
+use crate::tts::reader::{ReadingChunk, VoiceSlot, DEFAULT_PAUSE_MS};
 
 /// 台本パース・検証のエラー種別 (docs/script-reader-spec.md §2.8)。
 #[derive(Debug, Error, PartialEq)]
@@ -283,7 +280,7 @@ pub(crate) fn parse_script(content: &str) -> Result<Vec<ReadingChunk>, ScriptErr
     let default_pause_ms = defaults
         .default_pause_seconds
         .map(seconds_to_ms)
-        .unwrap_or_else(|| seconds_to_ms(DEFAULT_PAUSE_SECONDS));
+        .unwrap_or(DEFAULT_PAUSE_MS);
 
     // speakers 検証・slot マップ構築
     let mut slot_by_speaker: BTreeMap<String, VoiceSlot> = BTreeMap::new();
