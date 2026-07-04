@@ -21,3 +21,6 @@ Thumbs.db
 
 # ---- 設計検討の作業ファイル（コミットしない） ----
 docs/_scratch/
+
+# Python サイドカーのバイトコードキャッシュ
+src-tauri/python/__pycache__/
