@@ -431,7 +431,7 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `set_settings` | `settings: Settings` | `()` | 値の clamp（display_scale, tts_speed/volume 等）+ 永続化 + 後処理 |
+| `set_settings` | `settings: Settings` | `Settings` | 値の clamp（display_scale, tts_speed/volume 等）+ 永続化 + 後処理。**clamp 後の確定値を返す**（フロントはこれを保存済み値として反映） |
 | `get_settings` | なし | `Settings` | |
 | `set_api_key` | `provider, key: String` | `()` | keyring 保存 |
 | `has_api_key` | `provider: String` | `bool` | |
@@ -498,7 +498,7 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `list_ghosts` | なし | `AssetEntry[]` | |
 | `list_shells` | なし | `AssetEntry[]` | |
-| `dnd_install` | `paths: String[]` | `DndResult` | ★ DnD で受けたパスを ghost/shell に展開（§12） |
+| `dnd_install` | `paths: String[], overwrite: bool` | `DndResult` | ★ DnD で受けたパスを ghost/shell に展開（§12）。`overwrite=false` で競合を検知して `DndResult.conflicts` に振り分け、ユーザー確認後 `overwrite=true` で再実行する |
 
 **注**: `reload_assets` は提供しない。インストール/切替後は再起動の動線を notify でゴーストが案内する（§12）。
 
