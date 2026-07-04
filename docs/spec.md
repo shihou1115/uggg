@@ -386,7 +386,7 @@
 - `get_chat_log(limit)` で新しい順 N 件取得。
 - 設定パネルから開閉。
 
-#### 4.5.8 テキスト読み上げツール（詳細: docs/text-reader-spec.md）
+#### 4.5.8 テキスト読み上げツール（詳細: docs/text-reader-spec.md、台本形式: docs/script-reader-spec.md）
 - コンテキストメニュー「テキスト読み上げ」で専用パネルを開く。パネル**表示中のみ**、
   `.txt` ファイルの DnD を受理してメインキャラの声で読み上げる（複数 DnD は先頭 1 件）。
 - 入力: `.txt` のみ、1MB 上限、UTF-8 (BOM 有無) / Shift_JIS 自動判定。
