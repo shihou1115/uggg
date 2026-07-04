@@ -8,6 +8,7 @@
 | architecture.md | モジュール構成・契約・設計判断 | v1 ✅ |
 | test-plan.md | テスト戦略・手動チェックリスト | v1 ✅ |
 | implementation-plan.md | 実装計画（M0〜M6 マイルストーン） | v1 ✅ |
+| ai_model_routing.md | モデル役割分担・メイン切替運用の正本 | v1 ✅ |
 | _legacy-v003/ | v0.0.3 プロトタイプの全docs（参考資料） | 参照用 |
 
 ## 参考資料（_legacy-v003/）

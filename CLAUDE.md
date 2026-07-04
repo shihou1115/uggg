@@ -48,13 +48,30 @@ v0.0.3 で得た主な負債:
 - `npm run tauri build` — リリースビルド（NSIS インストーラ生成）。**リリース作業時は `.claude/skills/releasing-ugg` の手順に従うこと**（dev で動いても配布版が壊れる罠の再発防止）
 
 ## Model Routing / Token ROI
-- Fable 5（最大推論）= オーケストレーター、設計・判断・監査・レビュー・最終品質確認
-- Opus = 深い推論サブエージェント
-- Sonnet = 機械的な作業サブエージェント
-- 調査、整理、既存コード読解、単純実装、テスト追加、差分確認、軽微な修正は Opus/Sonnet をサブエージェントとして切り出す
-- 実装難易度が高い箇所、設計判断を誤ると手戻りが大きい箇所、UX・アーキテクチャに影響する箇所は Fable5 が直接扱ってよい。
-- サブエージェントには必要最小限のコンテキストだけを渡す
-- 詳細: [docs/_legacy-v003/ai_model_routing.md](docs/_legacy-v003/ai_model_routing.md)
+
+4 モデル体制。役割分担表の正本: [docs/ai_model_routing.md](docs/ai_model_routing.md)
+
+- **Fable 5** = 「型がない × 失敗コストが大きい × 全体を見る」判断だけ（仕様改訂・アーキ/契約変更・難所実装・リリース最終判定）
+- **Opus 4.8** = メインセッションの常用モデル。日常のオーケストレーション・レビュー・執筆・バグ原因推論
+- **Sonnet 5** = 型が決まった量産・実行（確定仕様の実装・テスト追加・コード調査・リリース作業の実行）
+- **Haiku 4.5** = 機械的な変換・検査（cargo check/tsc の実行と転記・突合検査・差分要約）
+
+### 自動振り分け（定義ファイルで固定済み）
+- サブエージェント: `.claude/agents/`（opus: reviewer / doc-writer / dict-writer、sonnet: implementer / test-writer / code-scout、haiku: build-checker / mechanic）
+- Workflow: `.claude/workflows/release-audit.js`（リリース前監査。stage ごとに model/effort 指定済み）
+- スキルにはモデルを書かない。スキルは上記エージェント・Workflow を呼ぶ
+
+### メインセッションのモデル切替（/model はユーザーが操作。アシスタントは提案まで）
+- 既定は Opus 4.8。Fable 5 の担当作業（上記 Fable 欄）が発生したら「Fable に切替推奨」と明示提案する
+- Fable 欄の作業が終わり量産・検証フェーズに入ったら「Opus に戻して OK」と明示提案する
+- 1 ターンで済む軽い設計相談は切替提案しない
+- **Fable 5 不可時**: Opus がメインとして Fable 欄も担当し、その結論を別 Opus サブエージェント（reviewer）に反証レビューさせる。Sonnet/Haiku の割当は変えない
+
+### 運用原則
+- Fable 起動前に、準備（収集・整形・検査）を下位モデルで済ませ、判断材料が揃った状態で Fable に渡す
+- サブエージェントには「対象ファイル・契約・完了条件」だけ渡す。報告は **変更内容 / 判断理由 / 懸念点 / 上位で判断すべきこと** に圧縮させる
+- 単発・未確定の業務は定義ファイル化せず、繰り返すと分かった時点で `.claude/agents/` に固定する
+- 節約するのは中間作業のみ。最終的な設計整合性・UX・品質の確認は上位モデルで行う
 
 ## ドキュメント索引
 
