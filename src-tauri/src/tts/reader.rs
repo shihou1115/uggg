@@ -58,6 +58,18 @@ pub fn decode_text_file(path: &Path) -> Result<String> {
     if ext.as_deref() != Some("txt") {
         bail!("対応していないファイル形式です (.txt のみ読み上げできます)");
     }
+    read_checked(path)
+}
+
+/// .md (台本) を読み込んで文字列にする。拡張子検証は呼び出し側 (dnd 受理規約) に委ね、
+/// ここではサイズ上限・エンコーディング判定のみ `decode_text_file` と共有する
+/// (docs/script-reader-spec.md §2.9)。
+pub fn decode_script_file(path: &Path) -> Result<String> {
+    read_checked(path)
+}
+
+/// サイズ上限チェック + バイト列読込 + デコード (.txt / .md 共通、拡張子非依存)。
+fn read_checked(path: &Path) -> Result<String> {
     let meta = std::fs::metadata(path)
         .map_err(|e| anyhow!("ファイルを開けません: {e}"))?;
     if meta.len() > MAX_FILE_BYTES {

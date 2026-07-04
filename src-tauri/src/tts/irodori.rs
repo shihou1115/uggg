@@ -272,6 +272,7 @@ impl IrodoriClient {
         text: &str,
         voice_ref_path: &Path,
         speed: f64,
+        caption: Option<String>,
         mock: bool,
         app: Option<AppHandle>,
     ) -> Result<Vec<u8>, TtsError> {
@@ -284,6 +285,7 @@ impl IrodoriClient {
             voice: voice_ref_path.to_string_lossy().into_owned(),
             response_format: "wav".to_string(),
             speed,
+            caption,
         };
         let resp = self
             .client
@@ -353,6 +355,10 @@ struct SpeechRequest {
     voice: String,
     response_format: String,
     speed: f64,
+    /// 台本の caption (docs/script-reader-spec.md §3.2)。None 時は JSON にキー自体を出さない
+    /// (旧 sidecar 互換)。`ReadingChunk.caption` (常に `null` を出力) とは対照的な規約。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caption: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -501,10 +507,42 @@ mod tests {
             voice: "C:/refs/main_1.wav".into(),
             response_format: "wav".into(),
             speed: 1.2,
+            caption: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"response_format\":\"wav\""));
         assert!(json.contains("\"voice\":\"C:/refs/main_1.wav\""));
         assert!(json.contains("\"speed\":1.2"));
+    }
+
+    // test23 (docs/script-reader-spec.md §5.1): SpeechRequest の caption 直列化。
+    // Some → フィールドあり、None → フィールドなし (skip_serializing_if の確認)。
+    // 旧 sidecar 互換の根拠 (caption キー自体を送らなければ pydantic 既定値 None で通る)。
+    #[test]
+    fn test23_speech_request_caption_some_includes_field() {
+        let req = SpeechRequest {
+            model: "irodori-voice-clone".into(),
+            input: "えええ！！".into(),
+            voice: "C:/refs/main_1.wav".into(),
+            response_format: "wav".into(),
+            speed: 1.0,
+            caption: Some("驚いて大声で".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"caption\":\"驚いて大声で\""), "unexpected: {json}");
+    }
+
+    #[test]
+    fn test23_speech_request_caption_none_omits_field() {
+        let req = SpeechRequest {
+            model: "irodori-voice-clone".into(),
+            input: "こんにちは".into(),
+            voice: "C:/refs/main_1.wav".into(),
+            response_format: "wav".into(),
+            speed: 1.0,
+            caption: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("caption"), "unexpected: {json}");
     }
 }

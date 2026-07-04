@@ -9,15 +9,32 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::state::AppState;
-use crate::tts::reader;
+use crate::tts::reader::{self, ReadingChunk};
+use crate::tts::script;
 
-/// .txt を読み込み、読み上げチャンク列にして返す。
-/// 拡張子 (.txt) / サイズ (1MB) / エンコーディング (UTF-8 / Shift_JIS) を検証する。
+/// .txt / .md (台本) を読み込み、読み上げチャンク列にして返す (docs/script-reader-spec.md §2.9)。
+/// - `.txt`: 従来どおりプレーン読み (拡張子 / サイズ 1MB / エンコーディング検証は `decode_text_file`)
+/// - `.md`: 台本形式としてパース (`script::parse_script`) し、120 字超の行は追加分割する
+/// - その他拡張子: エラー
 #[tauri::command]
-pub fn reader_load_text(path: String) -> Result<Vec<String>, String> {
+pub fn reader_load_text(path: String) -> Result<Vec<ReadingChunk>, String> {
     let p = std::path::PathBuf::from(&path);
-    let text = reader::decode_text_file(&p).map_err(|e| format!("{e:#}"))?;
-    let chunks = reader::split_reading_chunks(&text);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let chunks = match ext.as_deref() {
+        Some("txt") => {
+            let text = reader::decode_text_file(&p).map_err(|e| format!("{e:#}"))?;
+            reader::plain_text_chunks(&text)
+        }
+        Some("md") => {
+            let text = reader::decode_script_file(&p).map_err(|e| format!("{e:#}"))?;
+            let parsed = script::parse_script(&text).map_err(|e| e.to_string())?;
+            reader::split_long_chunks(parsed)
+        }
+        _ => return Err("対応していないファイル形式です (.txt / .md のみ読み上げできます)".to_string()),
+    };
     if chunks.is_empty() {
         return Err("読み上げるテキストがありません".to_string());
     }

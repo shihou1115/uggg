@@ -70,6 +70,7 @@ pub fn list_voices(state: State<'_, Arc<AppState>>) -> Result<Vec<VoiceOption>, 
 pub async fn synthesize_voice(
     text: String,
     slot: String,
+    caption: Option<String>,
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
 ) -> Result<String, String> {
@@ -80,6 +81,8 @@ pub async fn synthesize_voice(
     if !matches!(slot.as_str(), "main" | "sub") {
         return Err(format!("未知の slot: {slot}"));
     }
+    // 空文字列は None と同義に正規化する (docs/script-reader-spec.md §2.9)。
+    let caption = caption.filter(|c| !c.is_empty());
     let state_arc = state.inner().clone();
 
     let wav = match settings.tts_engine.as_str() {
@@ -88,7 +91,8 @@ pub async fn synthesize_voice(
         }
         "irodori" => {
             let irodori_result =
-                synthesize_irodori(state_arc.clone(), &slot, &text, Some(app.clone())).await;
+                synthesize_irodori(state_arc.clone(), &slot, &text, caption.clone(), Some(app.clone()))
+                    .await;
             match irodori_result {
                 Ok(wav) => wav,
                 Err(err) => match decide_fallback(&err) {
@@ -167,6 +171,7 @@ async fn synthesize_irodori(
     state: Arc<AppState>,
     slot: &str,
     text: &str,
+    caption: Option<String>,
     app: Option<AppHandle>,
 ) -> Result<Vec<u8>, crate::tts::irodori::TtsError> {
     use crate::tts::irodori::TtsError;
@@ -201,6 +206,7 @@ async fn synthesize_irodori(
             &preprocessed,
             std::path::Path::new(&voice_ref_row.file_path),
             speed,
+            caption,
             !use_real,
             app,
         )
@@ -542,7 +548,7 @@ pub async fn voice_ref_preview(
         return Err("プレビュー文字列が空です".to_string());
     }
     let state_arc = state.inner().clone();
-    let wav = synthesize_irodori(state_arc, &slot, &text, Some(app))
+    let wav = synthesize_irodori(state_arc, &slot, &text, None, Some(app))
         .await
         .map_err(|e| format!("{e}"))?;
     Ok(base64::engine::general_purpose::STANDARD.encode(wav))

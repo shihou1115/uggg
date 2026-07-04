@@ -78,6 +78,7 @@ class SpeechRequest(BaseModel):
     voice: str = Field(..., description="参照音声 ID または絶対パス")
     response_format: str = Field("wav", description="現状 wav のみサポート")
     speed: float = Field(1.0, ge=0.25, le=4.0)
+    caption: Optional[str] = Field(None, description="台本の声質・演技指示 (実モデルのみ有効)")
 
 
 class VoiceRefGenerateRequest(BaseModel):
@@ -300,7 +301,13 @@ class RealModelBackend:
             lora_adapter=None,
         )
 
-    def synthesize(self, text: str, voice_ref_path: Path, speed: float) -> bytes:
+    def synthesize(
+        self,
+        text: str,
+        voice_ref_path: Path,
+        speed: float,
+        caption: Optional[str] = None,
+    ) -> bytes:
         # speed 引数は OpenAI 互換 / API 拡張性のためにシグネチャに残してあるが、
         # 速度補正は Web Audio 側 (playbackRate) で一律に行う設計に揃えるため、
         # 合成側 duration_scale は 1.0 固定。voicevox 経路 (voicevox_core も speed は未渡し、
@@ -309,7 +316,7 @@ class RealModelBackend:
         runtime = self._load_synth()
         request = self._make_request(
             text=text,
-            caption=None,
+            caption=caption,
             ref_wav=str(voice_ref_path),
             no_ref=False,
             duration_scale=1.0,
@@ -409,6 +416,7 @@ def build_app(asset_dir: Path, mock: bool, backend: Optional[RealModelBackend]) 
                     text=req.input,
                     voice_ref_path=Path(req.voice),
                     speed=req.speed,
+                    caption=req.caption,
                 )
             except NotImplementedError as exc:
                 raise HTTPException(501, str(exc))
