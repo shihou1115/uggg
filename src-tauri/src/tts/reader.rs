@@ -45,6 +45,10 @@ pub const MAX_CHUNK_CHARS: usize = 120;
 /// 読み込みを許可する最大ファイルサイズ。テキスト 1MB ≒ 全角 50 万字 (朗読 10 時間超)。
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
+/// チャンク間の既定の間 (docs/script-reader-spec.md §2.6)。.txt は全チャンク一律この値。
+/// 台本 (.md) は `line.pause_after` / `defaults.default_pause_seconds` 未指定時にこの値へ解決する。
+pub const DEFAULT_PAUSE_MS: u32 = 500;
+
 /// .txt を読み込んで文字列にする。拡張子・サイズ・エンコーディングを検証する。
 pub fn decode_text_file(path: &Path) -> Result<String> {
     let ext = path
@@ -217,6 +221,47 @@ pub fn split_reading_chunks(text: &str) -> Vec<String> {
     split_reading_chunks_with_max(text, MAX_CHUNK_CHARS)
 }
 
+/// .txt を既定メタ付きの `ReadingChunk` 列に変換する (docs/script-reader-spec.md §2.6)。
+/// 全チャンク一律 slot=Main, speed_offset=0.0, caption=None, pause_after_ms=`DEFAULT_PAUSE_MS`。
+pub fn plain_text_chunks(text: &str) -> Vec<ReadingChunk> {
+    split_reading_chunks(text)
+        .into_iter()
+        .map(|text| ReadingChunk {
+            text,
+            slot: VoiceSlot::Main,
+            speed_offset: 0.0,
+            caption: None,
+            pause_after_ms: DEFAULT_PAUSE_MS,
+        })
+        .collect()
+}
+
+/// 120 字超の `ReadingChunk` を既存の文分割ロジックでさらに分割する
+/// (docs/script-reader-spec.md T5)。slot / speed_offset / caption は全断片に複製し、
+/// `pause_after_ms` は最終断片のみ元の値、中間断片は 0 にする
+/// (一文の途中に不自然な間を作らないため)。120 字以下のチャンクはそのまま返す。
+pub fn split_long_chunks(chunks: Vec<ReadingChunk>) -> Vec<ReadingChunk> {
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.text.chars().count() <= MAX_CHUNK_CHARS {
+            out.push(chunk);
+            continue;
+        }
+        let pieces = split_reading_chunks(&chunk.text);
+        let last = pieces.len().saturating_sub(1);
+        for (i, piece) in pieces.into_iter().enumerate() {
+            out.push(ReadingChunk {
+                text: piece,
+                slot: chunk.slot,
+                speed_offset: chunk.speed_offset,
+                caption: chunk.caption.clone(),
+                pause_after_ms: if i == last { chunk.pause_after_ms } else { 0 },
+            });
+        }
+    }
+    out
+}
+
 fn split_reading_chunks_with_max(text: &str, max: usize) -> Vec<String> {
     let toks = tokenize(text);
     let sentences = split_sentences(&toks);
@@ -379,5 +424,88 @@ mod tests {
         let err = decode_text_file(&p).unwrap_err().to_string();
         assert!(err.contains(".txt"), "unexpected: {err}");
         let _ = std::fs::remove_file(&p);
+    }
+
+    // === plain_text_chunks / split_long_chunks (docs/script-reader-spec.md §5.1 test20-22) ===
+
+    #[test]
+    fn test20_plain_text_chunks_have_default_meta() {
+        let got = plain_text_chunks("おはよう。こんにちは。\n次の行。");
+        assert!(!got.is_empty());
+        for chunk in &got {
+            assert_eq!(chunk.slot, VoiceSlot::Main);
+            assert_eq!(chunk.speed_offset, 0.0);
+            assert_eq!(chunk.caption, None);
+            assert_eq!(chunk.pause_after_ms, DEFAULT_PAUSE_MS);
+        }
+    }
+
+    #[test]
+    fn test21_split_long_chunks_duplicates_meta_and_zeroes_middle_pause() {
+        // 120 字超 (句点区切りの文を連ねて長行を作る)。
+        let long_text = "あ。".repeat(70); // 140 トークン
+        let original = ReadingChunk {
+            text: long_text.clone(),
+            slot: VoiceSlot::Sub,
+            speed_offset: 0.2,
+            caption: Some("驚いて大声で".to_string()),
+            pause_after_ms: 600,
+        };
+        let got = split_long_chunks(vec![original]);
+        assert!(got.len() > 1, "long chunk should be split into fragments");
+        let last = got.len() - 1;
+        for (i, frag) in got.iter().enumerate() {
+            assert_eq!(frag.slot, VoiceSlot::Sub);
+            assert_eq!(frag.speed_offset, 0.2);
+            assert_eq!(frag.caption.as_deref(), Some("驚いて大声で"));
+            if i == last {
+                assert_eq!(frag.pause_after_ms, 600, "final fragment keeps original pause");
+            } else {
+                assert_eq!(frag.pause_after_ms, 0, "middle fragment pause must be 0");
+            }
+        }
+        // 再結合すれば元のテキストに戻る (欠落・重複が無いこと)
+        let rejoined: String = got.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(rejoined, long_text);
+    }
+
+    #[test]
+    fn test21b_short_chunk_passes_through_unchanged() {
+        let original = ReadingChunk {
+            text: "短い行。".to_string(),
+            slot: VoiceSlot::Sub,
+            speed_offset: 0.2,
+            caption: Some("caption".to_string()),
+            pause_after_ms: 600,
+        };
+        let got = split_long_chunks(vec![original.clone()]);
+        assert_eq!(got, vec![original]);
+    }
+
+    #[test]
+    fn test22_split_long_chunks_never_breaks_emoji_cluster() {
+        // 絵文字クラスタ (ZWJ) を含む長行が分断されないこと。
+        let mut long_text = "あ".repeat(130);
+        long_text.push_str("😮\u{200D}💨");
+        long_text.push_str(&"い".repeat(10));
+        let original = ReadingChunk {
+            text: long_text,
+            slot: VoiceSlot::Main,
+            speed_offset: 0.0,
+            caption: None,
+            pause_after_ms: 500,
+        };
+        let got = split_long_chunks(vec![original]);
+        assert!(got.len() > 1);
+        let joined: Vec<&str> = got.iter().map(|c| c.text.as_str()).collect();
+        // ZWJ 絵文字はどこかのチャンクに丸ごと含まれ、分断された断片は現れない
+        let holder_count = joined.iter().filter(|c| c.contains("😮\u{200D}💨")).count();
+        assert_eq!(holder_count, 1, "emoji cluster must stay intact in exactly one fragment");
+        for c in &joined {
+            assert!(
+                !c.contains('\u{200D}') || c.contains("😮\u{200D}💨"),
+                "broken ZWJ fragment found: {c:?}"
+            );
+        }
     }
 }
