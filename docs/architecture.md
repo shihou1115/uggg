@@ -479,6 +479,8 @@ pub struct GhostBundle {
 | `voice_ref_list` | なし | `VoiceRef[]` | ★ |
 | `voice_ref_delete` | `slot: String` | `()` | ★ |
 | `voice_ref_preview` | `slot: String, text: String` | `String` | ★ 既存参照音声でプレビュー（WAV base64） |
+| `reader_load_text` | `path: String` | `Vec<String>` | テキスト読み上げ: .txt を読みチャンク分割して返す（spec §4.5.8） |
+| `set_reading_active` | `active: bool` | `()` | テキスト読み上げ: 読み上げ中フラグ（撫で抑制等に使用） |
 
 ### 4.8 assets
 

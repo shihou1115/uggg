@@ -1,6 +1,6 @@
 [package]
 name = "ugg"
-version = "0.1.0"
+version = "0.1.1"
 description = "ugg — desktop companion"
 authors = ["ugg"]
 edition = "2021"
