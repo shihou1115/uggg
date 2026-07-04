@@ -67,18 +67,22 @@ src-tauri/src/
 │
 ├── commands/                -- 各 Tauri コマンドの実装
 │   ├── mod.rs
-│   ├── boot.rs              -- get_boot_payload, frontend_ready
-│   ├── settings.rs          -- set_settings, get_settings, set_safe_mode (※削除予定)
-│   ├── dialogue.rs          -- send_user_message, send_with_clipboard, read_clipboard
+│   ├── boot.rs              -- get_boot_payload
+│   ├── lifecycle.rs         -- frontend_ready, quit_app, hide_window, set_autostart
+│   ├── settings.rs          -- set_settings, get_settings
+│   ├── secrets.rs           -- set_api_key, has_api_key, delete_api_key
+│   ├── dialogue.rs          -- send_user_message
 │   ├── interaction.rs       -- poke, nade
 │   ├── profile.rs           -- get_profile, add_profile, delete_profile
-│   ├── log.rs               -- get_chat_log, clear_history
-│   ├── tts.rs               -- synthesize_voice, list_voices, voicevox_assets_ready, download_voicevox_assets, voice_ref 系
-│   ├── assets.rs            -- list_ghosts, list_shells, reload_assets, dnd_install (新)
+│   ├── tts.rs               -- synthesize_voice, list_voices, voicevox_assets_ready, download_voicevox_assets, irodori 系, voice_ref 系
+│   ├── reader.rs            -- reader_load_text, set_reading_active
+│   ├── assets.rs            -- list_ghosts, list_shells, dnd_install
 │   ├── pomodoro.rs          -- start_pomodoro, stop_pomodoro, get_pomodoro_status
-│   ├── tools.rs             -- tools_enabled に応じて発火する関数群
-│   ├── data.rs              -- export_data, open_log_dir
-│   └── topics.rs            -- get_interests, set_interests, fetch_topics_now, complete_onboarding, skip_onboarding
+│   ├── tools.rs             -- list_reminders, add_reminder, delete_reminder, read_clipboard_text
+│   ├── data.rs              -- get_chat_log, clear_history, export_data, check_update_now
+│   ├── topics.rs            -- get_interests, set_interests, fetch_topics_now
+│   ├── onboarding.rs        -- complete_onboarding, skip_onboarding
+│   └── window.rs            -- update_alpha_mask
 │
 ├── dialogue/                -- 対話エンジン
 │   ├── mod.rs               -- persist_and_speak, モード判定
@@ -99,7 +103,8 @@ src-tauri/src/
 │   ├── voicevox.rs          -- voicevox_core 埋め込み（libloading + プリビルド C API）
 │   ├── irodori.rs           -- Irodori サイドカー HTTP クライアント
 │   ├── preprocess.rs        -- 漢字→ひらがな変換（voicevox_core の OpenJtalk を流用）
-│   ├── reader.rs            -- テキスト読み上げ: .txt 読込 + チャンク分割（text-reader-spec.md）
+│   ├── reader.rs            -- テキスト読み上げ: .txt 読込 + チャンク分割 + .md 台本対応（text-reader-spec.md / script-reader-spec.md）
+│   ├── script.rs            -- ★ .md 台本形式パース + 検証（フェンス抽出・ScriptError。script-reader-spec.md）
 │   ├── download.rs          -- 公式ダウンローダ起動（既定 voicevox_core 資産）
 │   └── voice_ref.rs         -- ★ Irodori 参照音声管理（生成・保存・削除）
 │
@@ -418,6 +423,9 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `get_boot_payload` | なし | `BootPayload` | キャラ画像（data URL）、settings、recent_log 等 |
 | `frontend_ready` | なし | `()` | boot 完了通知。起動挨拶（first_boot or boot）+ 更新チェック起動 |
+| `quit_app` | なし | `()` | コンテキストメニュー「終了」。Irodori サイドカーを best-effort shutdown 後に exit |
+| `hide_window` | なし | `()` | メインウインドウを hide（トレイから再表示） |
+| `set_autostart` | `enabled: bool` | `()` | OS 自動起動の切替（tauri-plugin-autostart） |
 
 ### 4.2 settings
 
@@ -434,8 +442,8 @@ pub struct GhostBundle {
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
 | `send_user_message` | `text: String` | `DialogueResponse` | モード判定・降格制御 |
-| `send_with_clipboard` | `text: String` | `DialogueResponse` | クリップボード本文を「# クリップボード」として注入（tools_enabled かつ advanced のみ） |
-| `read_clipboard` | なし | `String` | プレビュー用、2000字切り詰め |
+
+**注**: 旧設計の `send_with_clipboard` / `read_clipboard` は不採用。クリップボード連携は `read_clipboard_text`（§4.9）でフロントが本文を取得して入力欄に貼り付け、通常の `send_user_message` で送信する方式に統合した。
 
 ### 4.4 interaction
 
@@ -457,15 +465,17 @@ pub struct GhostBundle {
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
 | `get_chat_log` | `limit: u32` | `LogEntry[]` | 新しい順 |
-| `clear_history` | `include_profile: bool` | `()` | |
+| `clear_history` | `include_profile: bool` | `ClearResult` | |
 | `export_data` | `include_profile: bool` | `String` | 保存パス返却 |
-| `open_log_dir` | なし | `()` | |
+| `check_update_now` | なし | `()` | 設定パネル「いますぐチェック」。`update_feed_url` 未設定なら Err、結果は notify 経由で発話 |
+
+**注**: 旧設計の `open_log_dir` は不採用（ログ閲覧はアプリ内チャットログパネル + `export_data` で代替）。
 
 ### 4.7 tts
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `synthesize_voice` | `text: String, slot: "main"\|"sub"` | `String` | WAV を base64 で返す（slot 基準、エンジン振り分けはバックエンド） |
+| `synthesize_voice` | `text: String, slot: "main"\|"sub", caption: String\|null（省略可）` | `String` | WAV を base64 で返す（slot 基準、エンジン振り分けはバックエンド）。★ `caption` は Irodori 実モデルのみ使用（他経路は無視、空文字は None 正規化。script-reader-spec.md §3.3） |
 | `list_voices` | なし | `VoiceOption[]` | 現在エンジンの声一覧 |
 | `voicevox_assets_ready` | なし | `bool` | 資産有無 |
 | `download_voicevox_assets` | `agreed: bool, gh_token: String\|null` | `()` | 規約同意必須、進捗は `voicevox-download` イベント |
@@ -475,11 +485,11 @@ pub struct GhostBundle {
 | `irodori_check_gpu` | なし | `GpuInfo` | ★ 起動時 GPU 検出（Q3 対応） |
 | `irodori_assets_ready` | なし | `bool` | ★ |
 | `download_irodori_assets` | `agreed: bool` | `()` | ★ 進捗 `irodori-download` |
-| `voice_ref_generate` | `slot: String, caption: String` | `()` | ★ Irodori 参照音声生成 |
+| `voice_ref_generate` | `slot: String, caption: String` | `VoiceRef[]` | ★ Irodori 参照音声生成（同期完了、進捗イベントなし）。完了後の一覧を返す |
 | `voice_ref_list` | なし | `VoiceRef[]` | ★ |
-| `voice_ref_delete` | `slot: String` | `()` | ★ |
+| `voice_ref_delete` | `slot: String` | `VoiceRef[]` | ★ 削除後の一覧を返す |
 | `voice_ref_preview` | `slot: String, text: String` | `String` | ★ 既存参照音声でプレビュー（WAV base64） |
-| `reader_load_text` | `path: String` | `Vec<String>` | テキスト読み上げ: .txt を読みチャンク分割して返す（spec §4.5.8） |
+| `reader_load_text` | `path: String` | `ReadingChunk[]` | ★ テキスト読み上げ: 拡張子で分岐（.txt=プレーン読み / .md=台本形式。script-reader-spec.md）。演出メタ付きチャンク配列を返す（spec §4.5.8） |
 | `set_reading_active` | `active: bool` | `()` | テキスト読み上げ: 読み上げ中フラグ（撫で抑制等に使用） |
 
 ### 4.8 assets
@@ -488,8 +498,9 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `list_ghosts` | なし | `AssetEntry[]` | |
 | `list_shells` | なし | `AssetEntry[]` | |
-| `reload_assets` | なし | `()` | 設定で切替時 |
 | `dnd_install` | `paths: String[]` | `DndResult` | ★ DnD で受けたパスを ghost/shell に展開（§12） |
+
+**注**: `reload_assets` は提供しない。インストール/切替後は再起動の動線を notify でゴーストが案内する（§12）。
 
 ### 4.9 pomodoro / tools / topics
 
@@ -498,6 +509,10 @@ pub struct GhostBundle {
 | `start_pomodoro` | なし | `()` | settings の work/break/rounds を使用 |
 | `stop_pomodoro` | なし | `()` | |
 | `get_pomodoro_status` | なし | `PomodoroStatus` | |
+| `list_reminders` | なし | `ReminderEntry[]` | |
+| `add_reminder` | `text: String, offset_secs: i64` | `ReminderEntry[]` | 現在時刻からの相対秒。追加後の一覧を返す |
+| `delete_reminder` | `id: i64` | `ReminderEntry[]` | 削除後の一覧を返す |
+| `read_clipboard_text` | なし | `String` | クリップボードのテキスト取得（入力欄への貼り付け用）。非テキストは空文字、`tools_enabled = false` なら Err |
 | `get_interests` | なし | `InterestTopic[]` | |
 | `set_interests` | `topics: String[]` | `InterestTopic[]` | |
 | `fetch_topics_now` | なし | `()` | |
@@ -517,16 +532,16 @@ pub struct GhostBundle {
 | イベント | payload | 用途 |
 |---|---|---|
 | `dialogue` | `DialogueResponse` | バック起点の発話（ランダムトーク・notify 経由の system 発話） |
-| `mode-changed` | `{mode, reason}` | UI 表示用 |
-| `thinking` | `{active: bool}` | 「思考中」表示 |
 | `settings-changed` | `Settings` | バック起点の設定変更（トレイ等から） |
 | `open-settings` | なし | トレイ → 設定パネル |
 | `pomodoro` | `PomodoroStatus` | 毎秒・節目 |
 | `voicevox-download` | `string` | 資産DL 進捗行 |
 | `irodori-download` | `string` | ★ Irodori DL 進捗行 |
-| `voice-ref-progress` | `string` | ★ 参照音声生成進捗 |
+| `system-toast` | `string` | notify() の fallback。辞書に該当 system_message が無い場合のみ emit（best-effort、フロント側 listener は現状なし） |
 
-**注**: U3 採用により「system-notice」のような専用イベントは作らず、`notify()` 内部で `dialogue` 経由に統合する（§11）。
+**注**:
+- U3 採用により system 発話は `notify()` 内部で `dialogue` 経由に統合する（§11）。`system-toast` は辞書未定義時の fallback のみ。
+- 旧設計の `mode-changed` / `thinking` / `voice-ref-progress` イベントは不採用。モードは `DialogueResponse.mode` で各応答に同梱、思考中表示は送信中の入力欄 disable で代替、参照音声生成は `voice_ref_generate` の同期完了で通知する。
 
 ---
 
@@ -694,7 +709,7 @@ when:                                        # ⑥ 確率
 ### 7.1 全体フロー
 
 ```
-   synthesize_voice(text, slot)
+   synthesize_voice(text, slot, caption?)   ★ caption は Irodori 実モデルのみ使用
             │
             ▼
    ┌────────────────────┐
@@ -1000,7 +1015,6 @@ pub async fn irodori_check_gpu() -> GpuInfo {
     <div id="chat-input-wrap" class="solid"></div>
     <div id="tts-credit" class="solid"></div>
     <div id="pomodoro-badge" class="solid"></div>
-    <div id="thinking"></div>
   </div>
 </div>
 ```

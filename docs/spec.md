@@ -396,8 +396,13 @@
   再生は先読み 1 のパイプライン、失敗チャンクはスキップして件数表示。
 - 読み上げ中は自発発話を抑制（`set_reading_active` コマンド → 静音判定に追加）。
   リマインダーの静音特例は従来通り。停止ボタン / パネルクローズで即停止。
-- 追加コマンド: `reader_load_text(path) -> Vec<String>` / `set_reading_active(active)`。
-- 将来課題: 台本形式（話者指定・行ごとの速度・caption 演出。docs/text-reader-spec.md §7）。
+- 追加コマンド: `reader_load_text(path) -> Vec<ReadingChunk>` / `set_reading_active(active)`。
+  `synthesize_voice` に `caption: Option<String>` を追加（Irodori 実モデル経路のみ使用）。
+- **台本形式対応**: `.md` 台本（`speakers` / `lines` ブロック必須 + `defaults` 任意）も
+  受理する。話者 ID を ugg の slot（main / sub）へマッピングし、行ごとに話者を切り替える。
+  行ごとの `speed`（再生側 playbackRate に合成）、`caption`（声質・演技指示。Irodori 実モデル
+  時のみ有効、無効環境ではパネルに注記を表示して読み上げ）、`pause_after`（行間の間）を制御。
+  不正な台本はロード時に全行検証して fail-fast（部分再生しない）。詳細は docs/script-reader-spec.md 参照。
 
 ---
 
@@ -423,7 +428,7 @@
 | STT（音声入力） | マスコットとの音声会話。マイク許可UX含む再設計が必要。 |
 | 自動更新 | tauri-plugin-updater 採用検討。コード署名証明書取得が前提。 |
 | マルチ言語 | 現状日本語のみ。UI とゴースト辞書の i18n 化。 |
-| 多話者キャプション（高度） | Irodori-TTS の話者切替・カスタム声デザインの設定UI拡充。 |
+| 多話者キャプション（高度） | 基本形（2 話者切替・行ごと caption）は台本形式対応（script-reader-spec.md）で実装済み。残: 第 3 スロット以降・話者マッピング UI・カスタム声デザイン（VoiceDesign）・cfg_scale_caption の行指定。 |
 | マルチモニタの細やかな対応 | DPI 違いのモニタ間移動、起動モニタ選択。 |
 | ゴースト DnD 配信 | §4.5.6 の検討項目が MVP では決まらない場合、Phase 4 以降へ。 |
 | クラウド同期 | 設定・記憶のデバイス間同期。要設計。 |

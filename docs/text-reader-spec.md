@@ -196,6 +196,8 @@ src/panels/reader.ts             -- パネル UI + 逐次再生ループ (先読
 
 ## 7. 将来対応: 台本形式 (Script 形式) — 本リリースでは対象外
 
+**→ 本節は docs/script-reader-spec.md（2026-07-04 承認）で具体化済み。以下は当時の記録として残す。**
+
 upstream Irodori-TTS が採用する台本形式 (Markdown 内に 3 つの JSON コードブロック:
 `defaults` / `speakers` / `lines`) への対応を将来課題として記録する。プレーン .txt では
 表現できない、対話・朗読劇レベルの演出制御が目的。
