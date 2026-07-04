@@ -9,7 +9,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-import type { Settings } from "../types";
+import type { ReadingChunk, Settings, VoiceRef, VoiceSlot } from "../types";
 
 interface Inputs {
   panel: HTMLElement;
@@ -17,6 +17,7 @@ interface Inputs {
   file: HTMLElement;
   progress: HTMLElement;
   current: HTMLElement;
+  captionNote: HTMLElement;
   stop: HTMLButtonElement;
   message: HTMLElement;
 }
@@ -25,9 +26,6 @@ interface Inputs {
 interface ReadToken {
   cancelled: boolean;
 }
-
-/// チャンク間のポーズ (ms)。文章の切れ目で一息つかせる (text-reader-spec.md §2.3)。
-const CHUNK_PAUSE_MS = 500;
 
 let inputs: Inputs | null = null;
 let activeToken: ReadToken | null = null;
@@ -41,6 +39,7 @@ export function mountReaderPanel(): void {
     file: byId("reader-file"),
     progress: byId("reader-progress"),
     current: byId("reader-current"),
+    captionNote: byId("reader-caption-note"),
     stop: byId<HTMLButtonElement>("reader-stop"),
     message: byId("reader-message"),
   };
@@ -63,7 +62,7 @@ export function isReaderOpen(): boolean {
   return inputs?.panel.classList.contains("visible") ?? false;
 }
 
-/// 読み上げを開始する (実行中なら止めてから)。dnd.ts から .txt の DnD で呼ばれる。
+/// 読み上げを開始する (実行中なら止めてから)。dnd.ts から .txt/.md の DnD で呼ばれる。
 export async function startReading(path: string): Promise<void> {
   if (!inputs) return;
   await stopReading();
@@ -75,10 +74,11 @@ export async function startReading(path: string): Promise<void> {
   inputs.file.textContent = fileName;
   inputs.progress.textContent = "読み込み中…";
   hideMessage();
+  hideCaptionNote();
 
-  let chunks: string[];
+  let chunks: ReadingChunk[];
   try {
-    chunks = await invoke<string[]>("reader_load_text", { path });
+    chunks = await invoke<ReadingChunk[]>("reader_load_text", { path });
   } catch (err) {
     inputs.progress.textContent = "—";
     showMessage(`読み込み失敗: ${formatErr(err)}`, true);
@@ -89,6 +89,7 @@ export async function startReading(path: string): Promise<void> {
   // 速度・音量は開始時点の設定を使う (読み上げ中の設定変更は次回から反映)
   let speed = 1.0;
   let volume = 1.0;
+  let captionEnabled = false;
   try {
     const s = await invoke<Settings>("get_settings");
     if (!s.tts_enabled) {
@@ -98,19 +99,54 @@ export async function startReading(path: string): Promise<void> {
     }
     speed = s.tts_speed;
     volume = s.tts_volume;
+
+    // 再生開始前の slot 検証 (script-reader-spec.md §2.7)。Irodori 実モデル時のみ、
+    // 台本が使う slot に参照音声が揃っているか確認する。voicevox 時は検証不要。
+    if (s.tts_engine === "irodori") {
+      const assetsReady = await invoke<boolean>("irodori_assets_ready").catch(() => false);
+      captionEnabled = assetsReady;
+      if (assetsReady) {
+        const usedSlots = new Set<VoiceSlot>(chunks.map((c) => c.slot));
+        const refs = await invoke<VoiceRef[]>("voice_ref_list").catch(() => [] as VoiceRef[]);
+        const availableSlots = new Set(refs.map((r) => r.slot));
+        for (const slot of usedSlots) {
+          if (!availableSlots.has(slot)) {
+            inputs.progress.textContent = "—";
+            showMessage(
+              `slot=${slot} を使用していますが、${slot} の参照音声が未生成です` +
+                "(設定 → 音声 → 参照音声で生成してください)",
+              true,
+            );
+            return;
+          }
+        }
+      }
+    }
   } catch {
     // 設定が読めなくても既定値で続行
   }
   if (token.cancelled) return;
 
+  // caption 注記 (script-reader-spec.md §2.5): caption 行を含み、かつ caption が
+  // 無効な環境 (voicevox またはフォールバック中) のときだけ、再生中ずっと表示する。
+  const hasCaption = chunks.some((c) => c.caption !== null);
+  if (hasCaption && !captionEnabled) {
+    showCaptionNote();
+  }
+
   await invoke("set_reading_active", { active: true }).catch(() => {});
   inputs.stop.disabled = false;
 
-  const synth = (text: string): Promise<string | null> =>
-    invoke<string>("synthesize_voice", { text, slot: "main" }).catch((err) => {
+  const synth = (chunk: ReadingChunk): Promise<string | null> => {
+    const args: Record<string, unknown> = { text: chunk.text, slot: chunk.slot };
+    if (chunk.caption !== null) {
+      args.caption = chunk.caption;
+    }
+    return invoke<string>("synthesize_voice", args).catch((err) => {
       console.warn("[reader] chunk synth failed", err);
       return null;
     });
+  };
 
   let skipped = 0;
   try {
@@ -118,7 +154,7 @@ export async function startReading(path: string): Promise<void> {
     let next: Promise<string | null> = synth(chunks[0]);
     for (let i = 0; i < chunks.length; i++) {
       if (token.cancelled) return;
-      updateProgress(i + 1, chunks.length, chunks[i]);
+      updateProgress(i + 1, chunks.length, chunks[i].text);
       const wav = await next;
       next = i + 1 < chunks.length ? synth(chunks[i + 1]) : Promise.resolve(null);
       if (token.cancelled) return;
@@ -126,11 +162,11 @@ export async function startReading(path: string): Promise<void> {
         skipped += 1;
         continue;
       }
-      await playWav(wav, token, speed, volume);
-      // チャンク間ポーズ: 文章の切れ目で一息つく。ポーズ無しだと改行を跨いだ瞬間に
-      // 次の文が始まって不自然 (実機テストで確認)。最終チャンクの後には入れない。
+      const rate = clamp(speed + chunks[i].speed_offset, 0.5, 2.0);
+      await playWav(wav, token, rate, volume);
+      // チャンク間ポーズ: 文章の切れ目で一息つく。最終チャンクの後には入れない。
       if (i + 1 < chunks.length) {
-        await sleepCancellable(CHUNK_PAUSE_MS, token);
+        await sleepCancellable(chunks[i].pause_after_ms, token);
       }
     }
     if (!token.cancelled) {
@@ -145,6 +181,7 @@ export async function startReading(path: string): Promise<void> {
     if (activeToken === token) {
       activeToken = null;
       inputs.stop.disabled = true;
+      hideCaptionNote();
       await invoke("set_reading_active", { active: false }).catch(() => {});
     }
   }
@@ -168,6 +205,7 @@ export async function stopReading(): Promise<void> {
     inputs.stop.disabled = true;
     inputs.progress.textContent = "—";
     inputs.current.hidden = true;
+    hideCaptionNote();
   }
   await invoke("set_reading_active", { active: false }).catch(() => {});
 }
@@ -265,6 +303,17 @@ function showMessage(msg: string, isError: boolean): void {
 function hideMessage(): void {
   if (!inputs) return;
   inputs.message.hidden = true;
+}
+
+/// caption 無視の常設注記を表示する (script-reader-spec.md §2.5)。
+function showCaptionNote(): void {
+  if (!inputs) return;
+  inputs.captionNote.hidden = false;
+}
+
+function hideCaptionNote(): void {
+  if (!inputs) return;
+  inputs.captionNote.hidden = true;
 }
 
 function formatErr(err: unknown): string {

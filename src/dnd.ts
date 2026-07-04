@@ -35,11 +35,16 @@ export function registerDndResultListener(handler: DropHandler | null): void {
 }
 
 async function handleDnd(paths: string[]): Promise<void> {
-  // テキスト読み上げ (docs/text-reader-spec.md K2/K3): .txt は読み上げ経路へ分岐。
+  // テキスト読み上げ (docs/text-reader-spec.md K2/K3、docs/script-reader-spec.md §2.1):
+  // .txt (プレーン) / .md (台本形式) は読み上げ経路へ分岐。
   // パネル表示中のみ受理し、複数あれば先頭 1 件を読む。非表示時は無視 (仕様)。
-  // ghost/shell 導入経路 (zip/フォルダ) には .txt を流さない。
-  const txtPaths = paths.filter((p) => p.toLowerCase().endsWith(".txt"));
-  const rest = paths.filter((p) => !p.toLowerCase().endsWith(".txt"));
+  // ghost/shell 導入経路 (zip/フォルダ) には .txt/.md を流さない。
+  const isReaderTarget = (p: string): boolean => {
+    const lower = p.toLowerCase();
+    return lower.endsWith(".txt") || lower.endsWith(".md");
+  };
+  const txtPaths = paths.filter(isReaderTarget);
+  const rest = paths.filter((p) => !isReaderTarget(p));
   if (txtPaths.length > 0 && isReaderOpen()) {
     void startReading(txtPaths[0]);
   }

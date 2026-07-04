@@ -163,3 +163,18 @@ export interface VoiceRef {
   caption: string;
   created_ts: number;
 }
+
+// === 台本形式対応 (docs/script-reader-spec.md) ===
+
+/// `ReadingChunk.slot` の値。`SlotName` と同義だが台本仕様書 (§2.9) の型名に合わせて別名を張る。
+export type VoiceSlot = "main" | "sub";
+
+/// `reader_load_text` が返すチャンク 1 件 (script-reader-spec.md §2.9)。
+/// caption は常にキーを含み、無指定時は null (undefined ではない)。
+export interface ReadingChunk {
+  text: string;
+  slot: VoiceSlot;
+  speed_offset: number;
+  caption: string | null;
+  pause_after_ms: number;
+}
