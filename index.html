@@ -171,11 +171,11 @@
                 <option value="irodori">Irodori-TTS (GPU 必須)</option>
               </select>
             </label>
-            <label class="row">
+            <label class="row vv-speaker-row">
               <span>メインの声 (style ID)</span>
               <select id="settings-tts-speaker-main"></select>
             </label>
-            <label class="row">
+            <label class="row vv-speaker-row">
               <span>サブの声 (style ID)</span>
               <select id="settings-tts-speaker-sub"></select>
             </label>
@@ -202,6 +202,9 @@
                 <button type="button" id="settings-gh-token-delete">削除</button>
               </div>
             </div>
+            <p class="panel-hint force-hide" id="settings-vv-assets-note">
+              Irodori-TTS 使用時も、かな読み前処理とフォールバック用に VOICEVOX の音声資産が必要です。
+            </p>
             <p class="panel-hint">
               ダウンロードを実行すると <a href="https://voicevox.hiroshiba.jp/term/" target="_blank" rel="noopener">VOICEVOX 利用規約</a>
               および <a href="https://www.microsoft.com/web/webcomponents/license-terms" target="_blank" rel="noopener">ONNX Runtime ライセンス</a>
@@ -209,7 +212,7 @@
             </p>
             <p id="settings-tts-progress" class="panel-message" hidden></p>
           </section>
-          <section class="panel-section" data-page="voice">
+          <section class="panel-section" data-page="voice" id="settings-irodori-section">
             <h3>音声 (Irodori-TTS / 高品質モード)</h3>
             <div class="row">
               <span>GPU 検出</span>

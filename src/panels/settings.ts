@@ -283,6 +283,7 @@ function attachHandlers(i: Inputs): void {
   i.provider.addEventListener("change", () => {
     void refreshKeyState(i.provider.value);
   });
+  i.ttsEngine.addEventListener("change", () => updateVoiceEngineVisibility(i.ttsEngine.value));
   i.ttsDownloadBtn.addEventListener("click", () => void onTtsDownload());
   i.ghTokenDeleteBtn.addEventListener("click", () => void onDeleteGhToken());
   i.irodoriDownloadBtn.addEventListener("click", () => void onIrodoriDownload());
@@ -848,6 +849,24 @@ function showProgress(msg: string, isError: boolean): void {
   inputs.ttsProgress.hidden = false;
 }
 
+/// エンジン選択に応じて音声タブのセクション表示を切り替える。
+/// DOM は index.html に静的配置済み (WebView2 透過バグ回避)。ここでは hidden の
+/// 付け外しのみで、非表示中の入力値も保存対象からは外さない (見た目だけ変える)。
+function updateVoiceEngineVisibility(engine: string): void {
+  const irodori = engine === "irodori";
+  // .panel-section / .row は CSS で display を明示しているため hidden 属性では
+  // 隠せない。force-hide (display:none !important) の class トグルで確実に切り替える。
+  const irodoriSection = document.getElementById("settings-irodori-section");
+  if (irodoriSection) irodoriSection.classList.toggle("force-hide", !irodori);
+  // VOICEVOX の話者 (style ID) 選択は voicevox 時のみ
+  for (const row of document.querySelectorAll<HTMLElement>(".vv-speaker-row")) {
+    row.classList.toggle("force-hide", irodori);
+  }
+  // Irodori でも VOICEVOX 資産は必要な旨の注記は irodori 時のみ
+  const vvNote = document.getElementById("settings-vv-assets-note");
+  if (vvNote) vvNote.classList.toggle("force-hide", !irodori);
+}
+
 function applySettingsToForm(s: Settings): void {
   if (!inputs) return;
   inputs.mode.value = s.mode;
@@ -867,6 +886,7 @@ function applySettingsToForm(s: Settings): void {
   // M4c: tts_engine が "voicevox_core" | "irodori" に揃っているか UI で復元
   inputs.ttsEngine.value =
     s.tts_engine === "irodori" ? "irodori" : "voicevox_core";
+  updateVoiceEngineVisibility(inputs.ttsEngine.value);
   inputs.irodoriUseRealModel.checked = s.tts_irodori_use_real_model;
   inputs.autostart.checked = s.autostart;
   inputs.updateFeedUrl.value = s.update_feed_url ?? "";

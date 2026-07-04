@@ -329,6 +329,13 @@ body {
   display: block;
 }
 
+/* エンジン別の表示切替 (settings.ts updateVoiceEngineVisibility)。
+   .panel-section / .row は display を明示するため hidden 属性では隠せない。
+   v0.0.3 と同じく `display: none !important` で確実に隠す。 */
+.force-hide {
+  display: none !important;
+}
+
 .panel-section .checkbox-row {
   align-items: center;
 }
