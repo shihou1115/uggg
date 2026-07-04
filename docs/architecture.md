@@ -153,7 +153,7 @@ src/
 │   └── chatlog.ts           -- ログパネル
 │
 ├── tts/                     -- TTS フロント
-│   ├── speaker.ts           -- TtsSpeaker / NoopSpeaker / EngineSpeaker（slot基準キュー）
+│   ├── speaker.ts           -- TtsSpeaker / NoopSpeaker / EngineSpeaker（全 slot 直列の発声キュー + 先読み 1）
 │   ├── mouth.ts             -- 口パク（振幅駆動のみ、§A-4）
 │   └── credit.ts            -- VOICEVOX クレジット表示
 │
