@@ -13,6 +13,7 @@ pub mod irodori;
 pub mod irodori_download;
 pub mod preprocess;
 pub mod reader;
+pub mod script;
 pub mod sidecar;
 pub mod voice_ref;
 pub mod voicevox;

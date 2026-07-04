@@ -14,8 +14,29 @@
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
+use serde::Serialize;
 
 use crate::tts::preprocess::{split_emoji_segments, Segment};
+
+/// 台本の話者マッピング先。ugg の声スロット (docs/script-reader-spec.md §2.9)。
+#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceSlot {
+    Main,
+    Sub,
+}
+
+/// 読み上げの 1 チャンク (docs/script-reader-spec.md §2.9)。
+/// `caption` は `skip_serializing_if` を付けない — None を `null` として常時出力し、
+/// TS 側に `undefined` を考慮させない。
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct ReadingChunk {
+    pub text: String,
+    pub slot: VoiceSlot,
+    pub speed_offset: f64,
+    pub caption: Option<String>,
+    pub pause_after_ms: u32,
+}
 
 /// 1 チャンクの最大トークン数 (通常文字 1 トークン、Irodori 絵文字 1 トークン)。
 /// Irodori 実モデルの 1 回の生成が数秒〜十数秒に収まる実用長。実測に応じて調整する。
