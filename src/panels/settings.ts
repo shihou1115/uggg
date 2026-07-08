@@ -96,6 +96,10 @@ interface Inputs {
 let inputs: Inputs | null = null;
 let current: Settings | null = null;
 let onSaved: ((s: Settings) => void) | null = null;
+// Irodori 資産が導入済みか。未導入のうちは、エンジンが voicevox でも Irodori セクション
+// (ランタイム DL 導線) を表示し続ける必要がある (クリーンインストールでの詰み防止)。
+// refreshIrodoriState が更新し、updateVoiceEngineVisibility が参照する。
+let irodoriAssetsReady = false;
 
 export async function mountSettingsPanel(): Promise<void> {
   inputs = collectInputs();
@@ -428,6 +432,10 @@ async function refreshIrodoriState(): Promise<void> {
     inputs.irodoriAssetsState.textContent = "確認失敗";
     console.warn("[irodori] assets check failed", err);
   }
+  // 資産の有無を記録する (未導入なら voicevox 選択中でも Irodori セクションを見せて
+  // DL 導線を残す)。セクション表示の再適用は、下の自動フリップでエンジン値が確定した
+  // あとにまとめて行う。
+  irodoriAssetsReady = assetsOk;
   // ボタン disabled 制御 (GPU が無ければ DL も意味なし、実モデルチェックも不可)
   inputs.irodoriDownloadBtn.disabled = !gpuOk;
   const canUseReal = gpuOk && assetsOk;
@@ -464,6 +472,9 @@ async function refreshIrodoriState(): Promise<void> {
       }
     }
   }
+  // 確定したエンジン値と資産状態でセクション表示を再適用する (資産未導入なら
+  // voicevox でも Irodori セクションを表示し、ランタイム DL 導線を残す)。
+  updateVoiceEngineVisibility(inputs.ttsEngine.value);
   // 参照音声一覧
   try {
     const refs = await invoke<VoiceRef[]>("voice_ref_list");
@@ -525,13 +536,23 @@ async function onIrodoriDownload(): Promise<void> {
 
   try {
     await invoke("download_irodori_assets", { agreed: true });
-    showIrodoriProgress("ダウンロード完了。", false);
     await refreshIrodoriState();
+    // DL 直後はまだセットアップ継続中 (参照音声が未生成)。refreshIrodoriState は
+    // voicevox 選択のままだと Irodori セクションを畳むが、ここで見せ続けて次の一手
+    // (参照音声の生成 → エンジンを Irodori に切替) を案内する。engine を irodori に
+    // 自動選択はしない (参照音声未生成のまま irodori にすると VoiceRefMissing で無音になる)。
+    document
+      .getElementById("settings-irodori-section")
+      ?.classList.remove("force-hide");
+    showIrodoriProgress(
+      "ダウンロード完了。参照音声を生成し、エンジンで「Irodori-TTS」を選ぶと有効になります。",
+      false,
+    );
   } catch (err) {
     showIrodoriProgress(`ダウンロード失敗: ${formatErr(err)}`, true);
   } finally {
     unlisten();
-    // 完了後は GPU 状態に応じてボタン状態を refreshIrodoriState が再設定する
+    // 完了後のボタン状態は refreshIrodoriState が GPU/資産に応じて再設定済み
   }
 }
 
@@ -856,8 +877,12 @@ function updateVoiceEngineVisibility(engine: string): void {
   const irodori = engine === "irodori";
   // .panel-section / .row は CSS で display を明示しているため hidden 属性では
   // 隠せない。force-hide (display:none !important) の class トグルで確実に切り替える。
+  // Irodori セクションは「irodori 選択中」または「資産未導入 (=セットアップが必要)」の
+  // どちらかで表示する。voicevox 選択中でも資産が無ければ DL 導線を残す
+  // (これを隠すとクリーンインストールで Irodori を有効化する導線が消えて詰む)。
   const irodoriSection = document.getElementById("settings-irodori-section");
-  if (irodoriSection) irodoriSection.classList.toggle("force-hide", !irodori);
+  const hideIrodoriSection = !irodori && irodoriAssetsReady;
+  if (irodoriSection) irodoriSection.classList.toggle("force-hide", hideIrodoriSection);
   // VOICEVOX の話者 (style ID) 選択は voicevox 時のみ
   for (const row of document.querySelectorAll<HTMLElement>(".vv-speaker-row")) {
     row.classList.toggle("force-hide", irodori);
