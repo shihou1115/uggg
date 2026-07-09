@@ -70,6 +70,8 @@ fn main() {
             app.manage(state.clone());
             window::configure_main_window(app.handle())?;
             window::start_cursor_watcher(app.handle().clone(), state.clone());
+            // 初回起動時のみ取扱説明書を開く
+            system::manual::open_on_first_run(app.handle(), &state);
             // ウインドウ位置の復元 + 監視保存
             presence::window_pos::restore(app.handle(), &state);
             presence::window_pos::spawn_pos_saver(app.handle().clone(), state.clone());
