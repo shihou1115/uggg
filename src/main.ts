@@ -11,7 +11,7 @@ import {
 import { attachClickDetector } from "./interaction/click";
 import { attachNadeDetector } from "./interaction/nade";
 import { firePoke } from "./interaction/poke";
-import { mountContextMenu } from "./menu/context-menu";
+import { closeMenu, isMenuOpen, mountContextMenu } from "./menu/context-menu";
 import { showOnboarding } from "./panels/onboarding";
 import { mountPomodoroBadge } from "./panels/pomodoro";
 import { mountConfirm } from "./confirm";
@@ -63,6 +63,11 @@ async function boot(): Promise<void> {
   mountInput(renderResponse);
   setToolsEnabled(payload.settings.tools_enabled);
   attachClickDetector(({ count, x, y }) => {
+    // バルーンメニュー表示中のクリックは「閉じる」専用 (spec §4.3.5)
+    if (isMenuOpen()) {
+      closeMenu();
+      return;
+    }
     // spec §4.3.1: 1 回 = 入力導線 (促し発話 + 入力欄)、2-3 回 = つつき、4 回以上 = 連打
     if (count === 1) {
       onSingleClick(x, y);

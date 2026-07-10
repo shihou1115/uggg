@@ -119,6 +119,10 @@ body {
    `display: none !important` で確実に隠す (v0.0.3 と同じ方式)。
    動的 createElement だと WebView2 透過レイヤーで描画されないため
    要素の追加削除はせず、テキストと .visible クラスだけ書き換える。 */
+/* white-space: pre-wrap はコンテナ (.balloon) には付けないこと:
+   index.html の整形用改行 (要素間の空白テキストノード) が空行として描画され、
+   上下やテキスト〜メニュー間に幽霊余白が生まれる。pre-wrap はセリフ本文の
+   .balloon-text だけに適用する。 */
 .balloon {
   position: absolute;
   max-width: 300px;
@@ -133,7 +137,6 @@ body {
   word-break: break-word;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
   z-index: 50;
-  white-space: pre-wrap;
 }
 
 .balloon:not(.visible) {
@@ -463,38 +466,37 @@ body {
   filter: brightness(1.05);
 }
 
-#context-menu {
-  position: fixed;
+/* バルーン内メニュー (spec §4.3.5): 前口上テキストの下に区切り線付きで項目を並べる。
+   空のときは領域ごと消す (通常発話でバルーンを使うときの余白を防ぐ)。 */
+.balloon-menu:empty {
   display: none;
+}
+
+.balloon-menu {
+  margin-top: 8px;
+  border-top: 1px solid #ddd;
+  padding-top: 4px;
   min-width: 180px;
-  background: rgba(255, 255, 255, 0.98);
-  border: 1.5px solid #555;
-  border-radius: 8px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.24);
-  padding: 6px 0;
-  z-index: 250;
-  font-size: 13px;
 }
 
-#context-menu.visible {
-  display: block;
-}
-
-#context-menu .menu-item {
-  padding: 6px 14px;
+.balloon-menu-item {
+  padding: 5px 10px;
+  border-radius: 6px;
   cursor: pointer;
   user-select: none;
   color: #1c1c1c;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
-#context-menu .menu-item:hover {
+.balloon-menu-item:hover {
   background: #eef2fa;
 }
 
-#context-menu .menu-divider {
+.balloon-menu-divider {
   height: 1px;
   background: #ddd;
-  margin: 4px 0;
+  margin: 4px 2px;
 }
 
 /* transform-origin: bottom left により、style.left = 視覚ボックス左端のまま

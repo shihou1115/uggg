@@ -444,6 +444,8 @@ mod tests {
             system_messages: Default::default(),
             input_prompt_main: vec![],
             input_prompt_sub: vec![],
+            menu_prompt_main: vec![],
+            menu_prompt_sub: vec![],
         }
     }
 

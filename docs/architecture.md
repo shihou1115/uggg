@@ -168,7 +168,7 @@ src/
 │   └── onboarding.ts        -- 初回オンボーディング
 │
 ├── menu/
-│   └── context-menu.ts      -- ★ 右クリック→コンテキストメニュー（C-5）
+│   └── context-menu.ts      -- ★ 右クリック→バルーン内メニュー（C-5、spec §4.3.5）
 │
 ├── interaction/             -- 操作
 │   ├── click.ts             -- クリック種別判別
@@ -423,7 +423,7 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `get_boot_payload` | なし | `BootPayload` | キャラ画像（data URL）、settings、`char_positions`（保存済みキャラ X 位置。無ければ null）等 |
 | `frontend_ready` | なし | `()` | boot 完了通知。起動挨拶（first_boot or boot）+ 更新チェック起動 |
-| `quit_app` | なし | `()` | コンテキストメニュー「終了」。Irodori サイドカーを best-effort shutdown 後に exit |
+| `quit_app` | なし | `()` | 右クリックメニュー「終了」。Irodori サイドカーを best-effort shutdown 後に exit |
 | `hide_window` | なし | `()` | メインウインドウを hide（トレイから再表示） |
 | `set_autostart` | `enabled: bool` | `()` | OS 自動起動の切替（tauri-plugin-autostart） |
 
@@ -452,6 +452,7 @@ pub struct GhostBundle {
 | `poke` | `target: "main"\|"sub", region: "head"\|"chest"\|"body", rapid: bool` | `DialogueResponse \| null` | C-2 で縦のみ |
 | `nade` | `target: "main"\|"sub", region: "head"\|"chest"\|"body"` | `DialogueResponse \| null` | 同上、撫で |
 | `input_prompt` | `target: "main"\|"sub"` | `SpeechTurn \| null` | クリック時の入力促し（spec §4.3.1）。辞書 `input_prompt` から抽選し chat_log に記録。**dialogue イベントは emit しない**（フロントが renderPrompt で描画）。辞書未定義・sub 無しゴーストの sub は null |
+| `menu_prompt` | `target: "main"\|"sub"` | `SpeechTurn \| null` | 右クリックメニューの前口上（main）/ メインへの誘導（sub）（spec §4.3.5）。抽選・記録・非 emit の挙動は `input_prompt` と同じ（実装も共通ヘルパー） |
 
 ### 4.5 profile
 
@@ -568,6 +569,9 @@ system_messages:
 input_prompt:          # キャラクリック時の入力促し (詳細は §6.2)
   main: [ ... ]
   sub: [ ... ]
+menu_prompt:           # 右クリックメニューの前口上/誘導 (詳細は §6.2)
+  main: [ ... ]
+  sub: [ ... ]
 ```
 
 ### 6.2 セクション仕様
@@ -652,19 +656,25 @@ events:
   pomodoro_done: [ ... ]
 ```
 
-#### input_prompt（キャラクリック時の入力促し、spec §4.3.1）
+#### input_prompt / menu_prompt（促し系、spec §4.3.1 / §4.3.5）
 ```yaml
-input_prompt:
+input_prompt:            # キャラ 1 クリック → 入力欄の導線
   main:
     - { text: "なにか用かな？", pose: happy }
   sub:
     - { text: "……ボクに用か", pose: normal }
+menu_prompt:             # キャラ右クリック → バルーン内メニューの導線
+  main:                  # メニューの前口上 (この下にメニュー項目が続く)
+    - { text: "ご用件はどれかな？", pose: happy }
+  sub:                   # サブ右クリック時の「メインに頼め」誘導
+    - { text: "用事ならミミに頼んでくれ", pose: normal }
 ```
 
-- **クリックされた側だけが喋る単発ターン**（Line ではなく SpeechTurn のリスト。掛け合いにしない）
-- main / sub 各リストから無条件で 1 件抽選（when 非対応）
-- セクション省略可。無ければ促し無しで入力欄だけ開く（旧辞書互換）
-- 発話は `input_prompt` コマンドの戻り値をフロントが renderPrompt() で描画し、**入力欄が閉じるまで吹き出しを保持**する（通常の hold 時間で消さない）
+- どちらも **単発ターン**（Line ではなく SpeechTurn のリスト。掛け合いにしない）で、main / sub 各リストから無条件で 1 件抽選（when 非対応）
+- セクション省略可（旧辞書互換）。input_prompt 無し → 促し無しで入力欄だけ開く。menu_prompt 無し → セリフ無しでメニューのみ表示
+- 発話はコマンド戻り値をフロントが描画し、**閉じる操作まで吹き出しを保持**する（通常の hold 時間で消さない）
+  - input_prompt → renderPrompt()（入力欄クローズで消える）
+  - menu_prompt → renderMenuPrompt()（sub 誘導 → main 前口上の順。メニュークローズで消える）
 
 ### 6.3 when 条件（I2: 表現力強化）
 

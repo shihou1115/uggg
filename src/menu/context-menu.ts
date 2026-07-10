@@ -1,17 +1,29 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import { balloonMenuContainer, reposition } from "../dialogue/balloon";
+import { closeInput, isInputOpen } from "../dialogue/input";
 import { openReaderPanel } from "../panels/reader";
 import { openSettingsPanel } from "../panels/settings";
-import type { Settings } from "../types";
+import { hitTest } from "../stage/character";
+import { cancelSpeech, renderMenuPrompt } from "../system/ghost-speech";
+import type { Settings, SlotName, SpeechTurn } from "../types";
+
+/// 右クリックメニュー (spec §4.3.5)。独立 UI ではなく **メインのバルーン内** に表示する。
+/// - メイン右クリック: 前口上 (辞書 menu_prompt.main) → 同じバルーン内にメニュー項目
+/// - サブ右クリック: 誘導セリフ (menu_prompt.sub) をサブの吹き出しに出した後、メインへ遷移
+/// - キャラ以外の右クリック: 何もしない (既定メニューの抑止のみ)
+/// - 閉じる: 項目実行 / Esc / バルーン外 mousedown / 新しい発話による置き換え
 
 interface MenuItem {
   label: string;
   onClick: () => void | Promise<void>;
 }
 
-let menuEl: HTMLElement | null = null;
 let getSettings: () => Settings | null = () => null;
 let onModeToggle: (next: "low" | "advanced") => void = () => {};
+let menuOpen = false;
+/// 右クリック連打・sub→main 遷移中の追い越しを無効化する世代カウンタ。
+let flowSeq = 0;
 
 export function mountContextMenu(opts: {
   current: () => Settings | null;
@@ -19,58 +31,95 @@ export function mountContextMenu(opts: {
 }): void {
   getSettings = opts.current;
   onModeToggle = opts.onModeToggle;
-  menuEl = document.getElementById("context-menu");
-  if (!menuEl) return;
   document.addEventListener("contextmenu", onContext);
+  // バルーン外の mousedown で閉じる (項目クリックとバルーン内は素通り)。
+  // キャラ上の mousedown はここでは閉じない: 即閉じると main.ts のクリックゲートが
+  // メニュー表示中と認識できず、閉じた直後に入力導線が開いてしまう。
+  // キャラ上のクリックはゲート側 (250ms 後) が「閉じるだけ」で処理する。
   document.addEventListener("mousedown", (ev) => {
-    if (!menuEl?.classList.contains("visible")) return;
-    if (ev.target instanceof Node && menuEl.contains(ev.target)) return;
-    hideMenu();
+    if (!menuOpen) return;
+    const balloon = document.getElementById("balloon-main");
+    if (ev.target instanceof Node && balloon?.contains(ev.target)) return;
+    if (hitTest(ev.clientX, ev.clientY)) return;
+    closeMenu();
   });
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape" && menuEl?.classList.contains("visible")) {
-      hideMenu();
+    if (ev.key === "Escape" && menuOpen) {
+      closeMenu();
     }
   });
+}
+
+export function isMenuOpen(): boolean {
+  return menuOpen;
+}
+
+/// メニューを閉じる: 項目を空にし、前口上の発話ごとバルーンを畳む。
+export function closeMenu(): void {
+  if (!menuOpen) return;
+  menuOpen = false;
+  flowSeq++;
+  const menu = balloonMenuContainer("main");
+  if (menu) menu.innerHTML = "";
+  cancelSpeech();
 }
 
 function onContext(ev: MouseEvent): void {
   ev.preventDefault();
-  showMenuAt(ev.clientX, ev.clientY);
+  const hit = hitTest(ev.clientX, ev.clientY);
+  if (!hit) return;
+  void openMenuFlow(hit.slot);
 }
 
-function showMenuAt(x: number, y: number): void {
-  if (!menuEl) return;
-  const items = buildItems();
-  menuEl.innerHTML = "";
-  for (const item of items) {
+async function openMenuFlow(slot: SlotName): Promise<void> {
+  if (menuOpen) closeMenu();
+  if (isInputOpen()) closeInput();
+  const seq = ++flowSeq;
+  menuOpen = true;
+
+  // サブ右クリックは誘導セリフを先に取り、メインの前口上→メニューへ遷移する
+  const subTurn =
+    slot === "sub"
+      ? await invoke<SpeechTurn | null>("menu_prompt", { target: "sub" }).catch((err) => {
+          console.error("menu_prompt(sub) failed", err);
+          return null;
+        })
+      : null;
+  const mainTurn = await invoke<SpeechTurn | null>("menu_prompt", { target: "main" }).catch(
+    (err) => {
+      console.error("menu_prompt(main) failed", err);
+      return null;
+    },
+  );
+  if (seq !== flowSeq || !menuOpen) return; // 閉じられた・別フローに追い越された
+
+  const done = await renderMenuPrompt(subTurn, mainTurn);
+  if (!done || seq !== flowSeq || !menuOpen) return;
+  populateMenu();
+}
+
+function populateMenu(): void {
+  const menu = balloonMenuContainer("main");
+  if (!menu) return;
+  menu.innerHTML = "";
+  for (const item of buildItems()) {
     if ("divider" in item) {
       const sep = document.createElement("div");
-      sep.className = "menu-divider";
-      menuEl.appendChild(sep);
+      sep.className = "balloon-menu-divider";
+      menu.appendChild(sep);
       continue;
     }
     const el = document.createElement("div");
-    el.className = "menu-item";
+    el.className = "balloon-menu-item";
     el.textContent = item.label;
     el.addEventListener("click", () => {
-      hideMenu();
+      closeMenu();
       void item.onClick();
     });
-    menuEl.appendChild(el);
+    menu.appendChild(el);
   }
-  // ウインドウ端からはみ出さないよう位置補正
-  menuEl.classList.add("visible");
-  const w = menuEl.offsetWidth;
-  const h = menuEl.offsetHeight;
-  const left = Math.min(x, window.innerWidth - w - 8);
-  const top = Math.min(y, window.innerHeight - h - 8);
-  menuEl.style.left = `${Math.max(8, left)}px`;
-  menuEl.style.top = `${Math.max(8, top)}px`;
-}
-
-export function hideMenu(): void {
-  menuEl?.classList.remove("visible");
+  // 項目追加でバルーンが育つので配置し直す
+  reposition("main");
 }
 
 function buildItems(): Array<MenuItem | { divider: true }> {

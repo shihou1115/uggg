@@ -121,6 +121,7 @@ fn main() {
             commands::interaction::poke,
             commands::interaction::nade,
             commands::interaction::input_prompt,
+            commands::interaction::menu_prompt,
             commands::lifecycle::frontend_ready,
             commands::lifecycle::quit_app,
             commands::lifecycle::hide_window,

@@ -51,9 +51,9 @@ export function attachClickDetector(handle: ClickHandler): void {
 
 function onMouseDown(ev: MouseEvent): void {
   if (ev.button !== 0) return; // 左クリックのみ
-  // 入力欄やボタン (solid) は素通り
+  // 入力欄・ボタン・バルーン内メニュー (spec §4.3.5) は素通り
   const target = ev.target as HTMLElement | null;
-  if (target?.closest(".chat-input-target, input, button, textarea")) {
+  if (target?.closest(".chat-input-target, input, button, textarea, .balloon-menu")) {
     return;
   }
   state.pressed = true;

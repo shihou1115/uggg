@@ -299,6 +299,20 @@ input_prompt:
     - { text: "ミミじゃなくてボクでいいのか？……まあいい", pose: troubled }
     - { text: "……ん。起きてる。話せ", pose: normal }
 
+# 右クリックメニューの前口上 (spec §4.3.5)。
+# main: メニューがバルーン内に続けて表示される前提の一言。
+# sub: サブを右クリックしたとき、メインへ誘導する一言 (この後メインの前口上+メニューに遷移)。
+menu_prompt:
+  main:
+    - { text: "はーい、ご用件はどれかな？", pose: happy }
+    - { text: "なにか用かな？下から選んでね", pose: normal }
+    - { text: "呼んだ？メニュー出すね！", pose: happy }
+    - { text: "お手伝いできること、あるかな？", pose: normal }
+  sub:
+    - { text: "用事ならミミに頼んでくれ。ボクは猫だぞ", pose: normal }
+    - { text: "……ボクにメニューは無い。ミミのところだ", pose: troubled }
+    - { text: "そういうのはミミの担当だ。ほら", pose: normal }
+
 # ライフサイクル・操作・存在感系イベント
 events:
   first_boot:

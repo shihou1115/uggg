@@ -32,6 +32,9 @@ pub struct Dictionary {
     /// キャラクリック時の入力促し (spec §4.3.1)。クリックされた側だけの単発ターン。
     pub input_prompt_main: Vec<SpeechTurn>,
     pub input_prompt_sub: Vec<SpeechTurn>,
+    /// 右クリックメニューの前口上 (main) / メインへの誘導 (sub)。spec §4.3.5。
+    pub menu_prompt_main: Vec<SpeechTurn>,
+    pub menu_prompt_sub: Vec<SpeechTurn>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,11 +106,14 @@ struct DictionaryYaml {
     #[serde(default)]
     system_messages: HashMap<String, Vec<EventLineYaml>>,
     #[serde(default)]
-    input_prompt: InputPromptYaml,
+    input_prompt: SlotTurnsYaml,
+    #[serde(default)]
+    menu_prompt: SlotTurnsYaml,
 }
 
+/// main / sub 別の単発ターン集 (input_prompt / menu_prompt 共用)。
 #[derive(Debug, Default, Deserialize)]
-struct InputPromptYaml {
+struct SlotTurnsYaml {
     #[serde(default)]
     main: Vec<SpeechTurnYaml>,
     #[serde(default)]
@@ -502,6 +508,17 @@ impl Dictionary {
         };
         pick_random(list).cloned()
     }
+
+    /// 右クリックメニューの前口上/誘導 (spec §4.3.5)。target = "main" | "sub"。
+    /// 未定義の辞書では None → フロントはセリフ無しでメニューだけ表示する。
+    pub fn pick_menu_prompt(&self, target: &str) -> Option<SpeechTurn> {
+        let list = if target == "sub" {
+            &self.menu_prompt_sub
+        } else {
+            &self.menu_prompt_main
+        };
+        pick_random(list).cloned()
+    }
 }
 
 fn pick_event_candidate(
@@ -581,6 +598,8 @@ pub fn load_dictionary(path: &Path) -> Result<Dictionary> {
         system_messages: convert_event_map(yaml.system_messages)?,
         input_prompt_main: convert_turns(yaml.input_prompt.main),
         input_prompt_sub: convert_turns(yaml.input_prompt.sub),
+        menu_prompt_main: convert_turns(yaml.menu_prompt.main),
+        menu_prompt_sub: convert_turns(yaml.menu_prompt.sub),
     };
 
     validate_dictionary(&dict, path)?;
@@ -684,13 +703,15 @@ fn validate_dictionary(dict: &Dictionary, path: &Path) -> Result<()> {
             }
         }
     }
-    for (name, list) in [
-        ("main", &dict.input_prompt_main),
-        ("sub", &dict.input_prompt_sub),
+    for (section, name, list) in [
+        ("input_prompt", "main", &dict.input_prompt_main),
+        ("input_prompt", "sub", &dict.input_prompt_sub),
+        ("menu_prompt", "main", &dict.menu_prompt_main),
+        ("menu_prompt", "sub", &dict.menu_prompt_sub),
     ] {
         for (i, turn) in list.iter().enumerate() {
             if turn.text.trim().is_empty() {
-                checks.push(format!("input_prompt.{name}[{i}].text が空です"));
+                checks.push(format!("{section}.{name}[{i}].text が空です"));
             }
         }
     }

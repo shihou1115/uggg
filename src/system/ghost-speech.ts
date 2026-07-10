@@ -1,6 +1,11 @@
 import { listen } from "@tauri-apps/api/event";
 
-import { hideAllBalloons, hideBalloon, reposition, showBalloon } from "../dialogue/balloon";
+import {
+  hideAllBalloons,
+  hideBalloon,
+  reposition,
+  showBalloon,
+} from "../dialogue/balloon";
 import { newToken, typeInto, type TypewriterToken } from "../dialogue/typewriter";
 import { setPose } from "../stage/character";
 import type { DialogueResponse, SlotName, SpeechTurn, TalkSpeed } from "../types";
@@ -86,6 +91,41 @@ export function clearPrompt(): void {
   if (promptSlot === null) return;
   hideBalloon(promptSlot);
   promptSlot = null;
+}
+
+/// メニュー導線 (spec §4.3.5): sub の誘導セリフ (任意) → main の前口上、の順に発話する。
+/// sub の吹き出しは表示したまま main に遷移する (掛け合いと同じ見え方)。
+/// 前口上が無い辞書でも main バルーンだけは開く (メニューの器)。自動では消さない。
+/// 戻り値: 途中で cancel されず最後まで到達したら true。
+export async function renderMenuPrompt(
+  subTurn: SpeechTurn | null,
+  mainTurn: SpeechTurn | null,
+): Promise<boolean> {
+  if (currentToken) currentToken.cancelled = true;
+  ttsSpeaker?.interrupt();
+  const token = newToken();
+  currentToken = token;
+
+  promptSlot = null;
+  hideAllBalloons();
+  if (subTurn) {
+    await speakSlot(token, "sub", subTurn);
+    if (token.cancelled) return false;
+  }
+  if (mainTurn) {
+    await speakSlot(token, "main", mainTurn);
+  } else {
+    showBalloon("main");
+  }
+  return !token.cancelled;
+}
+
+/// 進行中の発話・促し表示を打ち切って全バルーンを隠す (メニュークローズ等から呼ぶ)。
+export function cancelSpeech(): void {
+  if (currentToken) currentToken.cancelled = true;
+  ttsSpeaker?.interrupt();
+  promptSlot = null;
+  hideAllBalloons();
 }
 
 async function speakSlot(

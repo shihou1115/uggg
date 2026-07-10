@@ -17,6 +17,9 @@
            .visible クラスの付与のみで行う。 -->
       <div id="balloon-main" class="balloon solid">
         <div class="balloon-text"></div>
+        <!-- 右クリックメニュー (spec §4.3.5): 前口上の下に項目を動的挿入する。
+             静的な器 + 動的な子要素の構成 (WebView2 透過バグ回避のパターン)。 -->
+        <div class="balloon-menu"></div>
       </div>
       <div id="balloon-sub" class="balloon solid">
         <div class="balloon-text"></div>
@@ -29,9 +32,7 @@
         <span id="pomodoro-badge-time">00:00</span>
         <span id="pomodoro-badge-round"></span>
       </div>
-      <!-- 設定パネルとコンテキストメニューも静的配置 (WebView2 透過バグ対策)。
-           初期は .visible 無しで隠す。 -->
-      <div id="context-menu" class="solid"></div>
+      <!-- 設定パネル等も静的配置 (WebView2 透過バグ対策)。初期は .visible 無しで隠す。 -->
       <!-- 汎用確認ダイアログ。alwaysOnTop + 透過の組み合わせで `window.confirm` が
            固まる問題があったため、独自モーダルに置換 (M6 動作確認時に判明)。 -->
       <div id="ugg-confirm-panel" class="solid panel">

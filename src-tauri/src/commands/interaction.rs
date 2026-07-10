@@ -49,20 +49,32 @@ pub fn nade(
 
 /// キャラクリック時の入力促し (spec §4.3.1)。クリックされた側だけの単発ターンを返す。
 /// 発話レンダリングはフロント (renderPrompt) が行うため dialogue イベントは emit しない。
-/// chat_log には poke 等と同様に 1 行記録する。辞書に input_prompt が無ければ None。
 #[tauri::command]
-pub fn input_prompt(
-    target: String,
-    state: State<'_, Arc<AppState>>,
+pub fn input_prompt(target: String, state: State<'_, Arc<AppState>>) -> Option<SpeechTurn> {
+    prompt_from_dictionary(state.inner(), &target, |dict, t| dict.pick_input_prompt(t))
+}
+
+/// キャラ右クリック時のメニュー前口上 (main) / メインへの誘導 (sub)。spec §4.3.5。
+/// メニュー本体の描画はフロント (バルーン内メニュー) が行う。
+#[tauri::command]
+pub fn menu_prompt(target: String, state: State<'_, Arc<AppState>>) -> Option<SpeechTurn> {
+    prompt_from_dictionary(state.inner(), &target, |dict, t| dict.pick_menu_prompt(t))
+}
+
+/// 促し系コマンドの共通処理: 辞書抽選 → chat_log へ 1 行記録 (emit はしない)。
+/// 辞書にセクションが無い・sub 無しゴーストの sub は None。
+fn prompt_from_dictionary(
+    state: &Arc<AppState>,
+    target: &str,
+    pick: impl Fn(&crate::ghost::dict::Dictionary, &str) -> Option<SpeechTurn>,
 ) -> Option<SpeechTurn> {
-    let s = state.inner().clone();
     let turn = {
-        let guard = s.ghost.lock().expect("ghost poisoned");
+        let guard = state.ghost.lock().expect("ghost poisoned");
         let bundle = guard.as_ref().ok()?;
         if target == "sub" && !bundle.sub_available() {
             return None;
         }
-        bundle.dictionary.pick_input_prompt(&target)
+        pick(&bundle.dictionary, target)
     }?;
     let role = if target == "sub" {
         ChatRole::Sub
@@ -70,10 +82,10 @@ pub fn input_prompt(
         ChatRole::Main
     };
     let now = chrono::Utc::now().timestamp();
-    let _ = s
+    let _ = state
         .db
         .append_chat(now, "low", role, &turn.text, turn.pose.as_deref());
-    crate::presence::idle::reset(&s);
+    crate::presence::idle::reset(state);
     Some(turn)
 }
 

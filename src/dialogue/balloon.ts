@@ -3,6 +3,8 @@ import type { SlotName } from "../types";
 interface BalloonView {
   root: HTMLElement;
   textEl: HTMLElement;
+  /// バルーン内メニュー (spec §4.3.5) のコンテナ。balloon-main のみ持つ。
+  menuEl: HTMLElement | null;
 }
 
 const views = new Map<SlotName, BalloonView>();
@@ -20,7 +22,8 @@ function ensureView(slot: SlotName): BalloonView {
   if (!textEl) {
     throw new Error(`balloon-${slot} に .balloon-text 要素がありません`);
   }
-  const view = { root, textEl };
+  const menuEl = root.querySelector<HTMLElement>(".balloon-menu");
+  const view = { root, textEl, menuEl };
   views.set(slot, view);
   return view;
 }
@@ -34,12 +37,19 @@ export function preallocateBalloons(): void {
 
 /// 吹き出しを表示状態にして、テキスト書き込み用の `.balloon-text` 要素を返す。
 /// 位置決めは reposition() を別途呼ぶ。
+/// バルーン内メニューの残骸は新しい発話のたびに掃除する (メニューは発話で置き換わる仕様)。
 export function showBalloon(slot: SlotName): HTMLElement {
   const view = ensureView(slot);
   view.textEl.textContent = "";
+  if (view.menuEl) view.menuEl.innerHTML = "";
   view.root.classList.add("visible");
   reposition(slot);
   return view.textEl;
+}
+
+/// バルーン内メニュー (spec §4.3.5) のコンテナを返す。無い slot は null。
+export function balloonMenuContainer(slot: SlotName): HTMLElement | null {
+  return ensureView(slot).menuEl;
 }
 
 export function hideBalloon(slot: SlotName): void {
