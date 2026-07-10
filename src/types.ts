@@ -126,6 +126,12 @@ export interface BootCharacters {
   sub: BootSlot | null;
 }
 
+/// キャラごとの保存済み X 位置 (ステージ内 CSS px、視覚ボックス左端)。spec §4.1.6。
+export interface CharPositions {
+  main: number | null;
+  sub: number | null;
+}
+
 export interface BootPayload {
   settings: Settings;
   ghost_id: string;
@@ -135,6 +141,7 @@ export interface BootPayload {
   characters: BootCharacters;
   pose_names: string[];
   onboarded: boolean;
+  char_positions: CharPositions;
 }
 
 /// M5-G: チャットログ 1 件 (バックエンド `Db::list_recent_chat_log` の戻り値)。

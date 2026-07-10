@@ -1,4 +1,5 @@
-//! つつき (poke) / 撫で (nade) コマンド (spec §4.3.2 / §4.3.3)。
+//! つつき (poke) / 撫で (nade) / 入力促し (input_prompt) コマンド
+//! (spec §4.3.1 / §4.3.2 / §4.3.3)。
 //!
 //! 縦のみ部位判定: head / chest / body。横は廃止。
 //! 探索順: `<event>_<target>_<region>` → `<event>_<target>`。
@@ -8,8 +9,9 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, State};
 
+use crate::db::ChatRole;
 use crate::dialogue::{self, banter, DialogueResponse};
-use crate::ghost::dict::WhenContext;
+use crate::ghost::dict::{SpeechTurn, WhenContext};
 use crate::state::AppState;
 
 #[tauri::command]
@@ -43,6 +45,36 @@ pub fn nade(
         crate::presence::idle::reset(&s);
     }
     resp
+}
+
+/// キャラクリック時の入力促し (spec §4.3.1)。クリックされた側だけの単発ターンを返す。
+/// 発話レンダリングはフロント (renderPrompt) が行うため dialogue イベントは emit しない。
+/// chat_log には poke 等と同様に 1 行記録する。辞書に input_prompt が無ければ None。
+#[tauri::command]
+pub fn input_prompt(
+    target: String,
+    state: State<'_, Arc<AppState>>,
+) -> Option<SpeechTurn> {
+    let s = state.inner().clone();
+    let turn = {
+        let guard = s.ghost.lock().expect("ghost poisoned");
+        let bundle = guard.as_ref().ok()?;
+        if target == "sub" && !bundle.sub_available() {
+            return None;
+        }
+        bundle.dictionary.pick_input_prompt(&target)
+    }?;
+    let role = if target == "sub" {
+        ChatRole::Sub
+    } else {
+        ChatRole::Main
+    };
+    let now = chrono::Utc::now().timestamp();
+    let _ = s
+        .db
+        .append_chat(now, "low", role, &turn.text, turn.pose.as_deref());
+    crate::presence::idle::reset(&s);
+    Some(turn)
 }
 
 /// 辞書探索 → DialogueResponse 組立。

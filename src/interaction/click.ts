@@ -1,4 +1,6 @@
-import { startWindowDrag } from "./drag";
+import { hitTest } from "../stage/character";
+import { moveCharBy, persistCharPositions } from "../stage/charpos";
+import type { SlotName } from "../types";
 
 const CLICK_WINDOW_MS = 250;
 const DRAG_THRESHOLD_PX = 4;
@@ -19,6 +21,10 @@ interface ClickState {
   downY: number;
   pressed: boolean;
   dragged: boolean;
+  /// mousedown がヒットしたキャラ。ドラッグ時の移動対象 (spec §4.3.4)。キャラ外は null。
+  slot: SlotName | null;
+  /// ドラッグ差分適用用: 直前 mousemove の X。
+  lastX: number;
 }
 
 const state: ClickState = {
@@ -28,6 +34,8 @@ const state: ClickState = {
   downY: 0,
   pressed: false,
   dragged: false,
+  slot: null,
+  lastX: 0,
 };
 
 let handler: ClickHandler | null = null;
@@ -52,23 +60,49 @@ function onMouseDown(ev: MouseEvent): void {
   state.dragged = false;
   state.downX = ev.clientX;
   state.downY = ev.clientY;
+  state.lastX = ev.clientX;
+  state.slot = hitTest(ev.clientX, ev.clientY)?.slot ?? null;
 }
 
 function onMouseMove(ev: MouseEvent): void {
-  if (!state.pressed || state.dragged) return;
-  const dx = ev.clientX - state.downX;
-  const dy = ev.clientY - state.downY;
-  if (dx * dx + dy * dy >= DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX) {
+  if (!state.pressed) return;
+  // ウインドウ外で mouseup を取りこぼした場合の自己回復:
+  // ボタンが離れているのに pressed のままなら押下シーケンスを破棄する。
+  if (ev.buttons === 0) {
+    finishPress(false);
+    return;
+  }
+  if (!state.dragged) {
+    const dx = ev.clientX - state.downX;
+    const dy = ev.clientY - state.downY;
+    if (dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX) return;
     state.dragged = true;
-    void startWindowDrag();
+    // 4px の遊び分は反映せず「掴んだ位置」から差分適用を始める
+    state.lastX = ev.clientX;
+    return;
+  }
+  // キャラ移動は X 軸のみ (spec §4.3.4)。キャラ外ドラッグでは何も動かさない。
+  if (state.slot) {
+    moveCharBy(state.slot, ev.clientX - state.lastX);
+    state.lastX = ev.clientX;
   }
 }
 
 function onMouseUp(): void {
   if (!state.pressed) return;
+  finishPress(true);
+}
+
+/// 押下シーケンスの終了。countClick=true なら (非ドラッグ時) クリック数判定へ進める。
+function finishPress(countClick: boolean): void {
+  const wasDragged = state.dragged;
+  const slot = state.slot;
   state.pressed = false;
-  if (state.dragged) {
-    state.dragged = false;
+  state.dragged = false;
+  state.slot = null;
+
+  if (wasDragged) {
+    if (slot) persistCharPositions();
     state.count = 0;
     if (state.resolveTimer !== null) {
       clearTimeout(state.resolveTimer);
@@ -76,6 +110,8 @@ function onMouseUp(): void {
     }
     return;
   }
+  if (!countClick) return;
+
   state.count++;
   if (state.resolveTimer !== null) clearTimeout(state.resolveTimer);
   const x = state.downX;

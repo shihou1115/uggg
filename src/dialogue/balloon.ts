@@ -54,23 +54,56 @@ export function hideAllBalloons(): void {
   }
 }
 
-/// 吹き出しをキャラの真上に配置する。
+/// キャラ左端と吹き出し右端の間隔 (しっぽ 8px を含む)。入力欄の配置計算も共有する。
+export const GAP_X = 24;
+/// 吹き出し上端をキャラ上端からどれだけ下げるか (キャラ高さ比)。顔の横に来る。
+export const HEAD_RATIO = 0.12;
+/// ウインドウ端との最小余白。
+export const MARGIN = 8;
+
+/// 吹き出しをキャラの左横に配置する (伺か風)。
+/// - 横: キャラ左端から GAP_X 空けて右端を合わせる。キャラが画面左端付近で
+///   収まらない場合はキャラの右横へ反転 (.flip、しっぽも反転。spec §4.1.3)
+/// - 縦: キャラ上端 + キャラ高さ × HEAD_RATIO (顔の高さ)
+/// - 相方の吹き出しと重なる場合は main を上へ・sub を下へ退避
 export function reposition(slot: SlotName): void {
   const view = views.get(slot);
   if (!view) return;
   const char = document.getElementById(`char-${slot}`);
   if (!char) return;
   const rect = char.getBoundingClientRect();
-  const margin = 12;
   const w = view.root.offsetWidth || 200;
   const h = view.root.offsetHeight || 60;
-  const centerX = rect.left + rect.width / 2;
-  let left = Math.round(centerX - w / 2);
-  let top = Math.round(rect.top - h - margin);
   const winW = window.innerWidth;
-  if (left < margin) left = margin;
-  if (left + w > winW - margin) left = Math.max(margin, winW - margin - w);
-  if (top < margin) top = margin;
+  const winH = window.innerHeight;
+
+  let left = Math.round(rect.left - GAP_X - w);
+  let flip = false;
+  if (left < MARGIN) {
+    const rightSide = Math.round(rect.right + GAP_X);
+    if (rightSide + w <= winW - MARGIN) {
+      left = rightSide;
+      flip = true;
+    } else {
+      left = MARGIN; // 両側とも収まらない極端ケースは左置きで clamp
+    }
+  }
+  view.root.classList.toggle("flip", flip);
+
+  let top = Math.round(rect.top + rect.height * HEAD_RATIO);
+
+  const other = views.get(slot === "main" ? "sub" : "main");
+  if (other && other.root.classList.contains("visible")) {
+    const o = other.root.getBoundingClientRect();
+    const overlaps =
+      left < o.right && left + w > o.left && top < o.bottom && top + h > o.top;
+    if (overlaps) {
+      top = slot === "main" ? Math.round(o.top - h - MARGIN) : Math.round(o.bottom + MARGIN);
+    }
+  }
+
+  if (top + h > winH - MARGIN) top = winH - MARGIN - h;
+  if (top < MARGIN) top = MARGIN;
   view.root.style.left = `${left}px`;
   view.root.style.top = `${top}px`;
 }

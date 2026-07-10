@@ -29,6 +29,8 @@ pub struct BootPayload {
     pub pose_names: Vec<String>,
     /// false なら初回オンボーディングを表示する。
     pub onboarded: bool,
+    /// 保存済みキャラ X 位置 (spec §4.1.6)。未保存は None → フロントが既定配置。
+    pub char_positions: crate::commands::window::CharPositions,
 }
 
 #[tauri::command]
@@ -77,6 +79,7 @@ fn build_payload(state: &AppState) -> anyhow::Result<BootPayload> {
     pose_names.dedup();
 
     let onboarded = crate::commands::onboarding::is_onboarded(&state.db);
+    let char_positions = crate::commands::window::load_char_positions(&state.db);
 
     Ok(BootPayload {
         settings,
@@ -90,5 +93,6 @@ fn build_payload(state: &AppState) -> anyhow::Result<BootPayload> {
         },
         pose_names,
         onboarded,
+        char_positions,
     })
 }

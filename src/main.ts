@@ -1,7 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { preallocateBalloons } from "./dialogue/balloon";
-import { mountInput, openInput, toggleInput } from "./dialogue/input";
+import {
+  closeInput,
+  isInputOpen,
+  mountInput,
+  openInputFor,
+  setToolsEnabled,
+} from "./dialogue/input";
 import { attachClickDetector } from "./interaction/click";
 import { attachNadeDetector } from "./interaction/nade";
 import { firePoke } from "./interaction/poke";
@@ -16,10 +22,11 @@ import { mountSettingsPanel, registerSavedListener } from "./panels/settings";
 import { mountCredit, refreshCredit } from "./tts/credit";
 import { createSpeaker, setTtsParams } from "./tts/speaker";
 import { installAlphaMaskHooks, scheduleMaskUpdate } from "./stage/alphamask";
-import { mountSlot, unmountSlot } from "./stage/character";
+import { hitTest, mountSlot, unmountSlot } from "./stage/character";
+import { initCharPositions, reclampAll } from "./stage/charpos";
 import { applyDisplayScale } from "./stage/scale";
-import { renderResponse, setTalkSpeed, startListening } from "./system/ghost-speech";
-import type { BootPayload, Settings } from "./types";
+import { renderPrompt, renderResponse, setTalkSpeed, startListening } from "./system/ghost-speech";
+import type { BootPayload, Settings, SpeechTurn } from "./types";
 
 let currentSettings: Settings | null = null;
 
@@ -47,13 +54,18 @@ async function boot(): Promise<void> {
   } else {
     unmountSlot("sub");
   }
+  // 保存済みキャラ X 位置の復元 (無ければ既定配置)。ペイント前に反映される。
+  initCharPositions(payload.char_positions);
+  // ステージリサイズ (モニタ構成変更の再ドック) でキャラをステージ内に収め直す
+  window.addEventListener("resize", reclampAll);
 
   preallocateBalloons();
   mountInput(renderResponse);
+  setToolsEnabled(payload.settings.tools_enabled);
   attachClickDetector(({ count, x, y }) => {
-    // spec §4.3.1: 1 回 = 入力欄、2-3 回 = つつき、4 回以上 = 連打
+    // spec §4.3.1: 1 回 = 入力導線 (促し発話 + 入力欄)、2-3 回 = つつき、4 回以上 = 連打
     if (count === 1) {
-      toggleInput();
+      onSingleClick(x, y);
     } else if (count >= 2) {
       void firePoke(count, x, y);
     }
@@ -80,6 +92,8 @@ async function boot(): Promise<void> {
   registerSavedListener((s) => {
     currentSettings = s;
     applyDisplayScale(s.display_scale);
+    reclampAll(); // スケール変更で視覚幅が変わるためステージ内に収め直す
+    setToolsEnabled(s.tools_enabled);
     setTalkSpeed(s.talk_speed);
     setTtsParams({ enabled: s.tts_enabled, speed: s.tts_speed, volume: s.tts_volume });
     void refreshCredit(s.tts_enabled, s.tts_engine, s.tts_speaker_main, s.tts_speaker_sub);
@@ -94,7 +108,6 @@ async function boot(): Promise<void> {
       currentSettings = updated;
     },
   });
-  window.addEventListener("ugg-open-input", () => openInput());
   window.addEventListener("ugg-hide-window", () => {
     void invoke("hide_window").catch((err) => console.error(err));
   });
@@ -125,6 +138,22 @@ async function boot(): Promise<void> {
   if (!payload.onboarded) {
     showOnboarding();
   }
+}
+
+/// クリック 1 回の入力導線 (spec §4.3.1)。
+/// 開いていれば閉じる。閉じていれば、クリックされたキャラの促し発話を出し、
+/// そのキャラのバルーン上側に入力欄を開く。キャラ外 (吹き出し等) は main 扱い。
+function onSingleClick(x: number, y: number): void {
+  if (isInputOpen()) {
+    closeInput();
+    return;
+  }
+  const slot = hitTest(x, y)?.slot ?? "main";
+  openInputFor(slot);
+  // 促し発話は辞書 input_prompt から。未定義の辞書では null (入力欄だけ開く)。
+  void invoke<SpeechTurn | null>("input_prompt", { target: slot })
+    .then((turn) => (turn ? renderPrompt(slot, turn) : undefined))
+    .catch((err) => console.error("input_prompt failed", err));
 }
 
 function observeUiMutations(): void {

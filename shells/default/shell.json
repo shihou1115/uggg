@@ -5,7 +5,7 @@
   "author": "ugga",
   "characters": {
     "main": {
-      "base_size": { "width": 280, "height": 420 },
+      "base_size": { "width": 256, "height": 384 },
       "default_pose": "normal",
       "poses": {
         "normal": "main/normal.png",
@@ -16,7 +16,7 @@
       "poke_regions": { "head_max": 0.45, "chest_max": 0.62 }
     },
     "sub": {
-      "base_size": { "width": 240, "height": 360 },
+      "base_size": { "width": 96, "height": 144 },
       "default_pose": "normal",
       "poses": {
         "normal": "sub/normal.png",

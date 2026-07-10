@@ -1,22 +1,24 @@
-//! ウインドウ位置の永続化 (spec §4.1.6)。
+//! ステージのドック (spec §4.1.6)。
 //!
-//! - 移動を 3 秒デバウンスで保存
-//! - 終了時は即時保存
-//! - 起動時に復元、モニタ外なら主モニタ中央へフォールバック
+//! ウインドウは「モニタ作業領域の全幅 × 高さ 600 (logical) の透明ステージ」として
+//! 作業領域下端に固定する。キャラの足元が常にタスクバー上端に乗り、ユーザーが
+//! ウインドウ自体を動かす手段は無い (キャラは stage/charpos.ts がステージ内で X 移動)。
 //!
-//! 位置は app_settings の `window_pos` キーに `{"x":..,"y":..}` JSON で保存。
+//! - 起動時: 保存位置 (`window_pos`) を含むモニタへドック。無ければ主モニタ
+//! - 1 秒間隔の監視: モニタ構成・解像度・タスクバー高さの変更を検知して再ドック
+//! - ドック位置を `window_pos` に保存 (次回起動のモニタ記憶のためだけに使う)
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, PhysicalPosition};
+use tauri::{AppHandle, Manager, Monitor, PhysicalPosition, PhysicalSize};
 
 use crate::state::AppState;
 
 const WINDOW_POS_KEY: &str = "window_pos";
-const DEBOUNCE_SECS: i64 = 3;
+/// ステージの高さ (CSS px)。キャラ (スケール 1.0 で最大 384px 級) とバルーンが収まる帯。
+const STAGE_HEIGHT_LOGICAL: f64 = 600.0;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct StoredPos {
@@ -24,9 +26,8 @@ struct StoredPos {
     y: i32,
 }
 
-/// 起動時に呼ぶ: 保存位置を復元。無ければ何もしない (Tauri 既定位置のまま)。
-/// モニタ外ならフォールバックとして主モニタ中央へ寄せる。
-pub fn restore(app: &AppHandle, state: &Arc<AppState>) {
+/// 起動時に呼ぶ: 前回のモニタ (無ければ主モニタ) の作業領域下端へドックする。
+pub fn dock(app: &AppHandle, state: &Arc<AppState>) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
@@ -34,62 +35,48 @@ pub fn restore(app: &AppHandle, state: &Arc<AppState>) {
         Ok(Some(v)) => serde_json::from_str::<StoredPos>(&v).ok(),
         _ => None,
     };
-    let Some(pos) = stored else {
-        center_on_primary(&window);
+    let Some(monitor) = pick_monitor(&window, stored) else {
         return;
     };
-
-    if is_fully_visible_on_some_monitor(&window, pos) {
-        let _ = window.set_position(PhysicalPosition::new(pos.x, pos.y));
-    } else {
-        // 保存値が画面外 (モニタ構成変更等) なら DB の値を空にしてフォールバック中央化。
-        // 次回起動時に「stored=None」経路に乗って center_on_primary が走る。
-        let _ = state.db.set_setting(WINDOW_POS_KEY, "");
-        center_on_primary(&window);
+    apply_dock(&window, &monitor);
+    if let Ok(p) = window.outer_position() {
+        persist(state, StoredPos { x: p.x, y: p.y });
     }
 }
 
-/// 監視タスクを起動: 1 秒ごとに現在位置を見て、変化があれば pos_dirty_since を更新。
-/// デバウンス期間 (3 秒) 変化が無ければ保存する。
-pub fn spawn_pos_saver(app: AppHandle, state: Arc<AppState>) {
+/// 監視タスク: 1 秒ごとに「現在のモニタの期待ドック矩形」と実矩形を比較し、
+/// ズレていれば再ドックする (解像度変更・タスクバー高さ変更・モニタ取り外し対応)。
+pub fn spawn_dock_keeper(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
-        let mut last: Option<StoredPos> = None;
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let Some(window) = app.get_webview_window("main") else {
                 continue;
             };
-            let Ok(p) = window.outer_position() else {
+            let Ok(pos) = window.outer_position() else {
                 continue;
             };
-            let cur = StoredPos { x: p.x, y: p.y };
-
-            match last {
-                Some(prev) if prev.x == cur.x && prev.y == cur.y => {
-                    // 動いていない: デバウンス満了で保存
-                    let dirty = state.presence.pos_dirty_since.load(Ordering::SeqCst);
-                    if dirty != 0 {
-                        let now = chrono::Utc::now().timestamp();
-                        if now - dirty >= DEBOUNCE_SECS {
-                            persist(&state, cur);
-                            state.presence.pos_dirty_since.store(0, Ordering::SeqCst);
-                        }
-                    }
-                }
-                _ => {
-                    // 動いた: dirty マークを更新
-                    state
-                        .presence
-                        .pos_dirty_since
-                        .store(chrono::Utc::now().timestamp(), Ordering::SeqCst);
-                    last = Some(cur);
-                }
+            let Some(monitor) = pick_monitor(&window, Some(StoredPos { x: pos.x, y: pos.y }))
+            else {
+                continue;
+            };
+            let (want_pos, want_size) = dock_rect(&monitor);
+            let size_ok = window
+                .outer_size()
+                .map(|s| s == want_size)
+                .unwrap_or(true);
+            if pos == want_pos && size_ok {
+                continue;
+            }
+            apply_dock(&window, &monitor);
+            if let Ok(p) = window.outer_position() {
+                persist(&state, StoredPos { x: p.x, y: p.y });
             }
         }
     });
 }
 
-/// 終了時の即時保存。
+/// 終了時の即時保存 (モニタ記憶)。
 pub fn persist_now(app: &AppHandle, state: &Arc<AppState>) {
     if let Some(window) = app.get_webview_window("main") {
         if let Ok(p) = window.outer_position() {
@@ -104,43 +91,40 @@ fn persist(state: &Arc<AppState>, pos: StoredPos) {
     }
 }
 
-/// ウインドウの中心点がいずれかのモニタ内にあるか (= 半分以上が見える)。
-/// 「ウインドウ全体が完全内」だと数ピクセルのはみ出しでも off-screen 扱いになるため緩めの判定。
-/// 「左上隅のみ」だと逆にウインドウ大半が画面外でも復元してしまう。中心点判定がちょうど良い妥協。
-fn is_fully_visible_on_some_monitor(
-    window: &tauri::WebviewWindow,
-    pos: StoredPos,
-) -> bool {
-    let Ok(monitors) = window.available_monitors() else {
-        return true; // 取得失敗時は復元を試みる
-    };
-    let Ok(size) = window.outer_size() else {
-        return true;
-    };
-    let cx = pos.x + (size.width as i32) / 2;
-    let cy = pos.y + (size.height as i32) / 2;
-    for m in monitors {
-        let mp = m.position();
-        let ms = m.size();
-        let (left, top) = (mp.x, mp.y);
-        let (right, bottom) = (mp.x + ms.width as i32, mp.y + ms.height as i32);
-        if cx >= left && cx < right && cy >= top && cy < bottom {
-            return true;
+/// 保存位置を含むモニタを返す。該当なし・保存なしは主モニタ (それも無ければ None)。
+fn pick_monitor(window: &tauri::WebviewWindow, stored: Option<StoredPos>) -> Option<Monitor> {
+    if let (Some(pos), Ok(monitors)) = (stored, window.available_monitors()) {
+        for m in monitors {
+            let mp = m.position();
+            let ms = m.size();
+            if pos.x >= mp.x
+                && pos.x < mp.x + ms.width as i32
+                && pos.y >= mp.y
+                && pos.y < mp.y + ms.height as i32
+            {
+                return Some(m);
+            }
         }
     }
-    false
+    window.primary_monitor().ok().flatten()
 }
 
-fn center_on_primary(window: &tauri::WebviewWindow) {
-    let Ok(Some(primary)) = window.primary_monitor() else {
-        return;
-    };
-    let mp = primary.position();
-    let ms = primary.size();
-    let Ok(win_size) = window.outer_size() else {
-        return;
-    };
-    let x = mp.x + (ms.width as i32 - win_size.width as i32) / 2;
-    let y = mp.y + (ms.height as i32 - win_size.height as i32) / 2;
-    let _ = window.set_position(PhysicalPosition::new(x, y));
+/// モニタの作業領域 (タスクバー除く) から期待ドック矩形を計算する。
+/// 幅 = 作業領域全幅、高さ = 600 logical を物理化 (作業領域高さでキャップ)、下端揃え。
+fn dock_rect(monitor: &Monitor) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
+    let wa = monitor.work_area();
+    let h = ((STAGE_HEIGHT_LOGICAL * monitor.scale_factor()).round() as u32)
+        .min(wa.size.height)
+        .max(1);
+    let pos = PhysicalPosition::new(
+        wa.position.x,
+        wa.position.y + wa.size.height as i32 - h as i32,
+    );
+    (pos, PhysicalSize::new(wa.size.width, h))
+}
+
+fn apply_dock(window: &tauri::WebviewWindow, monitor: &Monitor) {
+    let (pos, size) = dock_rect(monitor);
+    let _ = window.set_size(size);
+    let _ = window.set_position(pos);
 }

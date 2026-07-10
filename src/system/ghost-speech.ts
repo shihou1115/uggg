@@ -15,6 +15,8 @@ interface SpeakerLike {
 let currentToken: TypewriterToken | null = null;
 let talkSpeed: TalkSpeed = "normal";
 let ttsSpeaker: SpeakerLike | null = null;
+/// 入力促し (spec §4.3.1) を表示中の slot。入力欄が閉じるまで吹き出しを保持する。
+let promptSlot: SlotName | null = null;
 
 export function setSpeaker(s: SpeakerLike): void {
   ttsSpeaker = s;
@@ -41,6 +43,7 @@ export async function renderResponse(resp: DialogueResponse): Promise<void> {
   const token = newToken();
   currentToken = token;
 
+  promptSlot = null; // 促し表示は新しい応答で置き換えられる
   hideAllBalloons();
 
   const subFirst = resp.pattern === 2 && resp.sub != null;
@@ -63,6 +66,26 @@ export async function renderResponse(resp: DialogueResponse): Promise<void> {
   if (token.cancelled) return;
   hideBalloon("main");
   if (resp.sub) hideBalloon("sub");
+}
+
+/// 入力促し (spec §4.3.1): クリックされたキャラ単独の短い発話。
+/// 通常の応答と違い自動では消さず、入力欄が閉じるとき clearPrompt() で消す。
+export async function renderPrompt(slot: SlotName, turn: SpeechTurn): Promise<void> {
+  if (currentToken) currentToken.cancelled = true;
+  ttsSpeaker?.interrupt();
+  const token = newToken();
+  currentToken = token;
+
+  hideAllBalloons();
+  promptSlot = slot;
+  await speakSlot(token, slot, turn);
+}
+
+/// 促し発話の吹き出しを消す (入力欄クローズ時に input.ts から呼ばれる)。
+export function clearPrompt(): void {
+  if (promptSlot === null) return;
+  hideBalloon(promptSlot);
+  promptSlot = null;
 }
 
 async function speakSlot(

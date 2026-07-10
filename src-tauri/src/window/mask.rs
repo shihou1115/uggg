@@ -38,11 +38,30 @@ pub fn spawn_cursor_watcher(app: AppHandle, state: Arc<AppState>) {
             let opaque = check_opaque_at(&state, rel_x_css, rel_y_css, inner_w_css, inner_h_css);
             let want_ignore = !opaque;
             if last_ignore != Some(want_ignore) {
+                // 透過化 (ignore=true) への遷移は左ボタン押下中は保留する。
+                // キャラドラッグ (spec §4.3.4) 中はマスク更新 (50ms デバウンス) が
+                // カーソルに追いつかず、古いマスクの透明セル上で click-through が
+                // 発動して mousemove/mouseup を取りこぼすため。
+                // 対話化 (ignore=false) への遷移は常に即時。
+                if want_ignore && left_button_held() {
+                    continue;
+                }
                 let _ = window.set_ignore_cursor_events(want_ignore);
                 last_ignore = Some(want_ignore);
             }
         }
     });
+}
+
+#[cfg(windows)]
+fn left_button_held() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    (unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16 & 0x8000) != 0
+}
+
+#[cfg(not(windows))]
+fn left_button_held() -> bool {
+    false
 }
 
 fn check_opaque_at(state: &AppState, x_css: f64, y_css: f64, w_css: f64, h_css: f64) -> bool {

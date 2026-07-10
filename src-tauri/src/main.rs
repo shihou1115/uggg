@@ -72,9 +72,9 @@ fn main() {
             window::start_cursor_watcher(app.handle().clone(), state.clone());
             // 初回起動時のみ取扱説明書を開く
             system::manual::open_on_first_run(app.handle(), &state);
-            // ウインドウ位置の復元 + 監視保存
-            presence::window_pos::restore(app.handle(), &state);
-            presence::window_pos::spawn_pos_saver(app.handle().clone(), state.clone());
+            // ステージを作業領域下端へドック + 構成変更の監視
+            presence::window_pos::dock(app.handle(), &state);
+            presence::window_pos::spawn_dock_keeper(app.handle().clone(), state.clone());
             // 自発挙動: ランダムトーク + 放置監視
             tasks::spawn_random_talk(app.handle().clone(), state.clone());
             tasks::spawn_idle_watcher(app.handle().clone(), state.clone());
@@ -120,6 +120,7 @@ fn main() {
             commands::dialogue::send_user_message,
             commands::interaction::poke,
             commands::interaction::nade,
+            commands::interaction::input_prompt,
             commands::lifecycle::frontend_ready,
             commands::lifecycle::quit_app,
             commands::lifecycle::hide_window,
@@ -161,6 +162,7 @@ fn main() {
             commands::tts::voice_ref_generate,
             commands::tts::voice_ref_preview,
             commands::window::update_alpha_mask,
+            commands::window::set_char_positions,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start ugg");

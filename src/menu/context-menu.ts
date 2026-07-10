@@ -82,12 +82,6 @@ function buildItems(): Array<MenuItem | { divider: true }> {
   const quietLabel = settings?.quiet_mode ? "静音モード解除" : "静音モード ON";
   return [
     {
-      label: "このキャラと話す",
-      onClick: () => {
-        window.dispatchEvent(new CustomEvent("ugg-open-input"));
-      },
-    },
-    {
       label: modeLabel,
       onClick: () => onModeToggle(next),
     },

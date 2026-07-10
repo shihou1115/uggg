@@ -283,6 +283,22 @@ monologue:
   - main: { text: "深呼吸ひとつ。ほら、ちょっと楽になった？", pose: happy }
     sub: { text: "吸って、吐いて。それだけでいい", pose: normal }
 
+# キャラクリック時の入力促し (spec §4.3.1)。
+# クリックされた側だけが短く反応し、チャット入力欄への導線になる。
+# main/sub 個別の単発ターン (掛け合いにはしない)。
+input_prompt:
+  main:
+    - { text: "なにか用かな？", pose: happy }
+    - { text: "ん、呼んだ？お話しよっか", pose: happy }
+    - { text: "どうしたの？なんでも聞くよ", pose: normal }
+    - { text: "あたしに話しかけてくれるの？うれしいな", pose: happy }
+    - { text: "はいはーい、ミミですよ。ご用件をどうぞ！", pose: happy }
+  sub:
+    - { text: "……ボクに用か。聞くだけ聞いてやる", pose: normal }
+    - { text: "なんだ、話か。手短にな", pose: normal }
+    - { text: "ミミじゃなくてボクでいいのか？……まあいい", pose: troubled }
+    - { text: "……ん。起きてる。話せ", pose: normal }
+
 # ライフサイクル・操作・存在感系イベント
 events:
   first_boot:

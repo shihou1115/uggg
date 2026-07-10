@@ -112,7 +112,7 @@ src-tauri/src/
 │   ├── mod.rs
 │   ├── idle.rs              -- 30 分無操作 → events.idle
 │   ├── quiet.rs             -- 静音モード判定（quiet_mode / フルスクリーン / ポモドーロ集中 / 読み上げ中）
-│   └── window_pos.rs        -- ウインドウ位置永続化（3秒デバウンス）
+│   └── window_pos.rs        -- ステージのドック（作業領域下端全幅に固定・1秒監視で再ドック・モニタ記憶）
 │
 ├── window/                  -- ウインドウ管理
 │   ├── mod.rs               -- create_main_window
@@ -225,7 +225,7 @@ CREATE TABLE app_settings (
 );
 ```
 - `"settings"` キーに Settings 構造体全体を JSON で保存（フィールド追加に DDL 不要）
-- 個別キー: `window_pos`（{x,y}）, `first_boot_done`（"1"）, `last_update_check`（unix秒）, `profile_onboarded`（"1"）, `update_notice_seen:<version>`（"1"）等
+- 個別キー: `window_pos`（{x,y}。ステージのドック先モニタの記憶に使う）, `char_pos`（{main,sub} キャラごとの X 位置 CSS px）, `first_boot_done`（"1"）, `last_update_check`（unix秒）, `profile_onboarded`（"1"）, `update_notice_seen:<version>`（"1"）等
 
 #### `chat_log`
 ```sql
@@ -393,7 +393,7 @@ pub struct GhostBundle {
        ├─ ウインドウ生成
        ├─ クリック透過ポーリング起動（window/mask）
        ├─ presence::spawn_idle_watcher
-       ├─ presence::spawn_pos_saver
+       ├─ presence::spawn_dock_keeper
        ├─ tasks::spawn_random_talk (interval_rx)
        ├─ tasks::spawn_topics_fetcher (topics_rx)
        ├─ update::spawn_update_check
@@ -421,7 +421,7 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `get_boot_payload` | なし | `BootPayload` | キャラ画像（data URL）、settings、recent_log 等 |
+| `get_boot_payload` | なし | `BootPayload` | キャラ画像（data URL）、settings、`char_positions`（保存済みキャラ X 位置。無ければ null）等 |
 | `frontend_ready` | なし | `()` | boot 完了通知。起動挨拶（first_boot or boot）+ 更新チェック起動 |
 | `quit_app` | なし | `()` | コンテキストメニュー「終了」。Irodori サイドカーを best-effort shutdown 後に exit |
 | `hide_window` | なし | `()` | メインウインドウを hide（トレイから再表示） |
@@ -451,6 +451,7 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `poke` | `target: "main"\|"sub", region: "head"\|"chest"\|"body", rapid: bool` | `DialogueResponse \| null` | C-2 で縦のみ |
 | `nade` | `target: "main"\|"sub", region: "head"\|"chest"\|"body"` | `DialogueResponse \| null` | 同上、撫で |
+| `input_prompt` | `target: "main"\|"sub"` | `SpeechTurn \| null` | クリック時の入力促し（spec §4.3.1）。辞書 `input_prompt` から抽選し chat_log に記録。**dialogue イベントは emit しない**（フロントが renderPrompt で描画）。辞書未定義・sub 無しゴーストの sub は null |
 
 ### 4.5 profile
 
@@ -524,6 +525,7 @@ pub struct GhostBundle {
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
 | `update_alpha_mask` | `mask: AlphaMask` | `()` | クリック透過用 |
+| `set_char_positions` | `main: f64 \| null, sub: f64 \| null` | `()` | キャラごとの X 位置（ステージ内 CSS px、視覚ボックス左端）を `app_settings.char_pos` に保存。ドラッグ終了時に呼ぶ（spec §4.1.6 / §4.3.4） |
 
 ---
 
@@ -563,6 +565,9 @@ events:
 system_messages:
   cost_warning_80: [ ... ]
   # ... (詳細は §6.5)
+input_prompt:          # キャラクリック時の入力促し (詳細は §6.2)
+  main: [ ... ]
+  sub: [ ... ]
 ```
 
 ### 6.2 セクション仕様
@@ -646,6 +651,20 @@ events:
   break_end: [ ... ]
   pomodoro_done: [ ... ]
 ```
+
+#### input_prompt（キャラクリック時の入力促し、spec §4.3.1）
+```yaml
+input_prompt:
+  main:
+    - { text: "なにか用かな？", pose: happy }
+  sub:
+    - { text: "……ボクに用か", pose: normal }
+```
+
+- **クリックされた側だけが喋る単発ターン**（Line ではなく SpeechTurn のリスト。掛け合いにしない）
+- main / sub 各リストから無条件で 1 件抽選（when 非対応）
+- セクション省略可。無ければ促し無しで入力欄だけ開く（旧辞書互換）
+- 発話は `input_prompt` コマンドの戻り値をフロントが renderPrompt() で描画し、**入力欄が閉じるまで吹き出しを保持**する（通常の hold 時間で消さない）
 
 ### 6.3 when 条件（I2: 表現力強化）
 
@@ -990,6 +1009,7 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 - 不透明セル → `set_ignore_cursor_events(false)`
 - 透明セル / ウインドウ外 → `true`
 - 状態変化時のみ呼ぶ
+- **左ボタン押下中（GetAsyncKeyState）は透過化への遷移を保留**: キャラドラッグ（spec §4.3.4）中はマスク更新がカーソルに追いつかず、古いマスクの透明セル上で click-through が発動して mousemove/mouseup を取りこぼすため。対話化への遷移は常に即時
 
 ### 9.3 レイヤー分離との整合
 - `#character-layer` のキャラ画像アルファは scale 後の見かけサイズで合成
@@ -1004,9 +1024,9 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 
 ```html
 <div id="stage">
-  <div id="character-layer" style="transform: scale(var(--ugg-scale))">
-    <div id="char-main">...</div>
-    <div id="char-sub">...</div>
+  <div id="character-layer">   <!-- inset:0 の配置基準。scale は各 slot 側 -->
+    <div id="char-main" style="left: <x>px; transform: scale(var(--ugg-scale))">...</div>
+    <div id="char-sub" style="left: <x>px; transform: scale(var(--ugg-scale))">...</div>
   </div>
   <div id="ui-layer">           <!-- scale なし -->
     <div id="balloon-main"></div>
@@ -1019,26 +1039,32 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 </div>
 ```
 
-### 10.2 表示スケールの適用範囲
+### 10.2 ステージ方式とキャラ個別配置（spec §4.1.6 / §4.3.4）
 
-- `--ugg-scale` は CSS 変数として `:root` に保持
-- `#character-layer` の `transform: scale(var(--ugg-scale))` のみ反映
-- ウインドウサイズは Rust 側で同率拡縮
-- ステージは `position: fixed; bottom: 0; left: 0`（全スケール下端アンカー）
+- ウインドウ = **モニタ作業領域の全幅 × 高さ 600 の透明ステージ**。作業領域下端に固定（presence/window_pos.rs が起動時ドック + 1 秒監視で再ドック）。ユーザーはウインドウを動かせない
+- 各 `.char-slot` は `position: absolute; bottom: 0; left: <x>px`（x = stage/charpos.ts が管理、CSS px）。**キャラごとに独立して X 移動**し、Y は bottom:0 固定
+- `--ugg-scale` は CSS 変数として `:root` に保持し、**各 `.char-slot` に** `transform: scale(var(--ugg-scale))` を適用。`transform-origin: bottom left` のため `left` = 視覚ボックス左端のまま拡縮できる
+- 既定配置（char_pos 未保存時）: main はステージ右端、sub は main の左 40px（spec §4.1.1）
+- スケール変更・ステージリサイズ時は charpos.ts が全キャラをステージ内に再 clamp する
 
-### 10.3 吹き出し配置計算
+### 10.3 吹き出し配置計算（キャラ左横・伺か風）
 
 ```typescript
-function placeBalloon(balloon: HTMLElement, charSlot: "main" | "sub") {
-    const charLayer = document.getElementById("character-layer")!;
-    const char = document.getElementById(`char-${charSlot}`)!;
-    const charRect = char.getBoundingClientRect();    // scale 後の矩形
-    balloon.style.left = `${charRect.left + charRect.width / 2 - balloon.offsetWidth / 2}px`;
-    balloon.style.bottom = `${window.innerHeight - charRect.top + 10}px`;  // キャラ上部に
+function reposition(slot: "main" | "sub") {
+    const rect = char.getBoundingClientRect();        // scale 後の矩形
+    // 横: キャラ左端から 24px (しっぽ含む) 空けて右端を合わせる
+    let left = rect.left - 24 - balloon.offsetWidth;
+    // 左端 8px に収まらない場合はキャラの右横へ反転 (.flip、しっぽも反転)
+    if (left < 8) left = rect.right + 24;
+    // 縦: キャラ上端 + キャラ高さ × 0.12 (顔の高さ) に上端を置く
+    let top = rect.top + rect.height * 0.12;
+    // 相方の吹き出しと重なる場合: main は相方の上へ、sub は相方の下へ退避
+    // 最後に上下端 8px で clamp
 }
 ```
 
-- リサイズ・スケール変更時に再計算
+- しっぽは吹き出しの側辺（上端から 20px）からキャラ側を向く（通常 = 右辺から右向き、.flip 時 = 左辺から左向き）
+- タイプライター進行・キャラのドラッグ移動ごとに再計算（吹き出しの成長とキャラ追従）
 - フォント/border はスケールの影響を受けないため視認性確保
 
 ### 10.4 3つ目の吹き出し（A-3 パターン3/4）
@@ -1262,7 +1288,7 @@ async fn install_asset(
             ├─ create_main_window(app, settings.display_scale)
             ├─ window::mask::spawn_cursor_polling(app, state.clone())
             ├─ presence::idle::spawn_watcher(app, state.clone())
-            ├─ presence::window_pos::spawn_saver(state.clone())
+            ├─ presence::window_pos::spawn_dock_keeper(state.clone())
             ├─ workers::spawn_random_talk(app, state.clone(), interval_rx)
             ├─ workers::spawn_topics_fetcher(app, state.clone(), topics_rx)
             ├─ system::update::spawn_check(app, state.clone())

@@ -29,6 +29,9 @@ pub struct Dictionary {
     pub monologue: Vec<Line>,
     pub events: HashMap<String, Vec<EventLine>>,
     pub system_messages: HashMap<String, Vec<EventLine>>,
+    /// キャラクリック時の入力促し (spec §4.3.1)。クリックされた側だけの単発ターン。
+    pub input_prompt_main: Vec<SpeechTurn>,
+    pub input_prompt_sub: Vec<SpeechTurn>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +102,16 @@ struct DictionaryYaml {
     events: HashMap<String, Vec<EventLineYaml>>,
     #[serde(default)]
     system_messages: HashMap<String, Vec<EventLineYaml>>,
+    #[serde(default)]
+    input_prompt: InputPromptYaml,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InputPromptYaml {
+    #[serde(default)]
+    main: Vec<SpeechTurnYaml>,
+    #[serde(default)]
+    sub: Vec<SpeechTurnYaml>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,6 +491,17 @@ impl Dictionary {
         let candidates = self.system_messages.get(key)?;
         pick_event_candidate(candidates, ctx, sub_available)
     }
+
+    /// キャラクリック時の入力促し (spec §4.3.1)。target = "main" | "sub"。
+    /// 未定義の辞書 (旧形式含む) では None → フロントは促し無しで入力欄だけ開く。
+    pub fn pick_input_prompt(&self, target: &str) -> Option<SpeechTurn> {
+        let list = if target == "sub" {
+            &self.input_prompt_sub
+        } else {
+            &self.input_prompt_main
+        };
+        pick_random(list).cloned()
+    }
 }
 
 fn pick_event_candidate(
@@ -555,6 +579,8 @@ pub fn load_dictionary(path: &Path) -> Result<Dictionary> {
         monologue: convert_lines(yaml.monologue)?,
         events: convert_event_map(yaml.events)?,
         system_messages: convert_event_map(yaml.system_messages)?,
+        input_prompt_main: convert_turns(yaml.input_prompt.main),
+        input_prompt_sub: convert_turns(yaml.input_prompt.sub),
     };
 
     validate_dictionary(&dict, path)?;
@@ -589,6 +615,16 @@ fn convert_lines(items: Vec<LineYaml>) -> Result<Vec<Line>> {
         });
     }
     Ok(out)
+}
+
+fn convert_turns(items: Vec<SpeechTurnYaml>) -> Vec<SpeechTurn> {
+    items
+        .into_iter()
+        .map(|y| SpeechTurn {
+            text: y.text,
+            pose: y.pose,
+        })
+        .collect()
 }
 
 fn convert_event_map(
@@ -645,6 +681,16 @@ fn validate_dictionary(dict: &Dictionary, path: &Path) -> Result<()> {
         for (i, ev) in list.iter().enumerate() {
             if ev.line.main.text.trim().is_empty() {
                 checks.push(format!("events.{key}[{i}].main.text が空です"));
+            }
+        }
+    }
+    for (name, list) in [
+        ("main", &dict.input_prompt_main),
+        ("sub", &dict.input_prompt_sub),
+    ] {
+        for (i, turn) in list.iter().enumerate() {
+            if turn.text.trim().is_empty() {
+                checks.push(format!("input_prompt.{name}[{i}].text が空です"));
             }
         }
     }

@@ -442,6 +442,8 @@ mod tests {
             monologue: vec![],
             events: Default::default(),
             system_messages: Default::default(),
+            input_prompt_main: vec![],
+            input_prompt_sub: vec![],
         }
     }
 
