@@ -17,8 +17,12 @@ use tauri::{AppHandle, Manager, Monitor, PhysicalPosition, PhysicalSize};
 use crate::state::AppState;
 
 const WINDOW_POS_KEY: &str = "window_pos";
-/// ステージの高さ (CSS px)。キャラ (スケール 1.0 で最大 384px 級) とバルーンが収まる帯。
-const STAGE_HEIGHT_LOGICAL: f64 = 600.0;
+/// ステージの高さ (CSS px)。デフォルトシェルの最大キャラ (384px) を表示スケール上限
+/// (scale.ts MAX_SCALE = 2.0 → 768px) で拡大しても頭が切れず、その上のバルーン・入力欄
+/// まで収まる高さ。= 384 * 2.0 + 256 (バルーン/入力欄/余白)。作業領域が足りなければ
+/// dock_rect が wa.size.height でキャップする (低解像度で物理的に入らない分は不可避)。
+/// スケール連動でキャラ頭が切れる回帰 (v0.1.4 監査で検出) を防ぐための値。
+const STAGE_HEIGHT_LOGICAL: f64 = 1024.0;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct StoredPos {

@@ -1051,7 +1051,7 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 
 ### 10.2 ステージ方式とキャラ個別配置（spec §4.1.6 / §4.3.4）
 
-- ウインドウ = **モニタ作業領域の全幅 × 高さ 600 の透明ステージ**。作業領域下端に固定（presence/window_pos.rs が起動時ドック + 1 秒監視で再ドック）。ユーザーはウインドウを動かせない
+- ウインドウ = **モニタ作業領域の全幅 × 高さ 1024 (logical) の透明ステージ**。作業領域下端に固定（presence/window_pos.rs が起動時ドック + 1 秒監視で再ドック）。高さはスケール上限 2.0 でデフォルトシェルのキャラ (384px→768px) + バルーン/入力欄を収容する値（作業領域が足りなければキャップ）。ユーザーはウインドウを動かせない
 - 各 `.char-slot` は `position: absolute; bottom: 0; left: <x>px`（x = stage/charpos.ts が管理、CSS px）。**キャラごとに独立して X 移動**し、Y は bottom:0 固定
 - `--ugg-scale` は CSS 変数として `:root` に保持し、**各 `.char-slot` に** `transform: scale(var(--ugg-scale))` を適用。`transform-origin: bottom left` のため `left` = 視覚ボックス左端のまま拡縮できる
 - 既定配置（char_pos 未保存時）: main はステージ右端、sub は main の左 40px（spec §4.1.1）

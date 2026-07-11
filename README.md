@@ -2,7 +2,7 @@
 
 「伺か」コンセプトを **Tauri v2 (Rust + TypeScript)** で再構築したデスクトップマスコット。透過ウインドウ上でメイン/サブ 2 体のキャラクターが掛け合い対話する。Windows 専用。
 
-> v0.0.3 プロトタイプ (`C:\claude\ugga`) を経て、本リポジトリは **本開発** (`C:\claude\uggg`)。M0〜M6 完了、**v0.1.3 リリース済** (タグ `v0.1.3`)。
+> v0.0.3 プロトタイプ (`C:\claude\ugga`) を経て、本リポジトリは **本開発** (`C:\claude\uggg`)。M0〜M6 完了、**v0.1.4 リリース済** (タグ `v0.1.4`)。
 >
 > **使い方は [取扱説明書 (docs/manual.md)](docs/manual.md) を参照。** 以下は開発者向けの情報。
 
@@ -35,7 +35,7 @@ npm run tauri dev
 
 ```pwsh
 npm run tauri build
-# → src-tauri/target/release/bundle/nsis/ugg_0.1.3_x64-setup.exe
+# → src-tauri/target/release/bundle/nsis/ugg_0.1.4_x64-setup.exe
 ```
 
 検証:

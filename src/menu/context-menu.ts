@@ -51,7 +51,17 @@ export function mountContextMenu(opts: {
 }
 
 export function isMenuOpen(): boolean {
-  return menuOpen;
+  // フラグ単独だと、メニュー表示中に発話 (自発トーク・つつき等) が割り込んで
+  // showBalloon が .balloon-menu を空にしても menuOpen が true のまま残り、
+  // 次の 1 クリックが main.ts のゲートで closeMenu に食われて空振りする (v0.1.4 監査)。
+  // 実際に項目が残っているかで判定し、消えていればフラグも畳む。
+  if (!menuOpen) return false;
+  const menu = balloonMenuContainer("main");
+  if (!menu || menu.childElementCount === 0) {
+    menuOpen = false;
+    return false;
+  }
+  return true;
 }
 
 /// メニューを閉じる: 項目を空にし、前口上の発話ごとバルーンを畳む。
