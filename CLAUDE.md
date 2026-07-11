@@ -45,6 +45,15 @@ v0.0.3 で得た主な負債:
 - `npm run tauri dev` — 開発起動
 - `cargo check`（src-tauri/ 内で実行）— Rust 型検査
 - `npx tsc --noEmit` — TypeScript 型検査
+
+### dev 実機検証の起動待ちルール（2026-07-10 再発防止）
+
+- dev の起動/再起動待ちは **`scripts/dev-ready.ps1` の同期実行**で行う:
+  - 起動待ち: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-ready.ps1`
+  - 再起動待ち（`touch` でリビルドさせた後）: `... -AfterTouch <touch したファイル>`
+  - `Port 5273 is already in use` で dev が落ちたら: `... -CleanOrphans` を先に実行（孤児 vite/ugg.exe の掃除）
+- **dev ログの grep で起動判定をしない**（ANSI エスケープでパターンが壊れる・追記蓄積で回数閾値が無意味、の 2 通りで誤判定した実績）。ログは診断専用
+- **バックグラウンドの watch ループを起動待ちに使わない**（セッション終了で消滅し何も駆動しない実績）。待機は必ず 1 回の同期呼び出しで完結させ、exit code（0=READY / 1=タイムアウト）で分岐する
 - `npm run tauri build` — リリースビルド（NSIS インストーラ生成）。**リリース作業時は `.claude/skills/releasing-ugg` の手順に従うこと**（dev で動いても配布版が壊れる罠の再発防止）
 
 ## Model Routing / Token ROI
