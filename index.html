@@ -58,6 +58,39 @@
           <p id="chatlog-message" class="panel-message" hidden></p>
         </div>
       </div>
+      <!-- ポモドーロタイマー操作パネル (spec §4.4.5)。静的配置 (WebView2 透過バグ対策)。 -->
+      <div id="pomodoro-panel" class="solid panel">
+        <header class="panel-header">
+          <h2>ポモドーロタイマー</h2>
+          <button type="button" id="pomodoro-close" class="panel-close" aria-label="閉じる">×</button>
+        </header>
+        <div class="panel-body">
+          <section class="panel-section">
+            <div id="pomodoro-panel-status" class="pomodoro-status">停止中</div>
+          </section>
+          <section class="panel-section">
+            <h3>時間設定</h3>
+            <label class="row">
+              <span>集中 (分)</span>
+              <input type="number" id="pomodoro-work" min="1" max="180" step="1" />
+            </label>
+            <label class="row">
+              <span>休憩 (分)</span>
+              <input type="number" id="pomodoro-break" min="1" max="60" step="1" />
+            </label>
+            <label class="row">
+              <span>ラウンド数</span>
+              <input type="number" id="pomodoro-rounds" min="1" max="20" step="1" />
+            </label>
+            <p class="panel-hint">時間設定は設定パネルと共有され保存されます。進行中は変更できません。</p>
+          </section>
+        </div>
+        <footer class="panel-footer">
+          <button type="button" id="pomodoro-abort">中断</button>
+          <button type="button" id="pomodoro-pause">停止</button>
+          <button type="button" id="pomodoro-start" class="primary">開始</button>
+        </footer>
+      </div>
       <div id="settings-panel" class="solid panel">
         <header class="panel-header">
           <h2>設定</h2>

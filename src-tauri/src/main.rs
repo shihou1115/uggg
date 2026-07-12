@@ -130,6 +130,8 @@ fn main() {
             commands::onboarding::skip_onboarding,
             commands::pomodoro::start_pomodoro,
             commands::pomodoro::stop_pomodoro,
+            commands::pomodoro::pause_pomodoro,
+            commands::pomodoro::resume_pomodoro,
             commands::pomodoro::get_pomodoro_status,
             commands::topics::get_interests,
             commands::topics::set_interests,

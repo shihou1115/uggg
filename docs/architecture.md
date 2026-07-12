@@ -508,9 +508,11 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `start_pomodoro` | なし | `()` | settings の work/break/rounds を使用 |
-| `stop_pomodoro` | なし | `()` | |
-| `get_pomodoro_status` | なし | `PomodoroStatus` | |
+| `start_pomodoro` | なし | `()` | settings の work/break/rounds で開始（idle 時）。GUI パネルの「開始」（spec §4.4.5） |
+| `stop_pomodoro` | なし | `()` | idle に戻す（破棄）。GUI パネルの「中断」 |
+| `pause_pomodoro` | なし | `()` | 進行中のカウントダウンを一時停止（残り時間を保持）。GUI「停止」 |
+| `resume_pomodoro` | なし | `()` | 一時停止から同じ残り時間で再開。GUI「停止」の再押下 |
+| `get_pomodoro_status` | なし | `PomodoroStatus` | `phase` / `remaining_sec` / `round` / `rounds` / `paused: bool` |
 | `list_reminders` | なし | `ReminderEntry[]` | |
 | `add_reminder` | `text: String, offset_secs: i64` | `ReminderEntry[]` | 現在時刻からの相対秒。追加後の一覧を返す |
 | `delete_reminder` | `id: i64` | `ReminderEntry[]` | 削除後の一覧を返す |

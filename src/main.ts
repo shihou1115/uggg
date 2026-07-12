@@ -13,7 +13,7 @@ import { attachNadeDetector } from "./interaction/nade";
 import { firePoke } from "./interaction/poke";
 import { closeMenu, isMenuOpen, mountContextMenu } from "./menu/context-menu";
 import { showOnboarding } from "./panels/onboarding";
-import { mountPomodoroBadge } from "./panels/pomodoro";
+import { mountPomodoroBadge, mountPomodoroPanel } from "./panels/pomodoro";
 import { mountConfirm } from "./confirm";
 import { mountDnd } from "./dnd";
 import { mountChatLog } from "./panels/chatlog";
@@ -79,6 +79,15 @@ async function boot(): Promise<void> {
 
   await mountSettingsPanel();
   await mountPomodoroBadge();
+  mountPomodoroPanel({
+    current: () => currentSettings,
+    persist: async (patch) => {
+      if (!currentSettings) return;
+      currentSettings = await invoke<Settings>("set_settings", {
+        settings: { ...currentSettings, ...patch },
+      });
+    },
+  });
   mountCredit();
   mountChatLog();
   mountReaderPanel();

@@ -51,9 +51,15 @@ export function attachClickDetector(handle: ClickHandler): void {
 
 function onMouseDown(ev: MouseEvent): void {
   if (ev.button !== 0) return; // 左クリックのみ
-  // 入力欄・ボタン・バルーン内メニュー (spec §4.3.5) は素通り
+  // 入力欄・ボタン・バルーン内メニュー・各パネル・バッジ等の UI 要素は素通り。
+  // キャラ本体と透明部分のクリックだけを入力導線 (spec §4.3.1) の判定対象にする
+  // (パネルの空白部分クリックで入力欄が開く不具合の防止)。
   const target = ev.target as HTMLElement | null;
-  if (target?.closest(".chat-input-target, input, button, textarea, .balloon-menu")) {
+  if (
+    target?.closest(
+      ".chat-input-target, input, button, textarea, .balloon-menu, .panel, #pomodoro-badge, #chat-input-wrap",
+    )
+  ) {
     return;
   }
   state.pressed = true;

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { balloonMenuContainer, reposition } from "../dialogue/balloon";
 import { closeInput, isInputOpen } from "../dialogue/input";
+import { openPomodoroPanel } from "../panels/pomodoro";
 import { openReaderPanel } from "../panels/reader";
 import { openSettingsPanel } from "../panels/settings";
 import { hitTest } from "../stage/character";
@@ -150,12 +151,8 @@ function buildItems(): Array<MenuItem | { divider: true }> {
     },
     { divider: true },
     {
-      label: "ポモドーロ開始",
-      onClick: () => invoke("start_pomodoro").catch((e) => console.error(e)),
-    },
-    {
-      label: "ポモドーロ停止",
-      onClick: () => invoke("stop_pomodoro").catch((e) => console.error(e)),
+      label: "ポモドーロタイマー",
+      onClick: () => openPomodoroPanel(),
     },
     {
       label: "テキスト読み上げ",

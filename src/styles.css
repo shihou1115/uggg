@@ -115,6 +115,20 @@ body {
   color: #666;
 }
 
+/* ポモドーロ操作パネル (spec §4.4.5) */
+.pomodoro-status {
+  font-size: 15px;
+  font-family: "Consolas", "Meiryo", monospace;
+  color: #1c1c1c;
+  padding: 2px 0;
+}
+
+.panel-footer button:disabled {
+  opacity: 0.45;
+  cursor: default;
+  filter: none;
+}
+
 /* 吹き出し: index.html に静的配置済み。.visible が付くまで非表示。
    `display: none !important` で確実に隠す (v0.0.3 と同じ方式)。
    動的 createElement だと WebView2 透過レイヤーで描画されないため

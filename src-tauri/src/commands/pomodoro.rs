@@ -27,6 +27,8 @@ pub struct PomodoroStatus {
     pub remaining_sec: u32,
     pub round: u32,
     pub rounds: u32,
+    /// 一時停止中か (spec §4.4.5)。GUI がボタン状態切替に使う。
+    pub paused: bool,
 }
 
 fn phase_name(phase: u32) -> &'static str {
@@ -43,6 +45,7 @@ fn snapshot(state: &Arc<AppState>) -> PomodoroStatus {
         remaining_sec: state.pomodoro.remaining.load(Ordering::SeqCst),
         round: state.pomodoro.round.load(Ordering::SeqCst),
         rounds: state.pomodoro.rounds.load(Ordering::SeqCst),
+        paused: state.pomodoro.paused.load(Ordering::SeqCst),
     }
 }
 
@@ -56,6 +59,25 @@ pub fn stop_pomodoro(app: AppHandle, state: State<'_, Arc<AppState>>) {
     stop_internal(&app, state.inner());
 }
 
+/// GUI「停止」: 進行中のカウントダウンを一時停止 (idle 中は無視)。
+#[tauri::command]
+pub fn pause_pomodoro(app: AppHandle, state: State<'_, Arc<AppState>>) {
+    let s = state.inner();
+    if s.pomodoro.phase.load(Ordering::SeqCst) == PHASE_IDLE {
+        return;
+    }
+    s.pomodoro.paused.store(true, Ordering::SeqCst);
+    let _ = app.emit("pomodoro", snapshot(s));
+}
+
+/// GUI「停止」の再押下: 一時停止から同じ残り時間で再開。
+#[tauri::command]
+pub fn resume_pomodoro(app: AppHandle, state: State<'_, Arc<AppState>>) {
+    let s = state.inner();
+    s.pomodoro.paused.store(false, Ordering::SeqCst);
+    let _ = app.emit("pomodoro", snapshot(s));
+}
+
 fn stop_internal(app: &AppHandle, state: &Arc<AppState>) {
     state.pomodoro.gen.fetch_add(1, Ordering::SeqCst);
     state.pomodoro.focus.store(false, Ordering::SeqCst);
@@ -63,6 +85,7 @@ fn stop_internal(app: &AppHandle, state: &Arc<AppState>) {
     state.pomodoro.remaining.store(0, Ordering::SeqCst);
     state.pomodoro.round.store(0, Ordering::SeqCst);
     state.pomodoro.rounds.store(0, Ordering::SeqCst);
+    state.pomodoro.paused.store(false, Ordering::SeqCst);
     let _ = app.emit("pomodoro", snapshot(state));
 }
 
@@ -82,6 +105,7 @@ pub fn start_pomodoro(app: AppHandle, state: State<'_, Arc<AppState>>) {
     inner.pomodoro.round.store(0, Ordering::SeqCst);
     inner.pomodoro.phase.store(PHASE_IDLE, Ordering::SeqCst);
     inner.pomodoro.remaining.store(0, Ordering::SeqCst);
+    inner.pomodoro.paused.store(false, Ordering::SeqCst);
 
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -142,19 +166,24 @@ async fn run_phase(
 ) -> bool {
     state.pomodoro.remaining.store(secs, Ordering::SeqCst);
     let _ = app.emit("pomodoro", snapshot(state));
-    for _ in 0..secs {
+    loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if gen != state.pomodoro.gen.load(Ordering::SeqCst) {
-            return false;
+            return false; // stop (中断) / 新規 start で失効
+        }
+        // 一時停止中はカウントを進めず残り時間を保持 (spec §4.4.5)。
+        if state.pomodoro.paused.load(Ordering::SeqCst) {
+            continue;
         }
         let prev = state.pomodoro.remaining.fetch_sub(1, Ordering::SeqCst);
-        // 念のため0未満になっていたらリセット (saturating_sub 相当)
-        if prev == 0 {
+        if prev <= 1 {
+            // prev==1: 今の減算で 0 → フェーズ完了。prev==0 の異常時も 0 に正規化して完了。
             state.pomodoro.remaining.store(0, Ordering::SeqCst);
+            let _ = app.emit("pomodoro", snapshot(state));
+            return true;
         }
         let _ = app.emit("pomodoro", snapshot(state));
     }
-    true
 }
 
 /// 辞書 events から発話 (静音は無視: ユーザーが始めたタイマー)。

@@ -335,6 +335,8 @@ pub struct PomodoroState {
     pub round: AtomicU32,
     /// 総ラウンド数。
     pub rounds: AtomicU32,
+    /// 一時停止中フラグ (spec §4.4.5)。true の間はカウントダウンを止める。
+    pub paused: AtomicBool,
 }
 
 impl Default for PomodoroState {
@@ -346,6 +348,7 @@ impl Default for PomodoroState {
             remaining: AtomicU32::new(0),
             round: AtomicU32::new(0),
             rounds: AtomicU32::new(0),
+            paused: AtomicBool::new(false),
         }
     }
 }
