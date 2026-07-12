@@ -448,6 +448,7 @@ M4c は規模が大きいので **Phase A〜G** に分割して進める:
 | 2026-06-22 | architecture.md | `dialogue::advanced::system_prompt` シグネチャに `tools_block: &str` 追加。`build_messages` が `tools_enabled` のとき `render_tools_block(db)` で現在時刻 + 24 時間以内の保留中リマインダーを system prompt に注入。 | M5-B |
 | 2026-06-22 | architecture.md | `tasks::spawn_reminder_watcher` 追加 (10 秒間隔、`due_reminders(now)` を消費して `persist_and_speak` で発話 + DB 削除)。**静音中も鳴らす特例** (`quiet::should_stay_quiet` を見ない)。`notify::ReminderFired { text }` を将来用に追加。 | M5-B |
 | 2026-06-22 | architecture.md | `commands::tools` 新設: `list_reminders` / `add_reminder` / `delete_reminder` / `read_clipboard_text`。`tauri-plugin-clipboard-manager` を Cargo.toml + main.rs に統合。chat 入力欄 (`src/dialogue/input.ts`) に 📋 ボタンを追加し、`read_clipboard_text` で末尾追加。設定パネルに「ツール」セクション (tools_enabled + 保留中リマインダー一覧 + 削除ボタン)。 | M5-B |
+| 2026-07-12 | spec.md v1.1 | 新機能提案を有用性軸（頻度/代替不可能性/キャラ相乗/負効用リスク、実装難度は不使用）で評価し反映: **§4.6 日常支援を新設**（v0.2 スコープ: 統合リマインダー / ToDo・日課管理 / 状況対応型自発発話＋発話ガバナンス / カレンダー参照 read-only）。§4.2.1 に low=決定論的ローカル / advanced=解釈・生成の境界再定義と「LLM 停止でも生活支援は動く」不変条件。§4.5.3 に tools_enabled からのリマインダー独立の移行予告。§6 を Tier 別ロードマップへ再構成（音声入力を Tier A へ、縮小・凍結方針を明文化）。実装は未着手（Phase 2 = architecture 設計から）。 | v0.2 準備 |
 
 ---
 
