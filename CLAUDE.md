@@ -87,10 +87,11 @@ v0.0.3 で得た主な負債:
 
 | ファイル | 役割 | 状態 |
 |---|---|---|
-| docs/spec.md | 要件の正本 | v1 ✅ |
+| docs/spec.md | 要件の正本 | v1.1 ✅（§4.6 日常支援 追加） |
 | docs/architecture.md | モジュール構成・契約・設計判断 | v1 ✅ |
 | docs/test-plan.md | テスト戦略・手動チェックリスト | v1 ✅ |
 | docs/implementation-plan.md | 実装計画（M0〜M6 マイルストーン） | v1 ✅ |
+| docs/daily-support-design.md | **日常支援 Tier S の Phase 2 設計書**（§4.6 実装契約・DB・M7〜M10） | 設計 v1 ✅（未実装） |
 | [docs/_legacy-v003/baseline-v0.0.3.md](docs/_legacy-v003/baseline-v0.0.3.md) | **v0.0.3 機能・契約・残課題の網羅スナップショット** | 参照用 |
 | [docs/_legacy-v003/spec.md](docs/_legacy-v003/spec.md) | v0.0.3 要件（インプット） | 参照用 |
 | [docs/_legacy-v003/architecture.md](docs/_legacy-v003/architecture.md) | v0.0.3 設計（インプット） | 参照用 |
