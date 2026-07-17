@@ -12,6 +12,10 @@ pub fn pattern_1(kind: &'static str, mode: &'static str, line: DialogueLine) -> 
         pattern: 1,
         main: line.main,
         sub: line.sub,
+        speech_id: None,
+        category: None,
+        priority: None,
+        feedback_allowed: None,
     }
 }
 
@@ -50,5 +54,9 @@ pub fn assemble_advanced(line: DialogueLine, sub_available: bool) -> DialogueRes
         pattern: effective,
         main: line.main,
         sub: line.sub,
+        speech_id: None,
+        category: None,
+        priority: None,
+        feedback_allowed: None,
     }
 }

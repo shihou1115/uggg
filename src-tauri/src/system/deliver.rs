@@ -8,6 +8,7 @@
 //! 実到達は `DeliveryOutcome` で返し、Notice の呼び出し側 (リマインダー watcher) は
 //! `Deferred | Failed` を未達として active 維持・再試行につなぐ。
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -81,8 +82,20 @@ pub async fn deliver_event(
     let outcome = match line {
         Some(mut line) => {
             apply_placeholders_to_line(&mut line, placeholders);
-            let resp: DialogueResponse = banter::pattern_1("event", "low", line);
+            let mut resp: DialogueResponse = banter::pattern_1("event", "low", line);
+            // M9: 🔕 フィードバック用メタ (§4.3)。バック起点発話にのみ付与する。
+            // 🔕 の表示 (feedback_allowed) は Situation* のみ — 段 4/5 とバックオフの
+            // 適用対象と一致させる (Notice や独り言に「頻度を下げる」レバーは無い)。
+            let seq = state.governance.speech_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            resp.speech_id = Some(seq.to_string());
+            resp.category = Some(category.as_str());
+            resp.priority = Some(priority.as_str());
+            resp.feedback_allowed = Some(category.is_situation());
             if dialogue::persist_and_speak(app, state, &resp) {
+                // feedback_speech が「最新のタグ付き発話」とだけ照合できるよう記録
+                // (permit 保持中 = 直列化下なので競合しない)
+                *state.governance.last_speech.lock().expect("last_speech poisoned") =
+                    Some((seq, category));
                 DeliveryOutcome::Ghost
             } else {
                 toast_fallback(app, fallback)
@@ -98,24 +111,25 @@ pub async fn deliver_event(
     outcome
 }
 
-/// ユーザー起点の確認発話 (スヌーズ確認等) を辞書 events キーから**ゲートを通さず**
-/// 発話する。設計 §4.2「ユーザー起点の応答はゲートしない」に対応する補助経路で、
-/// record_delivered も呼ばない (自発発話の間隔会計に混ぜない)。
-/// 辞書未ヒット・発話失敗は false (呼び出し側は UI 表示で足りるため黙殺してよい)。
+/// ユーザー起点の確認発話 (スヌーズ確認・終了前確認等) を辞書 events キーから
+/// **ゲートを通さず**発話する。設計 §4.2「ユーザー起点の応答はゲートしない」に対応する
+/// 補助経路で、record_delivered も 🔕 メタの付与も行わない (自発発話の会計に混ぜない)。
+/// 戻り値は発話した内容 (辞書未ヒット・発話失敗は None。呼び出し側は UI 表示で足りるため
+/// 黙殺してよい。tray の終了前確認は hold 時間の計算に使う)。
 pub fn speak_event_now(
     app: &AppHandle,
     state: &Arc<AppState>,
     key: &str,
     placeholders: &[(&str, &str)],
-) -> bool {
-    let line = resolve_line(state, SpeechCategory::Reminder, key);
-    match line {
-        Some(mut line) => {
-            apply_placeholders_to_line(&mut line, placeholders);
-            let resp: DialogueResponse = banter::pattern_1("event", "low", line);
-            dialogue::persist_and_speak(app, state, &resp)
-        }
-        None => false,
+) -> Option<DialogueResponse> {
+    let line = resolve_line(state, SpeechCategory::Reminder, key)?;
+    let mut line = line;
+    apply_placeholders_to_line(&mut line, placeholders);
+    let resp: DialogueResponse = banter::pattern_1("event", "low", line);
+    if dialogue::persist_and_speak(app, state, &resp) {
+        Some(resp)
+    } else {
+        None
     }
 }
 

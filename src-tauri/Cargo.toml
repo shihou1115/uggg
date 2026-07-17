@@ -44,6 +44,9 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    # M9 状況検知 (daily-support-design §7.3): GetSystemPowerStatus / GetTickCount
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
 ] }
 
 [dev-dependencies]

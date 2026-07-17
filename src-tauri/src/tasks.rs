@@ -4,6 +4,7 @@
 //! - 放置監視: 60 秒チェック、最終操作から 30 分で 1 回 idle。
 //! - リマインダー watcher: 10 秒間隔で発火・起動時回収 (M7)。
 //! - daily watcher: 日課の復活 (日付変更検知) + 朝の ToDo 件数告知 (M8)。
+//! - context watcher: OS 状況検知 → 状況発話 4 カテゴリ (M9、spec §4.6.3)。
 //! - Irodori サイドカーのアイドル監視: 60 秒チェック、最終使用から 5 分で自動 shutdown (M4c Phase E)。
 //!
 //! M7 以降、自発発話はすべて `system::deliver::deliver_event` を通す
@@ -18,7 +19,7 @@ use chrono::Utc;
 use tauri::{AppHandle, Emitter};
 
 use crate::db::{ReminderKind, ReminderRow};
-use crate::presence::idle;
+use crate::presence::{context, idle};
 use crate::state::AppState;
 use crate::system::deliver::{self, DeliveryOutcome};
 use crate::system::governance::{Priority, SpeechCategory};
@@ -276,6 +277,223 @@ async fn recover_overdue_on_boot(app: &AppHandle, state: &Arc<AppState>) {
         }
     }
     // 未達なら何もしない: active のまま残り、通常ループが個別に再試行する
+}
+
+/// M9 (spec §4.6.3): context watcher。OS 状況検知 → 状況発話 4 カテゴリ。
+/// 60 秒間隔で連続利用セッションを計測し、条件を満たしたカテゴリを
+/// `deliver_event` (Ambient・ゲート下) で配達する。判定は `presence::context` の
+/// 純関数群、閾値も同モジュールの定数 (§11.1-2 実装確定)。
+/// - 休憩促し: 連続利用 90 分ごと (セッション内で繰り返し)
+/// - 深夜利用: 23-5 時に 30 分以上利用、1 晩 1 回 (`situation_late_night_date`)
+/// - バッテリー低下: 15% 以下かつ非 AC、1 回 (AC or 20% 超回復で解除)
+/// - ToDo フォロー: 14-18 時・1 日 1 回、today に未完了があれば思い出し
+/// - ToDo 滞留: 18-22 時・1 日 1 回、today に 3 日以上残っていれば再整理提案
+/// per-day dedup は app_settings に永続化 (todo_morning_date と同型)。
+/// 到達 (Ghost) と辞書なし (Failed) は消化し、Deferred (静音・busy) は次 tick 再挑戦。
+pub fn spawn_context_watcher(app: AppHandle, state: Arc<AppState>) {
+    const CHECK_INTERVAL_SECS: u64 = 60;
+    /// 他 watcher (リマインダー回収 20s / daily 30s) と起動タイミングをずらす。
+    const BOOT_DELAY_SECS: u64 = 45;
+    const LATE_NIGHT_DATE_KEY: &str = "situation_late_night_date";
+    const TODO_FOLLOW_DATE_KEY: &str = "todo_follow_date";
+    const TODO_STALE_DATE_KEY: &str = "todo_stale_date";
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)).await;
+        loop {
+            let settings = state.settings.lock().expect("settings poisoned").clone();
+            if !settings.daily_support_enabled {
+                tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+                continue;
+            }
+
+            // 連続利用セッションの更新 (OS アイドルが取れない環境では 0 のまま)
+            let now = Utc::now().timestamp();
+            let continuous = match context::os_idle_secs() {
+                Some(idle_secs) => {
+                    let prev = state.context.session_start.load(Ordering::SeqCst);
+                    let tick = context::update_session(prev, idle_secs, now);
+                    state
+                        .context
+                        .session_start
+                        .store(tick.session_start, Ordering::SeqCst);
+                    if tick.reset {
+                        state.context.break_prompted_secs.store(0, Ordering::SeqCst);
+                    }
+                    tick.continuous_secs
+                }
+                None => 0,
+            };
+            let now_local = chrono::Local::now();
+            let hour = {
+                use chrono::Timelike;
+                now_local.hour()
+            };
+            let today = now_local.date_naive();
+
+            // 1) 休憩促し (90 分ごと)
+            if settings.situation_break_enabled {
+                let prompted = state.context.break_prompted_secs.load(Ordering::SeqCst);
+                if context::break_due(continuous, prompted) {
+                    let time_label = format!("{}分", continuous / 60);
+                    let outcome = deliver::deliver_event(
+                        &app,
+                        &state,
+                        SpeechCategory::SituationBreak,
+                        Priority::Ambient,
+                        "situation_break",
+                        &[("time", time_label.as_str())],
+                        None,
+                    )
+                    .await;
+                    // Ghost=促した / Failed=辞書なし → このセッション分は消化。
+                    // Deferred (静音・busy) は prompted を進めず次 tick 再挑戦。
+                    if matches!(outcome, DeliveryOutcome::Ghost | DeliveryOutcome::Failed) {
+                        state
+                            .context
+                            .break_prompted_secs
+                            .store(continuous, Ordering::SeqCst);
+                    }
+                }
+            }
+
+            // 2) 深夜利用の声かけ (1 晩 1 回)
+            if settings.situation_late_night_enabled
+                && context::in_late_night(hour)
+                && continuous >= context::LATE_NIGHT_MIN_USE_SECS
+            {
+                let key = context::night_key(today, hour).to_string();
+                let announced = state
+                    .db
+                    .get_setting(LATE_NIGHT_DATE_KEY)
+                    .ok()
+                    .flatten()
+                    .map(|v| v == key)
+                    .unwrap_or(false);
+                if !announced {
+                    let outcome = deliver::deliver_event(
+                        &app,
+                        &state,
+                        SpeechCategory::SituationLateNight,
+                        Priority::Ambient,
+                        "situation_late_night",
+                        &[],
+                        None,
+                    )
+                    .await;
+                    if matches!(outcome, DeliveryOutcome::Ghost | DeliveryOutcome::Failed) {
+                        let _ = state.db.set_setting(LATE_NIGHT_DATE_KEY, &key);
+                    }
+                }
+            }
+
+            // 3) バッテリー低下 (1 回、AC/回復で解除)
+            if settings.situation_battery_enabled {
+                let info = context::battery();
+                let notified = state.context.battery_notified.load(Ordering::SeqCst);
+                let (should_notify, new_flag) = context::battery_transition(info, notified);
+                if should_notify {
+                    let percent = info.map(|b| b.percent).unwrap_or(0).to_string();
+                    let outcome = deliver::deliver_event(
+                        &app,
+                        &state,
+                        SpeechCategory::SituationBattery,
+                        Priority::Ambient,
+                        "situation_battery",
+                        &[("count", percent.as_str())],
+                        None,
+                    )
+                    .await;
+                    // 未達 (Deferred) はフラグを立てず次 tick で再挑戦
+                    if matches!(outcome, DeliveryOutcome::Ghost | DeliveryOutcome::Failed) {
+                        state.context.battery_notified.store(true, Ordering::SeqCst);
+                    }
+                } else {
+                    state.context.battery_notified.store(new_flag, Ordering::SeqCst);
+                }
+            }
+
+            // 4) ToDo フォロー (14-18 時・1 日 1 回) / 5) ToDo 滞留 (18-22 時・1 日 1 回)
+            if settings.todo_follow_enabled {
+                if (context::TODO_FOLLOW_FROM_HOUR..context::TODO_FOLLOW_TO_HOUR).contains(&hour) {
+                    follow_open_todos(&app, &state, TODO_FOLLOW_DATE_KEY, &today, FollowKind::Follow)
+                        .await;
+                }
+                if (context::TODO_STALE_FROM_HOUR..context::TODO_STALE_TO_HOUR).contains(&hour) {
+                    follow_open_todos(&app, &state, TODO_STALE_DATE_KEY, &today, FollowKind::Stale)
+                        .await;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+        }
+    });
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FollowKind {
+    /// 未完了の思い出し (todo_follow)。
+    Follow,
+    /// 3 日以上滞留の再整理提案 (todo_stale)。
+    Stale,
+}
+
+/// ToDo フォロー/滞留の共通処理: 1 日 1 回、today バケットの open な対象があれば
+/// 辞書キーで配達する。対象が無い日は発話なしで消化する (午後に追加された分で鳴らさない)。
+async fn follow_open_todos(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    date_key: &str,
+    today: &chrono::NaiveDate,
+    kind: FollowKind,
+) {
+    let done = state
+        .db
+        .get_setting(date_key)
+        .ok()
+        .flatten()
+        .map(|v| v == today.to_string())
+        .unwrap_or(false);
+    if done {
+        return;
+    }
+    let list = match state.db.list_todos(Some("today")) {
+        Ok(v) => v,
+        Err(err) => {
+            // 取得失敗は消化せず次 tick で再試行
+            eprintln!("[context] list_todos failed: {err:#}");
+            return;
+        }
+    };
+    let now = Utc::now().timestamp();
+    let target = list.iter().find(|t| {
+        t.status == "open"
+            && match kind {
+                FollowKind::Follow => true,
+                FollowKind::Stale => now - t.created_ts >= context::TODO_STALE_DAYS * 86_400,
+            }
+    });
+    let Some(target) = target else {
+        // 対象なし → 今日は消化
+        let _ = state.db.set_setting(date_key, &today.to_string());
+        return;
+    };
+    let dict_key = match kind {
+        FollowKind::Follow => "todo_follow",
+        FollowKind::Stale => "todo_stale",
+    };
+    let outcome = deliver::deliver_event(
+        app,
+        state,
+        SpeechCategory::SituationTodoFollow,
+        Priority::Ambient,
+        dict_key,
+        &[("body", target.text.as_str())],
+        None,
+    )
+    .await;
+    if matches!(outcome, DeliveryOutcome::Ghost | DeliveryOutcome::Failed) {
+        let _ = state.db.set_setting(date_key, &today.to_string());
+    }
 }
 
 /// 集約通知の本文。辞書側の「『{body}』の時間だよ」等に埋め込まれる前提で名詞句にする。

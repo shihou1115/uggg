@@ -16,6 +16,9 @@
            WebView2 透過レイヤーで描画されないバグがあるため。表示制御は
            .visible クラスの付与のみで行う。 -->
       <div id="balloon-main" class="balloon solid">
+        <!-- 🔕「いまのは邪魔」フィードバック (M9, spec §4.6.3)。feedback_allowed な
+             発話 (状況発話) の表示中のみ .visible。静的配置 (WebView2 透過バグ対策)。 -->
+        <button type="button" id="balloon-mute" title="この種の声かけの頻度を下げる">🔕</button>
         <div class="balloon-text"></div>
         <!-- 右クリックメニュー (spec §4.3.5): 前口上の下に項目を動的挿入する。
              静的な器 + 動的な子要素の構成 (WebView2 透過バグ回避のパターン)。 -->
@@ -397,6 +400,33 @@
             <p class="panel-hint">
               「3分後にお茶」「明日の朝ゴミ出し」「毎週月曜9時に会議」のように話しかけると
               LLM を介さず登録されます。一覧・完了・スヌーズ・ToDo は右クリックメニューの「予定・ToDo」から。
+            </p>
+          </section>
+          <section class="panel-section" data-page="daily">
+            <h3>状況に応じた声かけ (すべて任意)</h3>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-situation-break" />
+              <span>休憩促し (連続 90 分の利用ごと)</span>
+            </label>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-situation-late-night" />
+              <span>深夜利用の声かけ (23〜5 時、ひと晩に 1 回)</span>
+            </label>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-situation-battery" />
+              <span>バッテリー低下の知らせ (15% 以下)</span>
+            </label>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-todo-follow" />
+              <span>ToDo の思い出し (午後) と滞留の相談 (夕方)</span>
+            </label>
+            <label class="row">
+              <span>声かけ同士の最低間隔 (分)</span>
+              <input type="number" id="settings-min-speak-interval" min="0" max="1440" step="5" />
+            </label>
+            <p class="panel-hint">
+              声かけ中の吹き出しの 🔕 を押すと、その種類の頻度が下がります (3 回で自動オフ)。
+              集中タイマー・静音モード・夜間静音の間は声かけしません。
             </p>
           </section>
           <section class="panel-section" data-page="daily">

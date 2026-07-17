@@ -4,7 +4,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::state::{AppState, Settings};
 
-const SETTINGS_KEY: &str = "settings";
+pub(crate) const SETTINGS_KEY: &str = "settings";
 
 #[tauri::command]
 pub fn get_settings(state: State<'_, Arc<AppState>>) -> Settings {
@@ -19,6 +19,16 @@ pub fn set_settings(
 ) -> Result<Settings, String> {
     let mut next = settings;
     next.clamp();
+
+    // M9: Situation* を OFF→ON に戻したら 🔕 backoff をリセットする (reviewer 指摘。
+    // 恒久 throttle が再有効化後も残り、理由の見えないまま間隔が絞られるのを防ぐ)。
+    // メモリ反映前の値と比較する。
+    {
+        let prev = state.settings.lock().expect("settings poisoned").clone();
+        for cat in crate::system::governance::situation_reenabled(&prev, &next) {
+            crate::system::governance::reset_backoff(state.inner(), cat);
+        }
+    }
 
     // 永続化 (app_settings."settings" に JSON で保存)
     let json = serde_json::to_string(&next)

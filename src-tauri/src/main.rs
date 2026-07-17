@@ -68,6 +68,8 @@ fn main() {
         .setup(|app| {
             let state = Arc::new(AppState::initialize(app.handle())?);
             app.manage(state.clone());
+            // M9: 🔕 バックオフ (governance_backoff:*) を app_settings から復元
+            system::governance::load_backoff(&state);
             window::configure_main_window(app.handle())?;
             window::start_cursor_watcher(app.handle().clone(), state.clone());
             // 初回起動時のみ取扱説明書を開く
@@ -90,6 +92,8 @@ fn main() {
             tasks::spawn_reminder_watcher(app.handle().clone(), state.clone());
             // M8: daily watcher (日課の復活 + 朝の ToDo 件数告知)
             tasks::spawn_daily_watcher(app.handle().clone(), state.clone());
+            // M9: context watcher (OS 状況検知 → 状況発話 4 カテゴリ)
+            tasks::spawn_context_watcher(app.handle().clone(), state.clone());
             // タスクトレイ
             if let Err(err) = window::tray::install(app.handle(), state.clone()) {
                 eprintln!("[tray] install failed: {err:#}");
@@ -153,6 +157,7 @@ fn main() {
             commands::daily::reopen_todo,
             commands::daily::delete_todo,
             commands::daily::update_todo,
+            commands::daily::feedback_speech,
             commands::tools::read_clipboard_text,
             commands::profile::get_profile,
             commands::profile::add_profile,

@@ -372,6 +372,32 @@ body {
   border-right: 7px solid rgba(255, 255, 255, 0.96);
 }
 
+/* 🔕 フィードバックボタン (M9, spec §4.6.3)。状況発話の表示中のみ .visible。
+   バルーン右上に小さく置き、テキストと重ならないよう控えめにする。 */
+#balloon-mute {
+  display: none;
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  line-height: 1;
+  padding: 2px;
+  cursor: pointer;
+  opacity: 0.35;
+  filter: grayscale(0.4);
+}
+
+#balloon-mute.visible {
+  display: block;
+}
+
+#balloon-mute:hover {
+  opacity: 1;
+  filter: none;
+}
+
 .balloon-text {
   white-space: pre-wrap;
 }

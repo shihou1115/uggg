@@ -28,6 +28,22 @@ pub struct DialogueResponse {
     pub pattern: u8,
     pub main: SpeechTurn,
     pub sub: Option<SpeechTurn>,
+    // === M9: バック起点発話のメタ (🔕 フィードバック用、daily-support-design §4.3/§8.2) ===
+    // `system::deliver::deliver_event` だけが付与する。ユーザー起点の応答
+    // (`send_user_message` の戻り値) には付けない (None のままシリアライズから消える)。
+    /// 発話ごとの一意 id (連番文字列)。フロントは表示中発話の id を保持し、
+    /// 🔕 クリック時に `feedback_speech(speech_id, category)` で送り返す (誤適用防止)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speech_id: Option<String>,
+    /// `SpeechCategory::as_str()` の値。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<&'static str>,
+    /// "notice" | "ambient"。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<&'static str>,
+    /// 🔕 を表示してよい発話か (Situation* の Ambient のみ true、§4.3)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_allowed: Option<bool>,
 }
 
 /// バックエンド起点の発話を chat_log に保存しつつフロントへ emit する共通ヘルパ。
@@ -96,6 +112,10 @@ fn handle_reminder_request(
             pose: None,
         },
         sub: None,
+        speech_id: None,
+        category: None,
+        priority: None,
+        feedback_allowed: None,
     })
 }
 

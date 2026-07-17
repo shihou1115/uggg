@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::db::{ReminderFilter, ReminderKind, ReminderLogRow, ReminderRow, TodoRow};
 use crate::state::AppState;
 use crate::system::deliver;
-use crate::system::governance::{Priority, SpeechCategory};
+use crate::system::governance::{self, Priority, SpeechCategory};
 use crate::tools::{reminder, todo};
 
 /// フロント向けリマインダー 1 件。`ReminderRow` と同じフィールドを持つ
@@ -412,6 +412,64 @@ pub fn delete_todo(
     state.db.delete_todo(id).map_err(|e| format!("{e:#}"))?;
     emit_todos_changed(&app);
     list_todo_entries(state.inner(), None)
+}
+
+// ===== 発話ガバナンス (M9) =====
+
+/// 🔕「いまのは邪魔」フィードバック (M9、daily-support-design §4.3)。
+/// `speech_id` は deliver が payload に付けた連番。**最新のタグ付き発話と一致した
+/// ときだけ**適用する (別の発話に置き換わった後のクリックを誤適用しない)。
+/// 適用: 当該カテゴリの backoff を +1 (app_settings に永続化、gate 段 5 の間隔が
+/// 線形に延びる)。3 回に達したらカテゴリトグル自体を OFF にして永続化 +
+/// `settings-changed` を emit する (spec「頻度が自動で下がる」の最小実装)。
+#[tauri::command]
+pub fn feedback_speech(
+    speech_id: String,
+    category: String,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let cat = SpeechCategory::parse(&category)
+        .ok_or_else(|| format!("未知のカテゴリです: {category}"))?;
+    if !cat.is_situation() {
+        // feedback_allowed=false の発話からは来ない想定の二重防御。黙って無視。
+        return Ok(());
+    }
+    let id: u64 = speech_id
+        .parse()
+        .map_err(|_| "speech_id が不正です".to_string())?;
+    {
+        let last = state
+            .governance
+            .last_speech
+            .lock()
+            .expect("last_speech poisoned");
+        match *last {
+            Some((last_id, last_cat)) if last_id == id && last_cat == cat => {}
+            // 既に別の発話に置き換わっている → 古い 🔕 は無視 (エラーにしない)
+            _ => return Ok(()),
+        }
+    }
+    let n = governance::record_feedback(state.inner(), cat);
+    if n >= governance::BACKOFF_OFF_THRESHOLD {
+        // 実質 OFF 相当: カテゴリトグルを落として永続化 + フロント通知
+        let snapshot = {
+            let mut s = state.settings.lock().expect("settings poisoned");
+            if cat.disable_toggle(&mut s) {
+                Some(s.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(s) = snapshot {
+            // 永続化キーは commands::settings::set_settings / tray と共有
+            if let Ok(json) = serde_json::to_string(&s) {
+                let _ = state.db.set_setting(crate::commands::settings::SETTINGS_KEY, &json);
+            }
+            let _ = app.emit("settings-changed", &s);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]

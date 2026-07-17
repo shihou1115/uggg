@@ -506,8 +506,7 @@ events:
     - main: { text: "わー、『{body}』済んだんだ。さすが！", pose: happy }
       sub: { text: "ボクが見届けた。記録しておく", pose: normal }
 
-  # todo_follow / todo_stale: 未完了フォロー・複数日滞留の再整理提案。
-  # 発火は M9 (状況発話) で結線される。キーだけ M8 で先行整備 (daily-support-design §8.5)。
+  # todo_follow / todo_stale: 未完了フォロー・複数日滞留の再整理提案 (M9 で発火結線)。
   todo_follow:
     - main: { text: "そういえば『{body}』、まだ残ってたよ。無理のない範囲でね", pose: normal }
       sub: { text: "気が向いたときでいい。忘れてないかの確認だ", pose: normal }
@@ -518,6 +517,36 @@ events:
       sub: { text: "大きすぎるタスクは切るに限る", pose: normal }
     - main: { text: "『{body}』、今週は難しそう？予定を見直すのもアリだよ", pose: normal }
       sub: { text: "捨てる勇気も整理のうちだ", pose: normal }
+
+  # 状況発話 (M9, spec §4.6.3)。すべて既定 OFF のオプトイン・控えめな言い回し。
+  # situation_break: 連続利用の休憩促し。{time} は「90分」等に置換される。
+  situation_break:
+    - main: { text: "もう{time}くらい続けてるよ。ちょっと伸びでもしない？", pose: normal }
+      sub: { text: "水分補給も忘れるな。ボクは昼寝する", pose: normal }
+    - main: { text: "{time}経ったって。目を休める頃合いかも", pose: normal }
+      sub: { text: "遠くを見るといい。窓の外は見えないが", pose: troubled }
+    - main: { text: "集中してるね！でも{time}連続だから、一回立とう？", pose: happy }
+      sub: { text: "肩を回せ。ゴキッと鳴っても知らんが", pose: normal }
+  # situation_late_night: 深夜利用の声かけ (23-5 時、1 晩 1 回)。
+  situation_late_night:
+    - main: { text: "もうこんな時間だよ。明日にまわせるなら、そうしよ？", pose: troubled }
+      sub: { text: "夜更かしのツケは明日のお前に回るぞ", pose: normal }
+    - main: { text: "夜遅くまでおつかれさま。眠くなったら素直に寝てね", pose: normal }
+      sub: { text: "ボクらは何時でもいるから、無理して付き合うな", pose: normal }
+  # situation_battery: バッテリー低下 (15% 以下・非 AC、1 回)。{count} は残り %。
+  situation_battery:
+    - main: { text: "バッテリー残り{count}%だって！充電器つないで〜", pose: surprised }
+      sub: { text: "落ちてからでは遅いぞ。今すぐだ", pose: normal }
+    - main: { text: "電池が{count}%しかないよ。作業中のもの、保存しておこ？", pose: troubled }
+      sub: { text: "保存とコンセント。それだけ頼む", pose: normal }
+
+  # 終了前の確認 (M9, spec §4.6.2)。未完了の today ToDo があるときの終了挨拶。
+  # {count} は未完了件数。通常の quit の代わりに再生される。
+  todo_quit:
+    - main: { text: "今日の ToDo、あと{count}件残ってるけど、また明日ね！おつかれさま", pose: normal }
+      sub: { text: "残りは明日のお前に任せた。ゆっくり休め", pose: normal }
+    - main: { text: "{count}件は持ち越しだね。今日もがんばったよ、おやすみ！", pose: happy }
+      sub: { text: "全部やる日より、続く日のほうが偉いんだ。またな", pose: normal }
 
 # システムメッセージ (notify() 経由でゴーストが告知)
 system_messages:

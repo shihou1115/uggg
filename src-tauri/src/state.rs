@@ -356,8 +356,10 @@ pub struct AppState {
     pub presence: PresenceState,
     pub pomodoro: PomodoroState,
     pub tts: TtsState,
-    /// 発話ガバナンスのインメモリ状態 (M7、daily-support-design §4.2。DB 化しない)。
+    /// 発話ガバナンスのインメモリ状態 (M7、daily-support-design §4.2。backoff のみ永続化)。
     pub governance: crate::system::governance::GovernanceState,
+    /// M9 状況検知のインメモリ状態 (連続利用・バッテリー通知済み)。
+    pub context: ContextState,
 }
 
 /// TTS エンジンの遅延初期化を抱えるサブ状態。
@@ -392,6 +394,28 @@ impl Default for PresenceState {
         Self {
             idle_fired: AtomicBool::new(false),
             reading: AtomicBool::new(false),
+        }
+    }
+}
+
+/// M9 状況検知のサブ状態 (`tasks::spawn_context_watcher` が更新、daily-support-design §7.3)。
+/// セッション境界の値はインメモリのみ (再起動でリセットされてよい)。
+/// 「1 日 1 回」系の dedup は app_settings に持つ (todo_morning_date と同型)。
+pub struct ContextState {
+    /// 連続利用セッションの開始 unix 秒 (0 = アイドル中でセッションなし)。
+    pub session_start: AtomicI64,
+    /// このセッションで最後に休憩促しを出した時点の連続利用秒 (0 = 未促し)。
+    pub break_prompted_secs: AtomicI64,
+    /// バッテリー低下を通知済みか (AC 接続 or 20% 超回復でリセット)。
+    pub battery_notified: AtomicBool,
+}
+
+impl Default for ContextState {
+    fn default() -> Self {
+        Self {
+            session_start: AtomicI64::new(0),
+            break_prompted_secs: AtomicI64::new(0),
+            battery_notified: AtomicBool::new(false),
         }
     }
 }
@@ -502,6 +526,7 @@ impl AppState {
             pomodoro: PomodoroState::default(),
             tts: TtsState::default(),
             governance: crate::system::governance::GovernanceState::default(),
+            context: ContextState::default(),
         })
     }
 }

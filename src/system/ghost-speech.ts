@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import {
@@ -22,6 +23,10 @@ let talkSpeed: TalkSpeed = "normal";
 let ttsSpeaker: SpeakerLike | null = null;
 /// 入力促し (spec §4.3.1) を表示中の slot。入力欄が閉じるまで吹き出しを保持する。
 let promptSlot: SlotName | null = null;
+/// M9 🔕: 表示中のフィードバック可能発話 (speech_id + category)。
+/// 発話が置き換わるたびに更新し、古い発話への誤適用を speech_id で防ぐ (バック側でも照合)。
+let currentSpeechMeta: { id: string; category: string } | null = null;
+let muteBtn: HTMLElement | null = null;
 
 export function setSpeaker(s: SpeakerLike): void {
   ttsSpeaker = s;
@@ -32,9 +37,35 @@ export function setTalkSpeed(speed: TalkSpeed): void {
 }
 
 export async function startListening(): Promise<void> {
+  muteBtn = document.getElementById("balloon-mute");
+  muteBtn?.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    void onMuteClick();
+  });
   await listen<DialogueResponse>("dialogue", async (event) => {
     await renderResponse(event.payload);
   });
+}
+
+/// 🔕 クリック:「いまのは邪魔」をバックへ送り、発話を畳む。
+async function onMuteClick(): Promise<void> {
+  const meta = currentSpeechMeta;
+  if (!meta) return;
+  try {
+    await invoke("feedback_speech", { speechId: meta.id, category: meta.category });
+  } catch (err) {
+    console.error("feedback_speech failed", err);
+  }
+  cancelSpeech();
+}
+
+/// 表示中発話の 🔕 メタを更新し、ボタンの表示を切り替える。
+function setSpeechMeta(resp: DialogueResponse | null): void {
+  const allowed = !!(resp && resp.feedback_allowed && resp.speech_id && resp.category);
+  currentSpeechMeta = allowed
+    ? { id: resp!.speech_id as string, category: resp!.category as string }
+    : null;
+  muteBtn?.classList.toggle("visible", allowed);
 }
 
 /// DialogueResponse を 1 件レンダリングする。
@@ -49,6 +80,7 @@ export async function renderResponse(resp: DialogueResponse): Promise<void> {
   currentToken = token;
 
   promptSlot = null; // 促し表示は新しい応答で置き換えられる
+  setSpeechMeta(resp); // M9 🔕: フィードバック可能発話なら 🔕 を出す
   hideAllBalloons();
 
   const subFirst = resp.pattern === 2 && resp.sub != null;
@@ -81,6 +113,7 @@ export async function renderPrompt(slot: SlotName, turn: SpeechTurn): Promise<vo
   const token = newToken();
   currentToken = token;
 
+  setSpeechMeta(null);
   hideAllBalloons();
   promptSlot = slot;
   await speakSlot(token, slot, turn);
@@ -107,6 +140,7 @@ export async function renderMenuPrompt(
   currentToken = token;
 
   promptSlot = null;
+  setSpeechMeta(null);
   hideAllBalloons();
   if (subTurn) {
     await speakSlot(token, "sub", subTurn);
@@ -125,6 +159,7 @@ export function cancelSpeech(): void {
   if (currentToken) currentToken.cancelled = true;
   ttsSpeaker?.interrupt();
   promptSlot = null;
+  setSpeechMeta(null);
   hideAllBalloons();
 }
 

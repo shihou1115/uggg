@@ -87,6 +87,12 @@ interface Inputs {
   nightQuiet: HTMLInputElement;
   nightQuietFrom: HTMLInputElement;
   nightQuietTo: HTMLInputElement;
+  // M9: 状況発話 (ガバナンス)
+  situationBreak: HTMLInputElement;
+  situationLateNight: HTMLInputElement;
+  situationBattery: HTMLInputElement;
+  todoFollow: HTMLInputElement;
+  minSpeakInterval: HTMLInputElement;
   saveBtn: HTMLButtonElement;
   cancelBtn: HTMLButtonElement;
   closeBtn: HTMLButtonElement;
@@ -270,6 +276,11 @@ function collectInputs(): Inputs {
     nightQuiet: byId<HTMLInputElement>("settings-night-quiet"),
     nightQuietFrom: byId<HTMLInputElement>("settings-night-quiet-from"),
     nightQuietTo: byId<HTMLInputElement>("settings-night-quiet-to"),
+    situationBreak: byId<HTMLInputElement>("settings-situation-break"),
+    situationLateNight: byId<HTMLInputElement>("settings-situation-late-night"),
+    situationBattery: byId<HTMLInputElement>("settings-situation-battery"),
+    todoFollow: byId<HTMLInputElement>("settings-todo-follow"),
+    minSpeakInterval: byId<HTMLInputElement>("settings-min-speak-interval"),
     saveBtn: byId<HTMLButtonElement>("settings-save"),
     cancelBtn: byId<HTMLButtonElement>("settings-cancel"),
     closeBtn: byId<HTMLButtonElement>("settings-close"),
@@ -826,6 +837,13 @@ function hhmmToMinutes(value: string, fallback: number): number {
   return h * 60 + mm;
 }
 
+/// 非負整数に丸める (0 も有効値)。空欄・非数のみ fallback へ。
+/// `Number(value) || fallback` だと 0 が fallback に化けるため専用ヘルパにする。
+function clampNonNegInt(value: string, fallback: number): number {
+  const n = Math.round(Number(value));
+  return Number.isFinite(n) ? Math.max(0, n) : fallback;
+}
+
 function showProgress(msg: string, isError: boolean): void {
   if (!inputs) return;
   inputs.ttsProgress.textContent = msg;
@@ -885,6 +903,11 @@ function applySettingsToForm(s: Settings): void {
   inputs.nightQuiet.checked = s.night_quiet_enabled;
   inputs.nightQuietFrom.value = minutesToHHMM(s.night_quiet_from);
   inputs.nightQuietTo.value = minutesToHHMM(s.night_quiet_to);
+  inputs.situationBreak.checked = s.situation_break_enabled;
+  inputs.situationLateNight.checked = s.situation_late_night_enabled;
+  inputs.situationBattery.checked = s.situation_battery_enabled;
+  inputs.todoFollow.checked = s.todo_follow_enabled;
+  inputs.minSpeakInterval.value = String(s.min_speak_interval_min);
   inputs.ttsSpeed.value = String(s.tts_speed);
   inputs.ttsVolume.value = String(s.tts_volume);
   // 話者 select は資産 DL 済みのときだけ list_voices で埋められる。値は文字列で保持。
@@ -959,6 +982,14 @@ async function onSave(): Promise<void> {
     night_quiet_enabled: inputs.nightQuiet.checked,
     night_quiet_from: hhmmToMinutes(inputs.nightQuietFrom.value, current.night_quiet_from),
     night_quiet_to: hhmmToMinutes(inputs.nightQuietTo.value, current.night_quiet_to),
+    situation_break_enabled: inputs.situationBreak.checked,
+    situation_late_night_enabled: inputs.situationLateNight.checked,
+    situation_battery_enabled: inputs.situationBattery.checked,
+    todo_follow_enabled: inputs.todoFollow.checked,
+    min_speak_interval_min: clampNonNegInt(
+      inputs.minSpeakInterval.value,
+      current.min_speak_interval_min,
+    ),
     ghost_id: inputs.ghostId.value || current.ghost_id,
     shell_id: inputs.shellId.value || current.shell_id,
   };

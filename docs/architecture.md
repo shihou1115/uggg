@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v1.2）
+# ugg アーキテクチャ設計書（architecture.md v1.3）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -113,6 +113,7 @@ src-tauri/src/
 │   ├── mod.rs
 │   ├── idle.rs              -- 30 分無操作 → events.idle
 │   ├── quiet.rs             -- 静音モード判定（quiet_mode / フルスクリーン / ポモドーロ集中 / 読み上げ中）
+│   ├── context.rs           -- ★M9 OS 状況検知（GetLastInputInfo / GetSystemPowerStatus）+ 閾値判定の純関数
 │   └── window_pos.rs        -- ステージのドック（作業領域下端全幅に固定・1秒監視で再ドック・モニタ記憶）
 │
 ├── window/                  -- ウインドウ管理
@@ -395,10 +396,20 @@ pub struct AppState {
 `tauri::async_runtime::spawn` の投げ放しで管理し、ハンドル集約は不要だった）。
 
 ```rust
-// system/governance.rs (★M7)。DB 化しない（daily-support-design §2.4 で speech_log 撤回）
+// system/governance.rs (★M7、M9 拡張)。backoff のみ app_settings に永続化
 pub struct GovernanceState {
     pub last_spoke: AtomicI64,                       // 最後に自発発話が到達した unix 秒
-    pub last_by_category: [AtomicI64; 9],            // カテゴリ別（SpeechCategory::index()）
+    pub last_by_category: [AtomicI64; 9],            // カテゴリ別（SpeechCategory::index()）。段 5 が参照
+    pub backoff: [AtomicU32; 9],                     // ★M9 🔕 回数。governance_backoff:<cat> から復元
+    pub speech_seq: AtomicU64,                       // ★M9 speech_id 連番
+    pub last_speech: Mutex<Option<(u64, SpeechCategory)>>, // ★M9 最新タグ付き発話（🔕 照合用）
+}
+
+// state.rs (★M9)。連続利用セッション等のインメモリ状態（再起動でリセット可）
+pub struct ContextState {
+    pub session_start: AtomicI64,      // 連続利用セッション開始（0 = アイドル中）
+    pub break_prompted_secs: AtomicI64, // このセッションで最後に休憩促しした連続利用秒
+    pub battery_notified: AtomicBool,  // バッテリー低下通知済み（AC/20% 超回復で解除）
 }
 ```
 
@@ -628,6 +639,12 @@ pub struct GhostBundle {
 | `delete_todo` | `id` | `TodoEntry[]` | |
 | `update_todo` | `id, patch: { text?, bucket?, priority?, recurring? }` | `TodoEntry[]` | 部分更新。recurring は「キー省略=変更なし / null=日課解除 / 'daily'\|'weekly'=設定」の三値 |
 
+★M9 発話ガバナンス（spec §4.6.3）。
+
+| コマンド | 引数 | 戻り値 | 説明 |
+|---|---|---|---|
+| `feedback_speech` | `speech_id: String, category: String` | `()` | 🔕「いまのは邪魔」。**最新のタグ付き発話と一致したときだけ**適用（誤適用は黙って無視）。backoff +1 を `governance_backoff:<category>` に永続化し gate 段 5 の間隔を線形延長、3 回でカテゴリトグルを OFF（settings 永続化 + settings-changed）。Situation* 以外は no-op |
+
 ### 4.10 window
 
 | コマンド | 引数 | 戻り値 | 説明 |
@@ -641,7 +658,7 @@ pub struct GhostBundle {
 
 | イベント | payload | 用途 |
 |---|---|---|
-| `dialogue` | `DialogueResponse` | バック起点の発話（ランダムトーク・notify 経由の system 発話） |
+| `dialogue` | `DialogueResponse` | バック起点の発話（ランダムトーク・notify 経由の system 発話）。★M9: deliver 経由の発話には `speech_id` / `category` / `priority` / `feedback_allowed` が付く（🔕 用。ユーザー応答には付かない。TS 型は optional） |
 | `settings-changed` | `Settings` | バック起点の設定変更（トレイ等から） |
 | `open-settings` | なし | トレイ → 設定パネル |
 | `pomodoro` | `PomodoroStatus` | 毎秒・節目 |
@@ -771,8 +788,14 @@ events:
   # ★M8 ToDo（deliver_event 経由・サブ主体・責めない言い回し）
   todo_morning: [ ... ]        # 朝の件数告知。{count} = today の未完了件数
   todo_done: [ ... ]           # 完了の労い。{body} = 完了した本文
-  todo_follow: [ ... ]         # 未完了フォロー。M8 ではキーのみ定義、発火は M9（状況発話）
-  todo_stale: [ ... ]          # 複数日滞留の再整理提案。同上 M9
+  todo_follow: [ ... ]         # 未完了フォロー（M9 で発火: 14-18 時・1 日 1 回）。{body}
+  todo_stale: [ ... ]          # 3 日以上滞留の再整理提案（M9 で発火: 18-22 時・1 日 1 回）。{body}
+
+  # ★M9 状況発話（すべて既定 OFF のオプトイン・控えめな言い回し）
+  situation_break: [ ... ]      # 休憩促し。{time} = 「90分」等の連続利用時間
+  situation_late_night: [ ... ] # 深夜利用の声かけ（23-5 時・1 晩 1 回）
+  situation_battery: [ ... ]    # バッテリー低下。{count} = 残り %
+  todo_quit: [ ... ]            # ★M9 終了前確認: 未完了 today ToDo があるときの終了挨拶（quit の代替）。{count}
 ```
 
 **★M7 プレースホルダ規約**（daily-support-design §3.3）: `system/deliver.rs` 経由の
@@ -1336,7 +1359,24 @@ pub async fn deliver_event(
   リマインダー watcher とは分離（`reminder_notify_enabled` と結合させない）。
   設計書 §7.2 の「既存 watcher にピギーバック」は、リマインダー watcher が通知トグルで
   ループを止める構造のため専用 watcher に変更した（実装判断）。
-- **ユーザー起点の確認発話**（スヌーズ確認等）は `speak_event_now`（ゲート・record なし）。
+- **context watcher**（★M9、tasks.rs、60 秒間隔・起動 45 秒後開始）: `presence/context.rs`
+  の OS 検知（GetLastInputInfo / GetSystemPowerStatus）で連続利用セッションを計測
+  （アイドル 5 分で境界）し、状況発話 4 カテゴリを Ambient で配達する。閾値は
+  context.rs の定数が正（daily-support-design §11.1-2）: 休憩促し 90 分ごと /
+  深夜 23-5 時・30 分利用・1 晩 1 回（`situation_late_night_date`、0-5 時は前日夜キー）/
+  バッテリー 15% 以下・非 AC・1 回（AC or 20% 超回復で解除）/ ToDo フォロー 14-18 時・
+  1 日 1 回（`todo_follow_date`）/ ToDo 滞留 18-22 時・1 日 1 回・作成 3 日以上
+  （`todo_stale_date`）。カテゴリトグルは発火元で機能スイッチとして確認（gate 段 3 と同値）。
+  Ghost/Failed は消化、Deferred は次 tick 再挑戦（M8 と同ポリシー）。
+- **gate 段 5（連投回避）**（★M9）: Situation* 同カテゴリの最短間隔 = **120 分 × (1 + backoff)**。
+  🔕 フィードバック（`feedback_speech`、§4.11）が backoff を線形に増やし、3 回で
+  カテゴリトグル自体を OFF。backoff は `governance_backoff:<category>` に永続化し
+  起動時 `governance::load_backoff` で復元する。
+- **終了前確認**（★M9、spec §4.6.2 後半・2026-07-17 裁定）: トレイ「終了」時に未完了の
+  today ToDo があれば `events.todo_quit`（{count}）を `quit` の代わりに再生（ユーザー起点
+  につきゲート非対象）。コンテキストメニューの「終了」は M3 判断（即 exit）のまま。
+- **ユーザー起点の確認発話**（スヌーズ確認・終了前確認）は `speak_event_now`
+  （ゲート・record・🔕 メタなし。発話した `DialogueResponse` を返す）。
 
 ## 12. ゴースト/シェル DnD 展開（V1+W1）
 
@@ -1515,3 +1555,4 @@ async fn install_asset(
 | 2026-06-18 | v1 | Phase 2 対話で確定した全設計を反映、初版 |
 | 2026-07-17 | v1.1 | M7（日常支援 Tier S: 共通基盤 + 統合リマインダー、daily-support-design v2 準拠）を反映。DB v6（reminders 拡張 + reminder_log、§2）/ `system/deliver.rs`・`system/governance.rs` 新設（§11.4）/ `commands/daily.rs`（§4.11）/ イベント `reminders-changed`・`system-toast` 受け皿（§5）/ 辞書 events `reminder_fired`・`reminder_snoozed` + プレースホルダ規約（§6.2、`reminder_fired` は system_messages から events へ移動 §6.5）/ Settings に daily_support・夜間静音・ガバナンス系 10 フィールド追加 / AppState に GovernanceState（§3）。付随して実装との既知乖離を一部解消（monologue_cache → topics_cache、migration v4-v6 追記、notify() の severity 未実装注記、WorkerHandles 不採用注記） |
 | 2026-07-17 | v1.2 | M8（ToDo・日課管理 §4.6.2）を反映。DB v7 `todos`（§2）/ `tools/todo.rs`（検証 + 日課復活の境界計算）/ ToDo コマンド 6 種 + `todos-changed`（§4.11・§5）/ daily watcher（日課復活 + 朝の件数告知、§11.4）/ 辞書 events `todo_morning`・`todo_done`（発火）+ `todo_follow`・`todo_stale`（キーのみ、発火は M9）（§6.2）/ パネルに ToDo 節（3 バケットタブ） |
+| 2026-07-17 | v1.3 | M9（状況発話 + 検知 + ガバナンス完成 §4.6.3）を反映。`presence/context.rs`（OS 検知 + 閾値純関数、windows crate に Power/SystemInformation feature 追加）/ context watcher（休憩・深夜・バッテリー・ToDo フォロー/滞留、§11.4）/ gate 段 5 連投回避 + 🔕 backoff（`feedback_speech` §4.11、`governance_backoff:*` 永続化）/ `DialogueResponse` に speech_id・category・priority・feedback_allowed（§5、バック起点のみ）/ フロント #balloon-mute + 設定「状況に応じた声かけ」セクション / 辞書 `situation_break`・`situation_late_night`・`situation_battery`・`todo_quit`（§6.2。`situation_todo_follow` キーは `todo_follow`/`todo_stale` に統合）/ 終了前確認（tray quit で todo_quit 優先、spec §4.6.2 後半）/ AppState に ContextState（§3） |

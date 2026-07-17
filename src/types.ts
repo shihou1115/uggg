@@ -153,6 +153,14 @@ export interface DialogueResponse {
   pattern: number;
   main: SpeechTurn;
   sub: SpeechTurn | null;
+  // === M9: バック起点発話のメタ (🔕 フィードバック用)。ユーザー応答には付かない ===
+  /// 発話ごとの一意 id。🔕 クリック時に feedback_speech へ送り返す (誤適用防止)。
+  speech_id?: string;
+  /// SpeechCategory 識別子 ("monologue" | "situation_break" 等)。
+  category?: string;
+  priority?: "notice" | "ambient";
+  /// true のときだけ 🔕 を表示する (Situation* の Ambient のみ)。
+  feedback_allowed?: boolean;
 }
 
 export interface BaseSize {
