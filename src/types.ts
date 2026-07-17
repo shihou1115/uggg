@@ -30,14 +30,70 @@ export interface Settings {
   update_feed_url: string | null;
   topics_enabled: boolean;
   tools_enabled: boolean;
+  // === 日常支援 Tier S (M7, daily-support-design §5) ===
+  daily_support_enabled: boolean;
+  situation_break_enabled: boolean;
+  situation_late_night_enabled: boolean;
+  situation_battery_enabled: boolean;
+  todo_follow_enabled: boolean;
+  min_speak_interval_min: number;
+  night_quiet_enabled: boolean;
+  /// 0:00 からの分 (0〜1439)。from > to は日跨ぎ、from == to は終日。
+  night_quiet_from: number;
+  night_quiet_to: number;
+  reminder_notify_enabled: boolean;
 }
 
-/// M5-B: リマインダー 1 件。
+/// リマインダーの繰り返し種別 (M7)。
+export type ReminderKind = "once" | "daily" | "weekly";
+
+/// M5-B → M7 拡張: リマインダー 1 件 (バックエンド ReminderEntry と同期)。
 export interface ReminderEntry {
   id: number;
+  /// 次回発火予定 (UTC 秒)。
   due_ts: number;
   text: string;
   created_ts: number;
+  kind: ReminderKind;
+  /// weekly のみ: bit0=月 .. bit6=日。
+  weekday_mask: number;
+  /// daily/weekly のみ: ローカル 0:00 からの秒。
+  time_of_day: number;
+  /// false = 再発火しない (once の発火済み・完了・無視)。
+  active: boolean;
+  /// スヌーズ前の本来時刻 (UTC 秒)。
+  base_due_ts: number | null;
+  /// 通知済み・未処理 (完了/無視されていない発火が残っている)。
+  pending: boolean;
+}
+
+/// M7: リマインダー通知履歴 1 件 (バックエンド ReminderLogRow と同期)。
+export interface ReminderLogRow {
+  id: number;
+  reminder_id: number;
+  fired_ts: number;
+  ack: "fired" | "completed" | "dismissed";
+  ack_ts: number | null;
+  delivery: "ghost" | "toast" | "deferred" | "failed";
+}
+
+/// M8: ToDo の分類 (spec §4.6.2、3 区分のみ)。
+export type TodoBucket = "today" | "week" | "someday";
+/// M8: 日課の繰り返し。null = 単発。
+export type TodoRecurring = "daily" | "weekly" | null;
+
+/// M8: ToDo 1 件 (バックエンド TodoEntry と同期)。
+export interface TodoEntry {
+  id: number;
+  text: string;
+  bucket: TodoBucket;
+  /// 0=普通, 1=高。
+  priority: number;
+  recurring: TodoRecurring;
+  status: "open" | "done";
+  done_ts: number | null;
+  created_ts: number;
+  sort_order: number;
 }
 
 /// M5-F: ghosts / shells リストエントリ。

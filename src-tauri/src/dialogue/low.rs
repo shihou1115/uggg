@@ -34,11 +34,8 @@ pub fn event(
     Some(banter::pattern_1("event", "low", line))
 }
 
-/// ランダムトーク (独り言)。辞書 monologue から 1 件抽選。
-pub fn monologue(dict: &Dictionary, sub_available: bool) -> Option<DialogueResponse> {
-    let line = dict.pick_monologue(sub_available)?;
-    Some(banter::pattern_1("event", "low", line))
-}
+// M7: monologue ヘルパは削除した。独り言は system::deliver::deliver_event が
+// dict.pick_monologue を直接使う (ガバナンスゲート下、daily-support-design §4.2)。
 
 fn default_silence_line() -> DialogueLine {
     DialogueLine {

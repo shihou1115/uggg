@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v1）
+# ugg アーキテクチャ設計書（architecture.md v1.2）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -78,7 +78,8 @@ src-tauri/src/
 │   ├── reader.rs            -- reader_load_text, set_reading_active
 │   ├── assets.rs            -- list_ghosts, list_shells, dnd_install
 │   ├── pomodoro.rs          -- start_pomodoro, stop_pomodoro, get_pomodoro_status
-│   ├── tools.rs             -- list_reminders, add_reminder, delete_reminder, read_clipboard_text
+│   ├── daily.rs             -- ★M7/M8 リマインダー + ToDo 管理 (§4.11)
+│   ├── tools.rs             -- read_clipboard_text（リマインダー系は M7 で daily.rs へ移設）
 │   ├── data.rs              -- get_chat_log, clear_history, export_data, check_update_now
 │   ├── topics.rs            -- get_interests, set_interests, fetch_topics_now
 │   ├── onboarding.rs        -- complete_onboarding, skip_onboarding
@@ -124,13 +125,16 @@ src-tauri/src/
 │   ├── cost.rs              -- LLM コスト追跡・上限警告・自動降格
 │   ├── update.rs            -- 更新通知
 │   ├── topics.rs            -- 時事ネタ RSS 取得
-│   └── notify.rs            -- ★ 統合通知サービス notify()（横断方針 §3.1 ゴースト発話原則）
+│   ├── notify.rs            -- ★ 統合通知サービス notify()（横断方針 §3.1 ゴースト発話原則）
+│   ├── deliver.rs           -- ★M7 通知配達サービス deliver_event（自発発話の単一経路、§11.4）
+│   └── governance.rs        -- ★M7 発話ガバナンス can_deliver / record_delivered（§11.4）
 │
-└── tools/                   -- ツール群（tools_enabled 時のみ）
+└── tools/                   -- ツール群
     ├── mod.rs
-    ├── clock.rs             -- 時刻注入
-    ├── reminder.rs          -- リマインダー
-    └── clipboard.rs         -- クリップボード補助
+    ├── clock.rs             -- 時刻注入（tools_enabled 時のみ）
+    ├── reminder.rs          -- ★M7 統合リマインダー: 自然文パーサ parse_reminder + 次回計算 + TZ 変換（常時ローカル、tools_enabled から独立）
+    ├── todo.rs              -- ★M8 ToDo・日課: bucket/priority/recurring 検証 + 日課復活の境界計算（daily_support 配下）
+    └── clipboard.rs         -- クリップボード補助（tools_enabled 時のみ）
 ```
 
 ### 1.3 フロントエンド ディレクトリ構造
@@ -165,10 +169,11 @@ src/
 │   │   ├── voice.ts         -- TTS 設定（voicevox / irodori）
 │   │   ├── interests.ts     -- 時事ネタ・興味分野
 │   │   └── about.ts         -- バージョン・ライセンス
+│   ├── daily.ts             -- ★M7/M8 予定・ToDo パネル（リマインダー節 + ToDo 節: 3 バケットタブ・チェック完了・優先度/日課トグル）
 │   └── onboarding.ts        -- 初回オンボーディング
 │
 ├── menu/
-│   └── context-menu.ts      -- ★ 右クリック→バルーン内メニュー（C-5、spec §4.3.5）
+│   └── context-menu.ts      -- ★ 右クリック→バルーン内メニュー（C-5、spec §4.3.5）。M7 で「予定・リマインダー」項目追加
 │
 ├── interaction/             -- 操作
 │   ├── click.ts             -- クリック種別判別
@@ -211,8 +216,10 @@ src/
 | `user_profile` | 長期記憶 | 〜数百 | system prompt 注入・recall |
 | `interest_topics` | 時事ネタ興味分野 | 〜20 | RSS 検索キーワード |
 | `api_usage` | LLM コスト追跡 | 〜数万 | 月次集計・上限警告 |
-| `monologue_cache` | 独り言キャッシュ | 〜数十 | advanced モードの先読み |
-| `reminders` | リマインダー | 〜数十 | due_ts 到達で発火 |
+| `topics_cache` | 時事ネタ見出しキャッシュ | 〜数百 | advanced 独り言混入の材料（M5-C。旧記載の monologue_cache は未実装のまま廃案） |
+| `reminders` | リマインダーのスケジュール定義 | 〜数十 | active=1 かつ due_ts 到達で発火（★M7 拡張） |
+| `reminder_log` | ★M7 リマインダー発火・確認履歴 | 〜500（prune） | 完了/未完了管理・通知履歴・再通知判断 |
+| `todos` | ★M8 ToDo・日課 | 〜数百 | 3 バケット・2 段階優先度・日課復活 |
 | `voice_refs` | ★ Irodori 参照音声メタ | 最大 2（slot 1件ずつ） | クローン合成の元音声 |
 
 ### 2.2 各テーブル詳細
@@ -274,11 +281,65 @@ CREATE TABLE voice_refs (
 );
 ```
 
+#### `reminders`（★M7 v6 拡張）+ `reminder_log`（★M7 新設）
+
+**発火 ≠ 完了**（daily-support-design §2.1）: reminders はスケジュール定義、発火と完了/無視の
+履歴は reminder_log に分離する。時刻はすべて UTC 秒、繰り返しの time_of_day は
+ローカル 0:00 からの秒（TZ 契約は daily-support-design §2.5）。
+
+```sql
+-- v6 で既存 reminders(id, due_ts, text, created_ts) に追加
+kind         TEXT    NOT NULL DEFAULT 'once',  -- 'once'|'daily'|'weekly'
+weekday_mask INTEGER NOT NULL DEFAULT 0,       -- weekly: bit0=月..bit6=日
+time_of_day  INTEGER NOT NULL DEFAULT 0,       -- daily/weekly: ローカル 0:00 からの秒
+active       INTEGER NOT NULL DEFAULT 1,       -- 0 = 再発火停止（once の発火到達/完了/無視）
+base_due_ts  INTEGER,                          -- スヌーズ前の本来時刻（NULL = スヌーズなし）
+
+CREATE TABLE reminder_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    reminder_id INTEGER NOT NULL,
+    fired_ts    INTEGER NOT NULL,                 -- 発火（配達到達）時刻
+    ack         TEXT    NOT NULL DEFAULT 'fired', -- 'fired'|'completed'|'dismissed'
+    ack_ts      INTEGER,
+    delivery    TEXT    NOT NULL DEFAULT 'ghost'  -- DeliveryOutcome: 'ghost'|'toast'|'deferred'|'failed'
+);
+CREATE INDEX idx_reminder_log_rid ON reminder_log(reminder_id);
+```
+
+- **未完了 = ack='fired' の行が残っている**（一覧の pending 導出列・再通知判断の根拠）
+- watcher は**到達（ghost|toast）時のみ** log_fire する。未達（deferred|failed）は
+  active 維持のまま次ポーリングで再試行し、ログは残さない（10 秒間隔の再試行が
+  reminder_log を押し流すのを防ぐ実装判断。設計書 §7.1 の記述より狭い）
+- 保持は新しい順 500 行（prune_reminder_log）
+
+#### `todos`（★M8 v7 新設、daily-support-design §2.2）
+
+```sql
+CREATE TABLE todos (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    text       TEXT    NOT NULL,
+    bucket     TEXT    NOT NULL DEFAULT 'today',   -- 'today'|'week'|'someday'
+    priority   INTEGER NOT NULL DEFAULT 0,         -- 0=普通, 1=高（2 段階のみ）
+    recurring  TEXT,                               -- NULL|'daily'|'weekly'（日課）
+    status     TEXT    NOT NULL DEFAULT 'open',    -- 'open'|'done'
+    done_ts    INTEGER,
+    created_ts INTEGER NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0          -- 同 bucket 内の並び（追加時 max+1）
+);
+CREATE INDEX idx_todos_status ON todos(status, bucket);
+```
+
+- bucket/status/recurring は文字列のまま持ち、正規化・検証は `tools/todo.rs`（TS の文字列 union と 1:1）
+- **日課の復活**: done かつ recurring 非 NULL の行を、daily = 今日のローカル 0:00 より前・
+  weekly = 今週月曜のローカル 0:00 より前に done なら open へ戻す
+  （`reset_recurring_todos(daily_cutoff, weekly_cutoff)`。cutoff 計算は tools/todo.rs、TZ 契約 §2.5）。
+  実行タイミングは daily watcher（起動時 + ローカル日付の変更検知、§11.4）
+- 一覧の並び: open 先 → priority 高い順 → sort_order 昇順
+
 #### 既存（変更なし）
 - `interest_topics(id, topic, enabled)`
+- `topics_cache(id, topic, headline, link, fetched_ts)` UNIQUE(topic, headline)
 - `api_usage(id, ts, provider, model, prompt_tokens, completion_tokens, cost_usd)`
-- `monologue_cache(id, ts, payload_json)`
-- `reminders(id, due_ts, text, created_ts)`
 
 #### 廃止
 - `context_summaries` ← user_profile (origin='auto') に統合
@@ -287,11 +348,14 @@ CREATE TABLE voice_refs (
 ### 2.3 マイグレーション
 
 - DB スキーマバージョンを `app_settings` の `"db_schema_version"` キーで管理
-- 起動時に値を読み、必要なら up マイグレーションを順次適用
-- **MVP は v3 まで実装**（v0.0.3 からの DB 移行は提供しない、本開発は新規 DB を使う）
+- 起動時に値を読み、必要なら up マイグレーションを順次適用（v0.0.3 からの DB 移行は提供しない、本開発は新規 DB を使う）
   - v1: `app_settings` のみ (M0)
   - v2: `chat_log` / `user_profile` / `api_usage` を追加 (M2)
   - v3: `voice_refs` を追加 (M4c Phase A)
+  - v4: `interest_topics` / `topics_cache` を追加 (M5-C)
+  - v5: `reminders` を追加 (M5-B)
+  - v6: `reminders` 拡張 5 列 + `reminder_log` を追加 (M7)
+  - v7: `todos` を追加 (M8)。以降 Tier S で v8=calendar_cache (M10) を予定（daily-support-design §2）
 - 参照音声 .wav の配置は `%APPDATA%\ugg\irodori\refs\<slot>_<id>.wav` (architecture §2.4)。`voice_refs.file_path` には絶対パスを保存
 
 ### 2.4 ファイル資産（DB 外）
@@ -323,7 +387,18 @@ pub struct AppState {
     pub tts: TtsState,                              // エンジン保持
     pub pomodoro: PomodoroState,                    // ポモドーロ
     pub window: WindowState,                        // ウインドウ
-    pub workers: WorkerHandles,                     // ★ 集約
+    pub governance: GovernanceState,                // ★M7 発話ガバナンス（インメモリ）
+}
+```
+
+※ 初版に載っていた `workers: WorkerHandles` は実装されていない（watcher は
+`tauri::async_runtime::spawn` の投げ放しで管理し、ハンドル集約は不要だった）。
+
+```rust
+// system/governance.rs (★M7)。DB 化しない（daily-support-design §2.4 で speech_log 撤回）
+pub struct GovernanceState {
+    pub last_spoke: AtomicI64,                       // 最後に自発発話が到達した unix 秒
+    pub last_by_category: [AtomicI64; 9],            // カテゴリ別（SpeechCategory::index()）
 }
 ```
 
@@ -445,6 +520,8 @@ pub struct GhostBundle {
 
 **注**: 旧設計の `send_with_clipboard` / `read_clipboard` は不採用。クリップボード連携は `read_clipboard_text`（§4.9）でフロントが本文を取得して入力欄に貼り付け、通常の `send_user_message` で送信する方式に統合した。
 
+**★M7**: dispatch 冒頭で `daily_support_enabled` のとき `tools::reminder::parse_reminder` を先に試し、予定表現なら LLM を経ずに登録 + 確認応答（`reminders-changed` emit）。従来の `tools_enabled` ゲートは撤廃（spec §4.2.1 不変条件: リマインダーは advanced 非依存の常時ローカル）。
+
 ### 4.4 interaction
 
 | コマンド | 引数 | 戻り値 | 説明 |
@@ -513,15 +590,43 @@ pub struct GhostBundle {
 | `pause_pomodoro` | なし | `()` | 進行中のカウントダウンを一時停止（残り時間を保持）。GUI「停止」 |
 | `resume_pomodoro` | なし | `()` | 一時停止から同じ残り時間で再開。GUI「停止」の再押下 |
 | `get_pomodoro_status` | なし | `PomodoroStatus` | `phase` / `remaining_sec` / `round` / `rounds` / `paused: bool` |
-| `list_reminders` | なし | `ReminderEntry[]` | |
-| `add_reminder` | `text: String, offset_secs: i64` | `ReminderEntry[]` | 現在時刻からの相対秒。追加後の一覧を返す |
-| `delete_reminder` | `id: i64` | `ReminderEntry[]` | 削除後の一覧を返す |
 | `read_clipboard_text` | なし | `String` | クリップボードのテキスト取得（入力欄への貼り付け用）。非テキストは空文字、`tools_enabled = false` なら Err |
 | `get_interests` | なし | `InterestTopic[]` | |
 | `set_interests` | `topics: String[]` | `InterestTopic[]` | |
 | `fetch_topics_now` | なし | `()` | |
 | `complete_onboarding` | `nickname, interests, talk_style, topics_enabled` | `()` | |
 | `skip_onboarding` | なし | `()` | |
+
+### 4.11 daily（★M7 統合リマインダー、daily-support-design §7.1/§8.1）
+
+戻り値の `ReminderEntry[]` は Active フィルタ（要対応 = active=1 or 未処理発火あり）の一覧。
+変更系はすべて `reminders-changed` を emit する。`ReminderEntry` は DB `ReminderRow` と
+同フィールド + 導出列 `pending: bool`（TS 型も同期、3 表現の同期）。
+
+| コマンド | 引数 | 戻り値 | 説明 |
+|---|---|---|---|
+| `list_reminders` | `filter?: "active" \| "completed" \| "all"` | `ReminderEntry[]` | 省略時 active |
+| `add_reminder_nl` | `text: String` | `ReminderEntry[]` | 自然文登録（会話経路と同じ `parse_reminder`）。解釈不能なら Err |
+| `add_reminder` | `text, offset_secs` | `ReminderEntry[]` | 単発の内部 API（M5-B 互換） |
+| `complete_reminder` | `id` | `ReminderEntry[]` | 最新の未処理発火を ack='completed'。once は再発火も停止 |
+| `dismiss_reminder` | `id` | `ReminderEntry[]` | 同上で ack='dismissed' |
+| `snooze_reminder` | `id, mins` | `ReminderEntry[]` | due を延長し base_due_ts に本来時刻を保持。辞書 `reminder_snoozed` で確認発話（ゲート非対象） |
+| `delete_reminder` | `id` | `ReminderEntry[]` | reminder_log も削除 |
+| `update_reminder` | `id, patch: { text?, due_ts? }` | `ReminderEntry[]` | 部分更新 |
+| `get_reminder_log` | `id` | `ReminderLogRow[]` | 通知履歴（新しい順、最大 50） |
+
+★M8 ToDo（spec §4.6.2）。戻り値の `TodoEntry[]` は全 bucket の一覧（open 先・優先度高先。
+タブの件数表示のためフロントは全件を受けてクライアント側で bucket 絞り込み）。
+変更系はすべて `todos-changed` を emit。
+
+| コマンド | 引数 | 戻り値 | 説明 |
+|---|---|---|---|
+| `list_todos` | `bucket?: "today" \| "week" \| "someday"` | `TodoEntry[]` | 省略時 全件 |
+| `add_todo` | `text, bucket, priority, recurring?` | `TodoEntry[]` | 値は tools/todo.rs で検証（無効値は Err） |
+| `complete_todo` | `id` | `TodoEntry[]` | done + 労い発話 `todo_done`（deliver 経由・Ambient=集中/静音中は黙る）。二重完了は no-op |
+| `reopen_todo` | `id` | `TodoEntry[]` | done → open（チェック解除）。done_ts クリア |
+| `delete_todo` | `id` | `TodoEntry[]` | |
+| `update_todo` | `id, patch: { text?, bucket?, priority?, recurring? }` | `TodoEntry[]` | 部分更新。recurring は「キー省略=変更なし / null=日課解除 / 'daily'\|'weekly'=設定」の三値 |
 
 ### 4.10 window
 
@@ -542,7 +647,9 @@ pub struct GhostBundle {
 | `pomodoro` | `PomodoroStatus` | 毎秒・節目 |
 | `voicevox-download` | `string` | 資産DL 進捗行 |
 | `irodori-download` | `string` | ★ Irodori DL 進捗行 |
-| `system-toast` | `string` | notify() の fallback。辞書に該当 system_message が無い場合のみ emit（best-effort、フロント側 listener は現状なし） |
+| `system-toast` | `string` | notify() / deliver_event のトーストフォールバック。★M7 でフロント受け皿（`system/toast.ts`、#system-toast 帯）を実装（到達保証 Toast の成立要件） |
+| `reminders-changed` | なし | ★M7 リマインダーの変更通知（登録・発火・完了等）。パネルが再取得 |
+| `todos-changed` | なし | ★M8 ToDo の変更通知（追加・完了・日課復活等）。パネルが再取得 |
 
 **注**:
 - U3 採用により system 発話は `notify()` 内部で `dialogue` 経由に統合する（§11）。`system-toast` は辞書未定義時の fallback のみ。
@@ -656,7 +763,21 @@ events:
   focus_end: [ ... ]
   break_end: [ ... ]
   pomodoro_done: [ ... ]
+
+  # ★M7 統合リマインダー（deliver_event 経由・プレースホルダ置換あり）
+  reminder_fired: [ ... ]      # {body} = 登録本文。サブ無しシェルの縮退に備え main 側に {body} を含めること
+  reminder_snoozed: [ ... ]    # {time} = 「10分後」等
+
+  # ★M8 ToDo（deliver_event 経由・サブ主体・責めない言い回し）
+  todo_morning: [ ... ]        # 朝の件数告知。{count} = today の未完了件数
+  todo_done: [ ... ]           # 完了の労い。{body} = 完了した本文
+  todo_follow: [ ... ]         # 未完了フォロー。M8 ではキーのみ定義、発火は M9（状況発話）
+  todo_stale: [ ... ]          # 複数日滞留の再整理提案。同上 M9
 ```
+
+**★M7 プレースホルダ規約**（daily-support-design §3.3）: `system/deliver.rs` 経由の
+events 発話では `{body}` `{count}` `{time}` `{summary}` を置換する。未知の
+`{xxx}` は残さず空文字に落とす。従来の `pick_event` 直呼び経路（boot 等）では置換されない。
 
 #### input_prompt / menu_prompt（促し系、spec §4.3.1 / §4.3.5）
 ```yaml
@@ -729,9 +850,10 @@ when:                                        # ⑥ 確率
 | `voicevox_dl_complete` | 資産DL完了 | |
 | `voicevox_dl_failed` | 資産DL失敗 | `{ reason }` |
 | `irodori_unavailable` | GPU 不可・サイドカー起動失敗 | `{ reason }` |
-| `reminder_fired` | リマインダー時刻到達 | `{ text }` |
 
 各キーは省略可（辞書未定義時はトーストへフォールバック）。
+★M7: `reminder_fired` は system_messages から **events へ移動**した（deliver_event +
+プレースホルダ経路に一本化。notify() の `ReminderFired` variant は削除）。
 
 ---
 
@@ -1159,7 +1281,9 @@ pub async fn notify(
 | VoicevoxDlComplete | Minor |
 | VoicevoxDlFailed | Important |
 | IrodoriUnavailable | Important |
-| ReminderFired | Important（静音中も鳴らす特例あり） |
+
+※ 実装の notify() は severity 二段トーストを持たない（発話 or トースト fallback の二択）。
+★M7: `ReminderFired` variant は削除（§11.4 の deliver_event 経路へ一本化）。
 
 ### 11.3 呼び出し点
 
@@ -1168,9 +1292,51 @@ pub async fn notify(
 - `system/update.rs`: 新バージョン検出時に `notify(UpdateAvailable, ...)`
 - `tts/download.rs`: 資産DL完了/失敗時に `notify(VoicevoxDlComplete, ...)`
 - `tts/irodori.rs`: GPU不可検出/サイドカー起動失敗時に `notify(IrodoriUnavailable, ...)`
-- `tools/reminder.rs`: 時刻到達で `notify(ReminderFired, ...)`
 
----
+### 11.4 通知配達サービスと発話ガバナンス（★M7、daily-support-design §3/§4 が正）
+
+M7 で**すべての自発発話**（独り言・idle・リマインダー通知、以降の Tier S 発話）は
+`system/deliver.rs::deliver_event` に一本化した。notify()（§11.1）は従来どおり
+system_messages 用に残る（コスト・降格・DL 系のシステム告知）。
+
+```rust
+// system/deliver.rs
+pub enum DeliveryOutcome { Ghost, Toast, Deferred, Failed }  // reached() = Ghost|Toast
+
+pub async fn deliver_event(
+    app, state,
+    category: SpeechCategory,     // Monologue / Idle / Reminder / (M8-M10: Todo / Calendar / Situation*)
+    priority: Priority,           // Notice = 必ず届く（全段免除） / Ambient = 気配り系（全段適用）
+    key: &str,                    // 辞書 events キー（Monologue のみ monologue セクション）
+    placeholders: &[(&str, &str)],
+    fallback: Option<String>,     // 辞書未ヒット/発話失敗時の system-toast 文
+) -> DeliveryOutcome;
+```
+
+- **直列化**: `dialogue.busy` の try_acquire を permit として保持し check→配達→record を
+  1 クリティカルセクションで行う（check-then-act 競合と二重発話の防止）。取れなければ Deferred。
+- **ゲートは deliver 内で 1 回だけ**: `governance::can_deliver`（純粋判定）→ 配達成功後に
+  `governance::record_delivered`。呼び出し側 watcher はどちらも直接呼ばない（二重ゲート禁止）。
+- **判定表**（Ambient のみ適用、Notice は全段免除）: 段1 ハード静音（should_stay_quiet）→
+  段2 夜間静音（night_quiet_enabled + from/to、日跨ぎ可・from==to は終日）→
+  段3 カテゴリ設定 OFF → 段4 最低間隔 min_speak_interval_min（**Situation\* のみ**。
+  monologue/idle は既存の間隔設定を維持）。段5 連投回避は M9 で導入（パラメータ未決）。
+- **機能スイッチは発火元**: `reminder_notify_enabled`（+ マスタ `daily_support_enabled`）は
+  リマインダー watcher が確認する。OFF 中は発火を保留し、ON に戻すと届く（期限は消えない）。
+- **リマインダー watcher**（tasks.rs、10 秒間隔）: 到達時のみ log_fire し、once は
+  deactivate（発火済み・未完了）、繰り返しは次回 due へ reschedule。未達は active 維持で再試行。
+  起動 20 秒後に一度だけ回収パスを実行し、停止中に過ぎた期限が複数あれば
+  「『直近の本文』（ほか N-1 件）」の 1 発話に集約する。
+- **daily watcher**（★M8、tasks.rs、60 秒間隔・起動 30 秒後開始）: ①起動時 + ローカル
+  日付の変更検知で日課を復活（`tools::todo::reset_recurring`、冪等）し `todos-changed` を
+  emit。②朝の時間帯（5:00-11:00）に 1 日 1 回、today の未完了が 1 件以上なら
+  `todo_morning`（{count}、Ambient）を配達。告知済み日付は app_settings
+  `todo_morning_date` に保持し再起動でも二重告知しない。0 件の朝は告知なしで消化。
+  Deferred（静音・busy）は後続 tick で再挑戦、Failed（辞書なし）は当日分を消化。
+  リマインダー watcher とは分離（`reminder_notify_enabled` と結合させない）。
+  設計書 §7.2 の「既存 watcher にピギーバック」は、リマインダー watcher が通知トグルで
+  ループを止める構造のため専用 watcher に変更した（実装判断）。
+- **ユーザー起点の確認発話**（スヌーズ確認等）は `speak_event_now`（ゲート・record なし）。
 
 ## 12. ゴースト/シェル DnD 展開（V1+W1）
 
@@ -1347,3 +1513,5 @@ async fn install_asset(
 | 日付 | 版 | 内容 |
 |---|---|---|
 | 2026-06-18 | v1 | Phase 2 対話で確定した全設計を反映、初版 |
+| 2026-07-17 | v1.1 | M7（日常支援 Tier S: 共通基盤 + 統合リマインダー、daily-support-design v2 準拠）を反映。DB v6（reminders 拡張 + reminder_log、§2）/ `system/deliver.rs`・`system/governance.rs` 新設（§11.4）/ `commands/daily.rs`（§4.11）/ イベント `reminders-changed`・`system-toast` 受け皿（§5）/ 辞書 events `reminder_fired`・`reminder_snoozed` + プレースホルダ規約（§6.2、`reminder_fired` は system_messages から events へ移動 §6.5）/ Settings に daily_support・夜間静音・ガバナンス系 10 フィールド追加 / AppState に GovernanceState（§3）。付随して実装との既知乖離を一部解消（monologue_cache → topics_cache、migration v4-v6 追記、notify() の severity 未実装注記、WorkerHandles 不採用注記） |
+| 2026-07-17 | v1.2 | M8（ToDo・日課管理 §4.6.2）を反映。DB v7 `todos`（§2）/ `tools/todo.rs`（検証 + 日課復活の境界計算）/ ToDo コマンド 6 種 + `todos-changed`（§4.11・§5）/ daily watcher（日課復活 + 朝の件数告知、§11.4）/ 辞書 events `todo_morning`・`todo_done`（発火）+ `todo_follow`・`todo_stale`（キーのみ、発火は M9）（§6.2）/ パネルに ToDo 節（3 バケットタブ） |

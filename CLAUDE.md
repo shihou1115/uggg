@@ -27,7 +27,7 @@ v0.0.3 で得た主な負債:
 | 1 | 仕様再定義（機能の取捨選択・コアコンセプト言語化） | docs/spec.md | ✅ |
 | 2 | アーキテクチャ設計（TTS再設計・状態管理再設計・DB再設計） | docs/architecture.md | ✅ |
 | 3 | テスト計画 | docs/test-plan.md | ✅ |
-| **4** | **実装着手**（垂直スライス・M0〜M6） | src/, src-tauri/src/ | ✅ M0〜M6 完了、**v0.1.4 リリース済**（2026-07-11、タグ `v0.1.4`。伺か風 UI 刷新・キャラ個別移動・バルーンメニュー） |
+| **4** | **実装着手**（垂直スライス・M0〜M6） | src/, src-tauri/src/ | ✅ M0〜M6 完了、**v0.1.4 リリース済**（2026-07-11、タグ `v0.1.4`。伺か風 UI 刷新・キャラ個別移動・バルーンメニュー）。**M7（共通基盤 + 統合リマインダー）・M8（ToDo・日課）実装済み**（2026-07-17、未リリース。次は M9 状況発話） |
 
 ## 採用済みの技術選定（Phase 1〜2 で再調査しない）
 
@@ -88,10 +88,10 @@ v0.0.3 で得た主な負債:
 | ファイル | 役割 | 状態 |
 |---|---|---|
 | docs/spec.md | 要件の正本 | v1.1 ✅（§4.6 日常支援 追加） |
-| docs/architecture.md | モジュール構成・契約・設計判断 | v1 ✅ |
+| docs/architecture.md | モジュール構成・契約・設計判断 | v1.2 ✅（M7/M8 契約反映済み） |
 | docs/test-plan.md | テスト戦略・手動チェックリスト | v1 ✅ |
 | docs/implementation-plan.md | 実装計画（M0〜M6 マイルストーン） | v1 ✅ |
-| docs/daily-support-design.md | **日常支援 Tier S の Phase 2 設計書**（§4.6 実装契約・DB・M7〜M10） | 設計 v1 ✅（未実装） |
+| docs/daily-support-design.md | **日常支援 Tier S の Phase 2 設計書**（§4.6 実装契約・DB・M7〜M10） | 設計 v2 ✅（**M7/M8 実装済み**、M9〜M10 未実装） |
 | [docs/_legacy-v003/baseline-v0.0.3.md](docs/_legacy-v003/baseline-v0.0.3.md) | **v0.0.3 機能・契約・残課題の網羅スナップショット** | 参照用 |
 | [docs/_legacy-v003/spec.md](docs/_legacy-v003/spec.md) | v0.0.3 要件（インプット） | 参照用 |
 | [docs/_legacy-v003/architecture.md](docs/_legacy-v003/architecture.md) | v0.0.3 設計（インプット） | 参照用 |

@@ -189,7 +189,9 @@ fn render_tools_block(db: &Db) -> String {
     let now_label = crate::tools::clock::now_jp_label();
     let now_ts = chrono::Utc::now().timestamp();
     let mut out = format!("\n[現在] {now_label}\n");
-    let pending = db.list_reminders().unwrap_or_default();
+    let pending = db
+        .list_reminders(crate::db::ReminderFilter::Active)
+        .unwrap_or_default();
     let upcoming: Vec<_> = pending
         .into_iter()
         .filter(|r| r.due_ts > now_ts && r.due_ts - now_ts < 24 * 3600)

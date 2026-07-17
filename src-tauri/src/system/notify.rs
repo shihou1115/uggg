@@ -45,14 +45,9 @@ pub enum NoticeKind {
     UpdateAvailable {
         version: String,
     },
-    /// M5-B: リマインダー発火。静音中も鳴らす特例 (呼び出し側で should_stay_quiet を無視)。
-    /// 現状は `tasks::spawn_reminder_watcher` が `dialogue::persist_and_speak` で
-    /// 直接発話するので本 variant は手動 fire テスト・将来拡張用 (notify 経路を辞書テンプレで
-    /// 処理する場合に利用)。
-    #[allow(dead_code)]
-    ReminderFired {
-        text: String,
-    },
+    // M7: ReminderFired variant は削除した。リマインダー発火は
+    // `system::deliver::deliver_event` + 辞書 events.reminder_fired 経路に一本化
+    // (daily-support-design §3/§7.1)。
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +69,6 @@ impl NoticeKind {
             NoticeKind::IrodoriDlComplete => "irodori_dl_complete",
             NoticeKind::IrodoriDlFailed { .. } => "irodori_dl_failed",
             NoticeKind::UpdateAvailable { .. } => "update_available",
-            NoticeKind::ReminderFired { .. } => "reminder_fired",
         }
     }
 
@@ -106,13 +100,6 @@ impl NoticeKind {
             }
             NoticeKind::UpdateAvailable { version } => {
                 format!("ugg の新しいバージョン {version} が出ています")
-            }
-            NoticeKind::ReminderFired { text } => {
-                if text.is_empty() {
-                    "リマインダーの時間です".to_string()
-                } else {
-                    format!("リマインダー: {text}")
-                }
             }
         }
     }

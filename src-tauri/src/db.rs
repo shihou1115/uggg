@@ -82,13 +82,98 @@ pub struct UsageSummary {
     pub limited: bool,
 }
 
-/// リマインダー 1 件 (M5-B)。
+/// リマインダーの繰り返し種別 (M7, daily-support-design §2.1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReminderKind {
+    Once,
+    Daily,
+    Weekly,
+}
+
+impl ReminderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReminderKind::Once => "once",
+            ReminderKind::Daily => "daily",
+            ReminderKind::Weekly => "weekly",
+        }
+    }
+    fn parse(s: &str) -> Self {
+        match s {
+            "daily" => Self::Daily,
+            "weekly" => Self::Weekly,
+            _ => Self::Once,
+        }
+    }
+}
+
+/// リマインダー 1 件 (M5-B、M7 で v6 拡張)。
+/// reminders はスケジュール定義であり、発火・確認の履歴は `reminder_log` に分離する
+/// (発火 ≠ 完了、daily-support-design §2.1)。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReminderRow {
     pub id: i64,
+    /// 次回発火予定 (UTC 秒)。
     pub due_ts: i64,
     pub text: String,
     pub created_ts: i64,
+    pub kind: ReminderKind,
+    /// weekly のみ使用: bit0=月 .. bit6=日。
+    pub weekday_mask: u8,
+    /// daily/weekly のみ使用: ローカル 0:00 からの秒 (§2.5 TZ 契約)。
+    pub time_of_day: i32,
+    /// 1=有効。once は発火到達・完了・dismiss で 0 (再発火停止)。
+    pub active: bool,
+    /// スヌーズ前の本来時刻 (UTC 秒)。スヌーズしていなければ None。
+    pub base_due_ts: Option<i64>,
+    /// 導出列: ack='fired' のログが残っている (=通知したが未処理)。
+    /// テーブル列ではなく SELECT 時に reminder_log から EXISTS で計算する。
+    pub pending: bool,
+}
+
+/// リマインダー発火・確認履歴 1 件 (M7, daily-support-design §2.1)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReminderLogRow {
+    pub id: i64,
+    pub reminder_id: i64,
+    /// 発火 (配達試行) 時刻 UTC 秒。
+    pub fired_ts: i64,
+    /// 'fired' | 'completed' | 'dismissed'。
+    pub ack: String,
+    pub ack_ts: Option<i64>,
+    /// 配達結果 (§3.1 DeliveryOutcome): 'ghost' | 'toast' | 'deferred' | 'failed'。
+    pub delivery: String,
+}
+
+/// list_reminders のフィルタ (M7)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReminderFilter {
+    /// 予定あり (active=1) または未処理の発火が残っている (要対応)。
+    Active,
+    /// 終了済み: active=0 かつ未処理の発火なし。
+    Completed,
+    All,
+}
+
+/// ToDo 1 件 (M8, spec §4.6.2 / daily-support-design §2.2)。
+/// bucket/status/recurring は文字列のまま持ち、正規化・検証はコマンド層
+/// (`tools::todo`) が行う (TS 側の文字列 union と 1:1 のため。enum 化はしない)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TodoRow {
+    pub id: i64,
+    pub text: String,
+    /// 'today' | 'week' | 'someday'。
+    pub bucket: String,
+    /// 0=普通, 1=高 (2 段階のみ、spec §4.6.2)。
+    pub priority: i32,
+    /// None | 'daily' | 'weekly' (日課)。
+    pub recurring: Option<String>,
+    /// 'open' | 'done'。
+    pub status: String,
+    pub done_ts: Option<i64>,
+    pub created_ts: i64,
+    pub sort_order: i64,
 }
 
 /// 興味分野 1 件 (M5-C, architecture §2.2)。
@@ -274,6 +359,52 @@ impl Db {
                 INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_schema_version', '5');",
             )
             .context("migrate to schema v5")?;
+        }
+
+        if current < 6 {
+            // M7: 統合リマインダー (daily-support-design §2.1)。
+            // reminders = スケジュール定義、reminder_log = 発火・確認の履歴に分離する。
+            tx.execute_batch(
+                "ALTER TABLE reminders ADD COLUMN kind         TEXT    NOT NULL DEFAULT 'once';
+                 ALTER TABLE reminders ADD COLUMN weekday_mask INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE reminders ADD COLUMN time_of_day  INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE reminders ADD COLUMN active       INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE reminders ADD COLUMN base_due_ts  INTEGER;
+
+                 CREATE TABLE IF NOT EXISTS reminder_log (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     reminder_id INTEGER NOT NULL,
+                     fired_ts    INTEGER NOT NULL,
+                     ack         TEXT    NOT NULL DEFAULT 'fired',
+                     ack_ts      INTEGER,
+                     delivery    TEXT    NOT NULL DEFAULT 'ghost'
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_reminder_log_rid ON reminder_log(reminder_id);
+
+                 INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_schema_version', '6');",
+            )
+            .context("migrate to schema v6")?;
+        }
+
+        if current < 7 {
+            // M8: ToDo・日課管理 (daily-support-design §2.2)。
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS todos (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text       TEXT    NOT NULL,
+                    bucket     TEXT    NOT NULL DEFAULT 'today',
+                    priority   INTEGER NOT NULL DEFAULT 0,
+                    recurring  TEXT,
+                    status     TEXT    NOT NULL DEFAULT 'open',
+                    done_ts    INTEGER,
+                    created_ts INTEGER NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status, bucket);
+
+                INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_schema_version', '7');",
+            )
+            .context("migrate to schema v7")?;
         }
 
         tx.commit().context("commit migration tx")?;
@@ -487,34 +618,69 @@ impl Db {
         Ok(total)
     }
 
-    // ===== reminders (M5-B) =====
+    // ===== reminders (M5-B, M7 拡張) =====
 
+    /// SELECT の共通列。pending は reminder_log の未処理 fired から導出する。
+    const REMINDER_COLS: &'static str =
+        "id, due_ts, text, created_ts, kind, weekday_mask, time_of_day, active, base_due_ts,
+         EXISTS(SELECT 1 FROM reminder_log l WHERE l.reminder_id = reminders.id AND l.ack = 'fired') AS pending";
+
+    fn map_reminder(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReminderRow> {
+        let kind_str: String = row.get(4)?;
+        Ok(ReminderRow {
+            id: row.get(0)?,
+            due_ts: row.get(1)?,
+            text: row.get(2)?,
+            created_ts: row.get(3)?,
+            kind: ReminderKind::parse(&kind_str),
+            weekday_mask: row.get::<_, i64>(5)? as u8,
+            time_of_day: row.get::<_, i64>(6)? as i32,
+            active: row.get::<_, i64>(7)? != 0,
+            base_due_ts: row.get(8)?,
+            pending: row.get::<_, i64>(9)? != 0,
+        })
+    }
+
+    /// 単発 (once) リマインダーの登録。既存 M5-B 経路 (`add_reminder` コマンド) 互換。
     pub fn insert_reminder(&self, due_ts: i64, text: &str, created_ts: i64) -> Result<i64> {
+        self.insert_reminder_ex(due_ts, text, created_ts, ReminderKind::Once, 0, 0)
+    }
+
+    /// 繰り返しメタ付きの登録 (M7)。
+    pub fn insert_reminder_ex(
+        &self,
+        due_ts: i64,
+        text: &str,
+        created_ts: i64,
+        kind: ReminderKind,
+        weekday_mask: u8,
+        time_of_day: i32,
+    ) -> Result<i64> {
         let conn = self.conn.lock().expect("db poisoned");
         conn.execute(
-            "INSERT INTO reminders (due_ts, text, created_ts) VALUES (?1, ?2, ?3)",
-            params![due_ts, text, created_ts],
+            "INSERT INTO reminders (due_ts, text, created_ts, kind, weekday_mask, time_of_day, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+            params![due_ts, text, created_ts, kind.as_str(), weekday_mask as i64, time_of_day as i64],
         )
-        .context("insert_reminder")?;
+        .context("insert_reminder_ex")?;
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn list_reminders(&self) -> Result<Vec<ReminderRow>> {
+    pub fn list_reminders(&self, filter: ReminderFilter) -> Result<Vec<ReminderRow>> {
         let conn = self.conn.lock().expect("db poisoned");
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, due_ts, text, created_ts FROM reminders ORDER BY due_ts ASC",
-            )
-            .context("prepare list_reminders")?;
+        let where_clause = match filter {
+            ReminderFilter::Active => "WHERE active = 1 OR pending",
+            ReminderFilter::Completed => "WHERE active = 0 AND NOT pending",
+            ReminderFilter::All => "",
+        };
+        let sql = format!(
+            "SELECT * FROM (SELECT {} FROM reminders) {} ORDER BY due_ts ASC",
+            Self::REMINDER_COLS,
+            where_clause
+        );
+        let mut stmt = conn.prepare(&sql).context("prepare list_reminders")?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(ReminderRow {
-                    id: row.get(0)?,
-                    due_ts: row.get(1)?,
-                    text: row.get(2)?,
-                    created_ts: row.get(3)?,
-                })
-            })
+            .query_map([], Self::map_reminder)
             .context("query_map list_reminders")?;
         let mut out = Vec::new();
         for r in rows {
@@ -523,37 +689,333 @@ impl Db {
         Ok(out)
     }
 
-    /// `due_ts <= now` のリマインダーを返す (発火対象)。
-    pub fn due_reminders(&self, now_ts: i64) -> Result<Vec<ReminderRow>> {
+    /// `active=1 AND due_ts <= now` のリマインダーを返す (発火対象、M7)。
+    pub fn due_active_reminders(&self, now_ts: i64) -> Result<Vec<ReminderRow>> {
         let conn = self.conn.lock().expect("db poisoned");
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, due_ts, text, created_ts FROM reminders
-                 WHERE due_ts <= ?1 ORDER BY due_ts ASC",
-            )
-            .context("prepare due_reminders")?;
+        let sql = format!(
+            "SELECT {} FROM reminders WHERE active = 1 AND due_ts <= ?1 ORDER BY due_ts ASC",
+            Self::REMINDER_COLS
+        );
+        let mut stmt = conn.prepare(&sql).context("prepare due_active_reminders")?;
         let rows = stmt
-            .query_map(params![now_ts], |row| {
-                Ok(ReminderRow {
-                    id: row.get(0)?,
-                    due_ts: row.get(1)?,
-                    text: row.get(2)?,
-                    created_ts: row.get(3)?,
-                })
-            })
-            .context("query_map due_reminders")?;
+            .query_map(params![now_ts], Self::map_reminder)
+            .context("query_map due_active_reminders")?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.context("row due_reminders")?);
+            out.push(r.context("row due_active_reminders")?);
         }
         Ok(out)
+    }
+
+    pub fn get_reminder(&self, id: i64) -> Result<Option<ReminderRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let sql = format!("SELECT {} FROM reminders WHERE id = ?1", Self::REMINDER_COLS);
+        let row = conn.query_row(&sql, params![id], Self::map_reminder).ok();
+        Ok(row)
     }
 
     pub fn delete_reminder(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().expect("db poisoned");
         conn.execute("DELETE FROM reminders WHERE id = ?1", params![id])
             .context("delete_reminder")?;
+        conn.execute("DELETE FROM reminder_log WHERE reminder_id = ?1", params![id])
+            .context("delete_reminder_log")?;
         Ok(())
+    }
+
+    /// 本文・時刻の部分更新 (M7 の update_reminder コマンド)。None の項目は変更しない。
+    pub fn update_reminder(&self, id: i64, text: Option<&str>, due_ts: Option<i64>) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "UPDATE reminders SET
+                text   = COALESCE(?2, text),
+                due_ts = COALESCE(?3, due_ts)
+             WHERE id = ?1",
+            params![id, text, due_ts],
+        )
+        .context("update_reminder")?;
+        Ok(())
+    }
+
+    /// 繰り返しリマインダーの次回発火予定を設定する (M7)。
+    /// スヌーズ由来の base_due_ts は次周期でリセットする。
+    pub fn reschedule_reminder(&self, id: i64, next_due_ts: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "UPDATE reminders SET due_ts = ?2, base_due_ts = NULL WHERE id = ?1",
+            params![id, next_due_ts],
+        )
+        .context("reschedule_reminder")?;
+        Ok(())
+    }
+
+    /// スヌーズ (M7): due を new_due に延ばし、本来時刻を base_due_ts に保持する。
+    /// 多重スヌーズでは最初の本来時刻を保つ (COALESCE)。
+    pub fn snooze_reminder(&self, id: i64, base_due_ts: i64, new_due_ts: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "UPDATE reminders SET due_ts = ?3, base_due_ts = COALESCE(base_due_ts, ?2), active = 1
+             WHERE id = ?1",
+            params![id, base_due_ts, new_due_ts],
+        )
+        .context("snooze_reminder")?;
+        Ok(())
+    }
+
+    /// once の再発火停止 (M7)。「完了」ではない (未完了のまま止まる、§2.1)。
+    pub fn deactivate_reminder(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute("UPDATE reminders SET active = 0 WHERE id = ?1", params![id])
+            .context("deactivate_reminder")?;
+        Ok(())
+    }
+
+    // ===== reminder_log (M7) =====
+
+    /// 発火 (配達到達) の履歴を 1 行記録する。delivery は DeliveryOutcome の小文字表記。
+    pub fn log_fire(&self, reminder_id: i64, fired_ts: i64, delivery: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "INSERT INTO reminder_log (reminder_id, fired_ts, ack, delivery) VALUES (?1, ?2, 'fired', ?3)",
+            params![reminder_id, fired_ts, delivery],
+        )
+        .context("log_fire")?;
+        Ok(())
+    }
+
+    /// 当該リマインダーの最新の未処理 fired ログへ ack を付ける (M7)。
+    /// 対象が無ければ false (未発火のまま完了/無視された等)。
+    pub fn set_ack(&self, reminder_id: i64, ack: &str, ack_ts: i64) -> Result<bool> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let n = conn
+            .execute(
+                "UPDATE reminder_log SET ack = ?2, ack_ts = ?3 WHERE id = (
+                    SELECT id FROM reminder_log
+                    WHERE reminder_id = ?1 AND ack = 'fired'
+                    ORDER BY id DESC LIMIT 1
+                )",
+                params![reminder_id, ack, ack_ts],
+            )
+            .context("set_ack")?;
+        Ok(n > 0)
+    }
+
+    /// 通知履歴 (新しい順、最大 limit 件)。
+    pub fn list_reminder_log(&self, reminder_id: i64, limit: u32) -> Result<Vec<ReminderLogRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, reminder_id, fired_ts, ack, ack_ts, delivery FROM reminder_log
+                 WHERE reminder_id = ?1 ORDER BY id DESC LIMIT ?2",
+            )
+            .context("prepare list_reminder_log")?;
+        let rows = stmt
+            .query_map(params![reminder_id, limit as i64], |row| {
+                Ok(ReminderLogRow {
+                    id: row.get(0)?,
+                    reminder_id: row.get(1)?,
+                    fired_ts: row.get(2)?,
+                    ack: row.get(3)?,
+                    ack_ts: row.get(4)?,
+                    delivery: row.get(5)?,
+                })
+            })
+            .context("query_map list_reminder_log")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("row list_reminder_log")?);
+        }
+        Ok(out)
+    }
+
+    /// reminder_log を新しい順 keep 件だけ残して古い順に削除する (M7、既定 500)。
+    pub fn prune_reminder_log(&self, keep: u32) -> Result<u64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let n = conn
+            .execute(
+                "DELETE FROM reminder_log WHERE id NOT IN (
+                    SELECT id FROM reminder_log ORDER BY id DESC LIMIT ?1
+                )",
+                params![keep as i64],
+            )
+            .context("prune_reminder_log")?;
+        Ok(n as u64)
+    }
+
+    // ===== todos (M8) =====
+
+    fn map_todo(row: &rusqlite::Row<'_>) -> rusqlite::Result<TodoRow> {
+        Ok(TodoRow {
+            id: row.get(0)?,
+            text: row.get(1)?,
+            bucket: row.get(2)?,
+            priority: row.get::<_, i64>(3)? as i32,
+            recurring: row.get(4)?,
+            status: row.get(5)?,
+            done_ts: row.get(6)?,
+            created_ts: row.get(7)?,
+            sort_order: row.get(8)?,
+        })
+    }
+
+    const TODO_COLS: &'static str =
+        "id, text, bucket, priority, recurring, status, done_ts, created_ts, sort_order";
+
+    /// 追加。sort_order は同 bucket の末尾 (max+1)。値の検証は tools::todo が行う。
+    pub fn insert_todo(
+        &self,
+        text: &str,
+        bucket: &str,
+        priority: i32,
+        recurring: Option<&str>,
+        created_ts: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "INSERT INTO todos (text, bucket, priority, recurring, created_ts, sort_order)
+             VALUES (?1, ?2, ?3, ?4, ?5,
+                     (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM todos WHERE bucket = ?2))",
+            params![text, bucket, priority as i64, recurring, created_ts],
+        )
+        .context("insert_todo")?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 一覧。bucket 指定で絞り込み (None は全件)。
+    /// open が先・優先度高が先・sort_order 昇順 (パネルの表示順)。
+    pub fn list_todos(&self, bucket: Option<&str>) -> Result<Vec<TodoRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let sql = format!(
+            "SELECT {} FROM todos {} ORDER BY
+                 CASE status WHEN 'open' THEN 0 ELSE 1 END,
+                 priority DESC, sort_order ASC, id ASC",
+            Self::TODO_COLS,
+            if bucket.is_some() { "WHERE bucket = ?1" } else { "" }
+        );
+        let mut stmt = conn.prepare(&sql).context("prepare list_todos")?;
+        let mut out = Vec::new();
+        match bucket {
+            Some(b) => {
+                let rows = stmt
+                    .query_map(params![b], Self::map_todo)
+                    .context("query list_todos")?;
+                for r in rows {
+                    out.push(r.context("row list_todos")?);
+                }
+            }
+            None => {
+                let rows = stmt
+                    .query_map([], Self::map_todo)
+                    .context("query list_todos")?;
+                for r in rows {
+                    out.push(r.context("row list_todos")?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_todo(&self, id: i64) -> Result<Option<TodoRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let sql = format!("SELECT {} FROM todos WHERE id = ?1", Self::TODO_COLS);
+        let row = conn.query_row(&sql, params![id], Self::map_todo).ok();
+        Ok(row)
+    }
+
+    /// status の変更。'done' なら done_ts を刻み、'open' なら done_ts をクリアする。
+    pub fn set_todo_status(&self, id: i64, status: &str, now_ts: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let done_ts: Option<i64> = if status == "done" { Some(now_ts) } else { None };
+        conn.execute(
+            "UPDATE todos SET status = ?2, done_ts = ?3 WHERE id = ?1",
+            params![id, status, done_ts],
+        )
+        .context("set_todo_status")?;
+        Ok(())
+    }
+
+    pub fn delete_todo(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute("DELETE FROM todos WHERE id = ?1", params![id])
+            .context("delete_todo")?;
+        Ok(())
+    }
+
+    /// 部分更新 (M8 の update_todo コマンド)。None の項目は変更しない。
+    /// recurring だけは「変更しない/クリア/設定」の三値が要るため二重 Option。
+    pub fn update_todo(
+        &self,
+        id: i64,
+        text: Option<&str>,
+        bucket: Option<&str>,
+        priority: Option<i32>,
+        recurring: Option<Option<&str>>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "UPDATE todos SET
+                text     = COALESCE(?2, text),
+                bucket   = COALESCE(?3, bucket),
+                priority = COALESCE(?4, priority)
+             WHERE id = ?1",
+            params![id, text, bucket, priority.map(|p| p as i64)],
+        )
+        .context("update_todo")?;
+        if let Some(rec) = recurring {
+            conn.execute(
+                "UPDATE todos SET recurring = ?2 WHERE id = ?1",
+                params![id, rec],
+            )
+            .context("update_todo recurring")?;
+        }
+        Ok(())
+    }
+
+    /// 日課の復活 (M8, daily-support-design §2.2)。
+    /// daily: 今日のローカル 0:00 (UTC 秒) より前に done → open へ。
+    /// weekly: 今週月曜のローカル 0:00 より前に done → open へ。
+    /// cutoff の計算はローカル TZ 契約 (§2.5) に従い呼び出し側 (tools::todo) が行う。
+    pub fn reset_recurring_todos(&self, daily_cutoff_ts: i64, weekly_cutoff_ts: i64) -> Result<u64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut n = conn
+            .execute(
+                "UPDATE todos SET status = 'open', done_ts = NULL
+                 WHERE status = 'done' AND recurring = 'daily'
+                   AND (done_ts IS NULL OR done_ts < ?1)",
+                params![daily_cutoff_ts],
+            )
+            .context("reset daily todos")?;
+        n += conn
+            .execute(
+                "UPDATE todos SET status = 'open', done_ts = NULL
+                 WHERE status = 'done' AND recurring = 'weekly'
+                   AND (done_ts IS NULL OR done_ts < ?1)",
+                params![weekly_cutoff_ts],
+            )
+            .context("reset weekly todos")?;
+        Ok(n as u64)
+    }
+
+    /// 未完了件数 (朝の告知用)。bucket 指定で絞り込み (None は全 bucket)。
+    pub fn count_open_todos(&self, bucket: Option<&str>) -> Result<u64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let n: i64 = match bucket {
+            Some(b) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM todos WHERE status = 'open' AND bucket = ?1",
+                    params![b],
+                    |row| row.get(0),
+                )
+                .context("count_open_todos")?,
+            None => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM todos WHERE status = 'open'",
+                    [],
+                    |row| row.get(0),
+                )
+                .context("count_open_todos")?,
+        };
+        Ok(n as u64)
     }
 
     // ===== interest_topics (M5-C) =====
@@ -830,6 +1292,180 @@ mod tests {
         assert_eq!(row2.caption, "落ち着いた女性の声");
         assert_eq!(row2.file_path, "C:/refs/main_2.wav");
         assert_eq!(row2.created_ts, 200);
+    }
+
+    #[test]
+    fn reminders_v6_defaults_and_pending_flow() {
+        let db = make_db();
+        // 旧経路 (once) の登録: v6 既定値が入る
+        let id = db.insert_reminder(1000, "お茶", 900).unwrap();
+        let rows = db.list_reminders(ReminderFilter::All).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.id, id);
+        assert_eq!(r.kind, ReminderKind::Once);
+        assert!(r.active);
+        assert!(!r.pending);
+        assert_eq!(r.base_due_ts, None);
+
+        // 発火対象: due_ts <= now かつ active=1
+        assert_eq!(db.due_active_reminders(999).unwrap().len(), 0);
+        assert_eq!(db.due_active_reminders(1000).unwrap().len(), 1);
+
+        // 発火到達 → ログ + once は active=0 (発火済み・未完了)
+        db.log_fire(id, 1000, "ghost").unwrap();
+        db.deactivate_reminder(id).unwrap();
+        let r = &db.list_reminders(ReminderFilter::All).unwrap()[0];
+        assert!(!r.active);
+        assert!(r.pending, "fired ログが残っている間は未完了");
+        // 未完了は Active フィルタに残る (要対応)
+        assert_eq!(db.list_reminders(ReminderFilter::Active).unwrap().len(), 1);
+        assert_eq!(db.list_reminders(ReminderFilter::Completed).unwrap().len(), 0);
+
+        // 完了 ack で pending が消え Completed へ移る
+        assert!(db.set_ack(id, "completed", 1010).unwrap());
+        let r = &db.list_reminders(ReminderFilter::All).unwrap()[0];
+        assert!(!r.pending);
+        assert_eq!(db.list_reminders(ReminderFilter::Active).unwrap().len(), 0);
+        assert_eq!(db.list_reminders(ReminderFilter::Completed).unwrap().len(), 1);
+        // 未処理 fired が無い状態での再 ack は false
+        assert!(!db.set_ack(id, "completed", 1020).unwrap());
+
+        let log = db.list_reminder_log(id, 10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].ack, "completed");
+        assert_eq!(log[0].ack_ts, Some(1010));
+        assert_eq!(log[0].delivery, "ghost");
+    }
+
+    #[test]
+    fn reminders_recurring_reschedule_and_snooze() {
+        let db = make_db();
+        let id = db
+            .insert_reminder_ex(2000, "薬", 1900, ReminderKind::Daily, 0, 9 * 3600)
+            .unwrap();
+        let r = &db.list_reminders(ReminderFilter::All).unwrap()[0];
+        assert_eq!(r.kind, ReminderKind::Daily);
+        assert_eq!(r.time_of_day, 9 * 3600);
+
+        // スヌーズ: 本来時刻を base_due_ts に保持。多重スヌーズでも最初の値を保つ
+        db.snooze_reminder(id, 2000, 2600).unwrap();
+        let r = &db.list_reminders(ReminderFilter::All).unwrap()[0];
+        assert_eq!(r.due_ts, 2600);
+        assert_eq!(r.base_due_ts, Some(2000));
+        db.snooze_reminder(id, 2600, 3200).unwrap();
+        let r = &db.list_reminders(ReminderFilter::All).unwrap()[0];
+        assert_eq!(r.due_ts, 3200);
+        assert_eq!(r.base_due_ts, Some(2000), "多重スヌーズは最初の本来時刻を保持");
+
+        // 繰り返しの reschedule で base_due_ts はリセット
+        db.reschedule_reminder(id, 88400).unwrap();
+        let r = &db.list_reminders(ReminderFilter::All).unwrap()[0];
+        assert_eq!(r.due_ts, 88400);
+        assert_eq!(r.base_due_ts, None);
+        assert!(r.active);
+    }
+
+    #[test]
+    fn reminder_log_prune_keeps_newest() {
+        let db = make_db();
+        let id = db.insert_reminder(100, "x", 90).unwrap();
+        for i in 0..10 {
+            db.log_fire(id, 100 + i, "ghost").unwrap();
+        }
+        let removed = db.prune_reminder_log(3).unwrap();
+        assert_eq!(removed, 7);
+        let log = db.list_reminder_log(id, 100).unwrap();
+        assert_eq!(log.len(), 3);
+        // 新しい順に残る
+        assert_eq!(log[0].fired_ts, 109);
+        assert_eq!(log[2].fired_ts, 107);
+    }
+
+    #[test]
+    fn delete_reminder_removes_log_too() {
+        let db = make_db();
+        let id = db.insert_reminder(100, "x", 90).unwrap();
+        db.log_fire(id, 100, "ghost").unwrap();
+        db.delete_reminder(id).unwrap();
+        assert_eq!(db.list_reminders(ReminderFilter::All).unwrap().len(), 0);
+        assert_eq!(db.list_reminder_log(id, 10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn todos_crud_and_ordering() {
+        let db = make_db();
+        let a = db.insert_todo("洗い物", "today", 0, None, 100).unwrap();
+        let b = db.insert_todo("資料作成", "today", 1, None, 110).unwrap();
+        let c = db.insert_todo("旅行計画", "someday", 0, None, 120).unwrap();
+
+        // bucket 絞り込み + 優先度高が先
+        let today = db.list_todos(Some("today")).unwrap();
+        assert_eq!(today.len(), 2);
+        assert_eq!(today[0].id, b, "優先度 1 が先頭");
+        assert_eq!(today[1].id, a);
+        assert_eq!(db.list_todos(Some("someday")).unwrap().len(), 1);
+        assert_eq!(db.list_todos(None).unwrap().len(), 3);
+
+        // 完了 → done_ts が刻まれ、open が先に並ぶ
+        db.set_todo_status(a, "done", 200).unwrap();
+        let row = db.get_todo(a).unwrap().unwrap();
+        assert_eq!(row.status, "done");
+        assert_eq!(row.done_ts, Some(200));
+        let today = db.list_todos(Some("today")).unwrap();
+        assert_eq!(today[0].id, b, "open が先");
+        assert_eq!(today[1].id, a);
+        assert_eq!(db.count_open_todos(Some("today")).unwrap(), 1);
+        assert_eq!(db.count_open_todos(None).unwrap(), 2);
+
+        // open へ戻すと done_ts はクリア
+        db.set_todo_status(a, "open", 300).unwrap();
+        assert_eq!(db.get_todo(a).unwrap().unwrap().done_ts, None);
+
+        // 部分更新 (recurring の三値: 設定 → クリア)
+        db.update_todo(a, Some("食器洗い"), Some("week"), Some(1), Some(Some("daily")))
+            .unwrap();
+        let row = db.get_todo(a).unwrap().unwrap();
+        assert_eq!(row.text, "食器洗い");
+        assert_eq!(row.bucket, "week");
+        assert_eq!(row.priority, 1);
+        assert_eq!(row.recurring.as_deref(), Some("daily"));
+        db.update_todo(a, None, None, None, Some(None)).unwrap();
+        let row = db.get_todo(a).unwrap().unwrap();
+        assert_eq!(row.recurring, None, "recurring だけクリアされる");
+        assert_eq!(row.text, "食器洗い", "他フィールドは維持");
+
+        db.delete_todo(c).unwrap();
+        assert!(db.get_todo(c).unwrap().is_none());
+    }
+
+    #[test]
+    fn todos_recurring_reset_boundaries() {
+        let db = make_db();
+        // daily_cutoff=1000 (今日 0:00)、weekly_cutoff=500 (今週月曜 0:00) と見立てる
+        let d_old = db.insert_todo("薬", "today", 0, Some("daily"), 10).unwrap();
+        let d_new = db.insert_todo("体操", "today", 0, Some("daily"), 10).unwrap();
+        let w_old = db.insert_todo("掃除", "week", 0, Some("weekly"), 10).unwrap();
+        let w_new = db.insert_todo("買い出し", "week", 0, Some("weekly"), 10).unwrap();
+        let plain = db.insert_todo("単発", "today", 0, None, 10).unwrap();
+
+        db.set_todo_status(d_old, "done", 999).unwrap(); // 昨日完了 → 復活
+        db.set_todo_status(d_new, "done", 1000).unwrap(); // 今日完了 → 維持
+        db.set_todo_status(w_old, "done", 499).unwrap(); // 先週完了 → 復活
+        db.set_todo_status(w_new, "done", 500).unwrap(); // 今週完了 → 維持
+        db.set_todo_status(plain, "done", 1).unwrap(); // 日課でない → 維持
+
+        let n = db.reset_recurring_todos(1000, 500).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(db.get_todo(d_old).unwrap().unwrap().status, "open");
+        assert_eq!(db.get_todo(d_old).unwrap().unwrap().done_ts, None);
+        assert_eq!(db.get_todo(d_new).unwrap().unwrap().status, "done");
+        assert_eq!(db.get_todo(w_old).unwrap().unwrap().status, "open");
+        assert_eq!(db.get_todo(w_new).unwrap().unwrap().status, "done");
+        assert_eq!(db.get_todo(plain).unwrap().unwrap().status, "done");
+
+        // 冪等: もう一度実行しても変化なし
+        assert_eq!(db.reset_recurring_todos(1000, 500).unwrap(), 0);
     }
 
     #[test]

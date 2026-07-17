@@ -32,7 +32,9 @@ pub struct DialogueResponse {
 
 /// バックエンド起点の発話を chat_log に保存しつつフロントへ emit する共通ヘルパ。
 /// ランダムトーク・放置反応・ポモドーロ・起動/終了挨拶など、ユーザー入力を伴わない発話で使う。
-pub fn persist_and_speak(app: &AppHandle, state: &Arc<AppState>, resp: &DialogueResponse) {
+/// 戻り値は発話 (dialogue emit) が成立したか。M7 の通知配達 (`system::deliver`) が
+/// トーストフォールバック判定に使う。既存呼び出しは無視してよい。
+pub fn persist_and_speak(app: &AppHandle, state: &Arc<AppState>, resp: &DialogueResponse) -> bool {
     use tauri::Emitter;
     let now = Utc::now().timestamp();
     let _ = state
@@ -45,7 +47,9 @@ pub fn persist_and_speak(app: &AppHandle, state: &Arc<AppState>, resp: &Dialogue
     }
     if let Err(err) = app.emit("dialogue", resp) {
         eprintln!("[persist_and_speak] dialogue emit failed: {err}");
+        return false;
     }
+    true
 }
 
 // ===== オーケストレーション =====
@@ -53,25 +57,32 @@ pub fn persist_and_speak(app: &AppHandle, state: &Arc<AppState>, resp: &Dialogue
 // send_user_message から呼ばれる: モード判定・降格チェック・busy ゲート・
 // 失敗時 fallback ・ chat_log 永続化を 1 か所に集約する。
 
-/// M5-B: 「N 分後に X」を `tools::reminder::parse_request` で抽出済の req を受け取り、
-/// DB へ登録し、確認台詞 (`〇分後に「X」を覚えておくね`) を main 単独の発話として返す。
-/// chat_log にも user と main を保存し、LLM は呼ばないので advanced cost を消費しない。
+/// M7 (spec §4.6.1): `tools::reminder::parse_reminder` が抽出した予定を DB へ登録し、
+/// 確認台詞を main 単独の発話として返す。LLM は呼ばない (常時ローカル、advanced 非依存)。
+/// chat_log には user と main を保存する。
 fn handle_reminder_request(
+    app: &AppHandle,
     state: &Arc<AppState>,
     user_text: &str,
-    req: &crate::tools::reminder::ReminderRequest,
+    parsed: &crate::tools::reminder::ParsedReminder,
 ) -> Result<DialogueResponse, String> {
-    let body = if req.body.is_empty() {
-        // 本文が省略された場合は元の発話をそのまま使う (例「5分後」)
-        format!("「{user_text}」より")
-    } else {
-        req.body.clone()
-    };
-    crate::tools::reminder::add(state, &body, req.offset_secs)
+    // 本文が省略された場合は元の発話をそのまま使う (例「5分後」)
+    let default_body = format!("「{user_text}」より");
+    crate::tools::reminder::register(state, parsed, &default_body)
         .map_err(|e| format!("リマインダー登録に失敗: {e:#}"))?;
+    {
+        use tauri::Emitter;
+        let _ = app.emit("reminders-changed", ());
+    }
 
-    let confirm_text = format_confirmation(req.offset_secs, &body);
+    let body = if parsed.body.is_empty() {
+        default_body
+    } else {
+        parsed.body.clone()
+    };
     let now = Utc::now().timestamp();
+    let now_local = chrono::Local::now().naive_local();
+    let confirm_text = format_confirmation(&parsed.schedule, now_local, &body);
     let _ = state.db.append_chat(now, "low", ChatRole::User, user_text, None);
     let _ = state
         .db
@@ -88,15 +99,50 @@ fn handle_reminder_request(
     })
 }
 
-fn format_confirmation(offset_secs: i64, body: &str) -> String {
-    let (n, unit) = if offset_secs >= 3600 && offset_secs % 3600 == 0 {
-        (offset_secs / 3600, "時間")
-    } else if offset_secs >= 60 {
-        (offset_secs / 60, "分")
-    } else {
-        (offset_secs, "秒")
-    };
-    format!("{n}{unit}後に「{body}」を覚えておくね")
+fn format_confirmation(
+    schedule: &crate::tools::reminder::Schedule,
+    now_local: chrono::NaiveDateTime,
+    body: &str,
+) -> String {
+    use crate::tools::reminder::{weekday_mask_names, Schedule};
+    let fmt_tod = |tod: i32| format!("{}:{:02}", tod / 3600, (tod % 3600) / 60);
+    match schedule {
+        Schedule::Offset { secs } => {
+            let (n, unit) = if *secs >= 3600 && secs % 3600 == 0 {
+                (secs / 3600, "時間")
+            } else if *secs >= 60 {
+                (secs / 60, "分")
+            } else {
+                (*secs, "秒")
+            };
+            format!("{n}{unit}後に「{body}」を覚えておくね")
+        }
+        Schedule::AtTime { local } => {
+            use chrono::{Datelike, Timelike};
+            let day = (local.date() - now_local.date()).num_days();
+            let day_label = match day {
+                0 => "今日".to_string(),
+                1 => "明日".to_string(),
+                2 => "明後日".to_string(),
+                _ => format!("{}月{}日", local.month(), local.day()),
+            };
+            format!(
+                "{day_label}の{}:{:02}に「{body}」を覚えておくね",
+                local.hour(),
+                local.minute()
+            )
+        }
+        Schedule::Daily { time_of_day } => {
+            format!("毎日{}に「{body}」を覚えておくね", fmt_tod(*time_of_day))
+        }
+        Schedule::Weekly { weekday_mask, time_of_day } => {
+            format!(
+                "毎週{}曜の{}に「{body}」を覚えておくね",
+                weekday_mask_names(*weekday_mask),
+                fmt_tod(*time_of_day)
+            )
+        }
+    }
 }
 
 /// 連続 API エラーがこの回数に達したら一時降格する。
@@ -143,11 +189,13 @@ async fn run_dispatch(
 ) -> Result<DialogueResponse, String> {
     let settings = state.settings.lock().expect("settings poisoned").clone();
 
-    // M5-B: tools_enabled なら「N 分後に...」をパースしてリマインダー登録を試みる。
+    // M7 (spec §4.6.1): daily_support_enabled なら予定表現をパースしてリマインダー登録を
+    // 試みる。tools_enabled・advanced から独立した常時ローカル動作 (§4.2.1 不変条件)。
     // LLM は呼ばずに即時返事するので高速・低コスト。
-    if settings.tools_enabled {
-        if let Some(req) = crate::tools::reminder::parse_request(user_text) {
-            return handle_reminder_request(state, user_text, &req);
+    if settings.daily_support_enabled {
+        let now_local = chrono::Local::now().naive_local();
+        if let Some(parsed) = crate::tools::reminder::parse_reminder(user_text, now_local) {
+            return handle_reminder_request(app, state, user_text, &parsed);
         }
     }
 

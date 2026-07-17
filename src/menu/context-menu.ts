@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { balloonMenuContainer, reposition } from "../dialogue/balloon";
 import { closeInput, isInputOpen } from "../dialogue/input";
+import { openDailyPanel } from "../panels/daily";
 import { openPomodoroPanel } from "../panels/pomodoro";
 import { openReaderPanel } from "../panels/reader";
 import { openSettingsPanel } from "../panels/settings";
@@ -150,6 +151,10 @@ function buildItems(): Array<MenuItem | { divider: true }> {
       onClick: () => window.dispatchEvent(new CustomEvent("ugg-toggle-quiet")),
     },
     { divider: true },
+    {
+      label: "予定・ToDo",
+      onClick: () => void openDailyPanel(),
+    },
     {
       label: "ポモドーロタイマー",
       onClick: () => openPomodoroPanel(),

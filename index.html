@@ -32,6 +32,9 @@
         <span id="pomodoro-badge-time">00:00</span>
         <span id="pomodoro-badge-round"></span>
       </div>
+      <!-- システムトースト (M7): ゴースト発話が失敗したときの通知フォールバック受け皿。
+           静的配置 (WebView2 透過バグ対策)、.visible でトグル。クリックで閉じる。 -->
+      <div id="system-toast" class="solid" title="クリックで閉じる"></div>
       <!-- 設定パネル等も静的配置 (WebView2 透過バグ対策)。初期は .visible 無しで隠す。 -->
       <!-- 汎用確認ダイアログ。alwaysOnTop + 透過の組み合わせで `window.confirm` が
            固まる問題があったため、独自モーダルに置換 (M6 動作確認時に判明)。 -->
@@ -56,6 +59,62 @@
         <div class="panel-body">
           <div id="chatlog-list" class="chatlog-list"></div>
           <p id="chatlog-message" class="panel-message" hidden></p>
+        </div>
+      </div>
+      <!-- 予定・ToDo パネル (M7/M8, spec §4.6.1/§4.6.2)。リマインダー節 + ToDo 節の 2 セクション。
+           静的配置 (WebView2 透過バグ対策)。 -->
+      <div id="daily-panel" class="solid panel">
+        <header class="panel-header">
+          <h2>予定・ToDo</h2>
+          <button type="button" id="daily-close" class="panel-close" aria-label="閉じる">×</button>
+        </header>
+        <div class="panel-body">
+          <section class="panel-section">
+            <h3>リマインダー</h3>
+            <label class="row">
+              <span>自然文で追加</span>
+              <span class="key-cell daily-add-cell">
+                <input
+                  type="text"
+                  id="daily-add-input"
+                  placeholder="例: 3分後にお茶 / 明日の朝ゴミ出し / 毎週月曜9時に会議"
+                />
+                <button type="button" id="daily-add-btn">追加</button>
+              </span>
+            </label>
+            <label class="row">
+              <span>表示</span>
+              <select id="daily-filter">
+                <option value="active">要対応 (予定・未完了)</option>
+                <option value="all">すべて</option>
+                <option value="completed">終了分</option>
+              </select>
+            </label>
+            <div id="daily-reminder-list" class="daily-list"></div>
+            <p class="panel-hint">
+              チャットで話しかけても登録できます。行をクリックすると通知履歴を表示します。
+            </p>
+          </section>
+          <section class="panel-section">
+            <h3>ToDo</h3>
+            <div class="daily-todo-tabs" id="daily-todo-tabs">
+              <button type="button" data-bucket="today" class="active">今日</button>
+              <button type="button" data-bucket="week">今週</button>
+              <button type="button" data-bucket="someday">いつか</button>
+            </div>
+            <label class="row">
+              <span>追加</span>
+              <span class="key-cell daily-add-cell">
+                <input type="text" id="daily-todo-input" placeholder="表示中のリストに追加されます" />
+                <button type="button" id="daily-todo-add">追加</button>
+              </span>
+            </label>
+            <div id="daily-todo-list" class="daily-list"></div>
+            <p class="panel-hint">
+              ★=優先、↻=日課 (毎日/毎週、完了しても翌日/翌週に復活)。チェックで完了です。
+            </p>
+          </section>
+          <p id="daily-message" class="panel-message" hidden></p>
         </div>
       </div>
       <!-- ポモドーロタイマー操作パネル (spec §4.4.5)。静的配置 (WebView2 透過バグ対策)。 -->
@@ -102,6 +161,7 @@
             <select id="settings-page-selector">
               <option value="basic">基本 (対話モード / 表示 / OS)</option>
               <option value="character">キャラクター (キャラ / 存在感)</option>
+              <option value="daily">日常支援 (リマインダー / 静音)</option>
               <option value="voice">音声 (VOICEVOX / Irodori-TTS)</option>
               <option value="ai">AI・拡張 (LLM / ツール / 興味分野 / ポモドーロ)</option>
               <option value="system">システム (更新通知 / データ管理)</option>
@@ -324,18 +384,47 @@
               <span>OS ログイン時に ugg を自動起動する</span>
             </label>
           </section>
+          <section class="panel-section" data-page="daily">
+            <h3>日常支援</h3>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-daily-support" />
+              <span>日常支援を有効化 (チャット自然文でのリマインダー登録)</span>
+            </label>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-reminder-notify" />
+              <span>リマインダー発火時にキャラクターが知らせる (静音中も鳴る)</span>
+            </label>
+            <p class="panel-hint">
+              「3分後にお茶」「明日の朝ゴミ出し」「毎週月曜9時に会議」のように話しかけると
+              LLM を介さず登録されます。一覧・完了・スヌーズ・ToDo は右クリックメニューの「予定・ToDo」から。
+            </p>
+          </section>
+          <section class="panel-section" data-page="daily">
+            <h3>夜間静音</h3>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-night-quiet" />
+              <span>夜間は自発発話 (独り言・放置反応など) を止める</span>
+            </label>
+            <label class="row">
+              <span>開始</span>
+              <input type="time" id="settings-night-quiet-from" step="60" />
+            </label>
+            <label class="row">
+              <span>終了</span>
+              <input type="time" id="settings-night-quiet-to" step="60" />
+            </label>
+            <p class="panel-hint">
+              開始が終了より遅い場合は日跨ぎ (例: 23:00〜7:00)。登録したリマインダーの発火は夜間静音より優先されます。
+            </p>
+          </section>
           <section class="panel-section" data-page="ai">
-            <h3>ツール (時刻 / リマインダー / クリップボード)</h3>
+            <h3>ツール (時刻 / クリップボード)</h3>
             <label class="row checkbox-row">
               <input type="checkbox" id="settings-tools-enabled" />
-              <span>ツールを有効化 (advanced モードで時刻補強、入力欄の 📋 ボタン、「N 分後に...」でリマインダー登録)</span>
+              <span>ツールを有効化 (advanced モードで時刻補強、入力欄の 📋 ボタン)</span>
             </label>
-            <div class="row">
-              <span>保留中のリマインダー</span>
-              <div id="settings-reminders-list" class="key-state">—</div>
-            </div>
             <p class="panel-hint">
-              「3分後にお茶」「1時間後に休憩」のように発話すると LLM を介さず即座に登録されます。発火時刻になると静音中でも告知します。
+              リマインダーはツール設定から独立しました。「日常支援」ページをご覧ください。
             </p>
             <p id="settings-tools-message" class="panel-message" hidden></p>
           </section>

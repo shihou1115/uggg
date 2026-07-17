@@ -1,25 +1,31 @@
-//! バックグラウンドの自発挙動タスク (spec §4.4.3 / §4.4.4)。
+//! バックグラウンドの自発挙動タスク (spec §4.4.3 / §4.4.4 / §4.6.1 / §4.6.2)。
 //!
 //! - ランダムトーク: monologue_interval_min 分ごとに独り言。0 で無効。
 //! - 放置監視: 60 秒チェック、最終操作から 30 分で 1 回 idle。
+//! - リマインダー watcher: 10 秒間隔で発火・起動時回収 (M7)。
+//! - daily watcher: 日課の復活 (日付変更検知) + 朝の ToDo 件数告知 (M8)。
 //! - Irodori サイドカーのアイドル監視: 60 秒チェック、最終使用から 5 分で自動 shutdown (M4c Phase E)。
 //!
-//! いずれも busy / 静音 (quiet) のときは発火を持ち越す (idle 監視除く)。
-//! advanced モードの LLM 生成 + キャッシュは M2 のスコープ外として、M3 では low 辞書選択のみ。
+//! M7 以降、自発発話はすべて `system::deliver::deliver_event` を通す
+//! (静音・夜間静音・busy 直列化はその中の単一ゲートが判定する。呼び出し側は
+//! `should_stay_quiet` や busy を直接見ない。daily-support-design §3/§4)。
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
-use crate::dialogue::{self, low};
-use crate::ghost::dict::WhenContext;
-use crate::presence::{idle, quiet};
+use crate::db::{ReminderKind, ReminderRow};
+use crate::presence::idle;
 use crate::state::AppState;
+use crate::system::deliver::{self, DeliveryOutcome};
+use crate::system::governance::{Priority, SpeechCategory};
+use crate::tools::reminder::next_recurring_due_ts;
 
 /// ランダムトークタスク。1 分ごとに「前回発話からの経過 >= 設定間隔」を判定。
+/// 間隔は従来どおり本タスクが管理し、静音系の可否は deliver 内のゲートに委ねる。
 pub fn spawn_random_talk(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         let mut last_talk = Utc::now().timestamp();
@@ -39,36 +45,26 @@ pub fn spawn_random_talk(app: AppHandle, state: Arc<AppState>) {
             if now - last_talk < (interval_min as i64) * 60 {
                 continue;
             }
-            // 静音・busy なら持ち越し (last_talk を進めない)
-            if quiet::should_stay_quiet(&state) {
-                continue;
-            }
-            if state.dialogue.busy.try_acquire().is_err() {
-                continue;
-            }
-            // try_acquire の permit はスコープを抜けると解放される。発話処理は速いので保持しない。
-            if speak_monologue(&app, &state) {
-                last_talk = now;
+            // 静音・busy なら Deferred が返り持ち越し (last_talk を進めない)
+            let outcome = deliver::deliver_event(
+                &app,
+                &state,
+                SpeechCategory::Monologue,
+                Priority::Ambient,
+                "monologue",
+                &[],
+                None,
+            )
+            .await;
+            match outcome {
+                DeliveryOutcome::Ghost => last_talk = now,
+                // 辞書に monologue が無い等の Failed は次の間隔まで再試行しない
+                // (毎分の空振り辞書引きを防ぐ)。Deferred (静音・busy) は持ち越し。
+                DeliveryOutcome::Failed => last_talk = now,
+                DeliveryOutcome::Toast | DeliveryOutcome::Deferred => {}
             }
         }
     });
-}
-
-fn speak_monologue(app: &AppHandle, state: &Arc<AppState>) -> bool {
-    let resp = {
-        let guard = state.ghost.lock().expect("ghost poisoned");
-        match guard.as_ref() {
-            Ok(b) => low::monologue(&b.dictionary, b.sub_available()),
-            Err(_) => None,
-        }
-    };
-    match resp {
-        Some(resp) => {
-            dialogue::persist_and_speak(app, state, &resp);
-            true
-        }
-        None => false,
-    }
 }
 
 /// 放置監視タスク。60 秒ごとにチェックし、30 分無操作で 1 回だけ idle を発火。
@@ -85,36 +81,22 @@ pub fn spawn_idle_watcher(app: AppHandle, state: Arc<AppState>) {
             if state.presence.idle_fired.load(Ordering::SeqCst) {
                 continue;
             }
-            // 静音・busy なら持ち越し (idle_fired を立てない → 次のチェックで再挑戦)
-            if quiet::should_stay_quiet(&state) {
-                continue;
-            }
-            if state.dialogue.busy.try_acquire().is_err() {
-                continue;
-            }
-            if speak_idle(&app, &state) {
+            // 静音・busy なら Deferred (idle_fired を立てない → 次のチェックで再挑戦)
+            let outcome = deliver::deliver_event(
+                &app,
+                &state,
+                SpeechCategory::Idle,
+                Priority::Ambient,
+                "idle",
+                &[],
+                None,
+            )
+            .await;
+            if outcome == DeliveryOutcome::Ghost {
                 state.presence.idle_fired.store(true, Ordering::SeqCst);
             }
         }
     });
-}
-
-fn speak_idle(app: &AppHandle, state: &Arc<AppState>) -> bool {
-    let ctx = WhenContext::now();
-    let resp = {
-        let guard = state.ghost.lock().expect("ghost poisoned");
-        match guard.as_ref() {
-            Ok(b) => low::event(&b.dictionary, "idle", &ctx, b.sub_available()),
-            Err(_) => None,
-        }
-    };
-    match resp {
-        Some(resp) => {
-            dialogue::persist_and_speak(app, state, &resp);
-            true
-        }
-        None => false,
-    }
 }
 
 /// Irodori サイドカーのアイドル監視 (M4c Phase E, architecture §8.4)。
@@ -137,50 +119,266 @@ pub fn spawn_irodori_idle_watcher(state: Arc<AppState>) {
     });
 }
 
-/// M5-B: リマインダー watcher (10 秒間隔で `due_reminders(now)` をポーリング → 発火 → 削除)。
-/// **静音中も鳴らす特例** (spec §4.5.3): `quiet::should_stay_quiet` を見ない。
+/// M7 (spec §4.6.1): リマインダー watcher。
+/// 10 秒間隔で `due_active_reminders(now)` をポーリングし、`deliver_event` (Notice、
+/// ハード静音・夜間静音を越える) で配達する。**発火 ≠ 完了** (daily-support-design §2.1):
+/// - 到達 (Ghost|Toast) → `reminder_log` に記録し、once は active=0 (未完了のまま停止)、
+///   繰り返しは次回 due へ reschedule。
+/// - 未達 (Deferred|Failed) → active を維持し次ポーリングで再試行 (ログは残さない。
+///   静音中に 10 秒ごとの再試行が積もって reminder_log を押し流すのを防ぐ)。
+/// 起動時は一度だけ回収パスを実行し、アプリ停止中に過ぎた期限を拾う (複数は集約)。
 pub fn spawn_reminder_watcher(app: AppHandle, state: Arc<AppState>) {
     const CHECK_INTERVAL_SECS: u64 = 10;
+    /// フロント (webview) の準備を待ってから回収する。起動直後に emit しても
+    /// リスナー不在で発話が消えるため (update watcher の起動遅延と同じ手当)。
+    const BOOT_RECOVER_DELAY_SECS: u64 = 20;
     tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(BOOT_RECOVER_DELAY_SECS)).await;
+        recover_overdue_on_boot(&app, &state).await;
         loop {
             tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+            if !reminder_notify_allowed(&state) {
+                // 機能スイッチ OFF 中は発火を保留する (期限は消えず、ON に戻すと届く)
+                continue;
+            }
             let now = Utc::now().timestamp();
-            let due = match state.db.due_reminders(now) {
+            let due = match state.db.due_active_reminders(now) {
                 Ok(v) => v,
                 Err(err) => {
-                    eprintln!("[reminder] due_reminders failed: {err:#}");
+                    eprintln!("[reminder] due_active_reminders failed: {err:#}");
                     continue;
                 }
             };
             for r in due {
-                fire_reminder(&app, &state, &r);
-                if let Err(err) = state.db.delete_reminder(r.id) {
-                    eprintln!("[reminder] delete_reminder({}) failed: {err:#}", r.id);
+                let outcome = fire_reminder(&app, &state, &r).await;
+                if outcome.reached() {
+                    advance_after_delivery(&app, &state, &r, now, outcome);
                 }
             }
         }
     });
 }
 
-fn fire_reminder(app: &AppHandle, state: &Arc<AppState>, r: &crate::db::ReminderRow) {
-    use crate::dialogue::{self, DialogueResponse};
-    use crate::ghost::dict::SpeechTurn;
+/// 発火通知の機能スイッチ (設定)。gate のカテゴリ判定とは別で、Notice が
+/// ゲート全段免除でも「通知そのものを止めたい」意思をここで尊重する。
+fn reminder_notify_allowed(state: &Arc<AppState>) -> bool {
+    let s = state.settings.lock().expect("settings poisoned");
+    s.daily_support_enabled && s.reminder_notify_enabled
+}
+
+async fn fire_reminder(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    r: &ReminderRow,
+) -> DeliveryOutcome {
     let body = if r.text.is_empty() {
-        "リマインダーの時間だよ".to_string()
+        "リマインダー".to_string()
     } else {
-        format!("リマインダー: {}", r.text)
+        r.text.clone()
     };
-    let resp = DialogueResponse {
-        kind: "system_message",
-        mode: "low",
-        pattern: 1,
-        main: SpeechTurn {
-            text: body,
-            pose: None,
-        },
-        sub: None,
+    let fallback = format!("リマインダー: {body}");
+    deliver::deliver_event(
+        app,
+        state,
+        SpeechCategory::Reminder,
+        Priority::Notice,
+        "reminder_fired",
+        &[("body", body.as_str())],
+        Some(fallback),
+    )
+    .await
+}
+
+/// 到達後の状態遷移 (§7.1): ログ記録 → once は停止 / 繰り返しは次回へ。
+fn advance_after_delivery(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    r: &ReminderRow,
+    now: i64,
+    outcome: DeliveryOutcome,
+) {
+    const LOG_KEEP: u32 = 500;
+    if let Err(err) = state.db.log_fire(r.id, now, outcome.as_str()) {
+        eprintln!("[reminder] log_fire({}) failed: {err:#}", r.id);
+    }
+    match r.kind {
+        ReminderKind::Once => {
+            if let Err(err) = state.db.deactivate_reminder(r.id) {
+                eprintln!("[reminder] deactivate({}) failed: {err:#}", r.id);
+            }
+        }
+        ReminderKind::Daily | ReminderKind::Weekly => {
+            let now_local = chrono::Local::now().naive_local();
+            match next_recurring_due_ts(r.kind, r.weekday_mask, r.time_of_day, now_local) {
+                Some(next_due) => {
+                    if let Err(err) = state.db.reschedule_reminder(r.id, next_due) {
+                        eprintln!("[reminder] reschedule({}) failed: {err:#}", r.id);
+                    }
+                }
+                // weekly で mask=0 等、次回が計算できない行は無限再発火を避けて停止
+                None => {
+                    if let Err(err) = state.db.deactivate_reminder(r.id) {
+                        eprintln!("[reminder] deactivate({}) failed: {err:#}", r.id);
+                    }
+                }
+            }
+        }
+    }
+    if let Err(err) = state.db.prune_reminder_log(LOG_KEEP) {
+        eprintln!("[reminder] prune_reminder_log failed: {err:#}");
+    }
+    let _ = app.emit("reminders-changed", ());
+}
+
+/// 起動時回収 (§7.1-5): アプリ停止中に過ぎた期限を拾う。
+/// 2 件以上溜まっていたら、大量の連続発話を避けるため直近 1 件に集約して 1 回だけ
+/// 通知し、状態遷移 (ログ・停止/再スケジュール) は全件に適用する。
+async fn recover_overdue_on_boot(app: &AppHandle, state: &Arc<AppState>) {
+    if !reminder_notify_allowed(state) {
+        return;
+    }
+    let now = Utc::now().timestamp();
+    let due = match state.db.due_active_reminders(now) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("[reminder] boot recover query failed: {err:#}");
+            return;
+        }
     };
-    dialogue::persist_and_speak(app, state, &resp);
+    if due.is_empty() {
+        return;
+    }
+    if due.len() == 1 {
+        let r = &due[0];
+        let outcome = fire_reminder(app, state, r).await;
+        if outcome.reached() {
+            advance_after_delivery(app, state, r, now, outcome);
+        }
+        return;
+    }
+    // due_ts ASC で返るので末尾が直近。「『X』ほか N-1 件」に集約する。
+    let latest = due.last().expect("non-empty");
+    let body = aggregate_overdue_body(latest, due.len());
+    let fallback = format!("リマインダー: {body}");
+    let outcome = deliver::deliver_event(
+        app,
+        state,
+        SpeechCategory::Reminder,
+        Priority::Notice,
+        "reminder_fired",
+        &[("body", body.as_str())],
+        Some(fallback),
+    )
+    .await;
+    if outcome.reached() {
+        for r in &due {
+            advance_after_delivery(app, state, r, now, outcome);
+        }
+    }
+    // 未達なら何もしない: active のまま残り、通常ループが個別に再試行する
+}
+
+/// 集約通知の本文。辞書側の「『{body}』の時間だよ」等に埋め込まれる前提で名詞句にする。
+fn aggregate_overdue_body(latest: &ReminderRow, total: usize) -> String {
+    let name = if latest.text.is_empty() {
+        "リマインダー".to_string()
+    } else {
+        latest.text.clone()
+    };
+    format!("{name}（ほか{}件）", total - 1)
+}
+
+/// M8 (spec §4.6.2): daily watcher。
+/// - 日課の復活: 起動時 + ローカル日付の変更検知で `reset_recurring` (冪等) を実行し、
+///   復活があれば `todos-changed` を emit。
+/// - 朝の件数告知: 朝の時間帯 (5:00-11:00、辞書 boot の朝帯と同じ) に 1 日 1 回、
+///   today バケットの未完了が 1 件以上なら `todo_morning` を配達 (Ambient・ゲート下)。
+///   告知済みのローカル日付は app_settings に保持し、再起動で二重告知しない。
+/// リマインダー watcher とは分離する (reminder_notify_enabled と結合させない)。
+pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
+    const CHECK_INTERVAL_SECS: u64 = 60;
+    /// フロント準備待ち。リマインダーの起動時回収 (20 秒) より後にして起動直後の連続発話を避ける
+    /// (busy 直列化があるので同時でも壊れないが、間隔を空けたほうが読みやすい)。
+    const BOOT_DELAY_SECS: u64 = 30;
+    const MORNING_FROM_HOUR: u32 = 5;
+    const MORNING_TO_HOUR: u32 = 11;
+    const MORNING_DATE_KEY: &str = "todo_morning_date";
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)).await;
+        let mut last_date: Option<chrono::NaiveDate> = None;
+        loop {
+            let now_local = chrono::Local::now();
+            let today = now_local.date_naive();
+
+            // 1) 日課の復活 (起動直後の初回 tick + 日付変更時)。
+            //    DB エラー時は last_date を進めず次 tick で再試行する (失敗を消化しない)。
+            if last_date != Some(today) {
+                match crate::tools::todo::reset_recurring(&state) {
+                    Ok(n) => {
+                        if n > 0 {
+                            let _ = app.emit("todos-changed", ());
+                        }
+                        last_date = Some(today);
+                    }
+                    Err(err) => eprintln!("[daily] reset_recurring failed: {err:#}"),
+                }
+            }
+
+            // 2) 朝の件数告知 (1 日 1 回・朝帯のみ・daily_support 有効時)
+            let hour = {
+                use chrono::Timelike;
+                now_local.hour()
+            };
+            let daily_enabled = state
+                .settings
+                .lock()
+                .expect("settings poisoned")
+                .daily_support_enabled;
+            if daily_enabled && (MORNING_FROM_HOUR..MORNING_TO_HOUR).contains(&hour) {
+                let announced = state
+                    .db
+                    .get_setting(MORNING_DATE_KEY)
+                    .ok()
+                    .flatten()
+                    .map(|v| v == today.to_string())
+                    .unwrap_or(false);
+                if !announced {
+                    // 件数取得の失敗は消化せず次 tick で再試行 (「0 件の朝」と混同しない)
+                    match state.db.count_open_todos(Some("today")) {
+                        Err(err) => eprintln!("[daily] count_open_todos failed: {err:#}"),
+                        Ok(0) => {
+                            // 0 件の朝は告知なしで消化 (昼に追加された分で鳴らさない)
+                            let _ = state.db.set_setting(MORNING_DATE_KEY, &today.to_string());
+                        }
+                        Ok(count) => {
+                            let count_str = count.to_string();
+                            let outcome = deliver::deliver_event(
+                                &app,
+                                &state,
+                                SpeechCategory::Todo,
+                                Priority::Ambient,
+                                "todo_morning",
+                                &[("count", count_str.as_str())],
+                                None,
+                            )
+                            .await;
+                            match outcome {
+                                // 発話できた or 辞書が無い (今日はもう試さない) → 告知済みに
+                                DeliveryOutcome::Ghost | DeliveryOutcome::Failed => {
+                                    let _ =
+                                        state.db.set_setting(MORNING_DATE_KEY, &today.to_string());
+                                }
+                                // 静音・busy は later tick で再挑戦
+                                DeliveryOutcome::Toast | DeliveryOutcome::Deferred => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+        }
+    });
 }
 
 /// M5-C: `topics_enabled` が ON の間、1 時間おきに enabled な interest_topics の RSS を取得して

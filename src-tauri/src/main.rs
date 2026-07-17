@@ -86,8 +86,10 @@ fn main() {
             tasks::spawn_update_watcher(app.handle().clone(), state.clone());
             // M5-C: topics_enabled が ON の間、1 時間おきに RSS を取得して topics_cache に蓄積
             tasks::spawn_topics_watcher(state.clone());
-            // M5-B: リマインダー watcher (10 秒間隔、due_ts 到達で persist_and_speak)
+            // M5-B/M7: リマインダー watcher (10 秒間隔、deliver 経由で発火・起動時回収)
             tasks::spawn_reminder_watcher(app.handle().clone(), state.clone());
+            // M8: daily watcher (日課の復活 + 朝の ToDo 件数告知)
+            tasks::spawn_daily_watcher(app.handle().clone(), state.clone());
             // タスクトレイ
             if let Err(err) = window::tray::install(app.handle(), state.clone()) {
                 eprintln!("[tray] install failed: {err:#}");
@@ -136,9 +138,21 @@ fn main() {
             commands::topics::get_interests,
             commands::topics::set_interests,
             commands::topics::fetch_topics_now,
-            commands::tools::list_reminders,
-            commands::tools::add_reminder,
-            commands::tools::delete_reminder,
+            commands::daily::list_reminders,
+            commands::daily::add_reminder,
+            commands::daily::add_reminder_nl,
+            commands::daily::complete_reminder,
+            commands::daily::dismiss_reminder,
+            commands::daily::snooze_reminder,
+            commands::daily::delete_reminder,
+            commands::daily::update_reminder,
+            commands::daily::get_reminder_log,
+            commands::daily::list_todos,
+            commands::daily::add_todo,
+            commands::daily::complete_todo,
+            commands::daily::reopen_todo,
+            commands::daily::delete_todo,
+            commands::daily::update_todo,
             commands::tools::read_clipboard_text,
             commands::profile::get_profile,
             commands::profile::add_profile,

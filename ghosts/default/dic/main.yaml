@@ -466,6 +466,59 @@ events:
     - main: { text: "やりきったね！ごほうびに好きなことしていいんだよ", pose: happy }
       sub: { text: "頑張った後の休息は格別だぞ。堪能しろ", pose: normal }
 
+  # リマインダー発火 (M7, spec §4.6.1)。{body} は登録した本文に置換される。
+  # 注意: サブ無しシェルでは sub 行が落ちるため、{body} は必ず main 側に含めること
+  # (通知の本体が欠落する)。sub は念押し・掛け合い役。
+  reminder_fired:
+    - main: { text: "時間だよー！『{body}』、忘れてない？", pose: happy }
+      sub: { text: "登録した本人が忘れてたら世話ないぞ", pose: normal }
+    - main: { text: "はいはーい、『{body}』の時間です！", pose: happy }
+      sub: { text: "ボクはちゃんと覚えてた。えらいだろ", pose: normal }
+    - main: { text: "あっ、そろそろ『{body}』だよ。いってらっしゃい！", pose: normal }
+      sub: { text: "済んだらパネルで完了にしておけよ", pose: normal }
+    - when: { hour_from: 22, hour_to: 5 }
+      main: { text: "夜遅くにごめんね、『{body}』の時間だよ", pose: normal }
+      sub: { text: "こんな時間に鳴らせと言ったのはお前だからな", pose: troubled }
+
+  # スヌーズ確認 (M7)。{time} は「10分後」等に置換される。
+  reminder_snoozed:
+    - main: { text: "OK、{time}にもう一回声かけるね", pose: normal }
+      sub: { text: "先送りは一回までにしておけよ", pose: troubled }
+    - main: { text: "りょうかい！{time}にまた呼ぶねー", pose: happy }
+      sub: { text: "次は逃がさないからな", pose: normal }
+
+  # ToDo (M8, spec §4.6.2)。通知・催促はサブ主体、責めない言い回しが原則。
+  # todo_morning: 朝の件数告知。{count} は今日の未完了件数に置換される。
+  todo_morning:
+    - main: { text: "おはよ！今日の ToDo は{count}件だよ", pose: happy }
+      sub: { text: "軽いものから片付けるのがコツだ", pose: normal }
+    - main: { text: "今日やることは{count}件みたい。ぼちぼちいこ？", pose: normal }
+      sub: { text: "全部やれとは言わない。一つ動けば上等だ", pose: normal }
+    - main: { text: "{count}件の予定が待ってるよ。あたしも応援してる！", pose: happy }
+      sub: { text: "まずは一番小さいやつからだな", pose: normal }
+
+  # todo_done: 完了時の労い。{body} は完了した ToDo の本文。
+  todo_done:
+    - main: { text: "『{body}』完了！おつかれさま、えらい！", pose: happy }
+      sub: { text: "ふん、着実で結構", pose: normal }
+    - main: { text: "『{body}』終わったね！ひとつ軽くなった", pose: happy }
+      sub: { text: "その調子だ。次は急がなくていい", pose: normal }
+    - main: { text: "わー、『{body}』済んだんだ。さすが！", pose: happy }
+      sub: { text: "ボクが見届けた。記録しておく", pose: normal }
+
+  # todo_follow / todo_stale: 未完了フォロー・複数日滞留の再整理提案。
+  # 発火は M9 (状況発話) で結線される。キーだけ M8 で先行整備 (daily-support-design §8.5)。
+  todo_follow:
+    - main: { text: "そういえば『{body}』、まだ残ってたよ。無理のない範囲でね", pose: normal }
+      sub: { text: "気が向いたときでいい。忘れてないかの確認だ", pose: normal }
+    - main: { text: "『{body}』のこと、思い出しただけ！急かしてないよ？", pose: normal }
+      sub: { text: "そうだ、催促ではない。ただの独り言だ", pose: normal }
+  todo_stale:
+    - main: { text: "『{body}』が何日か残ってるね。分けるか、いつかリストに移す？", pose: normal }
+      sub: { text: "大きすぎるタスクは切るに限る", pose: normal }
+    - main: { text: "『{body}』、今週は難しそう？予定を見直すのもアリだよ", pose: normal }
+      sub: { text: "捨てる勇気も整理のうちだ", pose: normal }
+
 # システムメッセージ (notify() 経由でゴーストが告知)
 system_messages:
   mode_degraded:

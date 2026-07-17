@@ -116,10 +116,63 @@ pub struct Settings {
     /// オンボーディングで同意済みのときに true になる想定だが、設定パネルからも切替可能。
     #[serde(default)]
     pub topics_enabled: bool,
-    /// M5-B: ツール (時刻 / リマインダー / クリップボード) を 3 つまとめて有効化 (既定 false、spec §4.5.3)。
-    /// 個別切替は持たない。advanced モード前提。
+    /// M5-B: ツール (時刻 / クリップボード) の有効化 (既定 false、spec §4.5.3)。
+    /// M7 以降は「クリップボード 📋 + advanced 時刻注入」用途に縮小
+    /// (リマインダーは daily_support_enabled 配下の常時ローカル機能へ移行、
+    /// daily-support-design §4.5.3 移行 / spec §4.2.1 不変条件)。
     #[serde(default)]
     pub tools_enabled: bool,
+    // === 日常支援 Tier S (M7、daily-support-design §5) ===
+    /// Tier S マスタスイッチ (既定 true、v0.2 の目玉)。自然文リマインダー登録・
+    /// Tier S 通知の大元。個別カテゴリ (situation_* 等) は既定 OFF のオプトイン。
+    #[serde(default = "default_true")]
+    pub daily_support_enabled: bool,
+    // --- 発話ガバナンス (§4.6.3。カテゴリ発火の実装は M9、設定は共通基盤として M7 で導入) ---
+    /// 休憩促し (連続利用) 発話 (既定 false)。
+    #[serde(default)]
+    pub situation_break_enabled: bool,
+    /// 深夜利用の声かけ (既定 false)。
+    #[serde(default)]
+    pub situation_late_night_enabled: bool,
+    /// バッテリー低下の声かけ (既定 false)。
+    #[serde(default)]
+    pub situation_battery_enabled: bool,
+    /// ToDo/リマインダー未完了フォロー発話 (既定 false)。
+    #[serde(default)]
+    pub todo_follow_enabled: bool,
+    /// 状況発話系 (Situation*) Ambient の最低発話間隔 (分、既定 30)。
+    /// monologue/idle には適用しない (それぞれ既存の間隔設定を維持、設計 §4.2)。
+    #[serde(default = "default_min_speak_interval_min")]
+    pub min_speak_interval_min: u32,
+    /// 夜間静音の有効化 (既定 false)。時刻値は番兵にせず独立フラグで持つ。
+    #[serde(default)]
+    pub night_quiet_enabled: bool,
+    /// 夜間静音の開始 (0:00 からの分、既定 1380 = 23:00)。0 も有効値 (=0:00)。
+    #[serde(default = "default_night_quiet_from")]
+    pub night_quiet_from: u16,
+    /// 夜間静音の終了 (既定 420 = 07:00)。from > to は日跨ぎ、from == to は終日。
+    #[serde(default = "default_night_quiet_to")]
+    pub night_quiet_to: u16,
+    // --- リマインダー (§4.6.1) ---
+    /// リマインダー発火通知の on/off (既定 true)。登録自体は常時可能。
+    #[serde(default = "default_true")]
+    pub reminder_notify_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_min_speak_interval_min() -> u32 {
+    30
+}
+
+fn default_night_quiet_from() -> u16 {
+    1380 // 23:00
+}
+
+fn default_night_quiet_to() -> u16 {
+    420 // 07:00
 }
 
 fn default_llm_provider() -> String {
@@ -204,6 +257,16 @@ impl Default for Settings {
             update_feed_url: None,
             topics_enabled: false,
             tools_enabled: false,
+            daily_support_enabled: true,
+            situation_break_enabled: false,
+            situation_late_night_enabled: false,
+            situation_battery_enabled: false,
+            todo_follow_enabled: false,
+            min_speak_interval_min: default_min_speak_interval_min(),
+            night_quiet_enabled: false,
+            night_quiet_from: default_night_quiet_from(),
+            night_quiet_to: default_night_quiet_to(),
+            reminder_notify_enabled: true,
         }
     }
 }
@@ -269,6 +332,16 @@ impl Settings {
         if self.tts_engine.trim().is_empty() {
             self.tts_engine = default_tts_engine();
         }
+        // 日常支援 (M7): 分単位の時刻は 0..=1439、間隔は上限 1440 に丸める
+        if self.night_quiet_from > 1439 {
+            self.night_quiet_from = default_night_quiet_from();
+        }
+        if self.night_quiet_to > 1439 {
+            self.night_quiet_to = default_night_quiet_to();
+        }
+        if self.min_speak_interval_min > 1440 {
+            self.min_speak_interval_min = 1440;
+        }
     }
 }
 
@@ -283,6 +356,8 @@ pub struct AppState {
     pub presence: PresenceState,
     pub pomodoro: PomodoroState,
     pub tts: TtsState,
+    /// 発話ガバナンスのインメモリ状態 (M7、daily-support-design §4.2。DB 化しない)。
+    pub governance: crate::system::governance::GovernanceState,
 }
 
 /// TTS エンジンの遅延初期化を抱えるサブ状態。
@@ -426,6 +501,7 @@ impl AppState {
             presence: PresenceState::default(),
             pomodoro: PomodoroState::default(),
             tts: TtsState::default(),
+            governance: crate::system::governance::GovernanceState::default(),
         })
     }
 }

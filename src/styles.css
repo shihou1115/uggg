@@ -123,6 +123,179 @@ body {
   padding: 2px 0;
 }
 
+/* ===== システムトースト (M7, daily-support-design §3.2) =====
+   ゴースト発話が使えないときの通知フォールバック。バッジ類より上に出す。 */
+#system-toast {
+  position: fixed;
+  top: 12px;
+  right: 16px;
+  max-width: 340px;
+  padding: 8px 12px;
+  background: rgba(40, 40, 48, 0.94);
+  color: #fff;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+  z-index: 90;
+  display: none;
+  cursor: pointer;
+  user-select: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+#system-toast.visible {
+  display: block;
+}
+
+/* ===== 予定・リマインダーパネル (M7, spec §4.6.1) ===== */
+.daily-add-cell input {
+  flex: 1;
+}
+
+.daily-list {
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.daily-item {
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.daily-item.pending {
+  border-color: #c97a4a;
+  background: rgba(255, 245, 235, 0.85);
+}
+
+.daily-item-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.daily-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #e3ecf7;
+  color: #33567e;
+  white-space: nowrap;
+}
+
+.daily-badge.pending {
+  background: #f7e3d5;
+  color: #8a4a1c;
+}
+
+.daily-badge.done {
+  background: #e5e5e5;
+  color: #666;
+}
+
+.daily-when {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-family: "Consolas", "Meiryo", monospace;
+  color: #444;
+  white-space: nowrap;
+}
+
+.daily-text {
+  flex: 1;
+  font-size: 12px;
+  color: #1c1c1c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.daily-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.daily-actions button {
+  font-size: 11px;
+  padding: 2px 10px;
+  border: 1px solid #aaa;
+  border-radius: 6px;
+  background: white;
+  color: #1c1c1c;
+  cursor: pointer;
+}
+
+.daily-actions button:hover {
+  background: #f0f4fa;
+}
+
+.daily-log {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-top: 1px dashed #ccc;
+  font-size: 11px;
+  color: #555;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* ===== ToDo 節 (M8, spec §4.6.2) ===== */
+.daily-todo-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.daily-todo-tabs button {
+  flex: 1;
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid #aaa;
+  border-radius: 999px;
+  background: white;
+  color: #444;
+  cursor: pointer;
+}
+
+.daily-todo-tabs button.active {
+  border-color: #6e8db5;
+  background: #e3ecf7;
+  color: #33567e;
+  font-weight: bold;
+}
+
+.todo-item .daily-item-head {
+  cursor: default; /* リマインダー行と違い履歴展開は無い */
+}
+
+.todo-item input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: auto;
+  margin: 0;
+}
+
+.todo-item.done .daily-text {
+  text-decoration: line-through;
+  color: #999;
+}
+
+.daily-actions button.starred {
+  border-color: #c9a24a;
+  background: #fdf6e3;
+  color: #8a6d1c;
+}
+
 .panel-footer button:disabled {
   opacity: 0.45;
   cursor: default;
@@ -364,6 +537,7 @@ body {
 }
 .panel-body[data-active-page="basic"] .panel-section[data-page="basic"],
 .panel-body[data-active-page="character"] .panel-section[data-page="character"],
+.panel-body[data-active-page="daily"] .panel-section[data-page="daily"],
 .panel-body[data-active-page="voice"] .panel-section[data-page="voice"],
 .panel-body[data-active-page="ai"] .panel-section[data-page="ai"],
 .panel-body[data-active-page="system"] .panel-section[data-page="system"] {

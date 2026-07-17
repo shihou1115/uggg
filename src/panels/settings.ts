@@ -11,7 +11,6 @@ import type {
   DndResult,
   InterestTopic,
   IrodoriGpuInfo,
-  ReminderEntry,
   Settings,
   SlotName,
   TalkSpeed,
@@ -82,8 +81,12 @@ interface Inputs {
   topicsFetchBtn: HTMLButtonElement;
   topicsMessage: HTMLElement;
   toolsEnabled: HTMLInputElement;
-  remindersList: HTMLElement;
-  toolsMessage: HTMLElement;
+  // M7: 日常支援 (リマインダー / 夜間静音)
+  dailySupport: HTMLInputElement;
+  reminderNotify: HTMLInputElement;
+  nightQuiet: HTMLInputElement;
+  nightQuietFrom: HTMLInputElement;
+  nightQuietTo: HTMLInputElement;
   saveBtn: HTMLButtonElement;
   cancelBtn: HTMLButtonElement;
   closeBtn: HTMLButtonElement;
@@ -166,7 +169,6 @@ export async function openSettingsPanel(): Promise<void> {
   await refreshIrodoriState();
   await refreshAssetLists(current);
   await refreshInterests();
-  await refreshReminders();
   inputs.panel.classList.add("visible");
   inputs.msg.hidden = true;
   inputs.ttsProgress.hidden = true;
@@ -263,8 +265,11 @@ function collectInputs(): Inputs {
     topicsFetchBtn: byId<HTMLButtonElement>("settings-topics-fetch"),
     topicsMessage: byId("settings-topics-message"),
     toolsEnabled: byId<HTMLInputElement>("settings-tools-enabled"),
-    remindersList: byId("settings-reminders-list"),
-    toolsMessage: byId("settings-tools-message"),
+    dailySupport: byId<HTMLInputElement>("settings-daily-support"),
+    reminderNotify: byId<HTMLInputElement>("settings-reminder-notify"),
+    nightQuiet: byId<HTMLInputElement>("settings-night-quiet"),
+    nightQuietFrom: byId<HTMLInputElement>("settings-night-quiet-from"),
+    nightQuietTo: byId<HTMLInputElement>("settings-night-quiet-to"),
     saveBtn: byId<HTMLButtonElement>("settings-save"),
     cancelBtn: byId<HTMLButtonElement>("settings-cancel"),
     closeBtn: byId<HTMLButtonElement>("settings-close"),
@@ -801,66 +806,24 @@ function showTopicsMessage(msg: string, isError: boolean): void {
   inputs.topicsMessage.hidden = false;
 }
 
-// === M5-B: リマインダー一覧表示 + 削除 ====================================
+// M7: リマインダーの一覧・操作は専用パネル (panels/daily.ts) に移設した。
+// 設定パネル側は「日常支援」ページのトグル類のみを持つ。
 
-async function refreshReminders(): Promise<void> {
-  if (!inputs) return;
-  try {
-    const list = await invoke<ReminderEntry[]>("list_reminders");
-    renderReminders(list);
-  } catch (err) {
-    inputs.remindersList.textContent = "取得失敗";
-    console.warn("[tools] list_reminders failed", err);
-  }
+/// 「HH:MM」⇔ 0:00 からの分。time input の値変換 (M7 夜間静音)。
+function minutesToHHMM(min: number): string {
+  const clamped = Math.max(0, Math.min(1439, Math.floor(min)));
+  const h = Math.floor(clamped / 60);
+  const m = clamped % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
-function renderReminders(list: ReminderEntry[]): void {
-  if (!inputs) return;
-  inputs.remindersList.innerHTML = "";
-  if (list.length === 0) {
-    inputs.remindersList.textContent = "なし";
-    return;
-  }
-  const nowMs = Date.now();
-  for (const r of list) {
-    const item = document.createElement("div");
-    item.className = "row";
-    const due = new Date(r.due_ts * 1000);
-    const dueLabel = due.toLocaleString("ja-JP", {
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-    const remaining = Math.max(0, Math.floor((r.due_ts * 1000 - nowMs) / 60000));
-    const label = document.createElement("span");
-    label.textContent = `${dueLabel} (約 ${remaining} 分後): ${r.text}`;
-    const del = document.createElement("button");
-    del.type = "button";
-    del.textContent = "削除";
-    del.addEventListener("click", () => void onDeleteReminder(r.id));
-    item.appendChild(label);
-    item.appendChild(del);
-    inputs.remindersList.appendChild(item);
-  }
-}
-
-async function onDeleteReminder(id: number): Promise<void> {
-  if (!inputs) return;
-  try {
-    const list = await invoke<ReminderEntry[]>("delete_reminder", { id });
-    renderReminders(list);
-    showToolsMessage("リマインダーを削除しました", false);
-  } catch (err) {
-    showToolsMessage(`削除失敗: ${formatErr(err)}`, true);
-  }
-}
-
-function showToolsMessage(msg: string, isError: boolean): void {
-  if (!inputs) return;
-  inputs.toolsMessage.textContent = msg;
-  inputs.toolsMessage.classList.toggle("error", isError);
-  inputs.toolsMessage.hidden = false;
+function hhmmToMinutes(value: string, fallback: number): number {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!m) return fallback;
+  const h = Number(m[1]);
+  const mm = Number(m[2]);
+  if (h > 23 || mm > 59) return fallback;
+  return h * 60 + mm;
 }
 
 function showProgress(msg: string, isError: boolean): void {
@@ -917,6 +880,11 @@ function applySettingsToForm(s: Settings): void {
   inputs.updateFeedUrl.value = s.update_feed_url ?? "";
   inputs.topicsEnabled.checked = s.topics_enabled;
   inputs.toolsEnabled.checked = s.tools_enabled;
+  inputs.dailySupport.checked = s.daily_support_enabled;
+  inputs.reminderNotify.checked = s.reminder_notify_enabled;
+  inputs.nightQuiet.checked = s.night_quiet_enabled;
+  inputs.nightQuietFrom.value = minutesToHHMM(s.night_quiet_from);
+  inputs.nightQuietTo.value = minutesToHHMM(s.night_quiet_to);
   inputs.ttsSpeed.value = String(s.tts_speed);
   inputs.ttsVolume.value = String(s.tts_volume);
   // 話者 select は資産 DL 済みのときだけ list_voices で埋められる。値は文字列で保持。
@@ -986,6 +954,11 @@ async function onSave(): Promise<void> {
     update_feed_url: inputs.updateFeedUrl.value.trim() || null,
     topics_enabled: inputs.topicsEnabled.checked,
     tools_enabled: inputs.toolsEnabled.checked,
+    daily_support_enabled: inputs.dailySupport.checked,
+    reminder_notify_enabled: inputs.reminderNotify.checked,
+    night_quiet_enabled: inputs.nightQuiet.checked,
+    night_quiet_from: hhmmToMinutes(inputs.nightQuietFrom.value, current.night_quiet_from),
+    night_quiet_to: hhmmToMinutes(inputs.nightQuietTo.value, current.night_quiet_to),
     ghost_id: inputs.ghostId.value || current.ghost_id,
     shell_id: inputs.shellId.value || current.shell_id,
   };

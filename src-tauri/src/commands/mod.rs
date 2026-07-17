@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod boot;
+pub mod daily;
 pub mod data;
 pub mod dialogue;
 pub mod interaction;
