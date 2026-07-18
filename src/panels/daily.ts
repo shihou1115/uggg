@@ -11,7 +11,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-import type { ReminderEntry, ReminderLogRow, TodoBucket, TodoEntry } from "../types";
+import type {
+  CalendarEvent,
+  ReminderEntry,
+  ReminderLogRow,
+  TodoBucket,
+  TodoEntry,
+} from "../types";
 
 type Filter = "active" | "all" | "completed";
 
@@ -25,6 +31,8 @@ interface Inputs {
   todoList: HTMLElement;
   todoInput: HTMLInputElement;
   todoAddBtn: HTMLButtonElement;
+  calSection: HTMLElement;
+  calList: HTMLElement;
   closeBtn: HTMLButtonElement;
   msg: HTMLElement;
 }
@@ -48,6 +56,8 @@ export async function mountDailyPanel(): Promise<void> {
     todoList: byId("daily-todo-list"),
     todoInput: byId<HTMLInputElement>("daily-todo-input"),
     todoAddBtn: byId<HTMLButtonElement>("daily-todo-add"),
+    calSection: byId("daily-calendar-section"),
+    calList: byId("daily-calendar-list"),
     closeBtn: byId<HTMLButtonElement>("daily-close"),
     msg: byId("daily-message"),
   };
@@ -87,6 +97,9 @@ export async function mountDailyPanel(): Promise<void> {
   await listen("todos-changed", () => {
     if (isOpen()) void refreshTodos();
   });
+  await listen("calendar-changed", () => {
+    if (isOpen()) void refreshCalendar();
+  });
 }
 
 export async function openDailyPanel(): Promise<void> {
@@ -94,7 +107,7 @@ export async function openDailyPanel(): Promise<void> {
   inputs.panel.classList.add("visible");
   inputs.msg.hidden = true;
   expandedLogId = null;
-  await Promise.all([refresh(), refreshTodos()]);
+  await Promise.all([refresh(), refreshTodos(), refreshCalendar()]);
   setTimeout(() => inputs?.addInput.focus(), 0);
 }
 
@@ -442,6 +455,71 @@ function renderTodoItem(t: TodoEntry): HTMLElement {
   item.appendChild(head);
   item.appendChild(actions);
   return item;
+}
+
+// ===== カレンダー予定表示 (M10) =====
+
+async function refreshCalendar(): Promise<void> {
+  if (!inputs) return;
+  try {
+    const events = await invoke<CalendarEvent[]>("get_calendar_events", { days: 2 });
+    renderCalendar(events);
+  } catch (err) {
+    console.warn("[calendar] get_calendar_events failed", err);
+  }
+}
+
+function renderCalendar(events: CalendarEvent[]): void {
+  if (!inputs) return;
+  // ソース未設定なら節ごと隠す (常時は見せない)
+  if (events.length === 0) {
+    inputs.calSection.hidden = true;
+    inputs.calList.innerHTML = "";
+    return;
+  }
+  inputs.calSection.hidden = false;
+  inputs.calList.innerHTML = "";
+  const fragment = document.createDocumentFragment();
+  for (const ev of events) {
+    const item = document.createElement("div");
+    item.className = "daily-item";
+    const head = document.createElement("div");
+    head.className = "daily-item-head";
+
+    const when = document.createElement("span");
+    when.className = "daily-when";
+    when.textContent = formatEventWhen(ev);
+    head.appendChild(when);
+
+    const text = document.createElement("span");
+    text.className = "daily-text";
+    text.textContent = ev.summary;
+    head.appendChild(text);
+
+    if (ev.unsupported) {
+      const mark = document.createElement("span");
+      mark.className = "daily-badge";
+      mark.textContent = "繰り返し(一部)";
+      mark.title = "複雑な繰り返し予定のため当日分のみ表示しています";
+      head.appendChild(mark);
+    }
+    item.appendChild(head);
+    fragment.appendChild(item);
+  }
+  inputs.calList.appendChild(fragment);
+}
+
+/// 「07/20 (月) 終日」「今日 14:00」等。
+function formatEventWhen(ev: CalendarEvent): string {
+  const d = new Date(ev.start_ts * 1000);
+  const today = new Date();
+  const sameDay = d.toDateString() === today.toDateString();
+  const dayLabel = sameDay
+    ? "今日"
+    : d.toLocaleDateString("ja-JP", { month: "2-digit", day: "2-digit", weekday: "short" });
+  if (ev.all_day) return `${dayLabel} 終日`;
+  const time = d.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
+  return `${dayLabel} ${time}`;
 }
 
 function showMessage(msg: string, isError: boolean): void {

@@ -43,17 +43,21 @@ if ($CleanOrphans) {
             $killed += "ugg.exe(dev) pid=$($p.Id)"
         } catch {}
     }
-    # ポート 5273 (vite devUrl) を握る node のうち、本リポジトリ配下のものだけ止める
-    $conns = @(Get-NetTCPConnection -LocalPort 5273 -State Listen -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty OwningProcess -Unique)
-    foreach ($ownPid in $conns) {
-        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $ownPid" -ErrorAction SilentlyContinue
-        if ($proc -and $proc.Name -eq "node.exe" -and $proc.CommandLine -like "*$repo*") {
-            try {
-                Stop-Process -Id $proc.ProcessId -Force -Confirm:$false -ErrorAction Stop
-                $killed += "node(vite) pid=$($proc.ProcessId)"
-            } catch {}
-        }
+    # 本リポジトリの dev 用 node を漏れなく止める。
+    # 【2026-07-18 再発防止】以前は「ポート 5273 の vite」だけ殺していたが、
+    # tauri-cli ランチャー (tauri.js dev) の node が残り、次回 dev 起動時に
+    # ugg.exe を再起動して二重起動 → 同一 companion.db への同時書き込みで
+    # DB が破損する事故が起きた。vite / tauri-cli を含む「本リポジトリを
+    # CommandLine に含む node」を全て掃除する (hermes 等の無関係 node は
+    # $repo 一致で確実に除外される)。
+    $repoLike = "*" + $repo + "*"
+    $devNodes = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like $repoLike })
+    foreach ($proc in $devNodes) {
+        try {
+            Stop-Process -Id $proc.ProcessId -Force -Confirm:$false -ErrorAction Stop
+            $killed += "node(dev) pid=$($proc.ProcessId)"
+        } catch {}
     }
     if ($killed.Count -gt 0) {
         "CLEANED: " + ($killed -join ", ")

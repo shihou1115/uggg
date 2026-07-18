@@ -6,6 +6,7 @@ import { uggConfirm } from "../confirm";
 import { previewWavBase64 } from "../tts/speaker";
 import type {
   AssetEntry,
+  CalendarSource,
   ClearResult,
   DialogueMode,
   DndResult,
@@ -93,6 +94,15 @@ interface Inputs {
   situationBattery: HTMLInputElement;
   todoFollow: HTMLInputElement;
   minSpeakInterval: HTMLInputElement;
+  // M10: カレンダー
+  calList: HTMLElement;
+  calUrl: HTMLInputElement;
+  calAddUrl: HTMLButtonElement;
+  calPath: HTMLInputElement;
+  calAddPath: HTMLButtonElement;
+  calNotifyMin: HTMLInputElement;
+  calRefresh: HTMLButtonElement;
+  calMessage: HTMLElement;
   saveBtn: HTMLButtonElement;
   cancelBtn: HTMLButtonElement;
   closeBtn: HTMLButtonElement;
@@ -281,6 +291,14 @@ function collectInputs(): Inputs {
     situationBattery: byId<HTMLInputElement>("settings-situation-battery"),
     todoFollow: byId<HTMLInputElement>("settings-todo-follow"),
     minSpeakInterval: byId<HTMLInputElement>("settings-min-speak-interval"),
+    calList: byId("settings-calendar-list"),
+    calUrl: byId<HTMLInputElement>("settings-calendar-url"),
+    calAddUrl: byId<HTMLButtonElement>("settings-calendar-add-url"),
+    calPath: byId<HTMLInputElement>("settings-calendar-path"),
+    calAddPath: byId<HTMLButtonElement>("settings-calendar-add-path"),
+    calNotifyMin: byId<HTMLInputElement>("settings-calendar-notify-min"),
+    calRefresh: byId<HTMLButtonElement>("settings-calendar-refresh"),
+    calMessage: byId("settings-calendar-message"),
     saveBtn: byId<HTMLButtonElement>("settings-save"),
     cancelBtn: byId<HTMLButtonElement>("settings-cancel"),
     closeBtn: byId<HTMLButtonElement>("settings-close"),
@@ -318,6 +336,9 @@ function attachHandlers(i: Inputs): void {
   i.dataClearBtn.addEventListener("click", () => void onDataClear());
   i.updateCheckBtn.addEventListener("click", () => void onUpdateCheck());
   i.topicsFetchBtn.addEventListener("click", () => void onTopicsFetch());
+  i.calAddUrl.addEventListener("click", () => void onAddCalendarSource("url"));
+  i.calAddPath.addEventListener("click", () => void onAddCalendarSource("file"));
+  i.calRefresh.addEventListener("click", () => void onCalendarRefresh());
   i.panel.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") {
       ev.preventDefault();
@@ -817,6 +838,90 @@ function showTopicsMessage(msg: string, isError: boolean): void {
   inputs.topicsMessage.hidden = false;
 }
 
+// === M10: カレンダーソース UI =============================================
+
+function renderCalendarSources(sources: CalendarSource[]): void {
+  if (!inputs) return;
+  inputs.calList.innerHTML = "";
+  if (sources.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "panel-hint";
+    empty.textContent = "登録済みのカレンダーはありません。";
+    inputs.calList.appendChild(empty);
+    return;
+  }
+  sources.forEach((src, index) => {
+    const item = document.createElement("div");
+    item.className = "row";
+    const label = document.createElement("span");
+    const isFile = src.kind === "file";
+    label.textContent = `${isFile ? "📄" : "🌐"} ${isFile ? src.path : src.url}`;
+    label.style.overflow = "hidden";
+    label.style.textOverflow = "ellipsis";
+    const del = document.createElement("button");
+    del.type = "button";
+    del.textContent = "削除";
+    del.addEventListener("click", () => void onRemoveCalendarSource(index));
+    item.appendChild(label);
+    item.appendChild(del);
+    inputs!.calList.appendChild(item);
+  });
+}
+
+async function onAddCalendarSource(kind: "url" | "file"): Promise<void> {
+  if (!inputs) return;
+  const input = kind === "url" ? inputs.calUrl : inputs.calPath;
+  const value = input.value.trim();
+  if (!value) {
+    showCalendarMessage(kind === "url" ? "URL を入力してください" : "パスを入力してください", true);
+    return;
+  }
+  const source: CalendarSource =
+    kind === "url" ? { kind: "url", url: value } : { kind: "file", path: value };
+  try {
+    const list = await invoke<CalendarSource[]>("add_calendar_source", { source });
+    if (current) current.calendar_sources = list;
+    renderCalendarSources(list);
+    input.value = "";
+    showCalendarMessage("追加しました。『いま取得』で読み込めます", false);
+  } catch (err) {
+    showCalendarMessage(`追加失敗: ${formatErr(err)}`, true);
+  }
+}
+
+async function onRemoveCalendarSource(index: number): Promise<void> {
+  if (!inputs) return;
+  try {
+    const list = await invoke<CalendarSource[]>("remove_calendar_source", { index });
+    if (current) current.calendar_sources = list;
+    renderCalendarSources(list);
+    showCalendarMessage("削除しました", false);
+  } catch (err) {
+    showCalendarMessage(`削除失敗: ${formatErr(err)}`, true);
+  }
+}
+
+async function onCalendarRefresh(): Promise<void> {
+  if (!inputs) return;
+  inputs.calRefresh.disabled = true;
+  showCalendarMessage("取得中…", false);
+  try {
+    const n = await invoke<number>("refresh_calendar");
+    showCalendarMessage(`${n} 件の予定を取り込みました`, false);
+  } catch (err) {
+    showCalendarMessage(`取得失敗: ${formatErr(err)}`, true);
+  } finally {
+    inputs.calRefresh.disabled = false;
+  }
+}
+
+function showCalendarMessage(msg: string, isError: boolean): void {
+  if (!inputs) return;
+  inputs.calMessage.textContent = msg;
+  inputs.calMessage.classList.toggle("error", isError);
+  inputs.calMessage.hidden = false;
+}
+
 // M7: リマインダーの一覧・操作は専用パネル (panels/daily.ts) に移設した。
 // 設定パネル側は「日常支援」ページのトグル類のみを持つ。
 
@@ -908,6 +1013,8 @@ function applySettingsToForm(s: Settings): void {
   inputs.situationBattery.checked = s.situation_battery_enabled;
   inputs.todoFollow.checked = s.todo_follow_enabled;
   inputs.minSpeakInterval.value = String(s.min_speak_interval_min);
+  inputs.calNotifyMin.value = String(s.calendar_notify_min);
+  renderCalendarSources(s.calendar_sources);
   inputs.ttsSpeed.value = String(s.tts_speed);
   inputs.ttsVolume.value = String(s.tts_volume);
   // 話者 select は資産 DL 済みのときだけ list_voices で埋められる。値は文字列で保持。
@@ -989,6 +1096,11 @@ async function onSave(): Promise<void> {
     min_speak_interval_min: clampNonNegInt(
       inputs.minSpeakInterval.value,
       current.min_speak_interval_min,
+    ),
+    // calendar_sources は add/remove コマンドが即時永続化するので current を保つ
+    calendar_notify_min: clampNonNegInt(
+      inputs.calNotifyMin.value,
+      current.calendar_notify_min,
     ),
     ghost_id: inputs.ghostId.value || current.ghost_id,
     shell_id: inputs.shellId.value || current.shell_id,

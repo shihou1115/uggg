@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v1.3）
+# ugg アーキテクチャ設計書（architecture.md v1.4）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -128,7 +128,8 @@ src-tauri/src/
 │   ├── topics.rs            -- 時事ネタ RSS 取得
 │   ├── notify.rs            -- ★ 統合通知サービス notify()（横断方針 §3.1 ゴースト発話原則）
 │   ├── deliver.rs           -- ★M7 通知配達サービス deliver_event（自発発話の単一経路、§11.4）
-│   └── governance.rs        -- ★M7 発話ガバナンス can_deliver / record_delivered（§11.4）
+│   ├── governance.rs        -- ★M7 発話ガバナンス can_deliver / record_delivered（§11.4）
+│   └── calendar.rs          -- ★M10 ICS 取得・自前パース・RRULE near-term 展開（読み取り専用、§4.6.4）
 │
 └── tools/                   -- ツール群
     ├── mod.rs
@@ -221,6 +222,7 @@ src/
 | `reminders` | リマインダーのスケジュール定義 | 〜数十 | active=1 かつ due_ts 到達で発火（★M7 拡張） |
 | `reminder_log` | ★M7 リマインダー発火・確認履歴 | 〜500（prune） | 完了/未完了管理・通知履歴・再通知判断 |
 | `todos` | ★M8 ToDo・日課 | 〜数百 | 3 バケット・2 段階優先度・日課復活 |
+| `calendar_cache` | ★M10 ICS 予定の発生インスタンス | 〜数百 | (source_id,uid,start_ts) 複合キー・near-term 展開 |
 | `voice_refs` | ★ Irodori 参照音声メタ | 最大 2（slot 1件ずつ） | クローン合成の元音声 |
 
 ### 2.2 各テーブル詳細
@@ -356,7 +358,8 @@ CREATE INDEX idx_todos_status ON todos(status, bucket);
   - v4: `interest_topics` / `topics_cache` を追加 (M5-C)
   - v5: `reminders` を追加 (M5-B)
   - v6: `reminders` 拡張 5 列 + `reminder_log` を追加 (M7)
-  - v7: `todos` を追加 (M8)。以降 Tier S で v8=calendar_cache (M10) を予定（daily-support-design §2）
+  - v7: `todos` を追加 (M8)
+  - v8: `calendar_cache` を追加 (M10)。複合キー (source_id,uid,start_ts) + 実装追加列 `unsupported`（展開不能 RRULE の印）
 - 参照音声 .wav の配置は `%APPDATA%\ugg\irodori\refs\<slot>_<id>.wav` (architecture §2.4)。`voice_refs.file_path` には絶対パスを保存
 
 ### 2.4 ファイル資産（DB 外）
@@ -645,6 +648,15 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `feedback_speech` | `speech_id: String, category: String` | `()` | 🔕「いまのは邪魔」。**最新のタグ付き発話と一致したときだけ**適用（誤適用は黙って無視）。backoff +1 を `governance_backoff:<category>` に永続化し gate 段 5 の間隔を線形延長、3 回でカテゴリトグルを OFF（settings 永続化 + settings-changed）。Situation* 以外は no-op |
 
+★M10 カレンダー（spec §4.6.4、読み取り専用）。変更系は `calendar-changed` を emit。
+
+| コマンド | 引数 | 戻り値 | 説明 |
+|---|---|---|---|
+| `get_calendar_events` | `days?: u32`（省略時 2＝今日明日） | `CalendarEvent[]` | 表示窓の予定を開始順で |
+| `refresh_calendar` | — | `usize`（取得件数） | 全ソースを今すぐ再取得 |
+| `add_calendar_source` | `source: CalendarSource`（`{kind:"file",path}`\|`{kind:"url",url}`） | `CalendarSource[]` | 追加。source_id は index ベースのため**キャッシュを全 clear**して再取得 |
+| `remove_calendar_source` | `index: usize` | `CalendarSource[]` | 削除。同上でキャッシュ全 clear |
+
 ### 4.10 window
 
 | コマンド | 引数 | 戻り値 | 説明 |
@@ -667,6 +679,7 @@ pub struct GhostBundle {
 | `system-toast` | `string` | notify() / deliver_event のトーストフォールバック。★M7 でフロント受け皿（`system/toast.ts`、#system-toast 帯）を実装（到達保証 Toast の成立要件） |
 | `reminders-changed` | なし | ★M7 リマインダーの変更通知（登録・発火・完了等）。パネルが再取得 |
 | `todos-changed` | なし | ★M8 ToDo の変更通知（追加・完了・日課復活等）。パネルが再取得 |
+| `calendar-changed` | なし | ★M10 カレンダーの変更通知（取得・通知・ソース編集）。パネルが再取得 |
 
 **注**:
 - U3 採用により system 発話は `notify()` 内部で `dialogue` 経由に統合する（§11）。`system-toast` は辞書未定義時の fallback のみ。
@@ -796,6 +809,9 @@ events:
   situation_late_night: [ ... ] # 深夜利用の声かけ（23-5 時・1 晩 1 回）
   situation_battery: [ ... ]    # バッテリー低下。{count} = 残り %
   todo_quit: [ ... ]            # ★M9 終了前確認: 未完了 today ToDo があるときの終了挨拶（quit の代替）。{count}
+
+  # ★M10 カレンダー開始前通知（Notice=静音を越える。サブ主体）
+  calendar_upcoming: [ ... ]    # {summary} = 予定名、{time} = 開始 HH:MM（終日は「今日」）
 ```
 
 **★M7 プレースホルダ規約**（daily-support-design §3.3）: `system/deliver.rs` 経由の
@@ -1375,6 +1391,15 @@ pub async fn deliver_event(
 - **終了前確認**（★M9、spec §4.6.2 後半・2026-07-17 裁定）: トレイ「終了」時に未完了の
   today ToDo があれば `events.todo_quit`（{count}）を `quit` の代わりに再生（ユーザー起点
   につきゲート非対象）。コンテキストメニューの「終了」は M3 判断（即 exit）のまま。
+- **カレンダー watcher**（★M10、tasks.rs、60 秒間隔・起動 25 秒後開始）: `system/calendar.rs`
+  で全 ICS ソースを 30 分ごとに取得し `calendar_cache` へ near-term 展開して UPSERT。
+  開始前通知は `calendar_notify_min` 分前（終日は当日ローカル 8:00）に達した未通知予定を
+  `calendar_upcoming`（Notice）で 1 回。到達で `notified=1`。取得失敗はソース単位でログして
+  他を続行し既存キャッシュを維持（オフライン動作）。ソース未設定なら何もしない（既定オフ）。
+  **TZ は日本前提の簡易解決**（Z=UTC / 浮動・TZID=ローカル / VALUE=DATE=ローカル 0:00）、
+  **RRULE は DAILY/WEEKLY を BYDAY/INTERVAL/UNTIL/COUNT/EXDATE 込みで展開**、
+  MONTHLY/YEARLY は同日ステップの best-effort、解釈不能な RRULE は当日分のみ
+  `unsupported` 印で残す（daily-support-design §11.1）。
 - **ユーザー起点の確認発話**（スヌーズ確認・終了前確認）は `speak_event_now`
   （ゲート・record・🔕 メタなし。発話した `DialogueResponse` を返す）。
 
@@ -1555,4 +1580,5 @@ async fn install_asset(
 | 2026-06-18 | v1 | Phase 2 対話で確定した全設計を反映、初版 |
 | 2026-07-17 | v1.1 | M7（日常支援 Tier S: 共通基盤 + 統合リマインダー、daily-support-design v2 準拠）を反映。DB v6（reminders 拡張 + reminder_log、§2）/ `system/deliver.rs`・`system/governance.rs` 新設（§11.4）/ `commands/daily.rs`（§4.11）/ イベント `reminders-changed`・`system-toast` 受け皿（§5）/ 辞書 events `reminder_fired`・`reminder_snoozed` + プレースホルダ規約（§6.2、`reminder_fired` は system_messages から events へ移動 §6.5）/ Settings に daily_support・夜間静音・ガバナンス系 10 フィールド追加 / AppState に GovernanceState（§3）。付随して実装との既知乖離を一部解消（monologue_cache → topics_cache、migration v4-v6 追記、notify() の severity 未実装注記、WorkerHandles 不採用注記） |
 | 2026-07-17 | v1.2 | M8（ToDo・日課管理 §4.6.2）を反映。DB v7 `todos`（§2）/ `tools/todo.rs`（検証 + 日課復活の境界計算）/ ToDo コマンド 6 種 + `todos-changed`（§4.11・§5）/ daily watcher（日課復活 + 朝の件数告知、§11.4）/ 辞書 events `todo_morning`・`todo_done`（発火）+ `todo_follow`・`todo_stale`（キーのみ、発火は M9）（§6.2）/ パネルに ToDo 節（3 バケットタブ） |
+| 2026-07-18 | v1.4 | M10（カレンダー参照 §4.6.4、読み取り専用）を反映。DB v8 `calendar_cache`（複合キー + 実装追加列 unsupported、§2）/ `system/calendar.rs`（ICS 自前パース + RRULE near-term 展開 + TZ 簡易解決）/ カレンダーコマンド 4 種 + `calendar-changed`（§4.11・§5）/ calendar watcher（取得 + 開始前通知、§11.4）/ 辞書 `calendar_upcoming`（§6.2）/ Settings に calendar_sources（File\|Url）+ calendar_notify_min / フロント設定カレンダー UI + パネル今日明日表示。ファイル選択ダイアログは見送り（パス手入力、依存を増やさない）。**Tier S 4 機能そろい → v0.2 リリース候補**。 |
 | 2026-07-17 | v1.3 | M9（状況発話 + 検知 + ガバナンス完成 §4.6.3）を反映。`presence/context.rs`（OS 検知 + 閾値純関数、windows crate に Power/SystemInformation feature 追加）/ context watcher（休憩・深夜・バッテリー・ToDo フォロー/滞留、§11.4）/ gate 段 5 連投回避 + 🔕 backoff（`feedback_speech` §4.11、`governance_backoff:*` 永続化）/ `DialogueResponse` に speech_id・category・priority・feedback_allowed（§5、バック起点のみ）/ フロント #balloon-mute + 設定「状況に応じた声かけ」セクション / 辞書 `situation_break`・`situation_late_night`・`situation_battery`・`todo_quit`（§6.2。`situation_todo_follow` キーは `todo_follow`/`todo_stale` に統合）/ 終了前確認（tray quit で todo_quit 優先、spec §4.6.2 後半）/ AppState に ContextState（§3） |

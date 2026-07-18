@@ -42,6 +42,26 @@ export interface Settings {
   night_quiet_from: number;
   night_quiet_to: number;
   reminder_notify_enabled: boolean;
+  // === カレンダー (M10, spec §4.6.4) ===
+  calendar_sources: CalendarSource[];
+  calendar_notify_min: number;
+}
+
+/// M10: カレンダー ICS ソース (Rust の CalendarSource と serde tag 同期)。
+export type CalendarSource =
+  | { kind: "file"; path: string }
+  | { kind: "url"; url: string };
+
+/// M10: 予定 1 件 (バックエンド CalendarEvent と同期)。
+export interface CalendarEvent {
+  source_id: number;
+  uid: string;
+  summary: string;
+  start_ts: number;
+  end_ts: number | null;
+  all_day: boolean;
+  /// 繰り返し（未対応）で当日分のみ表示している予定。
+  unsupported: boolean;
 }
 
 /// リマインダーの繰り返し種別 (M7)。

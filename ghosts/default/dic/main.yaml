@@ -540,6 +540,16 @@ events:
     - main: { text: "電池が{count}%しかないよ。作業中のもの、保存しておこ？", pose: troubled }
       sub: { text: "保存とコンセント。それだけ頼む", pose: normal }
 
+  # カレンダー開始前通知 (M10, spec §4.6.4)。{summary} は予定名、{time} は開始時刻 (HH:MM)。
+  # サブ主体・Notice (静音を越える)。終日予定は {time} が「今日」になる。
+  calendar_upcoming:
+    - main: { text: "まもなく『{summary}』だよ。{time}から！", pose: normal }
+      sub: { text: "支度はいいか？遅れるなよ", pose: normal }
+    - main: { text: "予定のお知らせ！{time}から『{summary}』があるよ", pose: happy }
+      sub: { text: "リマインドはボクの仕事だ。感謝しろ", pose: normal }
+    - main: { text: "そろそろ『{summary}』の時間が近いね（{time}）", pose: normal }
+      sub: { text: "準備するなら今のうちだ", pose: normal }
+
   # 終了前の確認 (M9, spec §4.6.2)。未完了の today ToDo があるときの終了挨拶。
   # {count} は未完了件数。通常の quit の代わりに再生される。
   todo_quit:

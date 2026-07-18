@@ -12,8 +12,10 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::db::{ReminderFilter, ReminderKind, ReminderLogRow, ReminderRow, TodoRow};
-use crate::state::AppState;
+use crate::db::{
+    CalendarCacheRow, ReminderFilter, ReminderKind, ReminderLogRow, ReminderRow, TodoRow,
+};
+use crate::state::{AppState, CalendarSource};
 use crate::system::deliver;
 use crate::system::governance::{self, Priority, SpeechCategory};
 use crate::tools::{reminder, todo};
@@ -412,6 +414,120 @@ pub fn delete_todo(
     state.db.delete_todo(id).map_err(|e| format!("{e:#}"))?;
     emit_todos_changed(&app);
     list_todo_entries(state.inner(), None)
+}
+
+// ===== カレンダー (M10) =====
+
+/// フロント向け予定 1 件 (CalendarCacheRow と同期、TS は types.ts の CalendarEvent)。
+#[derive(Debug, Clone, Serialize)]
+pub struct CalendarEvent {
+    pub source_id: i64,
+    pub uid: String,
+    pub summary: String,
+    pub start_ts: i64,
+    pub end_ts: Option<i64>,
+    pub all_day: bool,
+    /// 繰り返し（未対応）で当日分のみ表示している予定 (UI に印)。
+    pub unsupported: bool,
+}
+
+impl From<CalendarCacheRow> for CalendarEvent {
+    fn from(r: CalendarCacheRow) -> Self {
+        Self {
+            source_id: r.source_id,
+            uid: r.uid,
+            summary: r.summary,
+            start_ts: r.start_ts,
+            end_ts: r.end_ts,
+            all_day: r.all_day,
+            unsupported: r.unsupported,
+        }
+    }
+}
+
+/// 今日・明日（既定）の予定を返す。`days` 省略時は 2 日分（今日 0:00〜明後日 0:00）。
+#[tauri::command]
+pub fn get_calendar_events(
+    days: Option<u32>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<CalendarEvent>, String> {
+    let now_local = chrono::Local::now().naive_local();
+    let from = reminder::local_to_utc_ts(now_local.date().and_hms_opt(0, 0, 0).unwrap());
+    let span = days.unwrap_or(2).clamp(1, 31) as i64;
+    let to = from + span * 86_400;
+    let rows = state.db.list_calendar(from, to).map_err(|e| format!("{e:#}"))?;
+    Ok(rows.into_iter().map(CalendarEvent::from).collect())
+}
+
+/// 全ソースを今すぐ再取得する（設定パネルの「いま取得」）。取得件数の合計を返す。
+#[tauri::command]
+pub async fn refresh_calendar(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<usize, String> {
+    let total = crate::tasks::refresh_all_calendars(state.inner()).await;
+    let _ = app.emit("calendar-changed", ());
+    Ok(total)
+}
+
+/// ソースを 1 件追加する。index ベースの source_id がずれるため、
+/// 追加時はキャッシュを全 clear して次回取得で作り直す（§11.1）。
+#[tauri::command]
+pub fn add_calendar_source(
+    source: CalendarSource,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<CalendarSource>, String> {
+    // 「パスのコピー」由来の引用符などを剥がしてから検証する
+    let mut source = source;
+    source.normalize();
+    let empty = match &source {
+        CalendarSource::File { path } => path.is_empty(),
+        CalendarSource::Url { url } => url.is_empty(),
+    };
+    if empty {
+        return Err("パスまたは URL を入力してください".to_string());
+    }
+    let list = mutate_sources(&app, &state, |sources| sources.push(source.clone()))?;
+    Ok(list)
+}
+
+/// index 指定でソースを削除する。
+#[tauri::command]
+pub fn remove_calendar_source(
+    index: usize,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<CalendarSource>, String> {
+    let list = mutate_sources(&app, &state, |sources| {
+        if index < sources.len() {
+            sources.remove(index);
+        }
+    })?;
+    Ok(list)
+}
+
+/// calendar_sources を編集して永続化し、キャッシュを clear + calendar-changed emit する。
+fn mutate_sources(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    edit: impl FnOnce(&mut Vec<CalendarSource>),
+) -> Result<Vec<CalendarSource>, String> {
+    let next = {
+        let mut s = state.settings.lock().expect("settings poisoned");
+        edit(&mut s.calendar_sources);
+        s.clone()
+    };
+    if let Ok(json) = serde_json::to_string(&next) {
+        let _ = state
+            .db
+            .set_setting(crate::commands::settings::SETTINGS_KEY, &json);
+    }
+    // index ベースの source_id が変わるので全 clear（次回 watcher / refresh で再構築）
+    let _ = state.db.clear_calendar();
+    let _ = app.emit("settings-changed", &next);
+    let _ = app.emit("calendar-changed", ());
+    Ok(next.calendar_sources)
 }
 
 // ===== 発話ガバナンス (M9) =====

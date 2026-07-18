@@ -94,6 +94,8 @@ fn main() {
             tasks::spawn_daily_watcher(app.handle().clone(), state.clone());
             // M9: context watcher (OS 状況検知 → 状況発話 4 カテゴリ)
             tasks::spawn_context_watcher(app.handle().clone(), state.clone());
+            // M10: カレンダー watcher (ICS 取得 + 開始前通知)
+            tasks::spawn_calendar_watcher(app.handle().clone(), state.clone());
             // タスクトレイ
             if let Err(err) = window::tray::install(app.handle(), state.clone()) {
                 eprintln!("[tray] install failed: {err:#}");
@@ -158,6 +160,10 @@ fn main() {
             commands::daily::delete_todo,
             commands::daily::update_todo,
             commands::daily::feedback_speech,
+            commands::daily::get_calendar_events,
+            commands::daily::refresh_calendar,
+            commands::daily::add_calendar_source,
+            commands::daily::remove_calendar_source,
             commands::tools::read_clipboard_text,
             commands::profile::get_profile,
             commands::profile::add_profile,

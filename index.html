@@ -98,6 +98,10 @@
               チャットで話しかけても登録できます。行をクリックすると通知履歴を表示します。
             </p>
           </section>
+          <section class="panel-section" id="daily-calendar-section" hidden>
+            <h3>今日・明日の予定</h3>
+            <div id="daily-calendar-list" class="daily-list"></div>
+          </section>
           <section class="panel-section">
             <h3>ToDo</h3>
             <div class="daily-todo-tabs" id="daily-todo-tabs">
@@ -428,6 +432,39 @@
               声かけ中の吹き出しの 🔕 を押すと、その種類の頻度が下がります (3 回で自動オフ)。
               集中タイマー・静音モード・夜間静音の間は声かけしません。
             </p>
+          </section>
+          <section class="panel-section" data-page="daily">
+            <h3>カレンダー (ICS 読み取り専用)</h3>
+            <div id="settings-calendar-list" class="daily-list"></div>
+            <label class="row">
+              <span>ICS の URL を追加</span>
+              <span class="key-cell daily-add-cell">
+                <input type="url" id="settings-calendar-url" placeholder="https://example.com/cal.ics" />
+                <button type="button" id="settings-calendar-add-url">追加</button>
+              </span>
+            </label>
+            <label class="row">
+              <span>ローカル .ics のパスを追加</span>
+              <span class="key-cell daily-add-cell">
+                <input type="text" id="settings-calendar-path" placeholder="C:\Users\...\my.ics" />
+                <button type="button" id="settings-calendar-add-path">追加</button>
+              </span>
+            </label>
+            <label class="row">
+              <span>開始何分前に知らせる</span>
+              <input type="number" id="settings-calendar-notify-min" min="0" max="1440" step="5" />
+            </label>
+            <div class="row">
+              <span></span>
+              <div class="key-cell">
+                <button type="button" id="settings-calendar-refresh">いま取得</button>
+              </div>
+            </div>
+            <p class="panel-hint">
+              URL は取得時のみ外部通信します（既定オフ・ユーザー設定のみ）。開始前にキャラクターが知らせます（静音中も鳴ります）。
+              複雑な繰り返し予定は当日分のみ「繰り返し(一部)」と表示することがあります。
+            </p>
+            <p id="settings-calendar-message" class="panel-message" hidden></p>
           </section>
           <section class="panel-section" data-page="daily">
             <h3>夜間静音</h3>

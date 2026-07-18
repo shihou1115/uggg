@@ -156,6 +156,24 @@ pub enum ReminderFilter {
     All,
 }
 
+/// カレンダー予定の 1 発生インスタンス (M10, spec §4.6.4 / daily-support-design §2.3)。
+/// 繰り返しは near-term 展開して発生回ごとに 1 行持つ。時刻はすべて UTC 秒 (§2.5)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CalendarCacheRow {
+    pub source_id: i64,
+    pub uid: String,
+    pub recurrence_id: Option<String>,
+    pub summary: String,
+    pub start_ts: i64,
+    pub end_ts: Option<i64>,
+    pub all_day: bool,
+    /// 'confirmed' | 'cancelled'。
+    pub status: String,
+    /// 繰り返しだが RRULE を near-term 展開できなかった予定 (当日分のみ・UI に印)。
+    pub unsupported: bool,
+    pub notified: bool,
+}
+
 /// ToDo 1 件 (M8, spec §4.6.2 / daily-support-design §2.2)。
 /// bucket/status/recurring は文字列のまま持ち、正規化・検証はコマンド層
 /// (`tools::todo`) が行う (TS 側の文字列 union と 1:1 のため。enum 化はしない)。
@@ -405,6 +423,33 @@ impl Db {
                 INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_schema_version', '7');",
             )
             .context("migrate to schema v7")?;
+        }
+
+        if current < 8 {
+            // M10: カレンダー参照 (daily-support-design §2.3)。
+            // 複合キー (source_id, uid, start_ts) で発生インスタンス単位に持つ。
+            // unsupported は展開できない RRULE の当日分に印を付ける実装追加列 (§11.1)。
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS calendar_cache (
+                    source_id     INTEGER NOT NULL,
+                    uid           TEXT    NOT NULL,
+                    recurrence_id TEXT,
+                    summary       TEXT    NOT NULL,
+                    start_ts      INTEGER NOT NULL,
+                    end_ts        INTEGER,
+                    all_day       INTEGER NOT NULL DEFAULT 0,
+                    status        TEXT    NOT NULL DEFAULT 'confirmed',
+                    notify_key    TEXT    NOT NULL,
+                    notified      INTEGER NOT NULL DEFAULT 0,
+                    unsupported   INTEGER NOT NULL DEFAULT 0,
+                    fetched_ts    INTEGER NOT NULL,
+                    PRIMARY KEY (source_id, uid, start_ts)
+                );
+                CREATE INDEX IF NOT EXISTS idx_calendar_start ON calendar_cache(start_ts);
+
+                INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_schema_version', '8');",
+            )
+            .context("migrate to schema v8")?;
         }
 
         tx.commit().context("commit migration tx")?;
@@ -996,6 +1041,162 @@ impl Db {
         Ok(n as u64)
     }
 
+    // ===== calendar_cache (M10) =====
+
+    fn map_calendar(row: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarCacheRow> {
+        Ok(CalendarCacheRow {
+            source_id: row.get(0)?,
+            uid: row.get(1)?,
+            recurrence_id: row.get(2)?,
+            summary: row.get(3)?,
+            start_ts: row.get(4)?,
+            end_ts: row.get(5)?,
+            all_day: row.get::<_, i64>(6)? != 0,
+            status: row.get(7)?,
+            unsupported: row.get::<_, i64>(8)? != 0,
+            notified: row.get::<_, i64>(9)? != 0,
+        })
+    }
+
+    const CALENDAR_COLS: &'static str =
+        "source_id, uid, recurrence_id, summary, start_ts, end_ts, all_day, status, unsupported, notified";
+
+    /// 発生インスタンスを 1 件 UPSERT する (M10)。notify_key 差分規則 (§2.3):
+    /// 既存行と notify_key が一致すれば notified を保持、変われば 0 にリセットする。
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_calendar_event(
+        &self,
+        source_id: i64,
+        uid: &str,
+        recurrence_id: Option<&str>,
+        summary: &str,
+        start_ts: i64,
+        end_ts: Option<i64>,
+        all_day: bool,
+        status: &str,
+        notify_key: &str,
+        unsupported: bool,
+        fetched_ts: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "INSERT INTO calendar_cache
+                (source_id, uid, recurrence_id, summary, start_ts, end_ts, all_day, status,
+                 notify_key, notified, unsupported, fetched_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)
+             ON CONFLICT(source_id, uid, start_ts) DO UPDATE SET
+                recurrence_id = excluded.recurrence_id,
+                summary       = excluded.summary,
+                end_ts        = excluded.end_ts,
+                all_day       = excluded.all_day,
+                status        = excluded.status,
+                unsupported   = excluded.unsupported,
+                fetched_ts    = excluded.fetched_ts,
+                notified = CASE WHEN calendar_cache.notify_key = excluded.notify_key
+                                THEN calendar_cache.notified ELSE 0 END,
+                notify_key = excluded.notify_key",
+            params![
+                source_id, uid, recurrence_id, summary, start_ts, end_ts, all_day as i64,
+                status, notify_key, unsupported as i64, fetched_ts
+            ],
+        )
+        .context("upsert_calendar_event")?;
+        Ok(())
+    }
+
+    /// 取得時刻より古い (=今回の再取得で消えた) 発生行を削除する (M10)。
+    /// notified 状態は生き残った行では保持される (fetched_ts を更新するため)。
+    pub fn delete_stale_calendar(&self, source_id: i64, fetch_ts: i64) -> Result<u64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let n = conn
+            .execute(
+                "DELETE FROM calendar_cache WHERE source_id = ?1 AND fetched_ts < ?2",
+                params![source_id, fetch_ts],
+            )
+            .context("delete_stale_calendar")?;
+        Ok(n as u64)
+    }
+
+    /// 表示窓 [from, to) の confirmed な予定を開始順で返す (M10)。
+    pub fn list_calendar(&self, from_ts: i64, to_ts: i64) -> Result<Vec<CalendarCacheRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let sql = format!(
+            "SELECT {} FROM calendar_cache
+             WHERE status = 'confirmed' AND start_ts >= ?1 AND start_ts < ?2
+             ORDER BY start_ts ASC",
+            Self::CALENDAR_COLS
+        );
+        let mut stmt = conn.prepare(&sql).context("prepare list_calendar")?;
+        let rows = stmt
+            .query_map(params![from_ts, to_ts], Self::map_calendar)
+            .context("query list_calendar")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("row list_calendar")?);
+        }
+        Ok(out)
+    }
+
+    /// 開始前通知の候補 (未通知・confirmed) を返す (M10)。
+    /// notify_at は終日と時刻付きで異なるため呼び出し側 (watcher) が計算し、
+    /// ここでは候補を広めに返して watcher が絞る:
+    /// - 時刻付き: まだ始まっていない (start_ts > now)
+    /// - 終日: 当日中 (start_ts + 86400 > now)。通知時刻 (当日ローカル 8:00) は
+    ///   start_ts (0:00) より後なので「開始前」条件だと一度も候補にならない
+    ///   (M10 reviewer 指摘の修正)
+    pub fn upcoming_calendar(&self, now_ts: i64, horizon_ts: i64) -> Result<Vec<CalendarCacheRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let sql = format!(
+            "SELECT {} FROM calendar_cache
+             WHERE status = 'confirmed' AND notified = 0
+               AND ((all_day = 0 AND start_ts > ?1) OR (all_day = 1 AND start_ts + 86400 > ?1))
+               AND start_ts <= ?2
+             ORDER BY start_ts ASC",
+            Self::CALENDAR_COLS
+        );
+        let mut stmt = conn.prepare(&sql).context("prepare upcoming_calendar")?;
+        let rows = stmt
+            .query_map(params![now_ts, horizon_ts], Self::map_calendar)
+            .context("query upcoming_calendar")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("row upcoming_calendar")?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_calendar_notified(&self, source_id: i64, uid: &str, start_ts: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "UPDATE calendar_cache SET notified = 1
+             WHERE source_id = ?1 AND uid = ?2 AND start_ts = ?3",
+            params![source_id, uid, start_ts],
+        )
+        .context("mark_calendar_notified")?;
+        Ok(())
+    }
+
+    /// 過去の発生行を prune する (end_ts か start_ts が cutoff 未満、§2.3)。
+    pub fn prune_calendar(&self, cutoff_ts: i64) -> Result<u64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let n = conn
+            .execute(
+                "DELETE FROM calendar_cache WHERE COALESCE(end_ts, start_ts) < ?1",
+                params![cutoff_ts],
+            )
+            .context("prune_calendar")?;
+        Ok(n as u64)
+    }
+
+    /// カレンダーキャッシュを全消去する (M10)。ソース構成の変更時に呼ぶ
+    /// (index ベースの source_id がずれるため全 clear して再取得する、§11.1)。
+    pub fn clear_calendar(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute("DELETE FROM calendar_cache", [])
+            .context("clear_calendar")?;
+        Ok(())
+    }
+
     /// 未完了件数 (朝の告知用)。bucket 指定で絞り込み (None は全 bucket)。
     pub fn count_open_todos(&self, bucket: Option<&str>) -> Result<u64> {
         let conn = self.conn.lock().expect("db poisoned");
@@ -1466,6 +1667,61 @@ mod tests {
 
         // 冪等: もう一度実行しても変化なし
         assert_eq!(db.reset_recurring_todos(1000, 500).unwrap(), 0);
+    }
+
+    #[test]
+    fn calendar_upsert_notify_key_diff_and_stale() {
+        let db = make_db();
+        // 初回挿入
+        db.upsert_calendar_event(0, "u1", None, "会議", 1000, Some(1100), false, "confirmed", "k-会議-1000-1100", false, 5000).unwrap();
+        db.upsert_calendar_event(0, "u2", None, "歯医者", 2000, Some(2100), false, "confirmed", "k-歯医者-2000-2100", false, 5000).unwrap();
+        // u1 を通知済みにする
+        db.mark_calendar_notified(0, "u1", 1000).unwrap();
+        assert!(db.list_calendar(0, 9999).unwrap().iter().find(|e| e.uid == "u1").unwrap().notified);
+
+        // 再取得 (fetch_ts=6000)。u1 は notify_key 不変 → notified 保持。u2 は summary 変更 → リセット。
+        db.upsert_calendar_event(0, "u1", None, "会議", 1000, Some(1100), false, "confirmed", "k-会議-1000-1100", false, 6000).unwrap();
+        db.mark_calendar_notified(0, "u2", 2000).unwrap(); // 一旦通知済みに
+        db.upsert_calendar_event(0, "u2", None, "歯医者(変更)", 2000, Some(2100), false, "confirmed", "k-歯医者変更-2000-2100", false, 6000).unwrap();
+        let rows = db.list_calendar(0, 9999).unwrap();
+        assert!(rows.iter().find(|e| e.uid == "u1").unwrap().notified, "notify_key 不変で notified 保持");
+        assert!(!rows.iter().find(|e| e.uid == "u2").unwrap().notified, "notify_key 変更で notified リセット");
+
+        // 別ソースの同一 start は複合キーで別行 (相互上書きしない)
+        db.upsert_calendar_event(1, "u1", None, "別ソース", 1000, None, false, "confirmed", "k-別-1000", false, 6000).unwrap();
+        assert_eq!(db.list_calendar(500, 1500).unwrap().len(), 2);
+
+        // stale 削除: source 0 を古い fetch_ts=6000 で再取得しなかった u3 は消える
+        db.upsert_calendar_event(0, "u3", None, "消える予定", 1200, None, false, "confirmed", "k-u3", false, 5000).unwrap();
+        let removed = db.delete_stale_calendar(0, 6000).unwrap();
+        assert_eq!(removed, 1, "fetch_ts<6000 の u3 のみ削除");
+        assert!(db.list_calendar(0, 9999).unwrap().iter().all(|e| e.uid != "u3"));
+    }
+
+    #[test]
+    fn calendar_upcoming_prune_clear() {
+        let db = make_db();
+        db.upsert_calendar_event(0, "a", None, "近い", 1000, Some(1100), false, "confirmed", "ka", false, 1).unwrap();
+        db.upsert_calendar_event(0, "b", None, "遠い", 5000, None, false, "confirmed", "kb", false, 1).unwrap();
+        db.upsert_calendar_event(0, "c", None, "キャンセル", 1050, None, false, "cancelled", "kc", false, 1).unwrap();
+        // now=900, horizon=1200 → a のみ (b は範囲外、c は cancelled)
+        let up = db.upcoming_calendar(900, 1200).unwrap();
+        assert_eq!(up.len(), 1);
+        assert_eq!(up[0].uid, "a");
+        // 通知済みは対象外
+        db.mark_calendar_notified(0, "a", 1000).unwrap();
+        assert_eq!(db.upcoming_calendar(900, 1200).unwrap().len(), 0);
+        // 終日 (all_day=1): 開始 (0:00) を過ぎても当日中 (start+86400) は候補に残る
+        // — 通知時刻 8:00 は start より後のため (M10 reviewer 指摘の回帰テスト)
+        db.upsert_calendar_event(0, "d", None, "終日", 100, None, true, "confirmed", "kd", false, 1).unwrap();
+        let up = db.upcoming_calendar(500, 90_000).unwrap();
+        assert!(up.iter().any(|e| e.uid == "d"), "開始後でも当日中の終日予定は候補");
+        assert_eq!(db.upcoming_calendar(100 + 86_400, 200_000).unwrap().len(), 0, "翌日には消える");
+        // prune: end/start < 1200 の過去分 (a=end1100, c=start1050, d=start100) が消える
+        assert_eq!(db.prune_calendar(1200).unwrap(), 3);
+        // clear
+        db.clear_calendar().unwrap();
+        assert_eq!(db.list_calendar(0, 99999).unwrap().len(), 0);
     }
 
     #[test]

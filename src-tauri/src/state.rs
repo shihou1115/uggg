@@ -39,6 +39,28 @@ impl Default for TalkSpeed {
     }
 }
 
+/// カレンダー ICS ソース (M10, spec §4.6.4 / daily-support-design §7.4)。
+/// 既定は空 (オプトイン)。外部送信は Url ソースの GET のみ (§3.3)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CalendarSource {
+    File { path: String },
+    Url { url: String },
+}
+
+impl CalendarSource {
+    /// 入力値の正規化: 前後の空白と引用符を剥がす。
+    /// エクスプローラの「パスのコピー」は `"C:\..."` と引用符付きで貼られ、
+    /// そのままだとファイル名として不正 (os error 123) になる (2026-07-18 実機で判明)。
+    pub fn normalize(&mut self) {
+        let fix = |s: &str| s.trim().trim_matches('"').trim().to_string();
+        match self {
+            CalendarSource::File { path } => *path = fix(path),
+            CalendarSource::Url { url } => *url = fix(url),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub mode: DialogueMode,
@@ -157,6 +179,52 @@ pub struct Settings {
     /// リマインダー発火通知の on/off (既定 true)。登録自体は常時可能。
     #[serde(default = "default_true")]
     pub reminder_notify_enabled: bool,
+    // --- カレンダー (§4.6.4、M10) ---
+    /// ICS ソース (ファイル/URL)。既定 空 (オプトイン、§3.3)。
+    #[serde(default)]
+    pub calendar_sources: Vec<CalendarSource>,
+    /// 予定開始の何分前に通知するか (既定 15)。
+    #[serde(default = "default_calendar_notify_min")]
+    pub calendar_notify_min: u32,
+}
+
+fn default_calendar_notify_min() -> u32 {
+    15
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_normalizes_quoted_calendar_paths() {
+        let mut s = Settings::default();
+        s.calendar_sources = vec![
+            CalendarSource::File {
+                path: "\"C:\\Users\\x\\Desktop\\cal.ics\"".to_string(),
+            },
+            CalendarSource::Url {
+                url: "  \"https://example.com/a.ics\"  ".to_string(),
+            },
+            CalendarSource::File {
+                path: "\"\"".to_string(), // 引用符だけ → 空として除去
+            },
+        ];
+        s.clamp();
+        assert_eq!(s.calendar_sources.len(), 2);
+        assert_eq!(
+            s.calendar_sources[0],
+            CalendarSource::File {
+                path: "C:\\Users\\x\\Desktop\\cal.ics".to_string()
+            }
+        );
+        assert_eq!(
+            s.calendar_sources[1],
+            CalendarSource::Url {
+                url: "https://example.com/a.ics".to_string()
+            }
+        );
+    }
 }
 
 fn default_true() -> bool {
@@ -267,6 +335,8 @@ impl Default for Settings {
             night_quiet_from: default_night_quiet_from(),
             night_quiet_to: default_night_quiet_to(),
             reminder_notify_enabled: true,
+            calendar_sources: Vec::new(),
+            calendar_notify_min: default_calendar_notify_min(),
         }
     }
 }
@@ -342,6 +412,19 @@ impl Settings {
         if self.min_speak_interval_min > 1440 {
             self.min_speak_interval_min = 1440;
         }
+        // カレンダー通知は 0〜1440 分前
+        if self.calendar_notify_min > 1440 {
+            self.calendar_notify_min = default_calendar_notify_min();
+        }
+        // ソースの正規化 (引用符剥がし。過去に引用符付きで保存された値も起動時の
+        // load_persisted_settings → clamp で修復される) + 空文字ソースの除去
+        for src in &mut self.calendar_sources {
+            src.normalize();
+        }
+        self.calendar_sources.retain(|s| match s {
+            CalendarSource::File { path } => !path.is_empty(),
+            CalendarSource::Url { url } => !url.is_empty(),
+        });
     }
 }
 

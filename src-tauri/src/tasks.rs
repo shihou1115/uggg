@@ -496,6 +496,126 @@ async fn follow_open_todos(
     }
 }
 
+/// M10 (spec §4.6.4): カレンダー watcher。
+/// 既定 30 分間隔で全 ICS ソースを取得して calendar_cache へ反映し、開始前通知を配達する。
+/// 通知は `calendar_notify_min` 分前（終日は当日ローカル 8:00）に達したら
+/// `calendar_upcoming`（Notice、静音を越える）で 1 回だけ。到達で notified=1。
+/// カレンダーは既定オフ（ソース未設定なら何もしない）。取得失敗は既存キャッシュ維持。
+pub fn spawn_calendar_watcher(app: AppHandle, state: Arc<AppState>) {
+    const CHECK_INTERVAL_SECS: u64 = 60;
+    const FETCH_INTERVAL_SECS: i64 = 30 * 60;
+    const BOOT_DELAY_SECS: u64 = 25;
+    /// near-term 展開の表示窓（今日〜7 日）。
+    const DISPLAY_DAYS: i64 = 7;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)).await;
+        let mut last_fetch: i64 = 0;
+        loop {
+            // 他の Tier S watcher と同様、マスタスイッチ OFF 中は取得も通知もしない
+            // (Notice は gate 段 3 を素通りするため、機能スイッチはここで見る。M10 reviewer 指摘)
+            let has_sources = {
+                let s = state.settings.lock().expect("settings poisoned");
+                s.daily_support_enabled && !s.calendar_sources.is_empty()
+            };
+            if has_sources {
+                let now = Utc::now().timestamp();
+                // 定期取得（起動直後 + FETCH_INTERVAL ごと）
+                if now - last_fetch >= FETCH_INTERVAL_SECS {
+                    let n = fetch_all_calendars(&state, DISPLAY_DAYS).await;
+                    last_fetch = now;
+                    if n > 0 {
+                        let _ = app.emit("calendar-changed", ());
+                    }
+                    // prune（前日より前の過去発生行）
+                    let cutoff = now - 86_400;
+                    if let Err(err) = state.db.prune_calendar(cutoff) {
+                        eprintln!("[calendar] prune failed: {err:#}");
+                    }
+                }
+                // 開始前通知（毎 tick 判定）
+                notify_upcoming(&app, &state).await;
+            }
+            tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+        }
+    });
+}
+
+/// 全ソースを取得して calendar_cache に反映する。取得件数の合計を返す。
+/// ソース失敗は個別にログして続行（1 ソースの障害で他を巻き込まない）。
+async fn fetch_all_calendars(state: &Arc<AppState>, display_days: i64) -> usize {
+    let sources = state
+        .settings
+        .lock()
+        .expect("settings poisoned")
+        .calendar_sources
+        .clone();
+    let mut total = 0;
+    for (idx, source) in sources.iter().enumerate() {
+        match crate::system::calendar::fetch_source_into_cache(state, idx as i64, source, display_days)
+            .await
+        {
+            Ok(n) => total += n,
+            Err(err) => eprintln!("[calendar] source {idx} fetch failed: {err:#}"),
+        }
+    }
+    total
+}
+
+/// refresh_calendar コマンドの実体（表示窓は watcher と同じ 7 日）。
+pub async fn refresh_all_calendars(state: &Arc<AppState>) -> usize {
+    fetch_all_calendars(state, 7).await
+}
+
+/// 開始前通知の対象を配達する。notify_at（時刻付き=start-notify_min、終日=当日 8:00）を
+/// 過ぎ、まだ start 前で未通知の予定を `calendar_upcoming` で 1 回配達する。
+async fn notify_upcoming(app: &AppHandle, state: &Arc<AppState>) {
+    use crate::system::calendar;
+    let notify_min = state
+        .settings
+        .lock()
+        .expect("settings poisoned")
+        .calendar_notify_min as i64;
+    let now = Utc::now().timestamp();
+    // 候補は「これから始まる未通知の予定」を広めに取り、notify_at を個別判定する
+    let horizon = now + 2 * 86_400;
+    let candidates = match state.db.upcoming_calendar(now, horizon) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("[calendar] upcoming query failed: {err:#}");
+            return;
+        }
+    };
+    for ev in candidates {
+        let notify_at = if ev.all_day {
+            calendar::all_day_notify_ts(ev.start_ts)
+        } else {
+            ev.start_ts - notify_min * 60
+        };
+        if now < notify_at {
+            continue; // まだ通知時刻前
+        }
+        let time_label = calendar::time_label(ev.start_ts, ev.all_day);
+        let fallback = format!("まもなく予定: {}（{}）", ev.summary, time_label);
+        let outcome = deliver::deliver_event(
+            app,
+            state,
+            SpeechCategory::Calendar,
+            Priority::Notice,
+            "calendar_upcoming",
+            &[("summary", ev.summary.as_str()), ("time", time_label.as_str())],
+            Some(fallback),
+        )
+        .await;
+        if outcome.reached() {
+            if let Err(err) = state.db.mark_calendar_notified(ev.source_id, &ev.uid, ev.start_ts) {
+                eprintln!("[calendar] mark_notified failed: {err:#}");
+            }
+            let _ = app.emit("calendar-changed", ());
+        }
+        // 未達（Deferred/Failed）は notified を立てず次 tick で再試行
+    }
+}
+
 /// 集約通知の本文。辞書側の「『{body}』の時間だよ」等に埋め込まれる前提で名詞句にする。
 fn aggregate_overdue_body(latest: &ReminderRow, total: usize) -> String {
     let name = if latest.text.is_empty() {
