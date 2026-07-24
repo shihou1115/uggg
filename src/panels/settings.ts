@@ -1005,7 +1005,9 @@ async function onWeatherSearch(): Promise<void> {
     const hits = await invoke<LocationHit[]>("search_location", { query });
     renderWeatherCandidates(hits);
     showWeatherMessage(
-      hits.length > 0 ? `${hits.length} 件見つかりました。選んでください` : "見つかりませんでした",
+      hits.length > 0
+        ? `${hits.length} 件見つかりました。選んでください`
+        : "見つかりませんでした。市区町村名・都道府県名で言い換えてお試しください (例: 東京→東京都、横浜→横浜市)",
       false,
     );
   } catch (err) {
