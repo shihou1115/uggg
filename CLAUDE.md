@@ -28,7 +28,7 @@ v0.0.3 で得た主な負債:
 | 2 | アーキテクチャ設計（TTS再設計・状態管理再設計・DB再設計） | docs/architecture.md | ✅ |
 | 3 | テスト計画 | docs/test-plan.md | ✅ |
 | **4** | **実装着手**（垂直スライス・M0〜M10） | src/, src-tauri/src/ | ✅ M0〜M10 完了。**v0.2.0 リリース済**（2026-07-18、タグ `v0.2.0`。日常支援 Tier S 全 4 機能: リマインダー / ToDo・日課 / 状況発話+ガバナンス / カレンダー参照。記録は docs/release-notes/v0.2.0.md） |
-| **v0.3** | 定例会話 + 天気（spec §4.7、2026-07-18 スコープ確定） | spec v1.2.2 + docs/regular-talk-design.md（M11〜M12 実装済み） | ✅ **v0.3 実装完了**（2026-07-24、ブランチ `feat/v0.3-regular-talk`・**未 push/未リリース**。M11 天気基盤 + M12 定例会話。cargo test 248 / tsc green・ライブ API 検証済み・docs 追随済み）。**残**: 実機 UI 目視確認（天気節・定例会話）、v0.3 リリース作業（`.claude/skills/releasing-ugg`） |
+| **v0.3** | 定例会話 + 天気（spec §4.7、2026-07-18 スコープ確定） | spec v1.2.2 + docs/regular-talk-design.md v1.1（M11〜M12 実装済み）+ docs/release-notes/v0.3.0.md | ✅ **v0.3.0 タグ済み**（2026-07-24、`feat/v0.3-regular-talk` の `b9bf981`・タグ `v0.3.0`・**lightweight**。M11 天気基盤 + M12 定例会話。リリース監査 GO: cargo test 248 / tsc green・ライブ API・実機 UI 目視・**インストール版起動確認**まで PASS・SHA-256 記録済み）。**残**: master へマージ + `origin` へ push（`3353bcd` 以降が未 push） |
 
 ## 採用済みの技術選定（Phase 1〜2 で再調査しない）
 
