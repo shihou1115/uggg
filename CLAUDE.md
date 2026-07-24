@@ -18,6 +18,7 @@ v0.0.3 で得た主な負債:
 3. **コマンド/イベント/設定フィールドを増やすときは spec の改訂を伴う**。 場当たりの追加を禁止。
 4. **v0.0.3 を直接コピーしない**。 [docs/_legacy-v003/](docs/_legacy-v003/) は**参考資料**としてのみ扱い、コードや構造をそのまま流用しない。
 5. **ghost / shell 資産は流用するが Phase 1 で見直しの対象**。 辞書 events キーの整理も Phase 1 で実施。
+6. **docs を肥大化させない**。 新規 .md は正本への節追加を先に検討し、完遂で不要になる文書は冒頭に削除予定を明記して作る。索引の正本は本ファイルのドキュメント索引 1 箇所（docs 側に索引を新設しない）。**リリースのタグ打ち後に `.claude/skills/tidy-docs` で役目を終えた文書を整理する**（初回 2026-07-24: 28→18 ファイル。判定基準・不可侵リストは skill 側が正本）。
 
 ## 進行ロードマップ（Phase 4 着手前）
 
@@ -91,10 +92,6 @@ v0.0.3 で得た主な負債:
 | docs/spec.md | 要件の正本 | v1.2.2 ✅（§4.7 定例会話・天気 = v0.3・**M11/M12 実装済み**表記） |
 | docs/architecture.md | モジュール構成・契約・設計判断 | v1.6 ✅（M7〜M10 + **M11 天気 + M12 定例会話**契約反映済み） |
 | docs/test-plan.md | テスト戦略・手動チェックリスト | v1.2 ✅（§5 F 節に天気 F-1〜8 + 定例会話 F-9〜15。Tier S §4.6 手動項目は未追加の負債あり） |
-| docs/implementation-plan.md | 実装計画（M0〜M6 マイルストーン） | v1 ✅ |
 | docs/daily-support-design.md | **日常支援 Tier S の Phase 2 設計書**（§4.6 実装契約・DB・M7〜M10） | 設計 v2 ✅（**M7〜M10 実装済み**、Tier S 完了） |
 | docs/regular-talk-design.md | **定例会話と天気（v0.3）の Phase 2 設計書**（§4.7 実装契約・天気 API 選定・M11〜M12） | 設計 v1 ✅（**M11・M12 実装済み** 2026-07-24） |
-| [docs/_legacy-v003/baseline-v0.0.3.md](docs/_legacy-v003/baseline-v0.0.3.md) | **v0.0.3 機能・契約・残課題の網羅スナップショット** | 参照用 |
-| [docs/_legacy-v003/spec.md](docs/_legacy-v003/spec.md) | v0.0.3 要件（インプット） | 参照用 |
-| [docs/_legacy-v003/architecture.md](docs/_legacy-v003/architecture.md) | v0.0.3 設計（インプット） | 参照用 |
-| [docs/_legacy-v003/quality_checklist.md](docs/_legacy-v003/quality_checklist.md) | v0.0.3 リリース前チェック（インプット） | 参照用 |
+| [docs/_legacy-v003/baseline-v0.0.3.md](docs/_legacy-v003/baseline-v0.0.3.md) | **v0.0.3 機能・契約・残課題の網羅スナップショット**（v0.0.3 の生 docs は 2026-07-24 の docs 整理で削除。原本はプロトタイプ `C:\claude\ugga` と git 履歴に現存） | 参照用 |

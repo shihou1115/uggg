@@ -150,8 +150,7 @@
 ```
 
 ### 3.2 モジュール詳細索引
-[architecture.md §ディレクトリ構造](architecture.md#ディレクトリ構造) と
-[context_index.md](context_index.md) を参照。
+v0.0.3 の architecture.md / context_index.md を参照（**2026-07-24 の docs 整理で本リポジトリからは削除**。原本はプロトタイプリポジトリ `C:\claude\ugga\docs\` と本リポジトリの git 履歴に現存）。
 
 ---
 
@@ -255,17 +254,12 @@ windows-sys (Win32_*) / **libloading 0.8**（v0.0.3 で追加・voicevox_core FF
 
 ## 7. 関連ドキュメント
 
+v0.0.3 の docs 一式（spec / architecture / context_index / quality_checklist / ai_model_routing / subagent_prompt_templates）は **2026-07-24 の docs 整理で本リポジトリからは削除**した。原本はプロトタイプリポジトリ `C:\claude\ugga\docs\` と本リポジトリの git 履歴（タグ `v0.3.0` 以前）に現存する。
+
 | 役割 | ファイル |
 |---|---|
-| 要件の正本 | [spec.md](spec.md) |
-| 実装契約・モジュール構成・コマンド/イベント仕様 | [architecture.md](architecture.md) |
-| 詳細情報の所在索引 | [context_index.md](context_index.md) |
-| リリース前チェックリスト | [quality_checklist.md](quality_checklist.md) |
-| モデル使い分け方針 | [ai_model_routing.md](ai_model_routing.md) |
-| サブエージェント依頼テンプレ | [subagent_prompt_templates.md](subagent_prompt_templates.md) |
-| ゴースト定義の実例 | [../ghosts/default/ghost.json](../ghosts/default/ghost.json) / [../ghosts/default/dic/main.yaml](../ghosts/default/dic/main.yaml) |
-| シェル定義の実例 | [../shells/default/shell.json](../shells/default/shell.json) |
-| ユーザー向け案内 | [../README.md](../README.md) |
+| ゴースト定義の実例 | [../../ghosts/default/ghost.json](../../ghosts/default/ghost.json) / [../../ghosts/default/dic/main.yaml](../../ghosts/default/dic/main.yaml) |
+| シェル定義の実例 | [../../shells/default/shell.json](../../shells/default/shell.json) |
 
 ---
 

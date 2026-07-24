@@ -136,7 +136,7 @@ src/panels/reader.ts             -- パネル UI + 逐次再生ループ (先読
 | 4 | `commands/reader.rs` + `state.rs` reading フラグ + `quiet.rs` 判定 + `main.rs` 登録 | `cargo check` |
 | 5 | `index.html` パネル + `panels/reader.ts` + `dnd.ts` 分岐 + `context-menu.ts` 項目 | `npx tsc --noEmit` |
 | 6 | 手動テスト R1〜R8 (§5.2) — **R4 で G5+ 絵文字検証を兼ねる** | 実機 |
-| 7 | `docs/manual.md` / `docs/quality_checklist.md` 更新、コミット | — |
+| 7 | `docs/manual.md` / 実機検証記録（現 `docs/test-plan.md` §5.8）更新、コミット | — |
 
 ## 5. テスト計画
 
@@ -158,7 +158,7 @@ src/panels/reader.ts             -- パネル UI + 逐次再生ループ (先読
 11. `.txt` 以外の拡張子 → エラー
 12. 1MB 超 → エラー
 
-### 5.2 実機手動テスト (quality_checklist へ R 節として追加)
+### 5.2 実機手動テスト (R 節。実施記録は docs/test-plan.md §5.8 = 旧 quality_checklist)
 
 | # | 手順 | 期待 |
 |---|---|---|

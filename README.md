@@ -17,7 +17,7 @@
 - **定例会話・天気 (v0.3)**: 朝・夜の定例会話（予定・ToDo・リマインダー・天気をまとめて配達、設定時刻以降の初回操作時に配達・6h 失効）、天気・降雨の一言（Open-Meteo・キー不要・地域手動設定で既定オフ・座標は市区町村粒度に丸め・CC BY 4.0 出典表示）
 - **補助ツール**: チャットログ、エクスポート、ゴースト/シェル切替、自動起動、更新通知、時事ネタ RSS、DnD 配信、クリップボード補助
 
-詳細は [docs/spec.md](docs/spec.md) と [docs/implementation-plan.md](docs/implementation-plan.md) を参照。
+詳細は [docs/spec.md](docs/spec.md)（要件の正本）と [docs/architecture.md](docs/architecture.md)（設計）を参照。
 
 ## ビルド・実行
 
@@ -68,7 +68,7 @@ src-tauri/            # バックエンド (Rust + Tauri 2)
   python/sidecar.py   # Irodori-TTS FastAPI サイドカー (M4c)
 ghosts/default/       # 同梱ゴースト (辞書 v3)
 shells/default/       # 同梱シェル (画像 + 配置定義)
-docs/                 # spec / architecture / implementation-plan 等
+docs/                 # spec / architecture / test-plan / 機能別設計書 等
 ```
 
 ## データ配置
