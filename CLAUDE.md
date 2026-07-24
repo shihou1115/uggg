@@ -28,7 +28,7 @@ v0.0.3 で得た主な負債:
 | 2 | アーキテクチャ設計（TTS再設計・状態管理再設計・DB再設計） | docs/architecture.md | ✅ |
 | 3 | テスト計画 | docs/test-plan.md | ✅ |
 | **4** | **実装着手**（垂直スライス・M0〜M10） | src/, src-tauri/src/ | ✅ M0〜M10 完了。**v0.2.0 リリース済**（2026-07-18、タグ `v0.2.0`。日常支援 Tier S 全 4 機能: リマインダー / ToDo・日課 / 状況発話+ガバナンス / カレンダー参照。記録は docs/release-notes/v0.2.0.md） |
-| **v0.3** | 定例会話 + 天気（spec §4.7、2026-07-18 スコープ確定） | spec v1.2.1 + docs/regular-talk-design.md → 実装 M11〜M12 | 🔄 **M11（天気基盤）実装済み**（2026-07-24、ブランチ `feat/v0.3-regular-talk`。cargo/tsc green・ライブ API 検証済み・architecture v1.5 反映済み）。次は M12（定例会話。着手前に M11 天気節 UI の目視確認が残る） |
+| **v0.3** | 定例会話 + 天気（spec §4.7、2026-07-18 スコープ確定） | spec v1.2.2 + docs/regular-talk-design.md（M11〜M12 実装済み） | ✅ **v0.3 実装完了**（2026-07-24、ブランチ `feat/v0.3-regular-talk`・**未 push/未リリース**。M11 天気基盤 + M12 定例会話。cargo test 248 / tsc green・ライブ API 検証済み・docs 追随済み）。**残**: 実機 UI 目視確認（天気節・定例会話）、v0.3 リリース作業（`.claude/skills/releasing-ugg`） |
 
 ## 採用済みの技術選定（Phase 1〜2 で再調査しない）
 
@@ -88,12 +88,12 @@ v0.0.3 で得た主な負債:
 
 | ファイル | 役割 | 状態 |
 |---|---|---|
-| docs/spec.md | 要件の正本 | v1.2.1 ✅（§4.7 定例会話・天気 = v0.3 スコープ + 発火規則の当日失効） |
-| docs/architecture.md | モジュール構成・契約・設計判断 | v1.5 ✅（M7〜M10 + **M11 天気**契約反映済み。§4.7.1 定例会話=M12 は未反映） |
-| docs/test-plan.md | テスト戦略・手動チェックリスト | v1.1 ✅（§5 に F 天気節を追加。Tier S §4.6 手動項目は未追加の負債あり） |
+| docs/spec.md | 要件の正本 | v1.2.2 ✅（§4.7 定例会話・天気 = v0.3・**M11/M12 実装済み**表記） |
+| docs/architecture.md | モジュール構成・契約・設計判断 | v1.6 ✅（M7〜M10 + **M11 天気 + M12 定例会話**契約反映済み） |
+| docs/test-plan.md | テスト戦略・手動チェックリスト | v1.2 ✅（§5 F 節に天気 F-1〜8 + 定例会話 F-9〜15。Tier S §4.6 手動項目は未追加の負債あり） |
 | docs/implementation-plan.md | 実装計画（M0〜M6 マイルストーン） | v1 ✅ |
 | docs/daily-support-design.md | **日常支援 Tier S の Phase 2 設計書**（§4.6 実装契約・DB・M7〜M10） | 設計 v2 ✅（**M7〜M10 実装済み**、Tier S 完了） |
-| docs/regular-talk-design.md | **定例会話と天気（v0.3）の Phase 2 設計書**（§4.7 実装契約・天気 API 選定・M11〜M12） | 設計 v1 ✅（反証レビュー反映済み、未実装） |
+| docs/regular-talk-design.md | **定例会話と天気（v0.3）の Phase 2 設計書**（§4.7 実装契約・天気 API 選定・M11〜M12） | 設計 v1 ✅（**M11・M12 実装済み** 2026-07-24） |
 | [docs/_legacy-v003/baseline-v0.0.3.md](docs/_legacy-v003/baseline-v0.0.3.md) | **v0.0.3 機能・契約・残課題の網羅スナップショット** | 参照用 |
 | [docs/_legacy-v003/spec.md](docs/_legacy-v003/spec.md) | v0.0.3 要件（インプット） | 参照用 |
 | [docs/_legacy-v003/architecture.md](docs/_legacy-v003/architecture.md) | v0.0.3 設計（インプット） | 参照用 |
