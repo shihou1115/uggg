@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v1.4）
+# ugg アーキテクチャ設計書（architecture.md v1.5）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -129,7 +129,8 @@ src-tauri/src/
 │   ├── notify.rs            -- ★ 統合通知サービス notify()（横断方針 §3.1 ゴースト発話原則）
 │   ├── deliver.rs           -- ★M7 通知配達サービス deliver_event（自発発話の単一経路、§11.4）
 │   ├── governance.rs        -- ★M7 発話ガバナンス can_deliver / record_delivered（§11.4）
-│   └── calendar.rs          -- ★M10 ICS 取得・自前パース・RRULE near-term 展開（読み取り専用、§4.6.4）
+│   ├── calendar.rs          -- ★M10 ICS 取得・自前パース・RRULE near-term 展開（読み取り専用、§4.6.4）
+│   └── weather.rs           -- ★M11 Open-Meteo forecast 取得・app_settings JSON キャッシュ・WMO ラベル・降雨判定（§4.7.2）
 │
 └── tools/                   -- ツール群
     ├── mod.rs
@@ -236,6 +237,7 @@ CREATE TABLE app_settings (
 ```
 - `"settings"` キーに Settings 構造体全体を JSON で保存（フィールド追加に DDL 不要）
 - 個別キー: `window_pos`（{x,y}。ステージのドック先モニタの記憶に使う）, `char_pos`（{main,sub} キャラごとの X 位置 CSS px）, `first_boot_done`（"1"）, `last_update_check`（unix秒）, `profile_onboarded`（"1"）, `update_notice_seen:<version>`（"1"）等
+- ★M11 天気: `weather_cache`（WeatherCache を JSON。専用テーブルを持たず app_settings に保存。「解除」= 空文字で消去、§4.7.2）, `weather_rain_date`（降雨の一言の 1 日 1 回 dedup。`*_date` 系と同型）
 
 #### `chat_log`
 ```sql
@@ -402,8 +404,8 @@ pub struct AppState {
 // system/governance.rs (★M7、M9 拡張)。backoff のみ app_settings に永続化
 pub struct GovernanceState {
     pub last_spoke: AtomicI64,                       // 最後に自発発話が到達した unix 秒
-    pub last_by_category: [AtomicI64; 9],            // カテゴリ別（SpeechCategory::index()）。段 5 が参照
-    pub backoff: [AtomicU32; 9],                     // ★M9 🔕 回数。governance_backoff:<cat> から復元
+    pub last_by_category: [AtomicI64; 12],           // カテゴリ別（SpeechCategory::index()）。段 5 が参照。★M11 9→12（SituationRain/RegularMorning/RegularEvening）
+    pub backoff: [AtomicU32; 12],                    // ★M9 🔕 回数。governance_backoff:<cat> から復元。★M11 12 へ拡張
     pub speech_seq: AtomicU64,                       // ★M9 speech_id 連番
     pub last_speech: Mutex<Option<(u64, SpeechCategory)>>, // ★M9 最新タグ付き発話（🔕 照合用）
 }
@@ -657,6 +659,13 @@ pub struct GhostBundle {
 | `add_calendar_source` | `source: CalendarSource`（`{kind:"file",path}`\|`{kind:"url",url}`） | `CalendarSource[]` | 追加。source_id は index ベースのため**キャッシュを全 clear**して再取得 |
 | `remove_calendar_source` | `index: usize` | `CalendarSource[]` | 削除。同上でキャッシュ全 clear |
 
+★M11 天気（spec §4.7.2）。新規イベントなし（天気キャッシュ更新は UI へ push しない）。
+
+| コマンド | 引数 | 戻り値 | 説明 |
+|---|---|---|---|
+| `search_location` | `query: String` | `LocationHit[]` | Open-Meteo Geocoding（language=ja）。2 文字未満は Err、0 件は空配列。設定は書かない（選択・保存はフロントが `set_settings`） |
+| `get_weather` | — | `WeatherSnapshot \| null` | `ensure_fresh` 経由の今日/明日予報。`weather_ready` でなければ null |
+
 ### 4.10 window
 
 | コマンド | 引数 | 戻り値 | 説明 |
@@ -682,6 +691,7 @@ pub struct GhostBundle {
 | `calendar-changed` | なし | ★M10 カレンダーの変更通知（取得・通知・ソース編集）。パネルが再取得 |
 
 **注**:
+- ★M11 天気は新規イベントを追加しない。天気キャッシュ更新は UI へ push せず、設定 UI は `get_weather` の戻り値で表示する。地域設定・解除は既存 `settings-changed` が飛ぶ。
 - U3 採用により system 発話は `notify()` 内部で `dialogue` 経由に統合する（§11）。`system-toast` は辞書未定義時の fallback のみ。
 - 旧設計の `mode-changed` / `thinking` / `voice-ref-progress` イベントは不採用。モードは `DialogueResponse.mode` で各応答に同梱、思考中表示は送信中の入力欄 disable で代替、参照音声生成は `voice_ref_generate` の同期完了で通知する。
 
@@ -812,6 +822,11 @@ events:
 
   # ★M10 カレンダー開始前通知（Notice=静音を越える。サブ主体）
   calendar_upcoming: [ ... ]    # {summary} = 予定名、{time} = 開始 HH:MM（終日は「今日」）
+
+  # ★M11 降雨の一言（spec §4.7.2。SituationRain=Ambient・朝帯 1 日 1 回・既定 OFF）
+  weather_rain: [ ... ]         # {label} = 天気ラベル、{p} = 降水確率%
+  weather_rain_outing: [ ... ]  # 当日に時刻付き予定があるときの強め版。{label} {p}
+  # 定例会話 regular_morning / regular_evening は M12（§4.7.1、未実装）
 ```
 
 **★M7 プレースホルダ規約**（daily-support-design §3.3）: `system/deliver.rs` 経由の
@@ -1344,7 +1359,7 @@ pub enum DeliveryOutcome { Ghost, Toast, Deferred, Failed }  // reached() = Ghos
 
 pub async fn deliver_event(
     app, state,
-    category: SpeechCategory,     // Monologue / Idle / Reminder / (M8-M10: Todo / Calendar / Situation*)
+    category: SpeechCategory,     // Monologue / Idle / Reminder / Todo / Calendar / Situation* / ★M11 SituationRain / (M12: RegularMorning・RegularEvening)
     priority: Priority,           // Notice = 必ず届く（全段免除） / Ambient = 気配り系（全段適用）
     key: &str,                    // 辞書 events キー（Monologue のみ monologue セクション）
     placeholders: &[(&str, &str)],
@@ -1366,7 +1381,7 @@ pub async fn deliver_event(
   deactivate（発火済み・未完了）、繰り返しは次回 due へ reschedule。未達は active 維持で再試行。
   起動 20 秒後に一度だけ回収パスを実行し、停止中に過ぎた期限が複数あれば
   「『直近の本文』（ほか N-1 件）」の 1 発話に集約する。
-- **daily watcher**（★M8、tasks.rs、60 秒間隔・起動 30 秒後開始）: ①起動時 + ローカル
+- **daily watcher**（★M8/M11、tasks.rs、60 秒間隔・起動 30 秒後開始）: ①起動時 + ローカル
   日付の変更検知で日課を復活（`tools::todo::reset_recurring`、冪等）し `todos-changed` を
   emit。②朝の時間帯（5:00-11:00）に 1 日 1 回、today の未完了が 1 件以上なら
   `todo_morning`（{count}、Ambient）を配達。告知済み日付は app_settings
@@ -1375,6 +1390,11 @@ pub async fn deliver_event(
   リマインダー watcher とは分離（`reminder_notify_enabled` と結合させない）。
   設計書 §7.2 の「既存 watcher にピギーバック」は、リマインダー watcher が通知トグルで
   ループを止める構造のため専用 watcher に変更した（実装判断）。
+  ★M11: ③天気の定期取得（`weather_ready` の間 3 時間ごと `weather::refresh_cache`、失敗は
+  既存キャッシュ維持）。④降雨の一言（朝帯 5:00-11:00・1 日 1 回、`weather::ensure_fresh` の
+  今日材料が降雨なら `weather_rain`/`weather_rain_outing`（当日の時刻付き予定の有無で出し分け）を
+  `SituationRain`=Ambient で配達。`weather_rain_date` で dedup。`regular_morning_enabled` 有効時は
+  吸収する条件式を持つが、結線は M12〔regular_* の発火は M12〕）。
 - **context watcher**（★M9、tasks.rs、60 秒間隔・起動 45 秒後開始）: `presence/context.rs`
   の OS 検知（GetLastInputInfo / GetSystemPowerStatus）で連続利用セッションを計測
   （アイドル 5 分で境界）し、状況発話 4 カテゴリを Ambient で配達する。閾値は
@@ -1582,3 +1602,4 @@ async fn install_asset(
 | 2026-07-17 | v1.2 | M8（ToDo・日課管理 §4.6.2）を反映。DB v7 `todos`（§2）/ `tools/todo.rs`（検証 + 日課復活の境界計算）/ ToDo コマンド 6 種 + `todos-changed`（§4.11・§5）/ daily watcher（日課復活 + 朝の件数告知、§11.4）/ 辞書 events `todo_morning`・`todo_done`（発火）+ `todo_follow`・`todo_stale`（キーのみ、発火は M9）（§6.2）/ パネルに ToDo 節（3 バケットタブ） |
 | 2026-07-18 | v1.4 | M10（カレンダー参照 §4.6.4、読み取り専用）を反映。DB v8 `calendar_cache`（複合キー + 実装追加列 unsupported、§2）/ `system/calendar.rs`（ICS 自前パース + RRULE near-term 展開 + TZ 簡易解決）/ カレンダーコマンド 4 種 + `calendar-changed`（§4.11・§5）/ calendar watcher（取得 + 開始前通知、§11.4）/ 辞書 `calendar_upcoming`（§6.2）/ Settings に calendar_sources（File\|Url）+ calendar_notify_min / フロント設定カレンダー UI + パネル今日明日表示。ファイル選択ダイアログは見送り（パス手入力、依存を増やさない）。**Tier S 4 機能そろい → v0.2 リリース候補**。 |
 | 2026-07-17 | v1.3 | M9（状況発話 + 検知 + ガバナンス完成 §4.6.3）を反映。`presence/context.rs`（OS 検知 + 閾値純関数、windows crate に Power/SystemInformation feature 追加）/ context watcher（休憩・深夜・バッテリー・ToDo フォロー/滞留、§11.4）/ gate 段 5 連投回避 + 🔕 backoff（`feedback_speech` §4.11、`governance_backoff:*` 永続化）/ `DialogueResponse` に speech_id・category・priority・feedback_allowed（§5、バック起点のみ）/ フロント #balloon-mute + 設定「状況に応じた声かけ」セクション / 辞書 `situation_break`・`situation_late_night`・`situation_battery`・`todo_quit`（§6.2。`situation_todo_follow` キーは `todo_follow`/`todo_stale` に統合）/ 終了前確認（tray quit で todo_quit 優先、spec §4.6.2 後半）/ AppState に ContextState（§3） |
+| 2026-07-24 | v1.5 | M11（天気基盤 §4.7.2）を反映。`system/weather.rs`（Open-Meteo forecast 取得・`app_settings["weather_cache"]` JSON キャッシュ = 新テーブルなし・schema v8 維持・WMO→日本語ラベル・降雨判定、§1.2/§2.2）/ 天気コマンド `search_location`・`get_weather`（§4.11、新規イベントなし §5）/ daily watcher に天気 3h 定期取得 + 降雨の一言（`weather_rain`/`weather_rain_outing`、§6.2・§11.4）/ SpeechCategory 9→12（`SituationRain` + M12 用 `RegularMorning`/`RegularEvening` を一括追加）+ `feedback_target()` で Regular* を間隔バックオフ非適用のまま 🔕 対象化、🔕 の is_situation ゲートを `deliver.rs` と `feedback_speech` の 2 箇所差し替え（§3.1）/ Settings 11 フィールド（weather_*4・situation_rain・regular_*6）+ 座標の小数 1 桁丸め clamp / 設定に天気節 + `#weather-credit` 出典表示（CC-BY 4.0）。**§4.7.1 定例会話（M12）は未実装**。 |
