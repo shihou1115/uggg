@@ -98,9 +98,7 @@ pub fn today_material(cache: &WeatherCache) -> Option<&DailyWeather> {
     material_for_date(cache, chrono::Local::now().date_naive())
 }
 
-/// 明日の材料。夜の定例会話 (M12) が消費する。M11 時点では未結線のため
-/// `#[allow(dead_code)]` (§3 の weather.rs 責務として today_material と対で今 M に含める)。
-#[allow(dead_code)]
+/// 明日の材料。夜の定例会話 (M12、regular_talk::build_evening_materials) が消費する。
 pub fn tomorrow_material(cache: &WeatherCache) -> Option<&DailyWeather> {
     material_for_date(cache, chrono::Local::now().date_naive() + chrono::Duration::days(1))
 }

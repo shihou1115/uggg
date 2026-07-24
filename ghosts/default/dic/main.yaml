@@ -550,6 +550,27 @@ events:
     - main: { text: "そろそろ『{summary}』の時間が近いね（{time}）", pose: normal }
       sub: { text: "準備するなら今のうちだ", pose: normal }
 
+  # 朝の定例会話 (M12, spec §4.7.1)。{body} は今日の予定・ToDo・未完了リマインダー・
+  # 天気をまとめた集約文 (low は決定論、advanced は言い回し整形のみ)。{body} が空文字でも
+  # 導入だけで自然に読める形にする (材料が全部空の朝はあいさつだけになる)。既定オフ。
+  regular_morning:
+    - main: { text: "おはよ！{body}", pose: happy }
+      sub: { text: "朝の報告は以上だ。今日もぼちぼちやれ", pose: normal }
+    - main: { text: "おはよう、今日も始まるね。{body}", pose: happy }
+      sub: { text: "聞き逃すなよ。一回しか言わないからな", pose: normal }
+    - main: { text: "朝だよ〜！{body}", pose: happy }
+      sub: { text: "支度はできてるか？ボクは万全だ", pose: normal }
+
+  # 夜の定例会話 (M12, spec §4.7.1)。{body} は今日の完了実績・持ち越し・明日の予定・
+  # 明日の天気をまとめた集約文。既定オフ。
+  regular_evening:
+    - main: { text: "今日もおつかれさま。{body}", pose: normal }
+      sub: { text: "あとは休むだけだ。いい夜を", pose: normal }
+    - main: { text: "一日おわり！{body}", pose: happy }
+      sub: { text: "がんばった分、ちゃんと休め", pose: normal }
+    - main: { text: "今日も一日いっしょにいられたね。{body}", pose: happy }
+      sub: { text: "……明日もまた、ここにいる", pose: troubled }
+
   # 降雨の一言 (M11, spec §4.7.2)。{label} は天気ラベル (「雨」「にわか雨」等)、
   # {p} は降水確率。既定オフ・状況発話 (SituationRain)・サブ主体・朝帯 1 日 1 回。
   weather_rain:

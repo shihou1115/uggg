@@ -286,6 +286,31 @@ body {
   font-weight: bold;
 }
 
+/* ===== 定例会話の曜日トグル (M12, regular-talk-design §9.1) ===== */
+.weekday-toggles {
+  flex: 1;
+  display: flex;
+  gap: 4px;
+}
+
+.weekday-toggle {
+  flex: 1;
+  font-size: 12px;
+  padding: 4px 0;
+  border: 1px solid #aaa;
+  border-radius: 6px;
+  background: white;
+  color: #444;
+  cursor: pointer;
+}
+
+.weekday-toggle.active {
+  border-color: #6e8db5;
+  background: #e3ecf7;
+  color: #33567e;
+  font-weight: bold;
+}
+
 .todo-item .daily-item-head {
   cursor: default; /* リマインダー行と違い履歴展開は無い */
 }

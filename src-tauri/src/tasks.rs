@@ -4,7 +4,8 @@
 //! - 放置監視: 60 秒チェック、最終操作から 30 分で 1 回 idle。
 //! - リマインダー watcher: 10 秒間隔で発火・起動時回収 (M7)。
 //! - daily watcher: 日課の復活 (日付変更検知) + 朝の ToDo 件数告知 (M8) +
-//!   天気の定期取得 + 降雨の一言 (M11、spec §4.7.2)。
+//!   天気の定期取得 + 降雨の一言 (M11、spec §4.7.2) + 朝・夜の定例会話
+//!   (M12、spec §4.7.1 / regular-talk-design §5.1)。
 //! - context watcher: OS 状況検知 → 状況発話 4 カテゴリ (M9、spec §4.6.3)。
 //! - Irodori サイドカーのアイドル監視: 60 秒チェック、最終使用から 5 分で自動 shutdown (M4c Phase E)。
 //!
@@ -16,7 +17,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use tauri::{AppHandle, Emitter};
 
 use crate::db::{ReminderKind, ReminderRow};
@@ -24,7 +25,7 @@ use crate::presence::{context, idle};
 use crate::state::AppState;
 use crate::system::deliver::{self, DeliveryOutcome};
 use crate::system::governance::{Priority, SpeechCategory};
-use crate::system::weather;
+use crate::system::{regular_talk, weather};
 use crate::tools::reminder::next_recurring_due_ts;
 
 /// ランダムトークタスク。1 分ごとに「前回発話からの経過 >= 設定間隔」を判定。
@@ -628,16 +629,24 @@ fn aggregate_overdue_body(latest: &ReminderRow, total: usize) -> String {
     format!("{name}（ほか{}件）", total - 1)
 }
 
-/// M8 (spec §4.6.2) / M11 (spec §4.7.2): daily watcher。
+/// M8 (spec §4.6.2) / M11 (spec §4.7.2) / M12 (spec §4.7.1): daily watcher。
+/// tick 内の処理順は regular-talk-design §5.1 のとおり「定例 > 単独告知」
+/// (吸収を先に判定し、同一 tick でのレース窓を作らない):
 /// - 日課の復活: 起動時 + ローカル日付の変更検知で `reset_recurring` (冪等) を実行し、
 ///   復活があれば `todos-changed` を emit。
 /// - 天気の定期取得 (M11): 3 時間ごとに `weather::refresh_cache` を呼びキャッシュを更新する
 ///   (calendar watcher の 30 分 fetch と同型)。
+/// - 朝の定例会話 (M12): 発火条件 (§5.2) を満たしたら材料集約 → 定型文組み立て →
+///   deliver_event。発火を試みたら同一 tick の朝告知・降雨・夜の定例会話をスキップする
+///   (1 tick 1 枠)。
 /// - 朝の件数告知: 朝の時間帯 (5:00-11:00、辞書 boot の朝帯と同じ) に 1 日 1 回、
 ///   today バケットの未完了が 1 件以上なら `todo_morning` を配達 (Ambient・ゲート下)。
 ///   告知済みのローカル日付は app_settings に保持し、再起動で二重告知しない。
+///   `regular_morning_enabled == true` の間は吸収され単独発火しない (§5.5)。
 /// - 降雨の一言 (M11): 同じ朝帯に 1 日 1 回、天気材料が降雨と判定できたら
 ///   `weather_rain`/`weather_rain_outing` を配達 (SituationRain、regular-talk-design §5.6)。
+///   朝告知と同じく `regular_morning_enabled == true` の間は吸収される。
+/// - 夜の定例会話 (M12): 発火条件を満たしたら同様に配達する。
 /// リマインダー watcher とは分離する (reminder_notify_enabled と結合させない)。
 pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
     const CHECK_INTERVAL_SECS: u64 = 60;
@@ -654,6 +663,10 @@ pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
         loop {
             let now_local = chrono::Local::now();
             let today = now_local.date_naive();
+            let (hour, minutes_now) = {
+                use chrono::Timelike;
+                (now_local.hour(), (now_local.hour() * 60 + now_local.minute()) as u16)
+            };
 
             // 1) 日課の復活 (起動直後の初回 tick + 日付変更時)。
             //    DB エラー時は last_date を進めず次 tick で再試行する (失敗を消化しない)。
@@ -683,17 +696,24 @@ pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
                 }
             }
 
-            // 3) 朝の件数告知 (1 日 1 回・朝帯のみ・daily_support 有効時)
-            let hour = {
-                use chrono::Timelike;
-                now_local.hour()
+            let (daily_enabled, regular_morning_enabled, rain_enabled) = {
+                let s = state.settings.lock().expect("settings poisoned");
+                (s.daily_support_enabled, s.regular_morning_enabled, s.situation_rain_enabled)
             };
-            let daily_enabled = state
-                .settings
-                .lock()
-                .expect("settings poisoned")
-                .daily_support_enabled;
-            if daily_enabled && (MORNING_FROM_HOUR..MORNING_TO_HOUR).contains(&hour) {
+
+            // 3) 朝の定例会話の判定 (M12、regular-talk-design §5.1/§5.2)。
+            //    条件を満たして配達を試みたら 4/5/6 はこの tick でスキップ (1 tick 1 枠)。
+            let morning_fired_this_tick = fire_morning_regular(&app, &state, today, minutes_now).await;
+
+            // 4) 朝の件数告知 (1 日 1 回・朝帯のみ・daily_support 有効時)。
+            //    regular_morning_enabled == true の間は吸収され単独発火しない (§5.5)。
+            if morning_absorption_allows(
+                regular_morning_enabled,
+                daily_enabled,
+                hour,
+                MORNING_FROM_HOUR,
+                MORNING_TO_HOUR,
+            ) {
                 let announced = state
                     .db
                     .get_setting(MORNING_DATE_KEY)
@@ -735,26 +755,194 @@ pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
                 }
             }
 
-            // 4) 降雨の一言 (M11、regular-talk-design §5.6)。朝帯・1 日 1 回・SituationRain。
-            //    regular_morning_enabled による吸収は M12 で結線するが、フィールド自体は
-            //    既に存在する (§4.1) ため条件式ごと書いておく。M11 では既定 false (UI 無し)
-            //    のため常に単独発火になる。
-            let (rain_enabled, regular_morning_enabled) = {
-                let s = state.settings.lock().expect("settings poisoned");
-                (s.situation_rain_enabled, s.regular_morning_enabled)
-            };
-            if daily_enabled
-                && rain_enabled
+            // 5) 降雨の一言 (M11、regular-talk-design §5.6)。朝帯・1 日 1 回・SituationRain。
+            //    朝告知と同じ吸収規則 (regular_morning_enabled == true の間は単独発火しない、§5.5)。
+            if morning_absorption_allows(
+                regular_morning_enabled,
+                daily_enabled,
+                hour,
+                MORNING_FROM_HOUR,
+                MORNING_TO_HOUR,
+            ) && rain_enabled
                 && weather_ready
-                && !regular_morning_enabled
-                && (MORNING_FROM_HOUR..MORNING_TO_HOUR).contains(&hour)
             {
                 fire_rain_once(&app, &state, today).await;
+            }
+
+            // 6) 夜の定例会話の判定 (M12)。同一 tick で朝が発火していたらスキップ
+            //    (1 tick 1 枠。朝夜の窓が重なる設定でも夜枠は次 tick 以降に直列化される)。
+            if !morning_fired_this_tick {
+                fire_evening_regular(&app, &state, today, minutes_now).await;
             }
 
             tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
         }
     });
+}
+
+/// 「PC を使っている」判定の閾値 (idle 秒未満をアクティブとみなす、regular-talk-design §5.2)。
+const REGULAR_ACTIVE_IDLE_SECS: i64 = 5 * 60;
+/// 発火失効窓 (分)。設定時刻からこの分数を過ぎたら当日分は失効する (regular-talk-design §5.2)。
+const REGULAR_SLOT_EXPIRE_MIN: u32 = 360;
+
+/// 定例会話 1 枠の発火条件 (regular-talk-design §5.2)。純粋判定・副作用なし。
+/// `weekday_bit`: 0=月..6=日 (`chrono::Datelike::weekday().num_days_from_monday()` の値、
+/// `tools::reminder` の weekday_mask と同一定義)。`idle_secs`: `presence::context::os_idle_secs()`
+/// の値 (None は判定不能 → アクティブ扱いで発火する)。
+#[allow(clippy::too_many_arguments)]
+fn regular_slot_due(
+    daily_support_enabled: bool,
+    slot_enabled: bool,
+    weekday_mask: u8,
+    weekday_bit: u8,
+    minutes_now: u16,
+    slot_time: u16,
+    delivered_today: bool,
+    idle_secs: Option<i64>,
+) -> bool {
+    if !daily_support_enabled || !slot_enabled || delivered_today {
+        return false;
+    }
+    if weekday_mask & (1 << weekday_bit) == 0 {
+        return false;
+    }
+    let minutes_now = minutes_now as u32;
+    let slot_time = slot_time as u32;
+    let expire = (slot_time + REGULAR_SLOT_EXPIRE_MIN).min(1440);
+    if !(minutes_now >= slot_time && minutes_now < expire) {
+        return false;
+    }
+    idle_secs.map(|s| s < REGULAR_ACTIVE_IDLE_SECS).unwrap_or(true)
+}
+
+/// 朝の件数告知・降雨の一言が単独発火の判定対象になるか (`regular_morning_enabled` に
+/// よる吸収、regular-talk-design §5.5)。吸収は設定値のみで判定し配達実績は見ない。
+fn morning_absorption_allows(
+    regular_morning_enabled: bool,
+    daily_support_enabled: bool,
+    hour: u32,
+    morning_from_hour: u32,
+    morning_to_hour: u32,
+) -> bool {
+    !regular_morning_enabled
+        && daily_support_enabled
+        && (morning_from_hour..morning_to_hour).contains(&hour)
+}
+
+/// M12 (spec §4.7.1): 朝の定例会話の判定 + 配達。条件成立で材料集約 → 定型文組み立て →
+/// (advanced なら LLM 整形) → `deliver_event`。消化規約は既存 watcher と同型
+/// (`Ghost`|`Failed` → date キー消化、`Deferred` → 次 tick 再挑戦)。
+/// 戻り値: この tick で発火条件を満たして配達を試みたか (1 tick 1 枠、夜枠の判定が使う)。
+async fn fire_morning_regular(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    today: chrono::NaiveDate,
+    minutes_now: u16,
+) -> bool {
+    const DATE_KEY: &str = "regular_morning_date";
+    let (daily_support_enabled, enabled, time, days) = {
+        let s = state.settings.lock().expect("settings poisoned");
+        (
+            s.daily_support_enabled,
+            s.regular_morning_enabled,
+            s.regular_morning_time,
+            s.regular_morning_days,
+        )
+    };
+    let delivered_today = state
+        .db
+        .get_setting(DATE_KEY)
+        .ok()
+        .flatten()
+        .map(|v| v == today.to_string())
+        .unwrap_or(false);
+    let weekday_bit = today.weekday().num_days_from_monday() as u8;
+    let idle_secs = context::os_idle_secs();
+    if !regular_slot_due(
+        daily_support_enabled,
+        enabled,
+        days,
+        weekday_bit,
+        minutes_now,
+        time,
+        delivered_today,
+        idle_secs,
+    ) {
+        return false;
+    }
+    let materials = regular_talk::build_morning_materials(state).await;
+    let script = regular_talk::build_morning_script(&materials);
+    let script = regular_talk::polish_script(state, &script).await;
+    let outcome = deliver::deliver_event(
+        app,
+        state,
+        SpeechCategory::RegularMorning,
+        Priority::Ambient,
+        "regular_morning",
+        &[("body", script.as_str())],
+        None,
+    )
+    .await;
+    if matches!(outcome, DeliveryOutcome::Ghost | DeliveryOutcome::Failed) {
+        let _ = state.db.set_setting(DATE_KEY, &today.to_string());
+    }
+    true
+}
+
+/// M12 (spec §4.7.1): 夜の定例会話の判定 + 配達。`fire_morning_regular` と同型。
+async fn fire_evening_regular(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    today: chrono::NaiveDate,
+    minutes_now: u16,
+) {
+    const DATE_KEY: &str = "regular_evening_date";
+    let (daily_support_enabled, enabled, time, days) = {
+        let s = state.settings.lock().expect("settings poisoned");
+        (
+            s.daily_support_enabled,
+            s.regular_evening_enabled,
+            s.regular_evening_time,
+            s.regular_evening_days,
+        )
+    };
+    let delivered_today = state
+        .db
+        .get_setting(DATE_KEY)
+        .ok()
+        .flatten()
+        .map(|v| v == today.to_string())
+        .unwrap_or(false);
+    let weekday_bit = today.weekday().num_days_from_monday() as u8;
+    let idle_secs = context::os_idle_secs();
+    if !regular_slot_due(
+        daily_support_enabled,
+        enabled,
+        days,
+        weekday_bit,
+        minutes_now,
+        time,
+        delivered_today,
+        idle_secs,
+    ) {
+        return;
+    }
+    let materials = regular_talk::build_evening_materials(state).await;
+    let script = regular_talk::build_evening_script(&materials);
+    let script = regular_talk::polish_script(state, &script).await;
+    let outcome = deliver::deliver_event(
+        app,
+        state,
+        SpeechCategory::RegularEvening,
+        Priority::Ambient,
+        "regular_evening",
+        &[("body", script.as_str())],
+        None,
+    )
+    .await;
+    if matches!(outcome, DeliveryOutcome::Ghost | DeliveryOutcome::Failed) {
+        let _ = state.db.set_setting(DATE_KEY, &today.to_string());
+    }
 }
 
 /// 降雨の一言 (M11、spec §4.7.2 / regular-talk-design §5.6)。朝帯 1 日 1 回、
@@ -968,5 +1156,86 @@ mod tests {
         let t = next_health_tick(0, false, 1);
         assert!(t.should_trigger);
         assert_eq!(t.fails_after, 0);
+    }
+
+    // ===== regular_slot_due (M12, regular-talk-design §5.2) =====
+
+    const ALL_DAYS: u8 = 0x7F;
+    /// 8:00 = 480 分。
+    const MORNING_TIME: u16 = 480;
+
+    #[test]
+    fn regular_slot_due_all_conditions_true() {
+        assert!(regular_slot_due(true, true, ALL_DAYS, 0, MORNING_TIME, MORNING_TIME, false, Some(0)));
+    }
+
+    #[test]
+    fn regular_slot_due_false_when_master_or_slot_disabled() {
+        assert!(!regular_slot_due(false, true, ALL_DAYS, 0, MORNING_TIME, MORNING_TIME, false, Some(0)));
+        assert!(!regular_slot_due(true, false, ALL_DAYS, 0, MORNING_TIME, MORNING_TIME, false, Some(0)));
+    }
+
+    #[test]
+    fn regular_slot_due_false_when_already_delivered_today() {
+        assert!(!regular_slot_due(true, true, ALL_DAYS, 0, MORNING_TIME, MORNING_TIME, true, Some(0)));
+    }
+
+    #[test]
+    fn regular_slot_due_checks_weekday_bit() {
+        // bit0=月 のみ有効、weekday_bit=1 (火) は対象外
+        let mon_only: u8 = 0b0000001;
+        assert!(regular_slot_due(true, true, mon_only, 0, MORNING_TIME, MORNING_TIME, false, Some(0)));
+        assert!(!regular_slot_due(true, true, mon_only, 1, MORNING_TIME, MORNING_TIME, false, Some(0)));
+    }
+
+    #[test]
+    fn regular_slot_due_minutes_comparison() {
+        // 設定時刻ちょうどは発火、直前は発火しない
+        assert!(regular_slot_due(true, true, ALL_DAYS, 0, MORNING_TIME, MORNING_TIME, false, Some(0)));
+        assert!(!regular_slot_due(true, true, ALL_DAYS, 0, MORNING_TIME - 1, MORNING_TIME, false, Some(0)));
+    }
+
+    #[test]
+    fn regular_slot_due_expire_window_boundary() {
+        // 失効窓は 360 分。設定時刻 + 359 分は発火、+360 分は失効 (半開区間)
+        let just_before_expire = MORNING_TIME + REGULAR_SLOT_EXPIRE_MIN as u16 - 1;
+        let at_expire = MORNING_TIME + REGULAR_SLOT_EXPIRE_MIN as u16;
+        assert!(regular_slot_due(true, true, ALL_DAYS, 0, just_before_expire, MORNING_TIME, false, Some(0)));
+        assert!(!regular_slot_due(true, true, ALL_DAYS, 0, at_expire, MORNING_TIME, false, Some(0)));
+    }
+
+    #[test]
+    fn regular_slot_due_expire_window_clamped_to_midnight() {
+        // 設定時刻 21:40 (1300分) + 360分 = 1660分 は当日に存在しないため 1440 に clamp される。
+        // 当日の最終分 (1439) はどちらにせよ発火してよい (clamp してもしなくても真)。
+        let late_time: u16 = 1300;
+        assert!(regular_slot_due(true, true, ALL_DAYS, 0, 1439, late_time, false, Some(0)));
+    }
+
+    #[test]
+    fn regular_slot_due_idle_gate() {
+        // アクティブ (5分未満) は発火、非アクティブは発火しない、取得不能はアクティブ扱い
+        assert!(regular_slot_due(true, true, ALL_DAYS, 0, MORNING_TIME, MORNING_TIME, false, Some(299)));
+        assert!(!regular_slot_due(true, true, ALL_DAYS, 0, MORNING_TIME, MORNING_TIME, false, Some(300)));
+        assert!(regular_slot_due(true, true, ALL_DAYS, 0, MORNING_TIME, MORNING_TIME, false, None));
+    }
+
+    // ===== morning_absorption_allows (M12, regular-talk-design §5.5) =====
+
+    #[test]
+    fn morning_absorption_allows_blocks_when_regular_morning_enabled() {
+        assert!(!morning_absorption_allows(true, true, 7, 5, 11));
+    }
+
+    #[test]
+    fn morning_absorption_allows_true_when_regular_morning_disabled() {
+        assert!(morning_absorption_allows(false, true, 7, 5, 11));
+    }
+
+    #[test]
+    fn morning_absorption_allows_respects_daily_support_and_hour_band() {
+        assert!(!morning_absorption_allows(false, false, 7, 5, 11), "daily_support off");
+        assert!(!morning_absorption_allows(false, true, 12, 5, 11), "朝帯の外");
+        assert!(!morning_absorption_allows(false, true, 4, 5, 11), "朝帯の前");
     }
 }

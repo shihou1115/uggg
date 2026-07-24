@@ -107,6 +107,15 @@ interface Inputs {
   calNotifyMin: HTMLInputElement;
   calRefresh: HTMLButtonElement;
   calMessage: HTMLElement;
+  // M12: 朝・夜の定例会話
+  regularMorningEnabled: HTMLInputElement;
+  regularMorningTime: HTMLInputElement;
+  regularMorningDays: HTMLElement;
+  regularMorningQuietHint: HTMLElement;
+  regularEveningEnabled: HTMLInputElement;
+  regularEveningTime: HTMLInputElement;
+  regularEveningDays: HTMLElement;
+  regularEveningQuietHint: HTMLElement;
   // M11: 天気
   weatherPlaceState: HTMLElement;
   weatherSearchInput: HTMLInputElement;
@@ -137,6 +146,8 @@ let irodoriAssetsReady = false;
 
 export async function mountSettingsPanel(): Promise<void> {
   inputs = collectInputs();
+  buildWeekdayToggles(inputs.regularMorningDays);
+  buildWeekdayToggles(inputs.regularEveningDays);
   attachHandlers(inputs);
   // 外部 (トレイ・notify) からの設定変更を反映するため
   await listen<Settings>("settings-changed", (ev) => {
@@ -318,6 +329,14 @@ function collectInputs(): Inputs {
     calNotifyMin: byId<HTMLInputElement>("settings-calendar-notify-min"),
     calRefresh: byId<HTMLButtonElement>("settings-calendar-refresh"),
     calMessage: byId("settings-calendar-message"),
+    regularMorningEnabled: byId<HTMLInputElement>("settings-regular-morning-enabled"),
+    regularMorningTime: byId<HTMLInputElement>("settings-regular-morning-time"),
+    regularMorningDays: byId("settings-regular-morning-days"),
+    regularMorningQuietHint: byId("settings-regular-morning-quiet-hint"),
+    regularEveningEnabled: byId<HTMLInputElement>("settings-regular-evening-enabled"),
+    regularEveningTime: byId<HTMLInputElement>("settings-regular-evening-time"),
+    regularEveningDays: byId("settings-regular-evening-days"),
+    regularEveningQuietHint: byId("settings-regular-evening-quiet-hint"),
     weatherPlaceState: byId("weather-place-state"),
     weatherSearchInput: byId<HTMLInputElement>("weather-search-input"),
     weatherSearchBtn: byId<HTMLButtonElement>("weather-search-btn"),
@@ -368,6 +387,12 @@ function attachHandlers(i: Inputs): void {
   i.calAddUrl.addEventListener("click", () => void onAddCalendarSource("url"));
   i.calAddPath.addEventListener("click", () => void onAddCalendarSource("file"));
   i.calRefresh.addEventListener("click", () => void onCalendarRefresh());
+  // M12: 夜間静音との重なり警告 (§9.3)。フォーム変更のたびに再計算する。
+  i.nightQuiet.addEventListener("change", () => updateRegularQuietHints());
+  i.nightQuietFrom.addEventListener("change", () => updateRegularQuietHints());
+  i.nightQuietTo.addEventListener("change", () => updateRegularQuietHints());
+  i.regularMorningTime.addEventListener("change", () => updateRegularQuietHints());
+  i.regularEveningTime.addEventListener("change", () => updateRegularQuietHints());
   i.weatherSearchBtn.addEventListener("click", () => void onWeatherSearch());
   i.weatherRefreshBtn.addEventListener("click", () => void onWeatherRefresh());
   i.weatherClearBtn.addEventListener("click", () => void onWeatherClear());
@@ -1124,6 +1149,72 @@ function hhmmToMinutes(value: string, fallback: number): number {
   return h * 60 + mm;
 }
 
+// ===== M12: 定例会話の曜日トグル (regular-talk-design §9.1) =====
+// bit0=月..bit6=日 (daily.ts の weekdayNames / Rust tools::reminder の weekday_mask と同一定義)。
+
+const WEEKDAY_LABELS = ["月", "火", "水", "木", "金", "土", "日"];
+
+/// 7 個のトグルボタンをコンテナへ 1 度だけ構築する (mountSettingsPanel から呼ぶ)。
+function buildWeekdayToggles(container: HTMLElement): void {
+  container.innerHTML = "";
+  for (let bit = 0; bit < WEEKDAY_LABELS.length; bit++) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "weekday-toggle";
+    btn.dataset.bit = String(bit);
+    btn.textContent = WEEKDAY_LABELS[bit];
+    btn.addEventListener("click", () => btn.classList.toggle("active"));
+    container.appendChild(btn);
+  }
+}
+
+function setWeekdayToggles(container: HTMLElement, mask: number): void {
+  for (const btn of Array.from(container.querySelectorAll<HTMLButtonElement>(".weekday-toggle"))) {
+    const bit = Number(btn.dataset.bit);
+    btn.classList.toggle("active", (mask & (1 << bit)) !== 0);
+  }
+}
+
+function readWeekdayToggles(container: HTMLElement): number {
+  let mask = 0;
+  for (const btn of Array.from(container.querySelectorAll<HTMLButtonElement>(".weekday-toggle"))) {
+    if (btn.classList.contains("active")) {
+      mask |= 1 << Number(btn.dataset.bit);
+    }
+  }
+  return mask;
+}
+
+// ===== M12: 夜間静音との重なり警告 (regular-talk-design §9.3) =====
+// Rust governance.rs::night_quiet_active と同一意味論 (分単位、from>to は日跨ぎ、
+// from==to は終日)。保存はブロックしない (UI 警告のみ)。
+
+function nightQuietActive(enabled: boolean, from: number, to: number, minutesOfDay: number): boolean {
+  if (!enabled) return false;
+  if (from === to) return true;
+  if (from < to) return from <= minutesOfDay && minutesOfDay < to;
+  return minutesOfDay >= from || minutesOfDay < to;
+}
+
+/// フォームの現在値から朝/夜それぞれの重なり警告を再計算する。時刻・夜間静音の
+/// 入力が変わるたびに呼ぶ (attachHandlers) ほか、フォーム読み込み直後にも呼ぶ。
+function updateRegularQuietHints(): void {
+  if (!inputs) return;
+  const enabled = inputs.nightQuiet.checked;
+  const from = hhmmToMinutes(inputs.nightQuietFrom.value, 0);
+  const to = hhmmToMinutes(inputs.nightQuietTo.value, 0);
+  const label = `${inputs.nightQuietFrom.value}〜${inputs.nightQuietTo.value}`;
+  const morningMinutes = hhmmToMinutes(inputs.regularMorningTime.value, 0);
+  const eveningMinutes = hhmmToMinutes(inputs.regularEveningTime.value, 0);
+  setQuietHint(inputs.regularMorningQuietHint, nightQuietActive(enabled, from, to, morningMinutes), label);
+  setQuietHint(inputs.regularEveningQuietHint, nightQuietActive(enabled, from, to, eveningMinutes), label);
+}
+
+function setQuietHint(el: HTMLElement, overlap: boolean, label: string): void {
+  el.textContent = `この時刻は夜間静音 (${label}) の中のため、この枠は配達されません`;
+  el.hidden = !overlap;
+}
+
 /// 非負整数に丸める (0 も有効値)。空欄・非数のみ fallback へ。
 /// `Number(value) || fallback` だと 0 が fallback に化けるため専用ヘルパにする。
 function clampNonNegInt(value: string, fallback: number): number {
@@ -1197,6 +1288,13 @@ function applySettingsToForm(s: Settings): void {
   inputs.minSpeakInterval.value = String(s.min_speak_interval_min);
   inputs.calNotifyMin.value = String(s.calendar_notify_min);
   renderCalendarSources(s.calendar_sources);
+  inputs.regularMorningEnabled.checked = s.regular_morning_enabled;
+  inputs.regularMorningTime.value = minutesToHHMM(s.regular_morning_time);
+  setWeekdayToggles(inputs.regularMorningDays, s.regular_morning_days);
+  inputs.regularEveningEnabled.checked = s.regular_evening_enabled;
+  inputs.regularEveningTime.value = minutesToHHMM(s.regular_evening_time);
+  setWeekdayToggles(inputs.regularEveningDays, s.regular_evening_days);
+  updateRegularQuietHints();
   inputs.situationRain.checked = s.situation_rain_enabled;
   applyWeatherState(s);
   inputs.ttsSpeed.value = String(s.tts_speed);
@@ -1286,6 +1384,12 @@ async function onSave(): Promise<void> {
       inputs.calNotifyMin.value,
       current.calendar_notify_min,
     ),
+    regular_morning_enabled: inputs.regularMorningEnabled.checked,
+    regular_morning_time: hhmmToMinutes(inputs.regularMorningTime.value, current.regular_morning_time),
+    regular_morning_days: readWeekdayToggles(inputs.regularMorningDays),
+    regular_evening_enabled: inputs.regularEveningEnabled.checked,
+    regular_evening_time: hhmmToMinutes(inputs.regularEveningTime.value, current.regular_evening_time),
+    regular_evening_days: readWeekdayToggles(inputs.regularEveningDays),
     // weather_enabled/latitude/longitude/place_name は候補選択・解除コマンドが
     // 即時永続化するので current を保つ (M11、calendar_sources と同型)。
     situation_rain_enabled: inputs.situationRain.checked,

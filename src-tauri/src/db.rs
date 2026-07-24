@@ -1219,6 +1219,20 @@ impl Db {
         Ok(n as u64)
     }
 
+    /// 指定 unix 秒以降に完了した件数 (夜の定例会話の完了実績用、M12、
+    /// regular-talk-design §5.3/§10.4)。
+    pub fn count_done_todos_since(&self, since_ts: i64) -> Result<u64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM todos WHERE status = 'done' AND done_ts >= ?1",
+                params![since_ts],
+                |row| row.get(0),
+            )
+            .context("count_done_todos_since")?;
+        Ok(n as u64)
+    }
+
     // ===== interest_topics (M5-C) =====
 
     /// 全件取得 (id 昇順)。
@@ -1638,6 +1652,21 @@ mod tests {
 
         db.delete_todo(c).unwrap();
         assert!(db.get_todo(c).unwrap().is_none());
+    }
+
+    #[test]
+    fn count_done_todos_since_filters_by_done_ts() {
+        let db = make_db();
+        let a = db.insert_todo("洗い物", "today", 0, None, 10).unwrap();
+        let b = db.insert_todo("資料作成", "today", 0, None, 10).unwrap();
+        let c = db.insert_todo("旅行計画", "someday", 0, None, 10).unwrap();
+        db.set_todo_status(a, "done", 999).unwrap(); // 昨日完了 → since=1000 では数えない
+        db.set_todo_status(b, "done", 1500).unwrap(); // 今日完了 → 数える
+        db.set_todo_status(c, "done", 2000).unwrap(); // 今日完了 (bucket 問わず全件対象)
+
+        assert_eq!(db.count_done_todos_since(1000).unwrap(), 2);
+        assert_eq!(db.count_done_todos_since(0).unwrap(), 3);
+        assert_eq!(db.count_done_todos_since(2001).unwrap(), 0);
     }
 
     #[test]

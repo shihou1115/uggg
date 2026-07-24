@@ -472,6 +472,39 @@
             <p id="settings-calendar-message" class="panel-message" hidden></p>
           </section>
           <section class="panel-section" data-page="daily">
+            <h3>朝・夜の定例会話</h3>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-regular-morning-enabled" />
+              <span>朝の定例会話 (今日の予定・ToDo・リマインダー・天気をまとめて話す)</span>
+            </label>
+            <label class="row">
+              <span>朝の時刻</span>
+              <input type="time" id="settings-regular-morning-time" step="60" />
+            </label>
+            <div class="row">
+              <span>朝の曜日</span>
+              <div class="weekday-toggles" id="settings-regular-morning-days"></div>
+            </div>
+            <p id="settings-regular-morning-quiet-hint" class="panel-message" hidden></p>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-regular-evening-enabled" />
+              <span>夜の定例会話 (今日の完了実績・持ち越し・明日の予定・天気をまとめて話す)</span>
+            </label>
+            <label class="row">
+              <span>夜の時刻</span>
+              <input type="time" id="settings-regular-evening-time" step="60" />
+            </label>
+            <div class="row">
+              <span>夜の曜日</span>
+              <div class="weekday-toggles" id="settings-regular-evening-days"></div>
+            </div>
+            <p id="settings-regular-evening-quiet-hint" class="panel-message" hidden></p>
+            <p class="panel-hint">
+              設定時刻を過ぎて最初に PC を使っているときに 1 回だけ話しかけます (既定 6 時間で当日分は失効)。
+              朝の定例会話が有効な間は、朝の ToDo 件数告知と降雨の一言はここに吸収されます。
+            </p>
+          </section>
+          <section class="panel-section" data-page="daily">
             <h3>天気 (生活情報)</h3>
             <div class="row">
               <span>設定中の地域</span>
