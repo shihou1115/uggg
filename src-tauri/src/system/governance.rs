@@ -372,6 +372,29 @@ pub fn can_deliver(state: &Arc<AppState>, cat: SpeechCategory, prio: Priority) -
     ambient_allowed(&settings, cat, minutes, last_spoke, last_cat, backoff, now.timestamp())
 }
 
+/// 静音プリフィルタ (M12 リリース監査対応、regular-talk-design §5.2): いま Ambient 発話が
+/// 段 1 (ハード静音) または段 2 (夜間静音) で確実にブロックされるかだけを安価に答える。
+///
+/// **これはゲートではない。** 判定の正本と会計 (check + record) は従来どおり
+/// `deliver::deliver_event` 内の `can_deliver`/`record_delivered` の 1 回だけであり
+/// (二重ゲート禁止はその会計の話)、本関数は「高コストな配達準備 (天気取得・LLM 整形) を
+/// 抑制中の 60 秒 tick ごとに繰り返さない」ための省力化にのみ使う。段 1/2 と同じ
+/// プリミティブ (`should_stay_quiet` / `night_quiet_active`) を合成しており独自ロジックを
+/// 持たない (乖離しない)。プリフィルタ通過後に静音へ遷移しても、gate が Deferred を
+/// 返すだけで従来挙動と同じ (レース窓は無害)。
+pub fn ambient_quiet_now(state: &Arc<AppState>) -> bool {
+    if quiet::should_stay_quiet(state) {
+        return true;
+    }
+    let (enabled, from, to) = {
+        let s = state.settings.lock().expect("settings poisoned");
+        (s.night_quiet_enabled, s.night_quiet_from, s.night_quiet_to)
+    };
+    let now = chrono::Local::now();
+    let minutes = now.time().hour() as u16 * 60 + now.time().minute() as u16;
+    night_quiet_active(enabled, from, to, minutes)
+}
+
 /// 段 2〜5 の純粋判定 (テスト対象)。段 1 (ハード静音) は呼び出し側で判定済みの前提。
 fn ambient_allowed(
     s: &Settings,

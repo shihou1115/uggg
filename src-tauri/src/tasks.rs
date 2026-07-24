@@ -24,7 +24,7 @@ use crate::db::{ReminderKind, ReminderRow};
 use crate::presence::{context, idle};
 use crate::state::AppState;
 use crate::system::deliver::{self, DeliveryOutcome};
-use crate::system::governance::{Priority, SpeechCategory};
+use crate::system::governance::{self, Priority, SpeechCategory};
 use crate::system::{regular_talk, weather};
 use crate::tools::reminder::next_recurring_due_ts;
 
@@ -870,6 +870,13 @@ async fn fire_morning_regular(
     ) {
         return false;
     }
+    // 静音プリフィルタ (リリース監査指摘): 段 1/2 で確実に Deferred になる tick では
+    // 材料集約 (天気取得) と LLM 整形を走らせない。抑制中に条件成立が続くと、date キーが
+    // 進まないまま毎 tick この重い列が反復するため (最長 6h の失効窓 × 毎分 LLM 呼び出し)。
+    // 正式判定と会計は従来どおり deliver_event 内の gate が行う (これはゲートではない)。
+    if governance::ambient_quiet_now(state) {
+        return false;
+    }
     let materials = regular_talk::build_morning_materials(state).await;
     let script = regular_talk::build_morning_script(&materials);
     let script = regular_talk::polish_script(state, &script).await;
@@ -927,6 +934,10 @@ async fn fire_evening_regular(
     ) {
         return;
     }
+    // 静音プリフィルタ (朝と同じ。fire_morning_regular のコメント参照)
+    if governance::ambient_quiet_now(state) {
+        return;
+    }
     let materials = regular_talk::build_evening_materials(state).await;
     let script = regular_talk::build_evening_script(&materials);
     let script = regular_talk::polish_script(state, &script).await;
@@ -959,6 +970,10 @@ async fn fire_rain_once(app: &AppHandle, state: &Arc<AppState>, today: chrono::N
         .map(|v| v == today.to_string())
         .unwrap_or(false);
     if done {
+        return;
+    }
+    // 静音プリフィルタ (定例会話と同じ省力化): 抑制中は取得・判定ごと次 tick へ見送る
+    if governance::ambient_quiet_now(state) {
         return;
     }
     let Some(cache) = weather::ensure_fresh(state).await else {
