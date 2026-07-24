@@ -4,18 +4,22 @@ import { listen } from "@tauri-apps/api/event";
 import { openChatLog } from "./chatlog";
 import { uggConfirm } from "../confirm";
 import { previewWavBase64 } from "../tts/speaker";
+import { isWeatherReady } from "../weather/credit";
 import type {
   AssetEntry,
   CalendarSource,
   ClearResult,
+  DailyWeather,
   DialogueMode,
   DndResult,
   InterestTopic,
   IrodoriGpuInfo,
+  LocationHit,
   Settings,
   SlotName,
   TalkSpeed,
   VoiceRef,
+  WeatherSnapshot,
 } from "../types";
 
 interface Inputs {
@@ -103,6 +107,17 @@ interface Inputs {
   calNotifyMin: HTMLInputElement;
   calRefresh: HTMLButtonElement;
   calMessage: HTMLElement;
+  // M11: 天気
+  weatherPlaceState: HTMLElement;
+  weatherSearchInput: HTMLInputElement;
+  weatherSearchBtn: HTMLButtonElement;
+  weatherCandidates: HTMLElement;
+  weatherRefreshBtn: HTMLButtonElement;
+  weatherClearBtn: HTMLButtonElement;
+  weatherPreview: HTMLElement;
+  situationRain: HTMLInputElement;
+  weatherRainHint: HTMLElement;
+  weatherMessage: HTMLElement;
   saveBtn: HTMLButtonElement;
   cancelBtn: HTMLButtonElement;
   closeBtn: HTMLButtonElement;
@@ -193,6 +208,10 @@ export async function openSettingsPanel(): Promise<void> {
   inputs.dataMessage.hidden = true;
   inputs.updateMessage.hidden = true;
   inputs.topicsMessage.hidden = true;
+  inputs.weatherMessage.hidden = true;
+  inputs.weatherPreview.hidden = true;
+  inputs.weatherCandidates.innerHTML = "";
+  inputs.weatherSearchInput.value = "";
   inputs.keyInput.value = "";
   setTimeout(() => inputs?.mode.focus(), 0);
 }
@@ -299,6 +318,16 @@ function collectInputs(): Inputs {
     calNotifyMin: byId<HTMLInputElement>("settings-calendar-notify-min"),
     calRefresh: byId<HTMLButtonElement>("settings-calendar-refresh"),
     calMessage: byId("settings-calendar-message"),
+    weatherPlaceState: byId("weather-place-state"),
+    weatherSearchInput: byId<HTMLInputElement>("weather-search-input"),
+    weatherSearchBtn: byId<HTMLButtonElement>("weather-search-btn"),
+    weatherCandidates: byId("weather-candidates"),
+    weatherRefreshBtn: byId<HTMLButtonElement>("weather-refresh-btn"),
+    weatherClearBtn: byId<HTMLButtonElement>("weather-clear-btn"),
+    weatherPreview: byId("weather-preview"),
+    situationRain: byId<HTMLInputElement>("settings-situation-rain"),
+    weatherRainHint: byId("weather-rain-hint"),
+    weatherMessage: byId("weather-message"),
     saveBtn: byId<HTMLButtonElement>("settings-save"),
     cancelBtn: byId<HTMLButtonElement>("settings-cancel"),
     closeBtn: byId<HTMLButtonElement>("settings-close"),
@@ -339,6 +368,9 @@ function attachHandlers(i: Inputs): void {
   i.calAddUrl.addEventListener("click", () => void onAddCalendarSource("url"));
   i.calAddPath.addEventListener("click", () => void onAddCalendarSource("file"));
   i.calRefresh.addEventListener("click", () => void onCalendarRefresh());
+  i.weatherSearchBtn.addEventListener("click", () => void onWeatherSearch());
+  i.weatherRefreshBtn.addEventListener("click", () => void onWeatherRefresh());
+  i.weatherClearBtn.addEventListener("click", () => void onWeatherClear());
   i.panel.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") {
       ev.preventDefault();
@@ -922,6 +954,154 @@ function showCalendarMessage(msg: string, isError: boolean): void {
   inputs.calMessage.hidden = false;
 }
 
+// === M11: 天気 UI (spec §4.7.2 / regular-talk-design §9.2) ==================
+// カレンダー節の「入力 → 追加 (即保存) → いま取得で検証」パターンを踏襲する。
+// 候補選択・解除はどちらも即時 set_settings (設定行為 = 同意/撤回)。
+
+/// 設定済み表示・ボタンの有効無効を現在の Settings から反映する。
+function applyWeatherState(s: Settings): void {
+  if (!inputs) return;
+  const ready = isWeatherReady(s);
+  inputs.weatherPlaceState.textContent = ready
+    ? `${s.weather_place_name || "(地名未取得)"}（${s.weather_latitude}, ${s.weather_longitude}）`
+    : "未設定";
+  inputs.weatherPlaceState.classList.toggle("has-key", ready);
+  inputs.weatherRefreshBtn.disabled = !ready;
+  inputs.weatherClearBtn.disabled = !ready;
+  inputs.situationRain.disabled = !ready;
+  inputs.weatherRainHint.hidden = ready;
+}
+
+function renderWeatherCandidates(hits: LocationHit[]): void {
+  if (!inputs) return;
+  inputs.weatherCandidates.innerHTML = "";
+  for (const hit of hits) {
+    const item = document.createElement("div");
+    item.className = "row";
+    const label = document.createElement("span");
+    label.textContent = [hit.name, hit.admin1, hit.country].filter((v) => !!v).join(" / ");
+    label.style.overflow = "hidden";
+    label.style.textOverflow = "ellipsis";
+    const selectBtn = document.createElement("button");
+    selectBtn.type = "button";
+    selectBtn.textContent = "選択";
+    selectBtn.addEventListener("click", () => void onWeatherSelect(hit));
+    item.appendChild(label);
+    item.appendChild(selectBtn);
+    inputs!.weatherCandidates.appendChild(item);
+  }
+}
+
+async function onWeatherSearch(): Promise<void> {
+  if (!inputs) return;
+  const query = inputs.weatherSearchInput.value.trim();
+  if (query.length < 2) {
+    showWeatherMessage("2 文字以上で検索してください", true);
+    return;
+  }
+  inputs.weatherSearchBtn.disabled = true;
+  showWeatherMessage("検索中…", false);
+  try {
+    const hits = await invoke<LocationHit[]>("search_location", { query });
+    renderWeatherCandidates(hits);
+    showWeatherMessage(
+      hits.length > 0 ? `${hits.length} 件見つかりました。選んでください` : "見つかりませんでした",
+      false,
+    );
+  } catch (err) {
+    showWeatherMessage(`検索失敗: ${formatErr(err)}`, true);
+  } finally {
+    inputs.weatherSearchBtn.disabled = false;
+  }
+}
+
+/// 候補選択 = 同意 (地域設定 + weather_enabled を同時に立てて即保存)。
+async function onWeatherSelect(hit: LocationHit): Promise<void> {
+  if (!inputs || !current) return;
+  const placeName = [hit.name, hit.admin1].filter((v) => !!v).join(" ");
+  const next: Settings = {
+    ...current,
+    weather_enabled: true,
+    weather_latitude: hit.latitude,
+    weather_longitude: hit.longitude,
+    weather_place_name: placeName,
+  };
+  try {
+    const saved = await invoke<Settings>("set_settings", { settings: next });
+    current = saved;
+    applyWeatherState(saved);
+    inputs.weatherCandidates.innerHTML = "";
+    inputs.weatherSearchInput.value = "";
+    showWeatherMessage(`「${placeName}」を設定しました`, false);
+  } catch (err) {
+    showWeatherMessage(`設定失敗: ${formatErr(err)}`, true);
+  }
+}
+
+/// 解除 = 同意の撤回。座標・地名を空に戻す (weather_cache のクリアはバックエンドの
+/// set_settings が weather_ready: true→false を検知して自動で行う)。
+async function onWeatherClear(): Promise<void> {
+  if (!inputs || !current) return;
+  if (!(await uggConfirm("設定中の地域を解除しますか？天気機能が無効になります。", "解除確認"))) {
+    return;
+  }
+  const next: Settings = {
+    ...current,
+    weather_enabled: false,
+    weather_latitude: null,
+    weather_longitude: null,
+    weather_place_name: "",
+  };
+  try {
+    const saved = await invoke<Settings>("set_settings", { settings: next });
+    current = saved;
+    applyWeatherState(saved);
+    inputs.weatherPreview.hidden = true;
+    showWeatherMessage("地域設定を解除しました", false);
+  } catch (err) {
+    showWeatherMessage(`解除失敗: ${formatErr(err)}`, true);
+  }
+}
+
+/// 検証用の技術的な読み出し (WMO code の日本語ラベル変換はバックエンドのみが持つ
+/// 単一情報源なので、ここでは複製せず生値を表示する)。
+function formatDailyPreview(d: DailyWeather): string {
+  return `${d.date}: code${d.weather_code} 最高${d.temp_max}℃ / 最低${d.temp_min}℃ / 降水${d.precip_prob_max}%`;
+}
+
+async function onWeatherRefresh(): Promise<void> {
+  if (!inputs) return;
+  inputs.weatherRefreshBtn.disabled = true;
+  showWeatherMessage("取得中…", false);
+  try {
+    const snap = await invoke<WeatherSnapshot | null>("get_weather");
+    if (!snap || snap.daily.length === 0) {
+      showWeatherPreview("天気を取得できませんでした（しばらくしてから再度お試しください）", true);
+    } else {
+      showWeatherPreview(snap.daily.map(formatDailyPreview).join(" / "), false);
+    }
+    showWeatherMessage("取得しました", false);
+  } catch (err) {
+    showWeatherPreview(`取得失敗: ${formatErr(err)}`, true);
+  } finally {
+    inputs.weatherRefreshBtn.disabled = !isWeatherReady(current);
+  }
+}
+
+function showWeatherMessage(msg: string, isError: boolean): void {
+  if (!inputs) return;
+  inputs.weatherMessage.textContent = msg;
+  inputs.weatherMessage.classList.toggle("error", isError);
+  inputs.weatherMessage.hidden = false;
+}
+
+function showWeatherPreview(msg: string, isError: boolean): void {
+  if (!inputs) return;
+  inputs.weatherPreview.textContent = msg;
+  inputs.weatherPreview.classList.toggle("error", isError);
+  inputs.weatherPreview.hidden = false;
+}
+
 // M7: リマインダーの一覧・操作は専用パネル (panels/daily.ts) に移設した。
 // 設定パネル側は「日常支援」ページのトグル類のみを持つ。
 
@@ -1015,6 +1195,8 @@ function applySettingsToForm(s: Settings): void {
   inputs.minSpeakInterval.value = String(s.min_speak_interval_min);
   inputs.calNotifyMin.value = String(s.calendar_notify_min);
   renderCalendarSources(s.calendar_sources);
+  inputs.situationRain.checked = s.situation_rain_enabled;
+  applyWeatherState(s);
   inputs.ttsSpeed.value = String(s.tts_speed);
   inputs.ttsVolume.value = String(s.tts_volume);
   // 話者 select は資産 DL 済みのときだけ list_voices で埋められる。値は文字列で保持。
@@ -1102,6 +1284,9 @@ async function onSave(): Promise<void> {
       inputs.calNotifyMin.value,
       current.calendar_notify_min,
     ),
+    // weather_enabled/latitude/longitude/place_name は候補選択・解除コマンドが
+    // 即時永続化するので current を保つ (M11、calendar_sources と同型)。
+    situation_rain_enabled: inputs.situationRain.checked,
     ghost_id: inputs.ghostId.value || current.ghost_id,
     shell_id: inputs.shellId.value || current.shell_id,
   };

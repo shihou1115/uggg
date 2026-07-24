@@ -186,10 +186,60 @@ pub struct Settings {
     /// 予定開始の何分前に通知するか (既定 15)。
     #[serde(default = "default_calendar_notify_min")]
     pub calendar_notify_min: u32,
+    // === 定例会話・天気 (M11、spec §4.7 / regular-talk-design §6) ===
+    // regular_* は本 M では未結線 (発火ロジック・設定 UI は M12)。データモデルだけ
+    // ここで確定させる (SpeechCategory::enabled() が M11 で参照するため、§4.1 コンパイル順)。
+    /// 朝の定例会話の有効化 (既定 false、オプトイン)。
+    #[serde(default)]
+    pub regular_morning_enabled: bool,
+    /// 朝の定例会話の時刻 (ローカル 0:00 からの分、既定 480 = 8:00)。
+    #[serde(default = "default_regular_morning_time")]
+    pub regular_morning_time: u16,
+    /// 朝の定例会話の有効曜日 (bit0=月..bit6=日、既定 127 = 毎日。reminder の
+    /// weekday_mask と同一定義)。
+    #[serde(default = "default_regular_days")]
+    pub regular_morning_days: u8,
+    /// 夜の定例会話の有効化 (既定 false)。
+    #[serde(default)]
+    pub regular_evening_enabled: bool,
+    /// 夜の定例会話の時刻 (既定 1260 = 21:00)。
+    #[serde(default = "default_regular_evening_time")]
+    pub regular_evening_time: u16,
+    /// 夜の定例会話の有効曜日 (既定 127 = 毎日)。
+    #[serde(default = "default_regular_days")]
+    pub regular_evening_days: u8,
+    /// 天気の有効化 (既定 false)。地域設定 (地名検索の選択) と同時に true になる
+    /// (設定行為 = 同意、spec §3.3/§4.7.2)。
+    #[serde(default)]
+    pub weather_enabled: bool,
+    /// 天気取得の緯度 (既定 None)。保存時 (clamp) に小数 1 桁へ丸める。
+    #[serde(default)]
+    pub weather_latitude: Option<f64>,
+    /// 天気取得の経度 (既定 None)。同上。
+    #[serde(default)]
+    pub weather_longitude: Option<f64>,
+    /// 表示専用の地名 (既定 ""、例:「東京都 千代田区」。geocoding の name + admin1)。
+    #[serde(default)]
+    pub weather_place_name: String,
+    /// 降雨の一言 (既定 false、spec §4.7.2)。
+    #[serde(default)]
+    pub situation_rain_enabled: bool,
 }
 
 fn default_calendar_notify_min() -> u32 {
     15
+}
+
+fn default_regular_morning_time() -> u16 {
+    480 // 8:00
+}
+
+fn default_regular_evening_time() -> u16 {
+    1260 // 21:00
+}
+
+fn default_regular_days() -> u8 {
+    127 // 毎日 (bit0..bit6 全立て)
 }
 
 #[cfg(test)]
@@ -224,6 +274,55 @@ mod tests {
                 url: "https://example.com/a.ics".to_string()
             }
         );
+    }
+
+    #[test]
+    fn clamp_rounds_and_ranges_weather_coordinates() {
+        let mut s = Settings::default();
+        s.weather_latitude = Some(35.6895123);
+        s.weather_longitude = Some(139.6917123);
+        s.clamp();
+        assert_eq!(s.weather_latitude, Some(35.7));
+        assert_eq!(s.weather_longitude, Some(139.7));
+
+        // 範囲外は clamp してから丸める
+        let mut over = Settings::default();
+        over.weather_latitude = Some(120.0);
+        over.weather_longitude = Some(-200.0);
+        over.clamp();
+        assert_eq!(over.weather_latitude, Some(90.0));
+        assert_eq!(over.weather_longitude, Some(-180.0));
+
+        // 非有限値は未設定に落ちる
+        let mut nan = Settings::default();
+        nan.weather_latitude = Some(f64::NAN);
+        nan.weather_longitude = Some(f64::INFINITY);
+        nan.clamp();
+        assert_eq!(nan.weather_latitude, None);
+        assert_eq!(nan.weather_longitude, None);
+    }
+
+    #[test]
+    fn weather_ready_requires_enabled_and_coordinates() {
+        let mut s = Settings::default();
+        assert!(!s.weather_ready(), "既定は未設定");
+        s.weather_latitude = Some(35.6);
+        s.weather_longitude = Some(139.7);
+        assert!(!s.weather_ready(), "座標だけでは不十分 (weather_enabled も必要)");
+        s.weather_enabled = true;
+        assert!(s.weather_ready());
+        s.weather_longitude = None;
+        assert!(!s.weather_ready(), "片方欠けても false");
+    }
+
+    #[test]
+    fn clamp_masks_regular_days_to_seven_bits() {
+        let mut s = Settings::default();
+        s.regular_morning_days = 0xFF;
+        s.regular_evening_days = 0b1000_0011; // 上位ビットを含む不正値
+        s.clamp();
+        assert_eq!(s.regular_morning_days, 0x7F);
+        assert_eq!(s.regular_evening_days, 0b0000_0011);
     }
 }
 
@@ -337,6 +436,17 @@ impl Default for Settings {
             reminder_notify_enabled: true,
             calendar_sources: Vec::new(),
             calendar_notify_min: default_calendar_notify_min(),
+            regular_morning_enabled: false,
+            regular_morning_time: default_regular_morning_time(),
+            regular_morning_days: default_regular_days(),
+            regular_evening_enabled: false,
+            regular_evening_time: default_regular_evening_time(),
+            regular_evening_days: default_regular_days(),
+            weather_enabled: false,
+            weather_latitude: None,
+            weather_longitude: None,
+            weather_place_name: String::new(),
+            situation_rain_enabled: false,
         }
     }
 }
@@ -425,7 +535,35 @@ impl Settings {
             CalendarSource::File { path } => !path.is_empty(),
             CalendarSource::Url { url } => !url.is_empty(),
         });
+        // 定例会話 (M11): 時刻は 0..=1439、曜日マスクは下位 7bit のみ有効。
+        if self.regular_morning_time > 1439 {
+            self.regular_morning_time = default_regular_morning_time();
+        }
+        self.regular_morning_days &= 0x7F;
+        if self.regular_evening_time > 1439 {
+            self.regular_evening_time = default_regular_evening_time();
+        }
+        self.regular_evening_days &= 0x7F;
+        // 天気 (M11): 座標は範囲 clamp + 小数 1 桁 (≒11km) へ**保存時**丸め (§6)。
+        // 送信時ではなく保存時に丸めることで、丸め前座標が DB・ログへ出る経路を断つ。
+        // 非有限値 (NaN 等の不正入力) は未設定 (None) に落とす (weather_ready が自然に false になる)。
+        self.weather_latitude = self.weather_latitude.and_then(|v| {
+            v.is_finite().then(|| round_coord(v.clamp(-90.0, 90.0)))
+        });
+        self.weather_longitude = self.weather_longitude.and_then(|v| {
+            v.is_finite().then(|| round_coord(v.clamp(-180.0, 180.0)))
+        });
     }
+
+    /// 天気機能が実際に使える状態か (有効化 + 座標設定済み、regular-talk-design §6)。
+    pub fn weather_ready(&self) -> bool {
+        self.weather_enabled && self.weather_latitude.is_some() && self.weather_longitude.is_some()
+    }
+}
+
+/// 座標を小数 1 桁 (≒11km、市区町村粒度) へ丸める (spec §3.3/§4.7.2)。
+fn round_coord(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
 }
 
 pub struct AppState {

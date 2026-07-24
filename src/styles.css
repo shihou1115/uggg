@@ -47,11 +47,22 @@ body {
   pointer-events: auto;
 }
 
-#tts-credit {
+/* クレジット表示バー (M11): VOICEVOX + Open-Meteo を並べてステージ下端中央に固定する。
+   個々のバッジは position を持たず、#credits-bar の flex レイアウトに任せる
+   (どちらか一方だけ visible でも中央寄せが崩れない)。 */
+#credits-bar {
   position: fixed;
   left: 50%;
   bottom: 4px;
   transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+  z-index: 45;
+  pointer-events: none;
+}
+
+#tts-credit,
+#weather-credit {
   padding: 2px 8px;
   font-size: 10px;
   font-family: system-ui, sans-serif;
@@ -59,13 +70,13 @@ body {
   background: rgba(0, 0, 0, 0.55);
   border-radius: 4px;
   pointer-events: none;
-  z-index: 45;
   display: none;
   user-select: none;
   white-space: nowrap;
 }
 
-#tts-credit.visible {
+#tts-credit.visible,
+#weather-credit.visible {
   display: block;
 }
 

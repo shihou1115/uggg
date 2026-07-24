@@ -3,7 +3,8 @@
 //! - ランダムトーク: monologue_interval_min 分ごとに独り言。0 で無効。
 //! - 放置監視: 60 秒チェック、最終操作から 30 分で 1 回 idle。
 //! - リマインダー watcher: 10 秒間隔で発火・起動時回収 (M7)。
-//! - daily watcher: 日課の復活 (日付変更検知) + 朝の ToDo 件数告知 (M8)。
+//! - daily watcher: 日課の復活 (日付変更検知) + 朝の ToDo 件数告知 (M8) +
+//!   天気の定期取得 + 降雨の一言 (M11、spec §4.7.2)。
 //! - context watcher: OS 状況検知 → 状況発話 4 カテゴリ (M9、spec §4.6.3)。
 //! - Irodori サイドカーのアイドル監視: 60 秒チェック、最終使用から 5 分で自動 shutdown (M4c Phase E)。
 //!
@@ -23,6 +24,7 @@ use crate::presence::{context, idle};
 use crate::state::AppState;
 use crate::system::deliver::{self, DeliveryOutcome};
 use crate::system::governance::{Priority, SpeechCategory};
+use crate::system::weather;
 use crate::tools::reminder::next_recurring_due_ts;
 
 /// ランダムトークタスク。1 分ごとに「前回発話からの経過 >= 設定間隔」を判定。
@@ -626,12 +628,16 @@ fn aggregate_overdue_body(latest: &ReminderRow, total: usize) -> String {
     format!("{name}（ほか{}件）", total - 1)
 }
 
-/// M8 (spec §4.6.2): daily watcher。
+/// M8 (spec §4.6.2) / M11 (spec §4.7.2): daily watcher。
 /// - 日課の復活: 起動時 + ローカル日付の変更検知で `reset_recurring` (冪等) を実行し、
 ///   復活があれば `todos-changed` を emit。
+/// - 天気の定期取得 (M11): 3 時間ごとに `weather::refresh_cache` を呼びキャッシュを更新する
+///   (calendar watcher の 30 分 fetch と同型)。
 /// - 朝の件数告知: 朝の時間帯 (5:00-11:00、辞書 boot の朝帯と同じ) に 1 日 1 回、
 ///   today バケットの未完了が 1 件以上なら `todo_morning` を配達 (Ambient・ゲート下)。
 ///   告知済みのローカル日付は app_settings に保持し、再起動で二重告知しない。
+/// - 降雨の一言 (M11): 同じ朝帯に 1 日 1 回、天気材料が降雨と判定できたら
+///   `weather_rain`/`weather_rain_outing` を配達 (SituationRain、regular-talk-design §5.6)。
 /// リマインダー watcher とは分離する (reminder_notify_enabled と結合させない)。
 pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
     const CHECK_INTERVAL_SECS: u64 = 60;
@@ -644,6 +650,7 @@ pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)).await;
         let mut last_date: Option<chrono::NaiveDate> = None;
+        let mut last_weather_fetch: i64 = 0;
         loop {
             let now_local = chrono::Local::now();
             let today = now_local.date_naive();
@@ -662,7 +669,21 @@ pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
                 }
             }
 
-            // 2) 朝の件数告知 (1 日 1 回・朝帯のみ・daily_support 有効時)
+            // 2) 天気の定期取得 (M11、regular-talk-design §5.1): 3 時間ごと。
+            //    鮮度に関わらず取得を試み、失敗時は既存キャッシュを維持する。
+            let weather_ready = {
+                let s = state.settings.lock().expect("settings poisoned");
+                s.weather_ready()
+            };
+            if weather_ready {
+                let now_ts = Utc::now().timestamp();
+                if now_ts - last_weather_fetch >= weather::WEATHER_FETCH_INTERVAL_SECS {
+                    weather::refresh_cache(&state).await;
+                    last_weather_fetch = now_ts;
+                }
+            }
+
+            // 3) 朝の件数告知 (1 日 1 回・朝帯のみ・daily_support 有効時)
             let hour = {
                 use chrono::Timelike;
                 now_local.hour()
@@ -714,9 +735,98 @@ pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
                 }
             }
 
+            // 4) 降雨の一言 (M11、regular-talk-design §5.6)。朝帯・1 日 1 回・SituationRain。
+            //    regular_morning_enabled による吸収は M12 で結線するが、フィールド自体は
+            //    既に存在する (§4.1) ため条件式ごと書いておく。M11 では既定 false (UI 無し)
+            //    のため常に単独発火になる。
+            let (rain_enabled, regular_morning_enabled) = {
+                let s = state.settings.lock().expect("settings poisoned");
+                (s.situation_rain_enabled, s.regular_morning_enabled)
+            };
+            if daily_enabled
+                && rain_enabled
+                && weather_ready
+                && !regular_morning_enabled
+                && (MORNING_FROM_HOUR..MORNING_TO_HOUR).contains(&hour)
+            {
+                fire_rain_once(&app, &state, today).await;
+            }
+
             tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
         }
     });
+}
+
+/// 降雨の一言 (M11、spec §4.7.2 / regular-talk-design §5.6)。朝帯 1 日 1 回、
+/// 天気材料が「降雨」と判定できたときだけ配達する。判定不能 (材料取得失敗) は
+/// date キーを進めず次 tick で再挑戦し、判定できて「降雨でない」なら黙って消化する
+/// (昼に降水確率が上がっても当日は鳴らさない。判定は朝 1 回)。
+async fn fire_rain_once(app: &AppHandle, state: &Arc<AppState>, today: chrono::NaiveDate) {
+    const RAIN_DATE_KEY: &str = "weather_rain_date";
+    let done = state
+        .db
+        .get_setting(RAIN_DATE_KEY)
+        .ok()
+        .flatten()
+        .map(|v| v == today.to_string())
+        .unwrap_or(false);
+    if done {
+        return;
+    }
+    let Some(cache) = weather::ensure_fresh(state).await else {
+        // 材料が取れない (取得失敗・キャッシュなし) → 次 tick で再挑戦
+        return;
+    };
+    let Some(material) = weather::today_material(&cache) else {
+        // 地点ローカル今日の日付がキャッシュに無い (深夜跨ぎ等) → 次 tick で再挑戦
+        return;
+    };
+    if !weather::is_rain(material) {
+        // 降雨でない朝は判定 1 回で消化 (以後は再チェックしない)
+        let _ = state.db.set_setting(RAIN_DATE_KEY, &today.to_string());
+        return;
+    }
+    let Some(label) = weather::weather_label(material.weather_code) else {
+        // 未知 code でラベルが組めない → {label} が空の壊れた文にしない。省いて消化する。
+        let _ = state.db.set_setting(RAIN_DATE_KEY, &today.to_string());
+        return;
+    };
+    let dict_key = if today_has_timed_event(state, today) {
+        "weather_rain_outing"
+    } else {
+        "weather_rain"
+    };
+    let prob = material.precip_prob_max.to_string();
+    let outcome = deliver::deliver_event(
+        app,
+        state,
+        SpeechCategory::SituationRain,
+        Priority::Ambient,
+        dict_key,
+        &[("label", label), ("p", prob.as_str())],
+        None,
+    )
+    .await;
+    // Ghost|Failed → 消化 (今日はもう試さない)。Deferred (静音・busy) → 次 tick 再挑戦。
+    if matches!(outcome, DeliveryOutcome::Ghost | DeliveryOutcome::Failed) {
+        let _ = state.db.set_setting(RAIN_DATE_KEY, &today.to_string());
+    }
+}
+
+/// 当日に時刻付き予定 (all_day == false) があるか。降雨の一言の言い回し強度分岐に使う。
+fn today_has_timed_event(state: &Arc<AppState>, today: chrono::NaiveDate) -> bool {
+    let Some(midnight) = today.and_hms_opt(0, 0, 0) else {
+        return false;
+    };
+    let from = crate::tools::reminder::local_to_utc_ts(midnight);
+    let to = from + 86_400;
+    match state.db.list_calendar(from, to) {
+        Ok(events) => events.iter().any(|e| !e.all_day),
+        Err(err) => {
+            eprintln!("[daily] list_calendar (降雨判定) failed: {err:#}");
+            false
+        }
+    }
 }
 
 /// M5-C: `topics_enabled` が ON の間、1 時間おきに enabled な interest_topics の RSS を取得して

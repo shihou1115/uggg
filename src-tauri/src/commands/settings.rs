@@ -20,14 +20,21 @@ pub fn set_settings(
     let mut next = settings;
     next.clamp();
 
-    // M9: Situation* を OFF→ON に戻したら 🔕 backoff をリセットする (reviewer 指摘。
-    // 恒久 throttle が再有効化後も残り、理由の見えないまま間隔が絞られるのを防ぐ)。
-    // メモリ反映前の値と比較する。
-    {
-        let prev = state.settings.lock().expect("settings poisoned").clone();
-        for cat in crate::system::governance::situation_reenabled(&prev, &next) {
-            crate::system::governance::reset_backoff(state.inner(), cat);
-        }
+    // メモリ反映前の値と比較する (🔕 backoff リセット・天気キャッシュ消去の判定に使う)。
+    let prev = state.settings.lock().expect("settings poisoned").clone();
+
+    // M9/M11: Situation*/Regular* を OFF→ON に戻したら 🔕 backoff をリセットする
+    // (reviewer 指摘。恒久 throttle が再有効化後も残り、理由の見えないまま間隔が
+    // 絞られるのを防ぐ)。
+    for cat in crate::system::governance::feedback_reenabled(&prev, &next) {
+        crate::system::governance::reset_backoff(state.inner(), cat);
+    }
+
+    // M11: 天気の「解除」(weather_ready: true→false、同意撤回) では
+    // app_settings の weather_cache も消す (regular-talk-design §9.2、設定行為 = 同意
+    // の対称。地名・キャッシュを残さない)。
+    if prev.weather_ready() && !next.weather_ready() {
+        crate::system::weather::clear_cache(state.inner());
     }
 
     // 永続化 (app_settings."settings" に JSON で保存)

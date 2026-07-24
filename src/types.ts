@@ -45,6 +45,21 @@ export interface Settings {
   // === カレンダー (M10, spec §4.6.4) ===
   calendar_sources: CalendarSource[];
   calendar_notify_min: number;
+  // === 定例会話・天気 (M11, spec §4.7 / regular-talk-design §6) ===
+  regular_morning_enabled: boolean;
+  /// ローカル 0:00 からの分 (0〜1439)。
+  regular_morning_time: number;
+  /// bit0=月..bit6=日。
+  regular_morning_days: number;
+  regular_evening_enabled: boolean;
+  regular_evening_time: number;
+  regular_evening_days: number;
+  weather_enabled: boolean;
+  /// 保存時に小数 1 桁へ丸められる (市区町村粒度)。
+  weather_latitude: number | null;
+  weather_longitude: number | null;
+  weather_place_name: string;
+  situation_rain_enabled: boolean;
 }
 
 /// M10: カレンダー ICS ソース (Rust の CalendarSource と serde tag 同期)。
@@ -268,4 +283,33 @@ export interface ReadingChunk {
   speed_offset: number;
   caption: string | null;
   pause_after_ms: number;
+}
+
+// === 天気 (M11, spec §4.7.2 / regular-talk-design §3・§7) ===
+
+/// 天気の日別データ 1 件 (バックエンド `weather::DailyWeather` と同期)。
+export interface DailyWeather {
+  /// "YYYY-MM-DD" (地点ローカル日付)。
+  date: string;
+  /// WMO weather code。
+  weather_code: number;
+  temp_max: number;
+  temp_min: number;
+  /// 0-100。
+  precip_prob_max: number;
+}
+
+/// `get_weather` の戻り値 (バックエンド `WeatherSnapshot` と同期)。
+export interface WeatherSnapshot {
+  fetched_ts: number;
+  daily: DailyWeather[];
+}
+
+/// `search_location` の戻り値 1 件 (バックエンド `LocationHit` と同期)。
+export interface LocationHit {
+  name: string;
+  admin1: string | null;
+  country: string | null;
+  latitude: number;
+  longitude: number;
 }

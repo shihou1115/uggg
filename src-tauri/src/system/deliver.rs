@@ -83,14 +83,16 @@ pub async fn deliver_event(
         Some(mut line) => {
             apply_placeholders_to_line(&mut line, placeholders);
             let mut resp: DialogueResponse = banter::pattern_1("event", "low", line);
-            // M9: 🔕 フィードバック用メタ (§4.3)。バック起点発話にのみ付与する。
-            // 🔕 の表示 (feedback_allowed) は Situation* のみ — 段 4/5 とバックオフの
-            // 適用対象と一致させる (Notice や独り言に「頻度を下げる」レバーは無い)。
+            // M9/M11: 🔕 フィードバック用メタ (§4.3)。バック起点発話にのみ付与する。
+            // 🔕 の表示 (feedback_allowed) は feedback_target() — Situation* (段 4/5 と
+            // バックオフの適用対象) に加え、M11 から Regular* 2 種 (カウントのみ、間隔
+            // 延長は無し) も対象にする (regular-talk-design §4.2)。Notice や独り言に
+            // 「頻度を下げる」レバーは無い。
             let seq = state.governance.speech_seq.fetch_add(1, Ordering::SeqCst) + 1;
             resp.speech_id = Some(seq.to_string());
             resp.category = Some(category.as_str());
             resp.priority = Some(priority.as_str());
-            resp.feedback_allowed = Some(category.is_situation());
+            resp.feedback_allowed = Some(category.feedback_target());
             if dialogue::persist_and_speak(app, state, &resp) {
                 // feedback_speech が「最新のタグ付き発話」とだけ照合できるよう記録
                 // (permit 保持中 = 直列化下なので競合しない)

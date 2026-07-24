@@ -18,6 +18,7 @@ use crate::db::{
 use crate::state::{AppState, CalendarSource};
 use crate::system::deliver;
 use crate::system::governance::{self, Priority, SpeechCategory};
+use crate::system::weather::{self, DailyWeather};
 use crate::tools::{reminder, todo};
 
 /// フロント向けリマインダー 1 件。`ReminderRow` と同じフィールドを持つ
@@ -547,8 +548,9 @@ pub fn feedback_speech(
 ) -> Result<(), String> {
     let cat = SpeechCategory::parse(&category)
         .ok_or_else(|| format!("未知のカテゴリです: {category}"))?;
-    if !cat.is_situation() {
+    if !cat.feedback_target() {
         // feedback_allowed=false の発話からは来ない想定の二重防御。黙って無視。
+        // M11: 対象は is_situation() + Regular*2 (feedback_target()、§4.2)。
         return Ok(());
     }
     let id: u64 = speech_id
@@ -621,4 +623,165 @@ pub fn update_todo(
         .map_err(|e| format!("{e:#}"))?;
     emit_todos_changed(&app);
     list_todo_entries(state.inner(), None)
+}
+
+// ===== 天気 (M11、spec §4.7.2 / regular-talk-design §7) =====
+
+/// 地名検索の候補 1 件 (Open-Meteo Geocoding API の結果、§2.2)。
+#[derive(Debug, Clone, Serialize)]
+pub struct LocationHit {
+    pub name: String,
+    pub admin1: Option<String>,
+    pub country: Option<String>,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+/// get_weather の戻り値 (設定パネルの「いま取得」検証・現在値表示用)。
+#[derive(Debug, Clone, Serialize)]
+pub struct WeatherSnapshot {
+    pub fetched_ts: i64,
+    pub daily: Vec<DailyWeather>,
+}
+
+impl From<weather::WeatherCache> for WeatherSnapshot {
+    fn from(c: weather::WeatherCache) -> Self {
+        Self {
+            fetched_ts: c.fetched_ts,
+            daily: c.daily,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GeocodingResponseRaw {
+    #[serde(default)]
+    results: Vec<GeocodingResultRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeocodingResultRaw {
+    name: String,
+    latitude: f64,
+    longitude: f64,
+    #[serde(default)]
+    admin1: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
+}
+
+/// RFC 3986 の unreserved 以外を %xx エンコード (system::topics::urlencode と同型・
+/// 別モジュールに閉じた実装なので複製する。共通化は次の HTTP 利用が現れた時点で検討)。
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn build_geocoding_url(query: &str) -> String {
+    format!(
+        "https://geocoding-api.open-meteo.com/v1/search?name={}&count=8&language=ja&format=json",
+        urlencode(query)
+    )
+}
+
+fn parse_geocoding_response(raw: &str) -> Result<Vec<LocationHit>, String> {
+    let resp: GeocodingResponseRaw =
+        serde_json::from_str(raw).map_err(|e| format!("地名検索の応答解析に失敗しました: {e}"))?;
+    Ok(resp
+        .results
+        .into_iter()
+        .map(|r| LocationHit {
+            name: r.name,
+            admin1: r.admin1,
+            country: r.country,
+            latitude: r.latitude,
+            longitude: r.longitude,
+        })
+        .collect())
+}
+
+/// 地名検索 (Open-Meteo Geocoding API、§2.2)。設定は読まない・書かない純 API 呼び出し。
+/// 座標の丸めは保存時 (Settings::clamp) に行うため、候補表示は API の生値のままでよい。
+#[tauri::command]
+pub async fn search_location(query: String) -> Result<Vec<LocationHit>, String> {
+    let trimmed = query.trim();
+    if trimmed.chars().count() < 2 {
+        return Err("2 文字以上で検索してください".to_string());
+    }
+    let url = build_geocoding_url(trimmed);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP クライアント構築に失敗しました: {e}"))?;
+    let body = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("地名検索に失敗しました: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("地名検索が HTTP エラーになりました: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("地名検索の応答取得に失敗しました: {e}"))?;
+    parse_geocoding_response(&body)
+}
+
+/// ensure_fresh を通したキャッシュを返す (設定 UI の「いま取得」検証・現在値表示用)。
+/// weather_ready でなければ Ok(None)。取得失敗かつキャッシュなしも Ok(None)
+/// (Err はコマンド実行自体の失敗のみ)。
+#[tauri::command]
+pub async fn get_weather(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<WeatherSnapshot>, String> {
+    Ok(weather::ensure_fresh(state.inner()).await.map(WeatherSnapshot::from))
+}
+
+#[cfg(test)]
+mod weather_tests {
+    use super::*;
+
+    #[test]
+    fn geocoding_url_encodes_query_and_sets_params() {
+        let url = build_geocoding_url("東京都 千代田区");
+        assert!(url.starts_with("https://geocoding-api.open-meteo.com/v1/search?name="));
+        assert!(url.contains("count=8"));
+        assert!(url.contains("language=ja"));
+        assert!(url.contains("format=json"));
+        assert!(!url.contains(' '), "クエリはエンコードされている必要がある");
+    }
+
+    #[test]
+    fn parse_geocoding_response_maps_results() {
+        let raw = r#"{
+            "results": [
+                {"name": "Tokyo", "latitude": 35.6895, "longitude": 139.69171,
+                 "admin1": "Tokyo", "country": "Japan"},
+                {"name": "Tokyo Ward", "latitude": 35.7, "longitude": 139.7}
+            ]
+        }"#;
+        let hits = parse_geocoding_response(raw).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].name, "Tokyo");
+        assert_eq!(hits[0].admin1.as_deref(), Some("Tokyo"));
+        assert_eq!(hits[0].country.as_deref(), Some("Japan"));
+        // admin1/country 省略時は None (0 件ヒット周辺の欠損に強い)
+        assert_eq!(hits[1].admin1, None);
+        assert_eq!(hits[1].country, None);
+    }
+
+    #[test]
+    fn parse_geocoding_response_empty_results_is_ok() {
+        let hits = parse_geocoding_response(r#"{}"#).unwrap();
+        assert!(hits.is_empty());
+        let hits2 = parse_geocoding_response(r#"{"results": []}"#).unwrap();
+        assert!(hits2.is_empty());
+    }
 }

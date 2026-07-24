@@ -164,6 +164,8 @@ fn main() {
             commands::daily::refresh_calendar,
             commands::daily::add_calendar_source,
             commands::daily::remove_calendar_source,
+            commands::daily::search_location,
+            commands::daily::get_weather,
             commands::tools::read_clipboard_text,
             commands::profile::get_profile,
             commands::profile::add_profile,

@@ -27,8 +27,13 @@
       <div id="balloon-sub" class="balloon solid">
         <div class="balloon-text"></div>
       </div>
-      <!-- VOICEVOX クレジット (TTS 有効時に常時表示、.solid) -->
-      <div id="tts-credit" class="solid" title="VOICEVOX 利用規約に基づくクレジット表記"></div>
+      <!-- クレジット表示バー: VOICEVOX (TTS 有効時) + Open-Meteo (天気有効時)。
+           どちらも .solid + .visible トグル。並べて表示できるよう共通の
+           #credits-bar でステージ下端中央に固定する (M11)。 -->
+      <div id="credits-bar">
+        <div id="tts-credit" class="solid" title="VOICEVOX 利用規約に基づくクレジット表記"></div>
+        <div id="weather-credit" class="solid" title="Weather data by Open-Meteo.com (CC BY 4.0)">天気: Open-Meteo.com</div>
+      </div>
       <!-- ポモドーロバッジ (静的配置、phase=idle 以外で .visible) -->
       <div id="pomodoro-badge" class="solid" title="クリックで停止">
         <span id="pomodoro-badge-phase">--</span>
@@ -465,6 +470,45 @@
               複雑な繰り返し予定は当日分のみ「繰り返し(一部)」と表示することがあります。
             </p>
             <p id="settings-calendar-message" class="panel-message" hidden></p>
+          </section>
+          <section class="panel-section" data-page="daily">
+            <h3>天気 (生活情報)</h3>
+            <div class="row">
+              <span>設定中の地域</span>
+              <span id="weather-place-state" class="key-state">未設定</span>
+            </div>
+            <label class="row">
+              <span>地域を検索</span>
+              <span class="key-cell daily-add-cell">
+                <input type="text" id="weather-search-input" placeholder="例: 東京都千代田区" />
+                <button type="button" id="weather-search-btn">検索</button>
+              </span>
+            </label>
+            <p class="panel-hint">
+              検索・選択した地名と座標 (市区町村単位に丸めます) は天気予報の取得のため Open-Meteo に送信されます。
+            </p>
+            <div id="weather-candidates" class="daily-list"></div>
+            <div class="row">
+              <span></span>
+              <div class="key-cell">
+                <button type="button" id="weather-refresh-btn" disabled>いま取得</button>
+                <button type="button" id="weather-clear-btn" disabled>解除</button>
+              </div>
+            </div>
+            <p id="weather-preview" class="panel-hint" hidden></p>
+            <label class="row checkbox-row">
+              <input type="checkbox" id="settings-situation-rain" disabled />
+              <span>降雨の一言 (雨が見込まれる朝に一度だけ知らせる)</span>
+            </label>
+            <p class="panel-hint" id="weather-rain-hint">先に地域を設定してください。</p>
+            <p class="panel-hint">
+              Weather data by
+              <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a>
+              (<a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener"
+                >CC BY 4.0</a
+              >)
+            </p>
+            <p id="weather-message" class="panel-message" hidden></p>
           </section>
           <section class="panel-section" data-page="daily">
             <h3>夜間静音</h3>

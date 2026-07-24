@@ -22,6 +22,7 @@ import { mountReaderPanel } from "./panels/reader";
 import { mountSystemToast } from "./system/toast";
 import { mountSettingsPanel, registerSavedListener } from "./panels/settings";
 import { mountCredit, refreshCredit } from "./tts/credit";
+import { mountWeatherCredit, refreshWeatherCredit } from "./weather/credit";
 import { createSpeaker, setTtsParams } from "./tts/speaker";
 import { installAlphaMaskHooks, scheduleMaskUpdate } from "./stage/alphamask";
 import { hitTest, mountSlot, unmountSlot } from "./stage/character";
@@ -91,6 +92,7 @@ async function boot(): Promise<void> {
     },
   });
   mountCredit();
+  mountWeatherCredit();
   mountChatLog();
   mountReaderPanel();
   await mountDailyPanel();
@@ -107,6 +109,7 @@ async function boot(): Promise<void> {
     payload.settings.tts_speaker_main,
     payload.settings.tts_speaker_sub,
   );
+  refreshWeatherCredit(payload.settings);
   registerSavedListener((s) => {
     currentSettings = s;
     applyDisplayScale(s.display_scale);
@@ -115,6 +118,7 @@ async function boot(): Promise<void> {
     setTalkSpeed(s.talk_speed);
     setTtsParams({ enabled: s.tts_enabled, speed: s.tts_speed, volume: s.tts_volume });
     void refreshCredit(s.tts_enabled, s.tts_engine, s.tts_speaker_main, s.tts_speaker_sub);
+    refreshWeatherCredit(s);
   });
   mountContextMenu({
     current: () => currentSettings,

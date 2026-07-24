@@ -1,4 +1,5 @@
-//! 発話ガバナンス (M7、daily-support-design §4)。
+//! 発話ガバナンス (M7、daily-support-design §4。M11 で 9→12 カテゴリへ拡張、
+//! regular-talk-design §4)。
 //!
 //! すべての自発発話 (独り言・idle・通知・催促・状況発話) の可否を一元判定する。
 //! **判定 (`can_deliver`) と記録 (`record_delivered`) は分離**し、両方を
@@ -34,6 +35,9 @@ use crate::state::{AppState, Settings};
 /// M7 で発火するのは Monologue / Idle / Reminder。残りは設計 §4.2 判定表の契約の
 /// 一部として M7 で定義済みで、発火元は M8 (Todo) / M9 (Situation*) / M10 (Calendar)
 /// が結線する (それまで未構築の variant を許容)。
+/// M11 で 3 variant を一括追加 (regular-talk-design §4.1、同じ「未構築 variant を許容」
+/// 先例に従う): SituationRain は M11 (daily watcher) が結線、RegularMorning/RegularEvening
+/// は Settings フィールドのみ M11 で追加し発火は M12 が結線する (既定 false で inert)。
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeechCategory {
@@ -46,10 +50,16 @@ pub enum SpeechCategory {
     SituationLateNight,
     SituationBattery,
     SituationTodoFollow,
+    /// 降雨の一言 (M11、spec §4.7.2)。is_situation() 対象 (段 4/5 適用)。
+    SituationRain,
+    /// 朝の定例会話 (M12 で発火結線)。is_situation() 対象外 (間隔バックオフ非適用)。
+    RegularMorning,
+    /// 夜の定例会話 (M12 で発火結線)。同上。
+    RegularEvening,
 }
 
 impl SpeechCategory {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 12;
 
     pub fn index(self) -> usize {
         match self {
@@ -62,6 +72,9 @@ impl SpeechCategory {
             SpeechCategory::SituationLateNight => 6,
             SpeechCategory::SituationBattery => 7,
             SpeechCategory::SituationTodoFollow => 8,
+            SpeechCategory::SituationRain => 9,
+            SpeechCategory::RegularMorning => 10,
+            SpeechCategory::RegularEvening => 11,
         }
     }
 
@@ -77,6 +90,9 @@ impl SpeechCategory {
             SpeechCategory::SituationLateNight => "situation_late_night",
             SpeechCategory::SituationBattery => "situation_battery",
             SpeechCategory::SituationTodoFollow => "situation_todo_follow",
+            SpeechCategory::SituationRain => "situation_rain",
+            SpeechCategory::RegularMorning => "regular_morning",
+            SpeechCategory::RegularEvening => "regular_evening",
         }
     }
 
@@ -91,12 +107,16 @@ impl SpeechCategory {
             "situation_late_night" => SpeechCategory::SituationLateNight,
             "situation_battery" => SpeechCategory::SituationBattery,
             "situation_todo_follow" => SpeechCategory::SituationTodoFollow,
+            "situation_rain" => SpeechCategory::SituationRain,
+            "regular_morning" => SpeechCategory::RegularMorning,
+            "regular_evening" => SpeechCategory::RegularEvening,
             _ => return None,
         })
     }
 
-    /// 段 4/5 (最低間隔・連投回避) と 🔕 フィードバックの適用対象 (Situation* のみ、§4.2/§4.3)。
+    /// 段 4/5 (最低間隔・連投回避) と 🔕 の間隔延長 (backoff) の適用対象 (§4.2/§4.3)。
     /// Monologue/Idle は既存の間隔設定 (monologue_interval_min / idle 30 分) を維持する。
+    /// Regular* は 1 日 1〜2 回の定例のため対象外 (spec §4.7.1 裁定)。
     pub fn is_situation(self) -> bool {
         matches!(
             self,
@@ -104,7 +124,16 @@ impl SpeechCategory {
                 | SpeechCategory::SituationLateNight
                 | SpeechCategory::SituationBattery
                 | SpeechCategory::SituationTodoFollow
+                | SpeechCategory::SituationRain
         )
+    }
+
+    /// 🔕 フィードバック (backoff カウント + 3 回でトグル OFF) の対象 (M11、§4.2)。
+    /// is_situation() (段 4/5 の間隔延長つき) に加え Regular* 2 種 (カウントのみ。
+    /// 間隔延長は is_situation() ゲートの段 5 にしか無いので構造上自然にそうなる)。
+    pub fn feedback_target(self) -> bool {
+        self.is_situation()
+            || matches!(self, SpeechCategory::RegularMorning | SpeechCategory::RegularEvening)
     }
 
     /// 🔕 で OFF に落とすカテゴリトグルを反転する。トグルを持つカテゴリなら true。
@@ -126,6 +155,18 @@ impl SpeechCategory {
                 s.todo_follow_enabled = false;
                 true
             }
+            SpeechCategory::SituationRain => {
+                s.situation_rain_enabled = false;
+                true
+            }
+            SpeechCategory::RegularMorning => {
+                s.regular_morning_enabled = false;
+                true
+            }
+            SpeechCategory::RegularEvening => {
+                s.regular_evening_enabled = false;
+                true
+            }
             _ => false,
         }
     }
@@ -133,6 +174,7 @@ impl SpeechCategory {
     /// 段 3: カテゴリ設定が有効か。
     /// Tier S 系は daily_support_enabled (マスタ) との AND。
     /// Todo/Calendar の個別設定は M8/M10 で追加され、それまではマスタのみ。
+    /// 定例会話 2 枠も同じマスタと AND する (§4.1: 材料が Tier S データのため)。
     fn enabled(self, s: &Settings) -> bool {
         match self {
             SpeechCategory::Monologue => s.monologue_interval_min > 0,
@@ -149,6 +191,13 @@ impl SpeechCategory {
             }
             SpeechCategory::SituationTodoFollow => {
                 s.daily_support_enabled && s.todo_follow_enabled
+            }
+            SpeechCategory::SituationRain => s.daily_support_enabled && s.situation_rain_enabled,
+            SpeechCategory::RegularMorning => {
+                s.daily_support_enabled && s.regular_morning_enabled
+            }
+            SpeechCategory::RegularEvening => {
+                s.daily_support_enabled && s.regular_evening_enabled
             }
         }
     }
@@ -231,6 +280,9 @@ const ALL_CATEGORIES: [SpeechCategory; SpeechCategory::COUNT] = [
     SpeechCategory::SituationLateNight,
     SpeechCategory::SituationBattery,
     SpeechCategory::SituationTodoFollow,
+    SpeechCategory::SituationRain,
+    SpeechCategory::RegularMorning,
+    SpeechCategory::RegularEvening,
 ];
 
 /// 🔕 フィードバックを 1 回記録する: backoff を +1 して永続化し、新しい回数を返す。
@@ -247,8 +299,12 @@ pub fn reset_backoff(state: &Arc<AppState>, cat: SpeechCategory) {
     let _ = state.db.set_setting(&backoff_key(cat), "0");
 }
 
-/// OFF→ON に切り替わった Situation* カテゴリを返す (set_settings が backoff リセットに使う)。
-pub fn situation_reenabled(old: &Settings, new: &Settings) -> Vec<SpeechCategory> {
+/// OFF→ON に切り替わった feedback_target() カテゴリを返す (set_settings が backoff
+/// リセットに使う)。対象は Situation*4 + SituationRain + Regular*2 = 7 (§4.2)。
+/// M11 で `situation_reenabled` から改名・対象拡張 (旧名は Situation* 4 種のみだった)。
+/// リセットしないと、🔕×3 で OFF になった枠を再有効化した直後の 🔕 1 回で
+/// 即 OFF に落ちる (counter が 3 のまま残るため)。
+pub fn feedback_reenabled(old: &Settings, new: &Settings) -> Vec<SpeechCategory> {
     let checks = [
         (
             old.situation_break_enabled,
@@ -269,6 +325,21 @@ pub fn situation_reenabled(old: &Settings, new: &Settings) -> Vec<SpeechCategory
             old.todo_follow_enabled,
             new.todo_follow_enabled,
             SpeechCategory::SituationTodoFollow,
+        ),
+        (
+            old.situation_rain_enabled,
+            new.situation_rain_enabled,
+            SpeechCategory::SituationRain,
+        ),
+        (
+            old.regular_morning_enabled,
+            new.regular_morning_enabled,
+            SpeechCategory::RegularMorning,
+        ),
+        (
+            old.regular_evening_enabled,
+            new.regular_evening_enabled,
+            SpeechCategory::RegularEvening,
         ),
     ];
     checks
@@ -450,20 +521,30 @@ mod tests {
     }
 
     #[test]
-    fn situation_reenabled_detects_off_to_on() {
-        let old = Settings::default(); // Situation* すべて false
+    fn feedback_reenabled_detects_off_to_on() {
+        let old = Settings::default(); // Situation*/Regular* すべて false
         let mut new = old.clone();
         new.situation_break_enabled = true;
         new.todo_follow_enabled = true;
-        let r = situation_reenabled(&old, &new);
-        assert_eq!(r.len(), 2);
+        new.situation_rain_enabled = true;
+        new.regular_morning_enabled = true;
+        let r = feedback_reenabled(&old, &new);
+        assert_eq!(r.len(), 4);
         assert!(r.contains(&SpeechCategory::SituationBreak));
         assert!(r.contains(&SpeechCategory::SituationTodoFollow));
+        assert!(r.contains(&SpeechCategory::SituationRain));
+        assert!(r.contains(&SpeechCategory::RegularMorning));
         // ON→ON (据置) と ON→OFF は対象外
         let mut prev_on = Settings::default();
         prev_on.situation_break_enabled = true;
-        assert!(situation_reenabled(&prev_on, &prev_on).is_empty());
-        assert!(situation_reenabled(&prev_on, &Settings::default()).is_empty());
+        assert!(feedback_reenabled(&prev_on, &prev_on).is_empty());
+        assert!(feedback_reenabled(&prev_on, &Settings::default()).is_empty());
+    }
+
+    #[test]
+    fn category_count_is_twelve() {
+        assert_eq!(SpeechCategory::COUNT, 12);
+        assert_eq!(ALL_CATEGORIES.len(), 12);
     }
 
     #[test]
@@ -472,7 +553,7 @@ mod tests {
             assert_eq!(SpeechCategory::parse(cat.as_str()), Some(cat));
         }
         assert_eq!(SpeechCategory::parse("unknown"), None);
-        // Situation* はトグルを持ち、🔕 で OFF に落ちる
+        // Situation*/Regular* はトグルを持ち、🔕 で OFF に落ちる
         let mut s = Settings::default();
         s.situation_break_enabled = true;
         assert!(SpeechCategory::SituationBreak.disable_toggle(&mut s));
@@ -481,6 +562,48 @@ mod tests {
         s2.todo_follow_enabled = true;
         assert!(SpeechCategory::SituationTodoFollow.disable_toggle(&mut s2));
         assert!(!s2.todo_follow_enabled);
+        let mut s3 = Settings::default();
+        s3.situation_rain_enabled = true;
+        s3.regular_morning_enabled = true;
+        s3.regular_evening_enabled = true;
+        assert!(SpeechCategory::SituationRain.disable_toggle(&mut s3));
+        assert!(!s3.situation_rain_enabled);
+        assert!(SpeechCategory::RegularMorning.disable_toggle(&mut s3));
+        assert!(!s3.regular_morning_enabled);
+        assert!(SpeechCategory::RegularEvening.disable_toggle(&mut s3));
+        assert!(!s3.regular_evening_enabled);
         assert!(!SpeechCategory::Monologue.disable_toggle(&mut Settings::default()));
+    }
+
+    #[test]
+    fn feedback_target_covers_situation_and_regular_only() {
+        for cat in [
+            SpeechCategory::SituationBreak,
+            SpeechCategory::SituationLateNight,
+            SpeechCategory::SituationBattery,
+            SpeechCategory::SituationTodoFollow,
+            SpeechCategory::SituationRain,
+            SpeechCategory::RegularMorning,
+            SpeechCategory::RegularEvening,
+        ] {
+            assert!(cat.feedback_target(), "{cat:?} は feedback_target であるべき");
+        }
+        for cat in [
+            SpeechCategory::Monologue,
+            SpeechCategory::Idle,
+            SpeechCategory::Reminder,
+            SpeechCategory::Todo,
+            SpeechCategory::Calendar,
+        ] {
+            assert!(!cat.feedback_target(), "{cat:?} は feedback_target ではないべき");
+        }
+    }
+
+    #[test]
+    fn regular_categories_are_not_situation() {
+        // Regular* は間隔バックオフ (段 4/5) の対象外 (spec §4.7.1 裁定)
+        assert!(!SpeechCategory::RegularMorning.is_situation());
+        assert!(!SpeechCategory::RegularEvening.is_situation());
+        assert!(SpeechCategory::SituationRain.is_situation());
     }
 }

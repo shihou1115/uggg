@@ -550,6 +550,20 @@ events:
     - main: { text: "そろそろ『{summary}』の時間が近いね（{time}）", pose: normal }
       sub: { text: "準備するなら今のうちだ", pose: normal }
 
+  # 降雨の一言 (M11, spec §4.7.2)。{label} は天気ラベル (「雨」「にわか雨」等)、
+  # {p} は降水確率。既定オフ・状況発話 (SituationRain)・サブ主体・朝帯 1 日 1 回。
+  weather_rain:
+    - main: { text: "今日は{label}みたい。降水確率{p}%、傘があると安心かも", pose: normal }
+      sub: { text: "濡れて風邪をひくなよ", pose: normal }
+    - main: { text: "空模様が{label}っぽいよ。念のため傘を持っていこ？", pose: troubled }
+      sub: { text: "降水確率{p}%だ。備えあれば憂いなし", pose: normal }
+  # weather_rain_outing: 当日に時刻付き予定があるときの強め版。
+  weather_rain_outing:
+    - main: { text: "今日は出かける予定があるのに{label}だって。降水確率{p}%、傘は忘れずに！", pose: troubled }
+      sub: { text: "濡れて帰ってきても知らんぞ", pose: normal }
+    - main: { text: "外出の日に{label}みたい…降水確率{p}%だから傘を持って行ってね", pose: troubled }
+      sub: { text: "予定があるなら尚更だ。準備を怠るな", pose: normal }
+
   # 終了前の確認 (M9, spec §4.6.2)。未完了の today ToDo があるときの終了挨拶。
   # {count} は未完了件数。通常の quit の代わりに再生される。
   todo_quit:
