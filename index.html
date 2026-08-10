@@ -694,10 +694,20 @@
               <span>話し方の希望 (任意)</span>
               <input type="text" id="onboarding-talk-style" placeholder="例: フランクに / 敬語で" />
             </label>
+            <!-- 興味 (spec §4.2.5): 長期記憶に投入され、時事ネタ ON 時は
+                 RSS 検索のキーワードにもなる。設定パネルと同じカンマ区切り。 -->
+            <label class="row">
+              <span>興味のあること (任意)</span>
+              <input type="text" id="onboarding-interests" placeholder="例: 映画, 料理, 宇宙" />
+            </label>
             <label class="row checkbox-row">
               <input type="checkbox" id="onboarding-topics" />
               <span>ネットの話題を会話に取り入れる (advanced モード時)</span>
             </label>
+            <p class="panel-hint">
+              興味は会話の材料になります。チェックを入れると、その言葉でネットの話題を検索します
+              (あとから設定でも変えられます)。
+            </p>
           </section>
         </div>
         <footer class="panel-footer">
