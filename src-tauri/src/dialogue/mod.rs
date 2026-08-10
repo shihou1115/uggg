@@ -28,6 +28,12 @@ pub struct DialogueResponse {
     pub pattern: u8,
     pub main: SpeechTurn,
     pub sub: Option<SpeechTurn>,
+    /// 掛け合いパターン3/4 の3ターン目 (spec §4.2.4)。パターン3は main の再発話、
+    /// パターン4は sub の再発話。`#balloon-extra` に独立表示する (spec §4.1.3)。
+    /// パターン1/2、または LLM が3ターン目を返さなかった場合は None
+    /// (その場合 pattern は 3→1・4→2 に縮退済み、`dialogue::banter::assemble_advanced` 参照)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<SpeechTurn>,
     // === M9: バック起点発話のメタ (🔕 フィードバック用、daily-support-design §4.3/§8.2) ===
     // `system::deliver::deliver_event` だけが付与する。ユーザー起点の応答
     // (`send_user_message` の戻り値) には付けない (None のままシリアライズから消える)。
@@ -112,6 +118,7 @@ fn handle_reminder_request(
             pose: None,
         },
         sub: None,
+        extra: None,
         speech_id: None,
         category: None,
         priority: None,

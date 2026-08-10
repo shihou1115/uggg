@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import { reposition } from "../dialogue/balloon";
+import { repositionAll } from "../dialogue/balloon";
 import { refreshInputPosition } from "../dialogue/input";
 import type { SlotName } from "../types";
 
@@ -36,7 +36,9 @@ function apply(slot: SlotName, x: number): void {
   const clamped = clampX(x, visualWidth(el));
   xPos.set(slot, clamped);
   el.style.left = `${clamped}px`;
-  reposition(slot);
+  // 表示中の吹き出しを全枠まとめて再配置する。動いたキャラを基準にする枠だけを
+  // 再計算すると、相方をドラッグしたときに extra が取り残されて重なる (§10.4 案A)。
+  repositionAll();
   refreshInputPosition(slot); // 入力欄がこのキャラにアンカーしていれば追従
 }
 

@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v1.6）
+# ugg アーキテクチャ設計書（architecture.md v1.7）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -253,6 +253,7 @@ CREATE TABLE chat_log (
 );
 CREATE INDEX idx_chat_log_ts ON chat_log(ts);
 ```
+- **1 応答あたりの行数**: 通常は user → main → sub の 3 行。**掛け合いパターン3/4（§10.4）では3ターン目を話者と同じロール（パターン3=main / パターン4=sub）で追記するため最大 4 行**になり、同一 ts・同一 role の行が 2 行並ぶ（スキーマは不変。role に新値は増やさない）
 
 #### `user_profile`（★ origin 拡張、source_keywords 追加）
 ```sql
@@ -534,7 +535,7 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `send_user_message` | `text: String` | `DialogueResponse` | モード判定・降格制御 |
+| `send_user_message` | `text: String` | `DialogueResponse` | モード判定・降格制御。**掛け合いパターン3/4 の3ターン目 `extra: SpeechTurn` が付くのはこの戻り値のみ**（optional・advanced のみ・安全縮退時は省略。§10.4） |
 
 **注**: 旧設計の `send_with_clipboard` / `read_clipboard` は不採用。クリップボード連携は `read_clipboard_text`（§4.9）でフロントが本文を取得して入力欄に貼り付け、通常の `send_user_message` で送信する方式に統合した。
 
@@ -681,7 +682,7 @@ pub struct GhostBundle {
 
 | イベント | payload | 用途 |
 |---|---|---|
-| `dialogue` | `DialogueResponse` | バック起点の発話（ランダムトーク・notify 経由の system 発話）。★M9: deliver 経由の発話には `speech_id` / `category` / `priority` / `feedback_allowed` が付く（🔕 用。ユーザー応答には付かない。TS 型は optional） |
+| `dialogue` | `DialogueResponse` | バック起点の発話（ランダムトーク・notify 経由の system 発話）。★M9: deliver 経由の発話には `speech_id` / `category` / `priority` / `feedback_allowed` が付く（🔕 用。ユーザー応答には付かない。TS 型は optional）。**このイベント経路は常に `banter::pattern_1` で組むため `extra`（3ターン目）は載らない** — 3ターン目が付くのは `send_user_message` の戻り値だけ（§4.3・§10.4） |
 | `settings-changed` | `Settings` | バック起点の設定変更（トレイ等から） |
 | `open-settings` | なし | トレイ → 設定パネル |
 | `pomodoro` | `PomodoroStatus` | 毎秒・節目 |
@@ -1241,30 +1242,52 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 
 ### 10.3 吹き出し配置計算（キャラ左横・伺か風）
 
+**型の分離**: `SlotName`（"main" | "sub"）はキャラ（pose・TTS 話者・位置の基準・`char-${slot}`）、
+`BalloonSlot`（"main" | "sub" | "extra"）は吹き出し枠（DOM）を指す別の型（フロント `src/types.ts`）。
+掛け合いパターン3/4 の3ターン目は「1ターン目と同じキャラが、別の吹き出し枠 (`extra`) で喋る」ため、
+`SlotName` に `"extra"` は追加しない（追加すると `char-extra` の DOM 参照・`setPose("extra")`・
+TTS 話者選択が破綻する）。`balloon.ts` の各吹き出し View は自分が現在基準にしているキャラ
+(`charSlot: SlotName`) を保持し、`showBalloon(balloonSlot, charSlot)` で更新する。
+
 ```typescript
-function reposition(slot: "main" | "sub") {
-    const rect = char.getBoundingClientRect();        // scale 後の矩形
+function reposition(balloonSlot: "main" | "sub" | "extra") {
+    const view = views.get(balloonSlot);
+    const char = char-${view.charSlot};          // 基準キャラ (main/sub 自身、extra はパターンにより main/sub)
+    const rect = char.getBoundingClientRect();    // scale 後の矩形
     // 横: キャラ左端から 24px (しっぽ含む) 空けて右端を合わせる
     let left = rect.left - 24 - balloon.offsetWidth;
     // 左端 8px に収まらない場合はキャラの右横へ反転 (.flip、しっぽも反転)
     if (left < 8) left = rect.right + 24;
     // 縦: キャラ上端 + キャラ高さ × 0.12 (顔の高さ) に上端を置く
     let top = rect.top + rect.height * 0.12;
-    // 相方の吹き出しと重なる場合: main は相方の上へ、sub は相方の下へ退避
+    // main/sub: 相方の吹き出しと重なる場合、main は相方の上へ、sub は相方の下へ退避
+    // extra: main・sub 両方の吹き出しと重なる間、外側 (上方向) へ退避 (§10.4)
     // 最後に上下端 8px で clamp
 }
 ```
 
 - しっぽは吹き出しの側辺（上端から 20px）からキャラ側を向く（通常 = 右辺から右向き、.flip 時 = 左辺から左向き）
-- タイプライター進行・キャラのドラッグ移動ごとに再計算（吹き出しの成長とキャラ追従）
+- タイプライター進行・キャラのドラッグ移動ごとに再計算（吹き出しの成長とキャラ追従）。ドラッグ追従は
+  `charpos.ts` が `repositionAllFor(charSlot)` を呼び、そのキャラを基準にしている吹き出し枠
+  （main/sub 自身 + 該当時の extra）をまとめて再配置する
 - フォント/border はスケールの影響を受けないため視認性確保
 
-### 10.4 3つ目の吹き出し（A-3 パターン3/4）
+### 10.4 3つ目の吹き出し（A-3 パターン3/4、実装確定）
 
-- パターン3: main → sub → main の **3 ターン目**を `#balloon-extra` に独立表示
-- パターン4: sub → main → sub の **3 ターン目**を `#balloon-extra` に独立表示
-- 配置: main/sub の吹き出しと重ならないよう、上方に積み上げ or 横に並べる（実装で詳細決定）
-- 全ターン描画+発話完了後に一括消去
+- パターン3: main → sub → main の **3 ターン目**（話者=main）を `#balloon-extra` に独立表示
+- パターン4: sub → main → sub の **3 ターン目**（話者=sub）を `#balloon-extra` に独立表示
+- **配置（案A: 話者キャラの横・さらに外側へ退避）**: 3ターン目の話者キャラの左横（既存 main/sub と
+  同じ伺か風レイアウト = キャラ左端から 24px 空けて右端合わせ、上端はキャラ上端 + 高さ 12%）に出し、
+  main・sub 両方の吹き出しと重なる間は上方向へ追い出す（§10.3 の main/sub 退避ロジックの一般化）。
+  3段積んで画面上端に収まらない場合は既存の 8px clamp で詰まる（破綻はしない）
+- **バックエンド**: パターン抽選 (`dialogue::banter::pick_advanced_pattern`) は LLM 呼び出し**前**に
+  行い、`advanced::system_prompt` がパターン別に出力形式を出し分ける（パターン3/4 のみ JSON に
+  `extra: { text, pose }` を要求）。`DialogueResponse.extra: Option<SpeechTurn>`
+  (`#[serde(skip_serializing_if = "Option::is_none")]`、フロント型は `extra?: SpeechTurn`) を追加
+- **安全縮退**: LLM が `extra` を返さなかった / 空文字だった場合は `banter::assemble_advanced` が
+  パターン 3→1・4→2 に縮退し、従来通り2ターンで表示する（辞書経路・サブ無しゴーストは無関係、常に
+  パターン1のまま）
+- 全ターン描画+発話完了後に一括消去（`hideAllBalloons()`）
 
 ---
 
@@ -1613,3 +1636,4 @@ async fn install_asset(
 | 2026-07-17 | v1.3 | M9（状況発話 + 検知 + ガバナンス完成 §4.6.3）を反映。`presence/context.rs`（OS 検知 + 閾値純関数、windows crate に Power/SystemInformation feature 追加）/ context watcher（休憩・深夜・バッテリー・ToDo フォロー/滞留、§11.4）/ gate 段 5 連投回避 + 🔕 backoff（`feedback_speech` §4.11、`governance_backoff:*` 永続化）/ `DialogueResponse` に speech_id・category・priority・feedback_allowed（§5、バック起点のみ）/ フロント #balloon-mute + 設定「状況に応じた声かけ」セクション / 辞書 `situation_break`・`situation_late_night`・`situation_battery`・`todo_quit`（§6.2。`situation_todo_follow` キーは `todo_follow`/`todo_stale` に統合）/ 終了前確認（tray quit で todo_quit 優先、spec §4.6.2 後半）/ AppState に ContextState（§3） |
 | 2026-07-24 | v1.6 | M12（朝・夜の定例会話 §4.7.1）を反映し **v0.3 実装完了**。`system/regular_talk.rs`（材料集約 + 定型文組み立て = low 完結 + advanced 言い回し整形、§1.2）/ daily watcher に朝・夜の定例会話を統合（tick §5.1 順・`regular_slot_due` 純関数・失効窓 6h・1 tick 1 枠・吸収 §5.5、§11.4）/ `regular_morning`/`regular_evening` 辞書（§6.2）/ `regular_{morning,evening}_date` dedup キー（§2.2）/ Db `count_done_todos_since`（夜の完了実績、schema v8 維持）/ 設定に定例会話節（朝/夜 有効・時刻・曜日トグル・夜間静音重なり警告）。SpeechCategory/Settings は M11 で追加済みのため無変更。新規コマンド・イベント・DB テーブルなし。既知の割り切り: advanced 整形は月次コスト上限の閾値チェックを経由しない（実コスト ≈ 月$0.004・受容）。 |
 | 2026-07-24 | v1.5 | M11（天気基盤 §4.7.2）を反映。`system/weather.rs`（Open-Meteo forecast 取得・`app_settings["weather_cache"]` JSON キャッシュ = 新テーブルなし・schema v8 維持・WMO→日本語ラベル・降雨判定、§1.2/§2.2）/ 天気コマンド `search_location`・`get_weather`（§4.11、新規イベントなし §5）/ daily watcher に天気 3h 定期取得 + 降雨の一言（`weather_rain`/`weather_rain_outing`、§6.2・§11.4）/ SpeechCategory 9→12（`SituationRain` + M12 用 `RegularMorning`/`RegularEvening` を一括追加）+ `feedback_target()` で Regular* を間隔バックオフ非適用のまま 🔕 対象化、🔕 の is_situation ゲートを `deliver.rs` と `feedback_speech` の 2 箇所差し替え（§3.1）/ Settings 11 フィールド（weather_*4・situation_rain・regular_*6）+ 座標の小数 1 桁丸め clamp / 設定に天気節 + `#weather-credit` 出典表示（CC-BY 4.0）。**§4.7.1 定例会話（M12）は未実装**。 |
+| 2026-08-10 | v1.7 | 掛け合いパターン3/4「3つ目の吹き出し」（spec §4.1.3 / §4.2.4）の未実装を解消。`banter::assemble_advanced` の無条件 3→1・4→2 フォールバックを廃止し、パターン抽選 (`pick_advanced_pattern`) を LLM 呼び出し前に前倒し、`advanced::system_prompt` がパターン別に出力形式を出し分け（§10.4）。`DialogueResponse.extra: Option<SpeechTurn>` 追加（§5）。フロントは `BalloonSlot`（"main"\|"sub"\|"extra"）を `SlotName`（"main"\|"sub"）と分離し `#balloon-extra` を静的配置、`balloon.ts` の `reposition`/`repositionAllFor` を吹き出し枠 + 基準キャラの一般化に書き換え（§10.3・§10.4、配置は案A = 話者キャラの横・さらに外側へ退避）。新規コマンド・イベント・DB テーブルなし。 |

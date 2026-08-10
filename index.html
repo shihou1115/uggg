@@ -27,6 +27,11 @@
       <div id="balloon-sub" class="balloon solid">
         <div class="balloon-text"></div>
       </div>
+      <!-- 掛け合いパターン3/4 の3ターン目 (spec §4.1.3 / §4.2.4)。main/sub と同じ
+           構造で静的配置する（メニューは main のみなので .balloon-menu は無し）。 -->
+      <div id="balloon-extra" class="balloon solid">
+        <div class="balloon-text"></div>
+      </div>
       <!-- クレジット表示バー: VOICEVOX (TTS 有効時) + Open-Meteo (天気有効時)。
            どちらも .solid + .visible トグル。並べて表示できるよう共通の
            #credits-bar でステージ下端中央に固定する (M11)。 -->

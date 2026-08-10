@@ -1,5 +1,12 @@
 export type DialogueMode = "low" | "advanced";
+/// キャラクター識別子。pose・TTS 話者・位置の基準・`char-${slot}` の参照に使う。
+/// 掛け合いパターン3/4 の3ターン目は「1ターン目と同じキャラ」が話すため "extra" は
+/// 増やさない（吹き出し枠の識別は `BalloonSlot` で分離する）。
 export type SlotName = "main" | "sub";
+/// 吹き出し枠（DOM）の識別子。`SlotName` とは独立（`BalloonSlot` は表示先の器、
+/// `SlotName` は話しているキャラ）。パターン3/4 の3ターン目は `"extra"` の枠を使うが、
+/// 話者キャラは main/sub のどちらか（`DialogueResponse.pattern` で決まる）。
+export type BalloonSlot = "main" | "sub" | "extra";
 export type TalkSpeed = "slow" | "normal" | "fast" | "instant";
 
 export interface Settings {
@@ -188,6 +195,10 @@ export interface DialogueResponse {
   pattern: number;
   main: SpeechTurn;
   sub: SpeechTurn | null;
+  /// 掛け合いパターン3/4 の3ターン目（spec §4.2.4）。パターン3は main の再発話、
+  /// パターン4は sub の再発話。`#balloon-extra` に独立表示する（spec §4.1.3）。
+  /// パターン1/2、または LLM が3ターン目を返さなかった場合は省略される（None ではなく未定義）。
+  extra?: SpeechTurn;
   // === M9: バック起点発話のメタ (🔕 フィードバック用)。ユーザー応答には付かない ===
   /// 発話ごとの一意 id。🔕 クリック時に feedback_speech へ送り返す (誤適用防止)。
   speech_id?: string;

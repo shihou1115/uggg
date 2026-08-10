@@ -9,7 +9,7 @@ import {
 } from "../dialogue/balloon";
 import { newToken, typeInto, type TypewriterToken } from "../dialogue/typewriter";
 import { setPose } from "../stage/character";
-import type { DialogueResponse, SlotName, SpeechTurn, TalkSpeed } from "../types";
+import type { BalloonSlot, DialogueResponse, SlotName, SpeechTurn, TalkSpeed } from "../types";
 
 interface SpeakerLike {
   speak(slot: SlotName, text: string): Promise<void>;
@@ -68,10 +68,38 @@ function setSpeechMeta(resp: DialogueResponse | null): void {
   muteBtn?.classList.toggle("visible", allowed);
 }
 
-/// DialogueResponse を 1 件レンダリングする。
-/// pattern により main/sub の順序を切り替える:
+interface Turn {
+  charSlot: SlotName;
+  balloonSlot: BalloonSlot;
+  turn: SpeechTurn;
+}
+
+/// pattern (spec §4.2.4) からターン列を組み立てる:
 ///   1: main → sub
 ///   2: sub → main
+///   3: main → sub → main (3ターン目は #balloon-extra、話者は main)
+///   4: sub → main → sub (3ターン目は #balloon-extra、話者は sub)
+/// sub/extra が欠けている (サブ無しゴースト・安全縮退済み) 場合はそのターンを飛ばす。
+function buildTurns(resp: DialogueResponse): Turn[] {
+  const turns: Turn[] = [];
+  const subTurn = resp.sub ? { charSlot: "sub" as const, balloonSlot: "sub" as const, turn: resp.sub } : null;
+  const mainTurn = { charSlot: "main" as const, balloonSlot: "main" as const, turn: resp.main };
+  if (resp.pattern === 2 || resp.pattern === 4) {
+    if (subTurn) turns.push(subTurn);
+    turns.push(mainTurn);
+  } else {
+    turns.push(mainTurn);
+    if (subTurn) turns.push(subTurn);
+  }
+  if (resp.pattern === 3 && resp.extra) {
+    turns.push({ charSlot: "main", balloonSlot: "extra", turn: resp.extra });
+  } else if (resp.pattern === 4 && resp.extra) {
+    turns.push({ charSlot: "sub", balloonSlot: "extra", turn: resp.extra });
+  }
+  return turns;
+}
+
+/// DialogueResponse を 1 件レンダリングする。
 /// 連続呼び出しは前ターンを cancel して即座に新ターンを開始する。
 export async function renderResponse(resp: DialogueResponse): Promise<void> {
   if (currentToken) currentToken.cancelled = true;
@@ -83,26 +111,16 @@ export async function renderResponse(resp: DialogueResponse): Promise<void> {
   setSpeechMeta(resp); // M9 🔕: フィードバック可能発話なら 🔕 を出す
   hideAllBalloons();
 
-  const subFirst = resp.pattern === 2 && resp.sub != null;
-  const turns: Array<{ slot: SlotName; turn: SpeechTurn }> = subFirst
-    ? [
-        { slot: "sub", turn: resp.sub as SpeechTurn },
-        { slot: "main", turn: resp.main },
-      ]
-    : [
-        { slot: "main", turn: resp.main },
-        ...(resp.sub ? [{ slot: "sub" as SlotName, turn: resp.sub }] : []),
-      ];
-
-  for (const t of turns) {
+  for (const t of buildTurns(resp)) {
     if (token.cancelled) return;
-    await speakSlot(token, t.slot, t.turn);
+    await speakSlot(token, t.charSlot, t.balloonSlot, t.turn);
   }
   if (token.cancelled) return;
   await sleep(holdDuration(resp));
   if (token.cancelled) return;
-  hideBalloon("main");
-  if (resp.sub) hideBalloon("sub");
+  // 全ターンの描画+発話完了後に一括消去 (spec §4.1.3)。extra を含め、表示していない
+  // 枠を隠しても無害 (hideBalloon は冪等)。
+  hideAllBalloons();
 }
 
 /// 入力促し (spec §4.3.1): クリックされたキャラ単独の短い発話。
@@ -116,7 +134,7 @@ export async function renderPrompt(slot: SlotName, turn: SpeechTurn): Promise<vo
   setSpeechMeta(null);
   hideAllBalloons();
   promptSlot = slot;
-  await speakSlot(token, slot, turn);
+  await speakSlot(token, slot, slot, turn);
 }
 
 /// 促し発話の吹き出しを消す (入力欄クローズ時に input.ts から呼ばれる)。
@@ -143,13 +161,13 @@ export async function renderMenuPrompt(
   setSpeechMeta(null);
   hideAllBalloons();
   if (subTurn) {
-    await speakSlot(token, "sub", subTurn);
+    await speakSlot(token, "sub", "sub", subTurn);
     if (token.cancelled) return false;
   }
   if (mainTurn) {
-    await speakSlot(token, "main", mainTurn);
+    await speakSlot(token, "main", "main", mainTurn);
   } else {
-    showBalloon("main");
+    showBalloon("main", "main");
   }
   return !token.cancelled;
 }
@@ -163,21 +181,26 @@ export function cancelSpeech(): void {
   hideAllBalloons();
 }
 
+/// `charSlot` = 発話するキャラ (pose・TTS 話者)、`balloonSlot` = 表示先の吹き出し枠。
+/// 通常ターンは両者が一致するが、掛け合いパターン3/4 の3ターン目は
+/// charSlot=main/sub・balloonSlot=extra になる (spec §4.1.3、architecture §10.4)。
 async function speakSlot(
   token: TypewriterToken,
-  slot: SlotName,
+  charSlot: SlotName,
+  balloonSlot: BalloonSlot,
   turn: SpeechTurn,
 ): Promise<void> {
-  if (turn.pose) setPose(slot, turn.pose);
-  const textEl = showBalloon(slot);
+  if (turn.pose) setPose(charSlot, turn.pose);
+  const textEl = showBalloon(balloonSlot, charSlot);
   // TTS フック: 描画開始と同時に再生開始 (順序保証は speaker 側のキュー)。
   // 失敗は内部で握りつぶされる (声なし継続)。
-  void ttsSpeaker?.speak(slot, turn.text);
-  await typeInto(textEl, turn.text, talkSpeed, token, () => reposition(slot));
+  void ttsSpeaker?.speak(charSlot, turn.text);
+  await typeInto(textEl, turn.text, talkSpeed, token, () => reposition(balloonSlot));
 }
 
 function holdDuration(resp: DialogueResponse): number {
-  const total = resp.main.text.length + (resp.sub?.text.length ?? 0);
+  const total =
+    resp.main.text.length + (resp.sub?.text.length ?? 0) + (resp.extra?.text.length ?? 0);
   // ベース 2.0 秒 + 文字数 × 80ms、上限 12 秒。M1 検証用にやや長め。
   return Math.min(12000, 2000 + total * 80);
 }
