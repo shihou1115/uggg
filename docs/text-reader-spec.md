@@ -1,7 +1,7 @@
 # 変更仕様書: テキスト読み上げツール (Text Reader)
 
 **日付**: 2026-07-04
-**状態**: レビュー待ち (承認後に spec.md / architecture.md へ反映して実装)
+**状態**: **実装済み・反映済み**（v0.1.1 で出荷。spec.md §4.5.8 / architecture.md / test-plan.md §5.9 の R1〜R10（2026-07-04 実機 PASS）に反映済み。台本形式への発展は script-reader-spec.md）
 **背景**: LLM が絵文字を安定して返さないため、Irodori-TTS V3 絵文字アノテーション (G5+)
 の実機検証が困難。任意テキストを読み上げるツールがあれば、絵文字入り .txt を投入して
 検証できる。同時に、青空文庫等の長文を「キャラの声で朗読させる」という一般用途としても
@@ -136,7 +136,7 @@ src/panels/reader.ts             -- パネル UI + 逐次再生ループ (先読
 | 4 | `commands/reader.rs` + `state.rs` reading フラグ + `quiet.rs` 判定 + `main.rs` 登録 | `cargo check` |
 | 5 | `index.html` パネル + `panels/reader.ts` + `dnd.ts` 分岐 + `context-menu.ts` 項目 | `npx tsc --noEmit` |
 | 6 | 手動テスト R1〜R8 (§5.2) — **R4 で G5+ 絵文字検証を兼ねる** | 実機 |
-| 7 | `docs/manual.md` / 実機検証記録（現 `docs/test-plan.md` §5.8）更新、コミット | — |
+| 7 | `docs/manual.md` / 実機検証記録（現 `docs/test-plan.md` §5.9）更新、コミット | — |
 
 ## 5. テスト計画
 
@@ -158,7 +158,7 @@ src/panels/reader.ts             -- パネル UI + 逐次再生ループ (先読
 11. `.txt` 以外の拡張子 → エラー
 12. 1MB 超 → エラー
 
-### 5.2 実機手動テスト (R 節。実施記録は docs/test-plan.md §5.8 = 旧 quality_checklist)
+### 5.2 実機手動テスト (R 節。実施記録は docs/test-plan.md §5.9 = 旧 quality_checklist)
 
 | # | 手順 | 期待 |
 |---|---|---|

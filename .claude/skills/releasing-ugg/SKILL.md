@@ -204,6 +204,6 @@ FileVersion / ProductVersion が Step 2 で決めたバージョンと一致す�
 ## 関連ドキュメント
 
 - `docs/test-plan.md` §7 — リリース前手順の正本 (この skill はその実務的補足)
-- `docs/test-plan.md` §5.8 — 機能別の実機検証記録 (M4c G1〜G6 / 読み上げ R / 台本 S。旧 quality_checklist.md、2026-07-24 統合)
+- `docs/test-plan.md` §5.9 — 機能別の実機検証記録 (M4c G1〜G6 / 読み上げ R / 台本 S。旧 quality_checklist.md、2026-07-24 統合)
 - `docs/release-notes/<version>.md` — 各リリースの記録先
 - `references/bundle-config.md` — `tauri.conf.json` bundle 各キーの意味と失敗モード

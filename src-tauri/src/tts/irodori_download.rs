@@ -80,15 +80,21 @@ const IRODORI_EXTRA_REQUIREMENTS: &[&str] = &[
 const SILENTCIPHER_ZIPBALL: &str =
     "https://github.com/SesameAILabs/silentcipher/archive/d46d7d0893a583d8968ab3a6626e2289faec9152.zip";
 
-/// dacvae (facebookresearch) の main ブランチ zipball。upstream Irodori-TTS pyproject の
+/// dacvae (facebookresearch) の**固定 commit** zipball。upstream Irodori-TTS pyproject の
 /// `dacvae = { git = "https://github.com/facebookresearch/dacvae" }` と同じリポジトリ。
+/// pin: 2025-12-22 時点の main HEAD。
 const DACVAE_ZIPBALL: &str =
-    "https://github.com/facebookresearch/dacvae/archive/refs/heads/main.zip";
+    "https://github.com/facebookresearch/dacvae/archive/414c20785fc3a28373073ea8ef7a1316eeeaca6e.zip";
 
-/// Irodori-TTS 本体 (Aratako) の main ブランチ zipball。`infer.py` / `irodori_tts.inference_runtime`
-/// を提供する。最新コードを追うため main ブランチを採用 (将来 release タグが切られたら pin する)。
+/// Irodori-TTS 本体 (Aratako) の**固定 commit** zipball。`infer.py` / `irodori_tts.inference_runtime`
+/// を提供する。pin: 2026-08-11 時点の main HEAD。
+///
+/// **3 資産すべてを commit 固定にする** (v0.4 負債返済 D4)。以前は本体と dacvae が
+/// `refs/heads/main` 追随で、上流の破壊的変更がそのまま配布版の初回 DL を壊しうる状態だった
+/// (silentcipher だけが pin 済みという非一貫)。更新するときは
+/// **ここを手で上げて実機で DL・合成まで通す**こと。
 const IRODORI_TTS_ZIPBALL: &str =
-    "https://github.com/Aratako/Irodori-TTS/archive/refs/heads/main.zip";
+    "https://github.com/Aratako/Irodori-TTS/archive/8224dafb46d0aba89209a8f905f1cb7e3299d9c1.zip";
 
 /// Python 配置ディレクトリ (`%APPDATA%\ugg\irodori\python\`)。
 /// Phase D 以降の `sidecar.py` 起動で使う。

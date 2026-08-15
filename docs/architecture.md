@@ -64,6 +64,7 @@ src-tauri/src/
 ├── main.rs                  -- エントリポイント。コマンド/イベント配線 + setup フックのみ。実装ロジックは持たない
 ├── state.rs                 -- AppState（サブ状態のコンテナ）と各サブ状態の定義
 ├── db.rs                    -- SQLite 接続・マイグレーション・低レベルクエリ
+├── tasks.rs                 -- バックグラウンド watcher 群（ランダムトーク / 放置 / リマインダー / daily / context / calendar / topics / update / Irodori 監視）。§11.4
 │
 ├── commands/                -- 各 Tauri コマンドの実装
 │   ├── mod.rs
@@ -90,19 +91,22 @@ src-tauri/src/
 │   ├── low.rs               -- 辞書ベース
 │   ├── advanced.rs          -- LLM 経由
 │   ├── llm.rs               -- OpenAI 互換クライアント（プロバイダ抽象なし）
-│   ├── monologue.rs         -- 独り言（advanced キャッシュ補充・low 辞書選択）
 │   └── banter.rs            -- 掛け合いパターン制御 (1-4 + question_curiosity)
+│                               ※ 独り言は M7 で専用ヘルパを廃し、deliver_event が dict.pick_monologue を直接引く
 │
 ├── ghost/                   -- ゴースト/シェル/辞書ロード
 │   ├── mod.rs
 │   ├── manifest.rs          -- ghost.json / shell.json パース
 │   ├── dict.rs              -- 辞書スキーマ v3 パース、when 条件評価
-│   └── asset_dnd.rs         -- ★ DnD 展開（zip/フォルダ、zip slip 対策）
+│   └── dnd.rs               -- ★ DnD 展開（zip/フォルダ、zip slip 対策・サイズ/深さ上限）
 │
 ├── tts/                     -- TTS
 │   ├── mod.rs               -- trait TtsEngine, 振り分け
 │   ├── voicevox.rs          -- voicevox_core 埋め込み（libloading + プリビルド C API）
 │   ├── irodori.rs           -- Irodori サイドカー HTTP クライアント
+│   ├── irodori_download.rs  -- Irodori 資産 DL（Python ランタイム・依存・HF モデル）
+│   ├── sidecar.rs           -- サイドカープロセスの起動・停止・監視
+│   ├── gpu.rs               -- GPU 検出（Irodori 可否判定）
 │   ├── preprocess.rs        -- 漢字→ひらがな変換（voicevox_core の OpenJtalk を流用）
 │   ├── reader.rs            -- テキスト読み上げ: .txt 読込 + チャンク分割 + .md 台本対応（text-reader-spec.md / script-reader-spec.md）
 │   ├── script.rs            -- ★ .md 台本形式パース + 検証（フェンス抽出・ScriptError。script-reader-spec.md）
@@ -126,6 +130,7 @@ src-tauri/src/
 │   ├── cost.rs              -- LLM コスト追跡・上限警告・自動降格
 │   ├── update.rs            -- 更新通知
 │   ├── topics.rs            -- 時事ネタ RSS 取得
+│   ├── manual.rs            -- 取扱説明書（同梱 manual.md）を初回起動時・メニューから開く
 │   ├── notify.rs            -- ★ 統合通知サービス notify()（横断方針 §3.1 ゴースト発話原則）
 │   ├── deliver.rs           -- ★M7 通知配達サービス deliver_event（自発発話の単一経路、§11.4）
 │   ├── governance.rs        -- ★M7 発話ガバナンス can_deliver / record_delivered（§11.4）

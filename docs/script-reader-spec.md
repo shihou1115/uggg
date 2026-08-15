@@ -1,7 +1,7 @@
 # 変更仕様書: テキスト読み上げツール 台本形式対応 (Script Reader)
 
 **日付**: 2026-07-04
-**状態**: レビュー待ち (承認後に spec.md / architecture.md / text-reader-spec.md §7 へ反映して実装)
+**状態**: **実装済み・反映済み**（v0.1.2 で出荷。spec.md / architecture.md / test-plan.md §5.9 の S1〜S12（2026-07-04 実機 全 PASS）に反映済み）
 **改訂 1**: 2026-07-04 外部レビュー 3 件を反映 (バリデーション規則の fail-fast 統一・caption 有効判定・
 slot 未設定検証・フェンス抽出規則の厳密化・pause 解決順の一元化・テスト計画増強)
 **改訂 2**: 2026-07-04 再レビュー 3 件を反映 (caption 注記と実行時フォールバックの矛盾解消・
@@ -322,7 +322,7 @@ slot / playbackRate / pause の 3 パラメタ適用、再生開始前の slot �
 | 4 | `commands/reader.rs` / `commands/tts.rs` / `irodori.rs` / `sidecar.py` の contract 変更 + `SpeechRequest` 直列化テスト | `cargo check` / `cargo test` |
 | 5 | `reader.ts` / `dnd.ts` / `types.ts` (slot 検証・注記ラベル込み) | `npx tsc --noEmit` |
 | 6 | 手動テスト S1〜S12 (§5.2) | 実機 |
-| 7 | `docs/manual.md` (台本形式の書き方) / 実機検証記録（現 `docs/test-plan.md` §5.8）更新、コミット | — |
+| 7 | `docs/manual.md` (台本形式の書き方) / 実機検証記録（現 `docs/test-plan.md` §5.9）更新、コミット | — |
 
 ## 5. テスト計画
 
@@ -361,7 +361,7 @@ slot / playbackRate / pause の 3 パラメタ適用、再生開始前の slot �
     (`skip_serializing_if` の確認。旧 sidecar 互換の根拠)。`ReadingChunk` は逆に
     None でも `caption: null` を常に出力すること
 
-### 5.2 実機手動テスト (S 節。実施記録は docs/test-plan.md §5.8 = 旧 quality_checklist)
+### 5.2 実機手動テスト (S 節。実施記録は docs/test-plan.md §5.9 = 旧 quality_checklist)
 
 **前提**: S4・S9 は Irodori 実モデル導入済み環境で行う。未導入環境では代替として
 sidecar ログで `SamplingRequest.caption` に値が透過されることを確認する (S4')。
