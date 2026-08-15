@@ -496,6 +496,11 @@ body {
   max-height: 90vh;
   display: flex;
   flex-direction: column;
+  /* パネルは白基調で固定描画するので、配下の UA ウィジェット (select / input /
+     button の既定色) も light に固定する。`:root` は `color-scheme: light dark` の
+     ため、OS がダークだと UA 由来の色だけダーク側に解決され、白背景と衝突する。
+     ステージ (透過ウインドウ) には影響させないよう **パネル配下だけ**に閉じる。 */
+  color-scheme: light;
   background: rgba(255, 255, 255, 0.98);
   border: 1.5px solid #555;
   border-radius: 12px;
@@ -702,6 +707,13 @@ body {
   border-radius: 6px;
   border: 1px solid #999;
   background: white;
+  /* 文字色を明示する。省略すると UA 既定の buttontext になり、`:root` の
+     `color-scheme: light dark` 配下ではダークテーマ時に明色へ解決されて
+     **白背景に白文字＝ボタンが真っ白に見える** (v0.4 実機確認で発見。
+     「キャンセル」やポモドーロの「中断」「停止」が読めなかった)。
+     .primary は color: white を持つため見えていた。他のボタン規則
+     (.daily-actions / .daily-todo-tabs) は元から色を明示している。 */
+  color: #1c1c1c;
   cursor: pointer;
   font: inherit;
 }
