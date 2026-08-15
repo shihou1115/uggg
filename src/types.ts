@@ -3,6 +3,29 @@ export type DialogueMode = "low" | "advanced";
 /// 掛け合いパターン3/4 の3ターン目は「1ターン目と同じキャラ」が話すため "extra" は
 /// 増やさない（吹き出し枠の識別は `BalloonSlot` で分離する）。
 export type SlotName = "main" | "sub";
+
+/// 表示モニタの選択 (spec §4.1.6、M13)。name + 座標で「表示構成が同じか」を判定する。
+export interface MonitorPref {
+  name: string | null;
+  x: number;
+  y: number;
+}
+
+export interface MonitorInfo extends MonitorPref {
+  width: number;
+  height: number;
+  scale_factor: number;
+  is_primary: boolean;
+  is_current: boolean;
+  is_selected: boolean;
+}
+
+export interface MonitorList {
+  monitors: MonitorInfo[];
+  has_pref: boolean;
+  /// 選択はあるが今の構成では見つからない（主モニタへ退避中）。
+  pref_unresolved: boolean;
+}
 /// 吹き出し枠（DOM）の識別子。`SlotName` とは独立（`BalloonSlot` は表示先の器、
 /// `SlotName` は話しているキャラ）。パターン3/4 の3ターン目は `"extra"` の枠を使うが、
 /// 話者キャラは main/sub のどちらか（`DialogueResponse.pattern` で決まる）。

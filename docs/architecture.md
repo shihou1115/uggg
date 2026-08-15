@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v1.8）
+# ugg アーキテクチャ設計書（architecture.md v1.9）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -245,6 +245,7 @@ CREATE TABLE app_settings (
 - 個別キー: `window_pos`（{x,y}。ステージのドック先モニタの記憶に使う）, `char_pos`（{main,sub} キャラごとの X 位置 CSS px）, `first_boot_done`（"1"）, `last_update_check`（unix秒）, `profile_onboarded`（"1"）, `update_notice_seen:<version>`（"1"）等
 - ★M11 天気: `weather_cache`（WeatherCache を JSON。専用テーブルを持たず app_settings に保存。「解除」= 空文字で消去、§4.7.2）, `weather_rain_date`（降雨の一言の 1 日 1 回 dedup。`*_date` 系と同型）
 - ★M12 定例会話: `regular_morning_date` / `regular_evening_date`（朝・夜の定例会話の 1 日 1 回 dedup、`*_date` 系と同型）
+- ★M13 表示モニタ: `monitor_pref`（ユーザーが選んだモニタ = `{name, x, y}` の JSON。**`window_pos`（前回位置）とは別物**で、選択があるときは `window_pos` を参照しない。空文字 = 選択なし）
 
 #### `chat_log`
 ```sql
@@ -680,6 +681,8 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `update_alpha_mask` | `mask: AlphaMask` | `()` | クリック透過用 |
 | `set_char_positions` | `main: f64 \| null, sub: f64 \| null` | `()` | キャラごとの X 位置（ステージ内 CSS px、視覚ボックス左端）を `app_settings.char_pos` に保存。ドラッグ終了時に呼ぶ（spec §4.1.6 / §4.3.4） |
+| `list_monitors` | — | `MonitorList` | ★M13 表示モニタの選択肢（`monitors[]` + `has_pref` + **`pref_unresolved`** = 選択はあるが今の構成に見つからない）。モニタの知識は `presence/window_pos.rs` に集約し、フロントは `@tauri-apps/api` の window API を使わない |
+| `set_monitor_pref` | `pref: MonitorPref \| null`（null = 自動） | `()` | ★M13 表示モニタを選ぶ。`app_settings.monitor_pref` に保存し、**その場で再ドック**する（1 秒監視を待たせない） |
 
 ---
 
@@ -1239,7 +1242,10 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 
 ### 10.2 ステージ方式とキャラ個別配置（spec §4.1.6 / §4.3.4）
 
-- ウインドウ = **モニタ作業領域の全幅 × 高さ 1024 (logical) の透明ステージ**。作業領域下端に固定（presence/window_pos.rs が起動時ドック + 1 秒監視で再ドック）。高さはスケール上限 2.0 でデフォルトシェルのキャラ (384px→768px) + バルーン/入力欄を収容する値（作業領域が足りなければキャップ）。ユーザーはウインドウを動かせない
+- ウインドウ = **モニタ作業領域の全幅 × 高さ 1024 (logical) の透明ステージ**。作業領域下端に固定（presence/window_pos.rs が起動時ドック + 1 秒監視で再ドック）。高さはスケール上限 2.0 でデフォルトシェルのキャラ (384px→768px) + バルーン/入力欄を収容する値（作業領域が足りなければキャップ）。ユーザーはウインドウをドラッグで動かせない（**表示モニタの選択のみ設定から可能**）
+- **★M13 モニタ決定は `resolve_target_monitor` の 1 箇所に集約**（spec §4.1.6）。優先順位は ①明示選択 `monitor_pref` が解決できればそれ ②選択が無いときだけ保存位置/現在位置から逆算 ③主モニタ。**選択がある場合は現在位置を見ない** — 1 秒監視は毎 tick この関数を呼ぶため、ここを分けないとポーリングが選択を上書きする。選択が今の構成で見つからないときは主モニタへ退避するが `monitor_pref` は消さず、構成が戻れば次 tick で復帰する
+- **★M13 同一性の判定は `name` + `position` の一致のみ**（`pref_matches`、純関数でテスト済み）。OS のモニタ名（Windows は GDI デバイス名）は接続順で別の物理モニタに付け替わるため、名前だけで採用すると「選んでいないモニタに固定」される。位置も見て、構成が変わっていたら退避に倒す
+- **★M13 `apply_dock` は `set_position` → `set_size` の順**。逆順だと旧 DPI のウインドウに新モニタ基準の物理サイズを与えることになり、DPI 変更で再スケールされうる
 - 各 `.char-slot` は `position: absolute; bottom: 0; left: <x>px`（x = stage/charpos.ts が管理、CSS px）。**キャラごとに独立して X 移動**し、Y は bottom:0 固定
 - `--ugg-scale` は CSS 変数として `:root` に保持し、**各 `.char-slot` に** `transform: scale(var(--ugg-scale))` を適用。`transform-origin: bottom left` のため `left` = 視覚ボックス左端のまま拡縮できる
 - 既定配置（char_pos 未保存時）: main はステージ右端、sub は main の左 40px（spec §4.1.1）
@@ -1642,4 +1648,5 @@ async fn install_asset(
 | 2026-07-24 | v1.6 | M12（朝・夜の定例会話 §4.7.1）を反映し **v0.3 実装完了**。`system/regular_talk.rs`（材料集約 + 定型文組み立て = low 完結 + advanced 言い回し整形、§1.2）/ daily watcher に朝・夜の定例会話を統合（tick §5.1 順・`regular_slot_due` 純関数・失効窓 6h・1 tick 1 枠・吸収 §5.5、§11.4）/ `regular_morning`/`regular_evening` 辞書（§6.2）/ `regular_{morning,evening}_date` dedup キー（§2.2）/ Db `count_done_todos_since`（夜の完了実績、schema v8 維持）/ 設定に定例会話節（朝/夜 有効・時刻・曜日トグル・夜間静音重なり警告）。SpeechCategory/Settings は M11 で追加済みのため無変更。新規コマンド・イベント・DB テーブルなし。既知の割り切り: advanced 整形は月次コスト上限の閾値チェックを経由しない（実コスト ≈ 月$0.004・受容）。 |
 | 2026-07-24 | v1.5 | M11（天気基盤 §4.7.2）を反映。`system/weather.rs`（Open-Meteo forecast 取得・`app_settings["weather_cache"]` JSON キャッシュ = 新テーブルなし・schema v8 維持・WMO→日本語ラベル・降雨判定、§1.2/§2.2）/ 天気コマンド `search_location`・`get_weather`（§4.11、新規イベントなし §5）/ daily watcher に天気 3h 定期取得 + 降雨の一言（`weather_rain`/`weather_rain_outing`、§6.2・§11.4）/ SpeechCategory 9→12（`SituationRain` + M12 用 `RegularMorning`/`RegularEvening` を一括追加）+ `feedback_target()` で Regular* を間隔バックオフ非適用のまま 🔕 対象化、🔕 の is_situation ゲートを `deliver.rs` と `feedback_speech` の 2 箇所差し替え（§3.1）/ Settings 11 フィールド（weather_*4・situation_rain・regular_*6）+ 座標の小数 1 桁丸め clamp / 設定に天気節 + `#weather-credit` 出典表示（CC-BY 4.0）。**§4.7.1 定例会話（M12）は未実装**。 |
 | 2026-08-10 | v1.7 | 掛け合いパターン3/4「3つ目の吹き出し」（spec §4.1.3 / §4.2.4）の未実装を解消。`banter::assemble_advanced` の無条件 3→1・4→2 フォールバックを廃止し、パターン抽選 (`pick_advanced_pattern`) を LLM 呼び出し前に前倒し、`advanced::system_prompt` がパターン別に出力形式を出し分け（§10.4）。`DialogueResponse.extra: Option<SpeechTurn>` 追加（§5）。フロントは `BalloonSlot`（"main"\|"sub"\|"extra"）を `SlotName`（"main"\|"sub"）と分離し `#balloon-extra` を静的配置、`balloon.ts` の `reposition` を吹き出し枠 + 基準キャラの一般化に書き換え、`repositionAll()`（main → sub → extra の固定順で全枠を再配置。**extra が常に退避する側**という一方向の規則で循環を避ける）を新設（§10.3・§10.4、配置は案A = 話者キャラの横・さらに外側へ退避）。新規コマンド・イベント・DB テーブルなし。**リリース前レビューの反映**: 安全縮退の条件に `sub` 欠落を追加（3ターン構成が成立しない応答で 3/4 を維持すると spec §4.2.4 違反の表示になる）／パターン4 の3ターン目の pose 語彙を sub の集合に是正（提示と検証の食い違い）／`chat_log` が最大 4 行になる旨を §2.2 に明記。 |
+| 2026-08-10 | v1.9 | **M13 表示モニタ選択**（spec §4.1.6 / foundation-design §2）。`presence/window_pos.rs` にモニタ決定の単一関数 `resolve_target_monitor` を導入し、`dock` と 1 秒監視の両方をそこ経由に（**明示選択が常に優先、選択時は現在位置を見ない**）。`MonitorPref{name,x,y}` を `app_settings.monitor_pref` に永続化（§2.2）。同一性判定は name+position の一致のみ（`pref_matches` は純関数でテスト 6 件）。選択が解決できないときは主モニタへ退避しつつ選択は保持。`apply_dock` を `set_position` → `set_size` の順に変更（DPI 混在対策）。コマンド `list_monitors` / `set_monitor_pref` を追加（§4.10、新規イベント・DB 変更なし）。設定「基本」→「表示」にモニタ選択の select と、退避中を示す注記を追加。 |
 | 2026-08-10 | v1.8 | オンボーディングの聞き取り（spec §4.2.5）の未達を解消。`complete_onboarding` が M2 以降捨てていた `interests` / `topics_enabled` を結線: 興味 → `user_profile`（origin=onboarding）+ `interest_topics`（RSS キーワード、空白・重複を除き上限 20）、`topics_enabled` → `Settings.topics_enabled` を書き換えて `settings-changed` を emit（**時事ネタの明示同意**。spec §3.3/§4.4.6「既定オフ・オンボーディング同意必須」がチェックボックスの捨てられにより機能していなかった）。コマンド引数に `AppHandle` を追加（§4.9）。フロントは onboarding パネルに興味入力（カンマ区切り、設定パネルと同規則）を追加。 |

@@ -193,6 +193,8 @@ fn main() {
             commands::tts::voice_ref_preview,
             commands::window::update_alpha_mask,
             commands::window::set_char_positions,
+            commands::window::list_monitors,
+            commands::window::set_monitor_pref,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start ugg");

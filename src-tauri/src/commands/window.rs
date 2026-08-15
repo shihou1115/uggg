@@ -2,9 +2,32 @@ use std::sync::Arc;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
+use crate::presence::window_pos::{self, MonitorList, MonitorPref};
 use crate::state::AppState;
+
+/// 表示モニタの選択肢を返す (spec §4.1.6、M13)。設定パネルが select を組むのに使う。
+///
+/// モニタの知識は `presence/window_pos.rs` に集約しているのでフロントの
+/// `@tauri-apps/api` からは触らない (現行フロントは window 系 API を一切使っていない)。
+#[tauri::command]
+pub fn list_monitors(app: AppHandle, state: State<'_, Arc<AppState>>) -> MonitorList {
+    window_pos::list_monitors(&app, state.inner())
+}
+
+/// 表示モニタを選ぶ / 選択を解除する (`None` = 自動 = 前回位置)。
+/// 保存したその場で再ドックし、1 秒監視を待たずに移動させる。
+#[tauri::command]
+pub fn set_monitor_pref(
+    pref: Option<MonitorPref>,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    window_pos::save_pref(state.inner(), pref.as_ref())?;
+    window_pos::redock_now(&app, state.inner());
+    Ok(())
+}
 
 /// キャラごとの X 位置 (ステージ内 CSS px、視覚ボックス左端)。spec §4.1.6。
 /// 未保存・sub 無しゴーストは None。

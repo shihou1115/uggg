@@ -15,6 +15,7 @@ import type {
   InterestTopic,
   IrodoriGpuInfo,
   LocationHit,
+  MonitorList,
   Settings,
   SlotName,
   TalkSpeed,
@@ -34,6 +35,8 @@ interface Inputs {
   keyDelete: HTMLButtonElement;
   displayScale: HTMLInputElement;
   talkSpeed: HTMLSelectElement;
+  monitor: HTMLSelectElement;
+  monitorHint: HTMLElement;
   quietMode: HTMLInputElement;
   autoQuietFullscreen: HTMLInputElement;
   monologueInterval: HTMLInputElement;
@@ -211,6 +214,7 @@ export async function openSettingsPanel(): Promise<void> {
   await refreshIrodoriState();
   await refreshAssetLists(current);
   await refreshInterests();
+  await refreshMonitors();
   inputs.panel.classList.add("visible");
   inputs.msg.hidden = true;
   inputs.ttsProgress.hidden = true;
@@ -261,6 +265,8 @@ function collectInputs(): Inputs {
     keyDelete: byId<HTMLButtonElement>("settings-key-delete"),
     displayScale: byId<HTMLInputElement>("settings-display-scale"),
     talkSpeed: byId<HTMLSelectElement>("settings-talk-speed"),
+    monitor: byId<HTMLSelectElement>("settings-monitor"),
+    monitorHint: byId("settings-monitor-hint"),
     quietMode: byId<HTMLInputElement>("settings-quiet-mode"),
     autoQuietFullscreen: byId<HTMLInputElement>("settings-auto-quiet-fullscreen"),
     monologueInterval: byId<HTMLInputElement>("settings-monologue-interval"),
@@ -387,6 +393,8 @@ function attachHandlers(i: Inputs): void {
   i.calAddUrl.addEventListener("click", () => void onAddCalendarSource("url"));
   i.calAddPath.addEventListener("click", () => void onAddCalendarSource("file"));
   i.calRefresh.addEventListener("click", () => void onCalendarRefresh());
+  // モニタ選択は選んだ瞬間に保存 + 再ドックする（一括保存には乗せない。M13）
+  i.monitor.addEventListener("change", () => void onMonitorChange());
   // M12: 夜間静音との重なり警告 (§9.3)。フォーム変更のたびに再計算する。
   i.nightQuiet.addEventListener("change", () => updateRegularQuietHints());
   i.nightQuietFrom.addEventListener("change", () => updateRegularQuietHints());
@@ -842,6 +850,72 @@ function showUpdateMessage(msg: string, isError: boolean): void {
   inputs.updateMessage.textContent = msg;
   inputs.updateMessage.classList.toggle("error", isError);
   inputs.updateMessage.hidden = false;
+}
+
+// === M13: 表示モニタ選択 (spec §4.1.6) ====================================
+
+/// select の value は「自動」= "" 、モニタは monitors[] の index。
+async function refreshMonitors(): Promise<void> {
+  if (!inputs) return;
+  try {
+    const list = await invoke<MonitorList>("list_monitors");
+    const sel = inputs.monitor;
+    sel.innerHTML = "";
+    const auto = document.createElement("option");
+    auto.value = "";
+    auto.textContent = "自動（前回の位置）";
+    sel.appendChild(auto);
+    list.monitors.forEach((m, idx) => {
+      const opt = document.createElement("option");
+      opt.value = String(idx);
+      const tags = [
+        m.is_primary ? "主" : null,
+        m.is_current ? "現在" : null,
+      ].filter(Boolean);
+      opt.textContent =
+        `${idx + 1}: ${m.width}×${m.height}` + (tags.length ? ` (${tags.join("・")})` : "");
+      if (m.is_selected) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    if (!list.has_pref) auto.selected = true;
+    // モニタが 1 台なら選ぶ意味がない
+    sel.disabled = list.monitors.length <= 1;
+    if (list.monitors.length <= 1) {
+      showMonitorHint("モニタが 1 台のため選択できません。");
+    } else if (list.pref_unresolved) {
+      // 選択は保持されている（spec §4.1.6）。消えたように見せないための注記。
+      showMonitorHint("選択中のモニタが見つかりません（主モニタに表示中）。つなぎ直すと戻ります。");
+    } else {
+      showMonitorHint(null);
+    }
+  } catch (err) {
+    console.warn("[monitor] list_monitors failed", err);
+    showMonitorHint(null);
+  }
+}
+
+async function onMonitorChange(): Promise<void> {
+  if (!inputs) return;
+  const raw = inputs.monitor.value;
+  try {
+    if (raw === "") {
+      await invoke("set_monitor_pref", { pref: null });
+    } else {
+      const list = await invoke<MonitorList>("list_monitors");
+      const m = list.monitors[Number(raw)];
+      if (!m) return;
+      await invoke("set_monitor_pref", { pref: { name: m.name, x: m.x, y: m.y } });
+    }
+    await refreshMonitors();
+  } catch (err) {
+    showMonitorHint(`モニタの切り替えに失敗しました: ${formatErr(err)}`);
+  }
+}
+
+function showMonitorHint(msg: string | null): void {
+  if (!inputs) return;
+  inputs.monitorHint.textContent = msg ?? "";
+  inputs.monitorHint.hidden = msg === null;
 }
 
 // === M5-C: 時事ネタ (興味分野) UI =========================================

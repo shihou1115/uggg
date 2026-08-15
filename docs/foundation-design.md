@@ -2,7 +2,7 @@
 
 **対象**: spec.md §6.0 の v0.4 スコープ ＝ ① 表示モニタ選択（§4.1.6）② advanced 独り言の LLM 生成 + キャッシュ補充（§4.4.4）③ 時事ネタの織り込み（§4.4.6）④ 品質・負債返済
 **位置付け**: spec（要件の正本）を実装可能な契約・構造へ具体化する Phase 2 成果物。docs/daily-support-design.md（v0.2）・docs/regular-talk-design.md（v0.3）と同列。
-**状態**: 設計 v1。**M15（負債返済）実装済み**（2026-08-10）。M13・M14 は未実装
+**状態**: 設計 v1。**M13（表示モニタ選択）・M15（負債返済）実装済み**（2026-08-10）。M14 は未実装
 **作成日**: 2026-08-10
 
 ---
@@ -75,9 +75,10 @@ tauri が返す `Monitor` から得られるのは `name()`（Windows では GDI
 struct MonitorPref {
     name: Option<String>,   // Monitor::name()
     x: i32, y: i32,         // 選択時の position（物理px）
-    width: u32, height: u32 // 選択時の size（物理px）
 }
 ```
+
+（判定に使うのは name と position だけなので、size は持たない — 使わないフィールドを先に生やさない）
 
 解決の条件は **1 つだけ**（満たさなければ「解決できない」＝主モニタへ退避）:
 
