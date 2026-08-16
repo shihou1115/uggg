@@ -69,12 +69,20 @@ pub fn export_data(
 
 /// M5-E: 履歴クリア。常に chat_log を全件削除、`include_profile=true` で user_profile も全削除。
 /// (origin に関係なく削除する仕様。記憶を残したいなら include_profile=false。)
+///
+/// M14: advanced 独り言のストックも**常に**消す (spec §4.4.4「履歴クリアの対象に含める」)。
+/// `include_profile` に依存させないのは、これが記憶ではなく生成物のキャッシュで、
+/// chat_log と同格だから (foundation-design §3.6)。
 #[tauri::command]
 pub fn clear_history(
     include_profile: bool,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ClearResult, String> {
     state.db.clear_chat_log().map_err(|e| format!("{e:#}"))?;
+    state
+        .db
+        .clear_monologue_cache()
+        .map_err(|e| format!("{e:#}"))?;
     let mut cleared_profiles: u64 = 0;
     if include_profile {
         cleared_profiles = state.db.clear_user_profile().map_err(|e| format!("{e:#}"))?;

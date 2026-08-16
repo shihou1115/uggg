@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v1.9）
+# ugg アーキテクチャ設計書（architecture.md v2.0）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -93,6 +93,8 @@ src-tauri/src/
 │   ├── llm.rs               -- OpenAI 互換クライアント（プロバイダ抽象なし）
 │   └── banter.rs            -- 掛け合いパターン制御 (1-4 + question_curiosity)
 │                               ※ 独り言は M7 で専用ヘルパを廃し、deliver_event が dict.pick_monologue を直接引く
+│                               ※ ★M14 advanced では deliver_event が先に monologue_cache を pop し、
+│                                  空・失効・low なら従来どおり dict.pick_monologue へ落ちる
 │
 ├── ghost/                   -- ゴースト/シェル/辞書ロード
 │   ├── mod.rs
@@ -136,7 +138,8 @@ src-tauri/src/
 │   ├── governance.rs        -- ★M7 発話ガバナンス can_deliver / record_delivered（§11.4）
 │   ├── calendar.rs          -- ★M10 ICS 取得・自前パース・RRULE near-term 展開（読み取り専用、§4.6.4）
 │   ├── weather.rs           -- ★M11 Open-Meteo forecast 取得・app_settings JSON キャッシュ・WMO ラベル・降雨判定（§4.7.2）
-│   └── regular_talk.rs      -- ★M12 定例会話: 材料集約 + 定型文組み立て（low）+ advanced 言い回し整形（§4.7.1）
+│   ├── regular_talk.rs      -- ★M12 定例会話: 材料集約 + 定型文組み立て（low）+ advanced 言い回し整形（§4.7.1）
+│   └── monologue.rs         -- ★M14 advanced 独り言のキャッシュ補充: LLM 生成 + 時事ネタ織り込み + 応答パース（§4.4.4/§4.4.6）。消費は deliver.rs 側
 │
 └── tools/                   -- ツール群
     ├── mod.rs
@@ -225,7 +228,8 @@ src/
 | `user_profile` | 長期記憶 | 〜数百 | system prompt 注入・recall |
 | `interest_topics` | 時事ネタ興味分野 | 〜20 | RSS 検索キーワード |
 | `api_usage` | LLM コスト追跡 | 〜数万 | 月次集計・上限警告 |
-| `topics_cache` | 時事ネタ見出しキャッシュ | 〜数百 | advanced 独り言混入の材料（M5-C。旧記載の monologue_cache は未実装のまま廃案） |
+| `topics_cache` | 時事ネタ見出しキャッシュ | 〜数百 | advanced 独り言に織り込む材料（M5-C で蓄積、★M14 で消費開始） |
+| `monologue_cache` | ★M14 advanced 独り言のストック | 〜20（STOCK_MAX） | LLM 生成済みの独り言を貯めて発話ごとの API 呼び出しを避ける。再起動をまたぐ |
 | `reminders` | リマインダーのスケジュール定義 | 〜数十 | active=1 かつ due_ts 到達で発火（★M7 拡張） |
 | `reminder_log` | ★M7 リマインダー発火・確認履歴 | 〜500（prune） | 完了/未完了管理・通知履歴・再通知判断 |
 | `todos` | ★M8 ToDo・日課 | 〜数百 | 3 バケット・2 段階優先度・日課復活 |
@@ -350,6 +354,36 @@ CREATE INDEX idx_todos_status ON todos(status, bucket);
   実行タイミングは daily watcher（起動時 + ローカル日付の変更検知、§11.4）
 - 一覧の並び: open 先 → priority 高い順 → sort_order 昇順
 
+#### `monologue_cache`（★M14 v9 新設、foundation-design §3.2）
+
+```sql
+CREATE TABLE monologue_cache (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ghost_id         TEXT    NOT NULL,   -- 生成に使ったゴースト。切替後の持ち越しを断つ鍵
+    text             TEXT    NOT NULL,
+    pose             TEXT,               -- 検証は消費時（シェルは push→pop の間に変わりうる）
+    topic_fetched_ts INTEGER,            -- 織り込んだ見出しの**取得時刻**。時事ネタ無しは NULL
+    created_ts       INTEGER NOT NULL
+);
+CREATE INDEX idx_monologue_cache_ghost ON monologue_cache(ghost_id);
+```
+
+- **`topic_fetched_ts` が二段失効の要**。生成時刻（`created_ts`）で判定すると、6 日前の見出しを
+  今日生成した文が「新しい」と誤判定される。複数の見出しを渡したバッチには**最も古い見出しの
+  取得時刻**を記録する（最も古いネタに引きずられるため、安全側）
+- 失効は 2 本立て: 時事ネタ入りは `TOPIC_MAX_AGE_SECS`（7 日、spec §4.4.6）、
+  時事ネタ無しは `MONOLOGUE_MAX_AGE_SECS`（30 日）。定数は `db.rs` に 1 箇所だけ置き、
+  **織り込み時（`system/monologue.rs`）と発話時（`pop_monologue_cache`）が同じ値を参照する**
+  （片方だけずれると「古いネタを喋る／使える材料を捨てる」に化ける）
+- `pop_monologue_cache(ghost_id, now)` は**選別 → 取得 → 削除を 1 トランザクション**で行い、
+  ghost_id 不一致・失効行はその場で捨てて次を見る。空なら `None` を返し、呼び出し側は辞書へ落ちる
+- `count_monologue_cache(ghost_id, now)` は **pop と同じ条件**で数える（失効行を頭数に入れると、
+  pop が全部捨てて辞書に落ちているのに「在庫あり」と見えて補充が止まる）。
+  設計書 §3.2 の `count(ghost_id)` に `now` を足したのはこの理由
+- sub は持たない（独り言は 1 キャラの発話。`DialogueLine{ main, sub: None }` に詰める）
+- 消去の契機: 履歴クリア（全件・`include_profile` 非依存、spec §4.5.5）／
+  時事ネタ同意の撤回（`topic_fetched_ts IS NOT NULL` の行だけ、foundation-design §3.6）
+
 #### 既存（変更なし）
 - `interest_topics(id, topic, enabled)`
 - `topics_cache(id, topic, headline, link, fetched_ts)` UNIQUE(topic, headline)
@@ -371,6 +405,7 @@ CREATE INDEX idx_todos_status ON todos(status, bucket);
   - v6: `reminders` 拡張 5 列 + `reminder_log` を追加 (M7)
   - v7: `todos` を追加 (M8)
   - v8: `calendar_cache` を追加 (M10)。複合キー (source_id,uid,start_ts) + 実装追加列 `unsupported`（展開不能 RRULE の印）
+  - v9: `monologue_cache` を追加 (★M14)。`ghost_id` でゴースト切替後の持ち越しを断ち、`topic_fetched_ts`（**見出しの取得時刻**であって生成時刻ではない）で発話時の賞味期限を判定する
 - 参照音声 .wav の配置は `%APPDATA%\ugg\irodori\refs\<slot>_<id>.wav` (architecture §2.4)。`voice_refs.file_path` には絶対パスを保存
 
 ### 2.4 ファイル資産（DB 外）
@@ -437,6 +472,7 @@ pub struct DialogueState {
     pub error_streak: AtomicI64,                    // API エラー連続回数
     pub cost_limited_emitted: AtomicBool,           // 上限超過通知済みフラグ
     pub greeted: AtomicBool,                        // 起動挨拶済み
+    pub monologue_refill_ts: AtomicI64,             // ★M14 独り言キャッシュを最後に補充しようとした unix 秒
 }
 
 pub struct PresenceState {
@@ -1648,5 +1684,6 @@ async fn install_asset(
 | 2026-07-24 | v1.6 | M12（朝・夜の定例会話 §4.7.1）を反映し **v0.3 実装完了**。`system/regular_talk.rs`（材料集約 + 定型文組み立て = low 完結 + advanced 言い回し整形、§1.2）/ daily watcher に朝・夜の定例会話を統合（tick §5.1 順・`regular_slot_due` 純関数・失効窓 6h・1 tick 1 枠・吸収 §5.5、§11.4）/ `regular_morning`/`regular_evening` 辞書（§6.2）/ `regular_{morning,evening}_date` dedup キー（§2.2）/ Db `count_done_todos_since`（夜の完了実績、schema v8 維持）/ 設定に定例会話節（朝/夜 有効・時刻・曜日トグル・夜間静音重なり警告）。SpeechCategory/Settings は M11 で追加済みのため無変更。新規コマンド・イベント・DB テーブルなし。既知の割り切り: advanced 整形は月次コスト上限の閾値チェックを経由しない（実コスト ≈ 月$0.004・受容）。 |
 | 2026-07-24 | v1.5 | M11（天気基盤 §4.7.2）を反映。`system/weather.rs`（Open-Meteo forecast 取得・`app_settings["weather_cache"]` JSON キャッシュ = 新テーブルなし・schema v8 維持・WMO→日本語ラベル・降雨判定、§1.2/§2.2）/ 天気コマンド `search_location`・`get_weather`（§4.11、新規イベントなし §5）/ daily watcher に天気 3h 定期取得 + 降雨の一言（`weather_rain`/`weather_rain_outing`、§6.2・§11.4）/ SpeechCategory 9→12（`SituationRain` + M12 用 `RegularMorning`/`RegularEvening` を一括追加）+ `feedback_target()` で Regular* を間隔バックオフ非適用のまま 🔕 対象化、🔕 の is_situation ゲートを `deliver.rs` と `feedback_speech` の 2 箇所差し替え（§3.1）/ Settings 11 フィールド（weather_*4・situation_rain・regular_*6）+ 座標の小数 1 桁丸め clamp / 設定に天気節 + `#weather-credit` 出典表示（CC-BY 4.0）。**§4.7.1 定例会話（M12）は未実装**。 |
 | 2026-08-10 | v1.7 | 掛け合いパターン3/4「3つ目の吹き出し」（spec §4.1.3 / §4.2.4）の未実装を解消。`banter::assemble_advanced` の無条件 3→1・4→2 フォールバックを廃止し、パターン抽選 (`pick_advanced_pattern`) を LLM 呼び出し前に前倒し、`advanced::system_prompt` がパターン別に出力形式を出し分け（§10.4）。`DialogueResponse.extra: Option<SpeechTurn>` 追加（§5）。フロントは `BalloonSlot`（"main"\|"sub"\|"extra"）を `SlotName`（"main"\|"sub"）と分離し `#balloon-extra` を静的配置、`balloon.ts` の `reposition` を吹き出し枠 + 基準キャラの一般化に書き換え、`repositionAll()`（main → sub → extra の固定順で全枠を再配置。**extra が常に退避する側**という一方向の規則で循環を避ける）を新設（§10.3・§10.4、配置は案A = 話者キャラの横・さらに外側へ退避）。新規コマンド・イベント・DB テーブルなし。**リリース前レビューの反映**: 安全縮退の条件に `sub` 欠落を追加（3ターン構成が成立しない応答で 3/4 を維持すると spec §4.2.4 違反の表示になる）／パターン4 の3ターン目の pose 語彙を sub の集合に是正（提示と検証の食い違い）／`chat_log` が最大 4 行になる旨を §2.2 に明記。 |
+| 2026-08-16 | v2.0 | **M14 advanced 独り言 + 時事ネタ織り込み**（spec §4.4.4 / §4.4.6 / foundation-design §3）。長らく未達だった「advanced では LLM 生成 + キャッシュ補充」を解消。**DB v9 `monologue_cache`**（§2.1・§2.2）+ Db メソッド 5（push/pop/count/clear/clear_with_topics）。**新規モジュール `system/monologue.rs`**（補充・プロンプト組み立て・応答パース、§1.2）。消費は `deliver::resolve_line` の Monologue 分岐で、**ghost ロックの外で pop → その後 pose 検証のためにロック**（DB I/O 中のロック保持を避ける）。補充は `spawn_random_talk` の tick の**発話判定の後**に回す（LLM 待ちで発話を遅らせない）。**二段失効**: 織り込み時 7 日（材料選別）+ 発話時 7 日（pop）、時事ネタ無しは 30 日。しきい値は 在庫 3 / バッチ 5 / 最短間隔 30 分 / 上限 20。**補充の前後で月額上限を評価**し、超過はチャット経路と同じ降格・告知（`dialogue::evaluate_cost_status` を `pub(crate)` 化して合流。これが無いと**チャットを使わず常駐するユーザーで上限が素通りする**）。会計は `api_usage` へ advanced 会話と同じ形で記録。`DialogueState.monologue_refill_ts`（§3.2）で最短間隔を管理。無効化契機 2 つ: 履歴クリア（全件、§4.5.5）/ 時事ネタ同意の撤回（該当行のみ）。**新規コマンド・イベント・Settings フィールドなし**。プロンプトに会話履歴・`user_profile` は渡さない（独り言は応答ではない）。LLM 経路の全失敗（low/降格/キー無し/API エラー/タイムアウト/応答破損/上限超過/在庫空/全件失効/ゴースト未読込/DB エラー）は辞書の `pick_monologue` に落ちる（spec §4.2.1 AI 非依存）。**レビューで是正した 5 点**（foundation-design §7.1 に記録）: ① 独り言 OFF（`monologue_interval_min == 0`）でも補充が課金していた → ゲート追加 ② ストックの鍵を `settings.ghost_id` から**読み込み済み `bundle.ghost.id`** へ（ゴースト切替は再起動が要るため、切替直後は settings 側が先行して人格とズレ、旧人格の文を新ゴースト行として積んでいた）③ **降格中は pop せず辞書へ**（spec §4.4.4 の明文）④ 織り込む見出しに**残り寿命 24 時間**を要求（期限ぎりぎりの材料が「積んでは即失効」の有料ループを作る）⑤ 材料を**現に有効な `interest_topics`** に絞る（外した興味の見出しが最大 7 日残って喋られる）。 |
 | 2026-08-10 | v1.9 | **M13 表示モニタ選択**（spec §4.1.6 / foundation-design §2）。`presence/window_pos.rs` にモニタ決定の単一関数 `resolve_target_monitor` を導入し、`dock` と 1 秒監視の両方をそこ経由に（**明示選択が常に優先、選択時は現在位置を見ない**）。`MonitorPref{name,x,y}` を `app_settings.monitor_pref` に永続化（§2.2）。同一性判定は name+position の一致のみ（`pref_matches` は純関数でテスト 6 件）。選択が解決できないときは主モニタへ退避しつつ選択は保持。`apply_dock` を `set_position` → `set_size` の順に変更（DPI 混在対策）。コマンド `list_monitors` / `set_monitor_pref` を追加（§4.10、新規イベント・DB 変更なし）。設定「基本」→「表示」にモニタ選択の select と、退避中を示す注記を追加。 |
 | 2026-08-10 | v1.8 | オンボーディングの聞き取り（spec §4.2.5）の未達を解消。`complete_onboarding` が M2 以降捨てていた `interests` / `topics_enabled` を結線: 興味 → `user_profile`（origin=onboarding）+ `interest_topics`（RSS キーワード、空白・重複を除き上限 20）、`topics_enabled` → `Settings.topics_enabled` を書き換えて `settings-changed` を emit（**時事ネタの明示同意**。spec §3.3/§4.4.6「既定オフ・オンボーディング同意必須」がチェックボックスの捨てられにより機能していなかった）。コマンド引数に `AppHandle` を追加（§4.9）。フロントは onboarding パネルに興味入力（カンマ区切り、設定パネルと同規則）を追加。 |

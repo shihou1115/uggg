@@ -316,7 +316,9 @@ fn system_prompt(bundle: &GhostBundle, pattern: u8, profile_block: &str, tools_b
     )
 }
 
-fn available_pose_names(bundle: &GhostBundle) -> String {
+/// main キャラの pose 名一覧 (プロンプトで LLM に提示する語彙)。
+/// M14 の独り言生成 (`system::monologue`) も同じ語彙を使う。
+pub(crate) fn available_pose_names(bundle: &GhostBundle) -> String {
     let mut names: Vec<&str> = bundle
         .shell
         .characters

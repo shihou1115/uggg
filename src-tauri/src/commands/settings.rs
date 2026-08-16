@@ -37,6 +37,17 @@ pub fn set_settings(
         crate::system::weather::clear_cache(state.inner());
     }
 
+    // M14: 時事ネタの同意を撤回 (topics_enabled: true→false) したら、既に織り込み済みの
+    // 独り言ストックを捨てる (foundation-design §3.6)。同意を外したのに、補充済みの
+    // 時事ネタ入りの文を最大 7 日間喋り続けるのを防ぐ (天気の「解除」と同じ作法)。
+    if prev.topics_enabled && !next.topics_enabled {
+        match state.db.clear_monologue_cache_with_topics() {
+            Ok(n) if n > 0 => println!("[settings] 時事ネタ入りの独り言ストックを {n} 件削除"),
+            Ok(_) => {}
+            Err(err) => eprintln!("[settings] 独り言ストックの掃除に失敗: {err:#}"),
+        }
+    }
+
     // 永続化 (app_settings."settings" に JSON で保存)
     let json = serde_json::to_string(&next)
         .map_err(|e| format!("Settings の JSON シリアライズ失敗: {e}"))?;

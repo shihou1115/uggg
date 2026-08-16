@@ -258,7 +258,10 @@ async fn run_dispatch(
     fallback_low(state, user_text)
 }
 
-async fn evaluate_cost_status(
+/// 当月コストを評価し、80% 警告 / 上限超過 (降格 + 告知) を月内一度きりで出す。
+/// M14: advanced 独り言の補充 (`system::monologue`) も**同じ関数**を通す
+/// (背景処理だけが上限を素通りする穴を作らない、foundation-design §3.5)。
+pub(crate) async fn evaluate_cost_status(
     app: &AppHandle,
     state: &Arc<AppState>,
     settings: &crate::state::Settings,

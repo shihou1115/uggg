@@ -25,50 +25,59 @@ use crate::presence::{context, idle};
 use crate::state::AppState;
 use crate::system::deliver::{self, DeliveryOutcome};
 use crate::system::governance::{self, Priority, SpeechCategory};
-use crate::system::{regular_talk, weather};
+use crate::system::{monologue, regular_talk, weather};
 use crate::tools::reminder::next_recurring_due_ts;
 
 /// ランダムトークタスク。1 分ごとに「前回発話からの経過 >= 設定間隔」を判定。
 /// 間隔は従来どおり本タスクが管理し、静音系の可否は deliver 内のゲートに委ねる。
+///
+/// M14: 同じ tick で advanced 独り言のストック補充も回す (spec §4.4.4)。**発話判定の後**に
+/// 置くのが要点 — 補充は LLM 待ちで数秒かかるので、前に置くと発話タイミングが遅れる
+/// (foundation-design §3.3)。補充自体のゲート (mode・降格・在庫・上限・最短間隔) は
+/// `monologue::maybe_refill` が持ち、ここは毎分呼ぶだけ。
 pub fn spawn_random_talk(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         let mut last_talk = Utc::now().timestamp();
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
-
-            let interval_min = {
-                let s = state.settings.lock().expect("settings poisoned");
-                s.monologue_interval_min
-            };
-            if interval_min == 0 {
-                // 無効: タイマーをリセットしておく (有効化後すぐ撃たないように)
-                last_talk = Utc::now().timestamp();
-                continue;
-            }
-            let now = Utc::now().timestamp();
-            if now - last_talk < (interval_min as i64) * 60 {
-                continue;
-            }
-            // 静音・busy なら Deferred が返り持ち越し (last_talk を進めない)
-            let outcome = deliver::deliver_event(
-                &app,
-                &state,
-                SpeechCategory::Monologue,
-                Priority::Ambient,
-                "monologue",
-                &[],
-                None,
-            )
-            .await;
-            match outcome {
-                DeliveryOutcome::Ghost => last_talk = now,
-                // 辞書に monologue が無い等の Failed は次の間隔まで再試行しない
-                // (毎分の空振り辞書引きを防ぐ)。Deferred (静音・busy) は持ち越し。
-                DeliveryOutcome::Failed => last_talk = now,
-                DeliveryOutcome::Toast | DeliveryOutcome::Deferred => {}
-            }
+            last_talk = random_talk_tick(&app, &state, last_talk).await;
+            monologue::maybe_refill(&app, &state).await;
         }
     });
+}
+
+/// ランダムトーク 1 tick 分の発話判定。戻り値は更新後の `last_talk`。
+async fn random_talk_tick(app: &AppHandle, state: &Arc<AppState>, last_talk: i64) -> i64 {
+    let interval_min = {
+        let s = state.settings.lock().expect("settings poisoned");
+        s.monologue_interval_min
+    };
+    if interval_min == 0 {
+        // 無効: タイマーをリセットしておく (有効化後すぐ撃たないように)
+        return Utc::now().timestamp();
+    }
+    let now = Utc::now().timestamp();
+    if now - last_talk < (interval_min as i64) * 60 {
+        return last_talk;
+    }
+    // 静音・busy なら Deferred が返り持ち越し (last_talk を進めない)
+    let outcome = deliver::deliver_event(
+        app,
+        state,
+        SpeechCategory::Monologue,
+        Priority::Ambient,
+        "monologue",
+        &[],
+        None,
+    )
+    .await;
+    match outcome {
+        DeliveryOutcome::Ghost => now,
+        // 辞書に monologue が無い等の Failed は次の間隔まで再試行しない
+        // (毎分の空振り辞書引きを防ぐ)。Deferred (静音・busy) は持ち越し。
+        DeliveryOutcome::Failed => now,
+        DeliveryOutcome::Toast | DeliveryOutcome::Deferred => last_talk,
+    }
 }
 
 /// 放置監視タスク。60 秒ごとにチェックし、30 分無操作で 1 回だけ idle を発火。

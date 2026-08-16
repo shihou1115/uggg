@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -202,9 +202,8 @@ pub struct InterestTopic {
     pub enabled: bool,
 }
 
-/// 時事ネタキャッシュ 1 件 (M5-C, advanced 独り言混入用)。
-/// advanced 独り言経路への結線は将来課題 (現状はキャッシュに蓄積するのみ)。
-#[allow(dead_code)]
+/// 時事ネタキャッシュ 1 件 (M5-C)。
+/// M14 で advanced 独り言の補充 (`system::monologue`) が材料として読み出す。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TopicCacheRow {
     pub id: i64,
@@ -213,6 +212,27 @@ pub struct TopicCacheRow {
     pub link: String,
     pub fetched_ts: i64,
 }
+
+/// advanced 独り言ストック 1 件 (M14, foundation-design §3.2)。
+/// `pop_monologue_cache` が返す「そのまま喋れる 1 件」。ghost_id / created_ts は
+/// pop 時の選別で使い切るので持たない (消費側に用途が無いフィールドは生やさない)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonologueCacheRow {
+    pub text: String,
+    pub pose: Option<String>,
+    /// 織り込んだ見出しの取得時刻。時事ネタを含まない文は None。
+    pub topic_fetched_ts: Option<i64>,
+}
+
+/// 時事ネタの賞味期限 (spec §4.4.6「賞味期限は 1 週間」)。
+/// **織り込み時** (`system::monologue` の材料選別) と**発話時** (`pop_monologue_cache`)
+/// の二段で同じ値を使う — 片方だけずれると「古いネタを喋る / 使える材料を捨てる」に化けるため、
+/// 定義は 1 箇所に置いて両方から参照する。
+pub const TOPIC_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// 時事ネタを含まない独り言の失効 (foundation-design §3.2)。
+/// 人格や状況が変わっている可能性があり、無期限に持ち越す理由が無い。
+pub const MONOLOGUE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// チャットログ 1 件 (M5-G: get_chat_log の返却型)。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -450,6 +470,27 @@ impl Db {
                 INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_schema_version', '8');",
             )
             .context("migrate to schema v8")?;
+        }
+
+        if current < 9 {
+            // M14: advanced 独り言のストック (foundation-design §3.2)。
+            // ghost_id: 生成に使ったゴースト。切替後に前ゴーストの人格で喋らないための鍵。
+            // topic_fetched_ts: 織り込んだ見出しの**取得時刻** (生成時刻ではない)。
+            //   発話時の賞味期限判定 (§4.4.6 の二段失効) に使う。時事ネタ無しの文は NULL。
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS monologue_cache (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ghost_id         TEXT    NOT NULL,
+                    text             TEXT    NOT NULL,
+                    pose             TEXT,
+                    topic_fetched_ts INTEGER,
+                    created_ts       INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_monologue_cache_ghost ON monologue_cache(ghost_id);
+
+                INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_schema_version', '9');",
+            )
+            .context("migrate to schema v9")?;
         }
 
         tx.commit().context("commit migration tx")?;
@@ -1348,6 +1389,124 @@ impl Db {
         Ok(out)
     }
 
+    // ===== monologue_cache (M14, foundation-design §3.2) =====
+
+    /// advanced 独り言のストックを 1 件積む (補充経路 `system::monologue` 専用)。
+    pub fn push_monologue_cache(
+        &self,
+        ghost_id: &str,
+        text: &str,
+        pose: Option<&str>,
+        topic_fetched_ts: Option<i64>,
+        created_ts: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        conn.execute(
+            "INSERT INTO monologue_cache (ghost_id, text, pose, topic_fetched_ts, created_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ghost_id, text, pose, topic_fetched_ts, created_ts],
+        )
+        .context("push_monologue_cache")?;
+        Ok(())
+    }
+
+    /// ストックから 1 件取り出して削除する。**取り出しと削除を 1 トランザクション**で行い、
+    /// 同じ tx で使えない行をまとめて捨てる (foundation-design §3.2 / §3.4):
+    ///
+    /// - `ghost_id` が現在のゴーストと違う行 — 人格も pose もシェル依存で、切替後は使えない
+    /// - 生成から `MONOLOGUE_MAX_AGE_SECS` (30 日) を超えた行
+    /// - 時事ネタ入りで、見出しの取得から `TOPIC_MAX_AGE_SECS` (7 日) を超えた行 (**発話時失効**)
+    ///
+    /// 残った中から最古 (FIFO) を 1 件返す。空なら `None` — 呼び出し側は辞書の独り言へ落ちる。
+    pub fn pop_monologue_cache(
+        &self,
+        ghost_id: &str,
+        now: i64,
+    ) -> Result<Option<MonologueCacheRow>> {
+        let mut guard = self.conn.lock().expect("db poisoned");
+        let tx = guard.transaction().context("begin pop_monologue_cache tx")?;
+        tx.execute(
+            "DELETE FROM monologue_cache
+             WHERE ghost_id <> ?1
+                OR created_ts < ?2
+                OR (topic_fetched_ts IS NOT NULL AND topic_fetched_ts < ?3)",
+            params![
+                ghost_id,
+                now - MONOLOGUE_MAX_AGE_SECS,
+                now - TOPIC_MAX_AGE_SECS
+            ],
+        )
+        .context("prune stale monologue_cache rows")?;
+        let picked = tx
+            .query_row(
+                "SELECT id, text, pose, topic_fetched_ts FROM monologue_cache
+                 ORDER BY id ASC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        MonologueCacheRow {
+                            text: row.get(1)?,
+                            pose: row.get(2)?,
+                            topic_fetched_ts: row.get(3)?,
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .context("select oldest monologue_cache row")?;
+        if let Some((id, _)) = &picked {
+            tx.execute("DELETE FROM monologue_cache WHERE id = ?1", params![id])
+                .context("delete popped monologue_cache row")?;
+        }
+        tx.commit().context("commit pop_monologue_cache tx")?;
+        Ok(picked.map(|(_, row)| row))
+    }
+
+    /// **いま使える**ストック件数 (補充要否の判定用)。
+    /// `pop_monologue_cache` と同じ条件で数える — 失効済み・別ゴーストの行を頭数に入れると、
+    /// pop が全部捨てて辞書に落ちているのに「在庫あり」と見えて補充が止まるため。
+    pub fn count_monologue_cache(&self, ghost_id: &str, now: i64) -> Result<u64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM monologue_cache
+                 WHERE ghost_id = ?1
+                   AND created_ts >= ?2
+                   AND (topic_fetched_ts IS NULL OR topic_fetched_ts >= ?3)",
+                params![
+                    ghost_id,
+                    now - MONOLOGUE_MAX_AGE_SECS,
+                    now - TOPIC_MAX_AGE_SECS
+                ],
+                |row| row.get(0),
+            )
+            .context("count_monologue_cache")?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// ストックを全消去 (履歴クリア §4.5.5。`include_profile` に依らず常に消す)。
+    pub fn clear_monologue_cache(&self) -> Result<u64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let n = conn
+            .execute("DELETE FROM monologue_cache", [])
+            .context("clear_monologue_cache")?;
+        Ok(n as u64)
+    }
+
+    /// 時事ネタを織り込んだ行だけ消去 (時事ネタ同意の撤回時、foundation-design §3.6)。
+    /// 同意を外したのに時事ネタ入りの文を喋り続けないための掃除。
+    pub fn clear_monologue_cache_with_topics(&self) -> Result<u64> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let n = conn
+            .execute(
+                "DELETE FROM monologue_cache WHERE topic_fetched_ts IS NOT NULL",
+                [],
+            )
+            .context("clear_monologue_cache_with_topics")?;
+        Ok(n as u64)
+    }
+
     /// 古い topics_cache を削除 (since_ts 未満)。
     pub fn prune_topics_cache(&self, since_ts: i64) -> Result<u64> {
         let conn = self.conn.lock().expect("db poisoned");
@@ -1483,6 +1642,146 @@ mod tests {
         let db = Db::open(&path).expect("open db");
         db.migrate().expect("migrate");
         db
+    }
+
+    // ===== monologue_cache (M14, foundation-design §3.2/§3.4) =====
+
+    const NOW: i64 = 1_800_000_000;
+
+    /// 素の 1 件 (時事ネタ無し・生成時刻 = now) を積む。
+    fn push_plain(db: &Db, ghost: &str, text: &str) {
+        db.push_monologue_cache(ghost, text, None, None, NOW)
+            .expect("push");
+    }
+
+    #[test]
+    fn monologue_cache_pops_oldest_first_and_removes_it() {
+        let db = make_db();
+        push_plain(&db, "default", "1 件目");
+        push_plain(&db, "default", "2 件目");
+        assert_eq!(db.count_monologue_cache("default", NOW).unwrap(), 2);
+
+        let first = db.pop_monologue_cache("default", NOW).unwrap().unwrap();
+        assert_eq!(first.text, "1 件目", "FIFO で最古から出す");
+        assert_eq!(db.count_monologue_cache("default", NOW).unwrap(), 1);
+
+        let second = db.pop_monologue_cache("default", NOW).unwrap().unwrap();
+        assert_eq!(second.text, "2 件目");
+        // 取り出しと削除は同じ tx なので、空になったら None。
+        assert!(db.pop_monologue_cache("default", NOW).unwrap().is_none());
+    }
+
+    #[test]
+    fn monologue_cache_roundtrips_pose_and_topic_ts() {
+        let db = make_db();
+        db.push_monologue_cache("default", "ねむい", Some("happy"), Some(NOW - 100), NOW)
+            .expect("push");
+        let row = db.pop_monologue_cache("default", NOW).unwrap().unwrap();
+        assert_eq!(
+            row,
+            MonologueCacheRow {
+                text: "ねむい".into(),
+                pose: Some("happy".into()),
+                topic_fetched_ts: Some(NOW - 100),
+            }
+        );
+    }
+
+    #[test]
+    fn monologue_cache_discards_other_ghosts_rows() {
+        // ゴースト切替後に前の人格の台詞を喋らない (pose もシェル依存で成立しない)。
+        let db = make_db();
+        push_plain(&db, "old_ghost", "前のゴーストの独り言");
+        assert_eq!(db.count_monologue_cache("new_ghost", NOW).unwrap(), 0);
+        assert!(db.pop_monologue_cache("new_ghost", NOW).unwrap().is_none());
+        // 使えない行はその場で捨てられ、以後は old_ghost 側から見ても残っていない。
+        assert_eq!(db.count_monologue_cache("old_ghost", NOW).unwrap(), 0);
+    }
+
+    #[test]
+    fn monologue_cache_expires_stale_topic_rows_at_speech_time() {
+        // 発話時失効 (spec §4.4.6 の 2 段目): 見出しの取得から 7 日超なら使わない。
+        let db = make_db();
+        let stale_topic_ts = NOW - TOPIC_MAX_AGE_SECS - 1;
+        db.push_monologue_cache("default", "古いネタ入り", None, Some(stale_topic_ts), NOW)
+            .expect("push");
+        db.push_monologue_cache("default", "新しいネタ入り", None, Some(NOW - 60), NOW)
+            .expect("push");
+
+        assert_eq!(
+            db.count_monologue_cache("default", NOW).unwrap(),
+            1,
+            "失効済みは在庫に数えない (数えると補充が止まる)"
+        );
+        let row = db.pop_monologue_cache("default", NOW).unwrap().unwrap();
+        assert_eq!(row.text, "新しいネタ入り", "古いネタは飛ばして次を見る");
+        assert!(db.pop_monologue_cache("default", NOW).unwrap().is_none());
+    }
+
+    #[test]
+    fn monologue_cache_keeps_topic_row_exactly_at_the_boundary() {
+        // ちょうど 7 日は「超えていない」ので使う (織り込み側の判定と同じ向き)。
+        let db = make_db();
+        db.push_monologue_cache("default", "境界", None, Some(NOW - TOPIC_MAX_AGE_SECS), NOW)
+            .expect("push");
+        assert_eq!(db.count_monologue_cache("default", NOW).unwrap(), 1);
+        assert!(db.pop_monologue_cache("default", NOW).unwrap().is_some());
+    }
+
+    #[test]
+    fn monologue_cache_expires_plain_rows_after_thirty_days() {
+        // 時事ネタ無しの文も生成から 30 日を超えたら使わない (永久に残さない)。
+        let db = make_db();
+        let old_created = NOW - MONOLOGUE_MAX_AGE_SECS - 1;
+        db.push_monologue_cache("default", "大昔の独り言", None, None, old_created)
+            .expect("push");
+        assert_eq!(db.count_monologue_cache("default", NOW).unwrap(), 0);
+        assert!(db.pop_monologue_cache("default", NOW).unwrap().is_none());
+    }
+
+    #[test]
+    fn monologue_cache_plain_row_survives_topic_ttl() {
+        // 時事ネタ無しの文は、7 日を過ぎても 30 日までは使える (7 日で消えないこと)。
+        let db = make_db();
+        db.push_monologue_cache("default", "純粋な独り言", None, None, NOW - 10 * 24 * 3600)
+            .expect("push");
+        assert_eq!(db.count_monologue_cache("default", NOW).unwrap(), 1);
+        assert!(db.pop_monologue_cache("default", NOW).unwrap().is_some());
+    }
+
+    #[test]
+    fn clear_monologue_cache_removes_everything() {
+        // 履歴クリア (§4.5.5) は include_profile に依らず全件消す。
+        let db = make_db();
+        push_plain(&db, "default", "a");
+        db.push_monologue_cache("default", "b", None, Some(NOW), NOW)
+            .expect("push");
+        assert_eq!(db.clear_monologue_cache().unwrap(), 2);
+        assert_eq!(db.count_monologue_cache("default", NOW).unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_monologue_cache_with_topics_spares_plain_rows() {
+        // 時事ネタ同意の撤回では、時事ネタ入りだけ消して素の独り言は残す。
+        let db = make_db();
+        push_plain(&db, "default", "素の独り言");
+        db.push_monologue_cache("default", "ネタ入り", None, Some(NOW), NOW)
+            .expect("push");
+        assert_eq!(db.clear_monologue_cache_with_topics().unwrap(), 1);
+        let row = db.pop_monologue_cache("default", NOW).unwrap().unwrap();
+        assert_eq!(row.text, "素の独り言");
+        assert!(db.pop_monologue_cache("default", NOW).unwrap().is_none());
+    }
+
+    #[test]
+    fn migration_is_idempotent_at_v9() {
+        // 既存 DB への再 migrate で v9 が壊れない (テーブルもデータも残る)。
+        let db = make_db();
+        push_plain(&db, "default", "残るはず");
+        db.migrate().expect("re-migrate");
+        assert_eq!(db.count_monologue_cache("default", NOW).unwrap(), 1);
+        let version = db.get_setting("db_schema_version").unwrap();
+        assert_eq!(version.as_deref(), Some("9"));
     }
 
     #[test]

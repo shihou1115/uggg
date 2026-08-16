@@ -689,6 +689,11 @@ pub struct DialogueState {
     pub cost_limited_emitted: AtomicBool,
     /// 起動挨拶済みフラグ (二重発火防止)。
     pub greeted: AtomicBool,
+    /// M14: advanced 独り言のキャッシュ補充を最後に試みた unix 秒 (0 = 未実施)。
+    /// 失敗が続いても最短間隔より短い周期で LLM を叩かないための歯止め
+    /// (foundation-design §3.3)。LLM 呼び出しのペース制御なので degraded_until と
+    /// 同じ DialogueState に置く。永続化しない (再起動後はストックの有無で決まる)。
+    pub monologue_refill_ts: AtomicI64,
 }
 
 impl Default for DialogueState {
@@ -701,6 +706,7 @@ impl Default for DialogueState {
             cost_warning_80_emitted: AtomicBool::new(false),
             cost_limited_emitted: AtomicBool::new(false),
             greeted: AtomicBool::new(false),
+            monologue_refill_ts: AtomicI64::new(0),
         }
     }
 }

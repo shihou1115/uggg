@@ -15,8 +15,8 @@ use chrono::Utc;
 use tauri::{AppHandle, Emitter};
 
 use crate::dialogue::{self, banter, DialogueResponse};
-use crate::ghost::dict::{DialogueLine, WhenContext};
-use crate::state::AppState;
+use crate::ghost::dict::{DialogueLine, SpeechTurn, WhenContext};
+use crate::state::{AppState, DialogueMode};
 use crate::system::governance::{self, Priority, SpeechCategory};
 
 /// 配達の到達結果 (§3.1)。
@@ -140,6 +140,14 @@ fn resolve_line(
     category: SpeechCategory,
     key: &str,
 ) -> Option<DialogueLine> {
+    // M14: 独り言だけは advanced のストック (LLM 生成 + 時事ネタ織り込み) を先に見る。
+    // **ghost ロックの外**で DB を触るのが要点 (foundation-design §3.3): pop は書き込み
+    // トランザクションなので、ghost ロックの内側でやると DB I/O の間ずっと保持してしまう。
+    if matches!(category, SpeechCategory::Monologue) {
+        if let Some(line) = pop_advanced_monologue(state) {
+            return Some(line);
+        }
+    }
     let guard = state.ghost.lock().expect("ghost poisoned");
     let bundle = guard.as_ref().ok()?;
     let sub = bundle.sub_available();
@@ -147,6 +155,55 @@ fn resolve_line(
         SpeechCategory::Monologue => bundle.dictionary.pick_monologue(sub),
         _ => bundle.dictionary.pick_event(key, &WhenContext::now(), sub),
     }
+}
+
+/// advanced のストックから独り言を 1 件取り出す (M14、foundation-design §3.3)。
+///
+/// `None` を返す条件はすべて「辞書の独り言へ落ちる」に合流する (spec §4.2.1 AI 非依存):
+/// low モード / **降格中** / ストックが空 / 全部失効 (ゴースト不一致・時事ネタ 7 日超・
+/// 生成 30 日超) / ゴースト未読込 / DB エラー。
+fn pop_advanced_monologue(state: &Arc<AppState>) -> Option<DialogueLine> {
+    let mode = state.settings.lock().expect("settings poisoned").mode.clone();
+    if !matches!(mode, DialogueMode::Advanced) {
+        return None;
+    }
+    // spec §4.4.4:「降格中・LLM 障害時は low と同じ辞書経路にフォールバックする」。
+    // ストックを喋るだけなら API は叩かないが、**降格中は advanced の顔を出さない**のが
+    // 要件の書き方なのでそれに従う (ストックは消費されず、復帰後にそのまま使える)。
+    let degraded_until = state.dialogue.degraded_until.load(Ordering::SeqCst);
+    if degraded_until != 0 && Utc::now().timestamp() < degraded_until {
+        return None;
+    }
+    // 鍵は**いま読み込まれている bundle の id**（`settings.ghost_id` はゴースト切替時に
+    // 再起動より先に変わるため、実際に喋っている人格とズレる）。ロックは id の複製だけで
+    // すぐ外し、DB I/O は ghost ロックの外で行う (foundation-design §3.3)。
+    let ghost_id = {
+        let guard = state.ghost.lock().expect("ghost poisoned");
+        guard.as_ref().ok()?.ghost.id.clone()
+    };
+    let row = state
+        .db
+        .pop_monologue_cache(&ghost_id, Utc::now().timestamp())
+        .unwrap_or_else(|err| {
+            eprintln!("[deliver] 独り言ストックの取り出しに失敗、辞書へ: {err:#}");
+            None
+        })?;
+    // pose はシェル依存で、生成時と今とでシェルが違いうる。存在しない pose を渡すと
+    // 表情が変わらないだけでなく、フロントが未知 pose を掴むので None に落とす
+    // (advanced 応答の validate_pose と同じ考え方)。
+    let pose = row.pose.and_then(|p| {
+        let guard = state.ghost.lock().expect("ghost poisoned");
+        let bundle = guard.as_ref().ok()?;
+        bundle.shell.characters.main.poses.contains_key(&p).then_some(p)
+    });
+    Some(DialogueLine {
+        main: SpeechTurn {
+            text: row.text,
+            pose,
+        },
+        // 独り言は 1 キャラの発話 (ストックは sub を持たない、foundation-design §3.2)。
+        sub: None,
+    })
 }
 
 fn toast_fallback(app: &AppHandle, fallback: Option<String>) -> DeliveryOutcome {
