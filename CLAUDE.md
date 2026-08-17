@@ -29,8 +29,8 @@ v0.0.3 で得た主な負債:
 | 2 | アーキテクチャ設計（TTS再設計・状態管理再設計・DB再設計） | docs/architecture.md | ✅ |
 | 3 | テスト計画 | docs/test-plan.md | ✅ |
 | **4** | **実装着手**（垂直スライス・M0〜M10） | src/, src-tauri/src/ | ✅ M0〜M10 完了。**v0.2.0 リリース済**（2026-07-18、タグ `v0.2.0`。日常支援 Tier S 全 4 機能: リマインダー / ToDo・日課 / 状況発話+ガバナンス / カレンダー参照。記録は docs/release-notes/v0.2.0.md） |
-| **v0.4** | 基盤・完成度（spec §6.0、2026-08-10 スコープ確定） | spec v1.3（要件化済み）→ **次は Phase 2 設計書** → 実装 | 🔄 **要件化済み**。① 表示モニタ選択 ② advanced 独り言の LLM 生成+キャッシュ ③ 時事ネタ織り込み（賞味期限 1 週間） ④ 負債返済。②③ は spec 未達の解消。音声入力は不採用（完成度を極める必要があり時期尚早） |
-| **v0.3** | 定例会話 + 天気（spec §4.7、2026-07-18 スコープ確定） | spec v1.2.2 + docs/regular-talk-design.md v1.1（M11〜M12 実装済み）+ docs/release-notes/v0.3.0.md | ✅ **v0.3.0 タグ済み**（2026-07-24、`feat/v0.3-regular-talk` の `b9bf981`・タグ `v0.3.0`・**lightweight**。M11 天気基盤 + M12 定例会話。リリース監査 GO: cargo test 248 / tsc green・ライブ API・実機 UI 目視・**インストール版起動確認**まで PASS・SHA-256 記録済み）。**残**: master へマージ + `origin` へ push（`3353bcd` 以降が未 push） |
+| **v0.4** | 基盤・完成度（spec §6.0、2026-08-10 スコープ確定） | spec v1.3 + docs/foundation-design.md（M13〜M15 実装済み）+ docs/release-notes/v0.4.0.md | ✅ **v0.4.0**（2026-08-17、master `e6eb1ab` 以降）。① 表示モニタ選択（M13）② advanced 独り言の LLM 生成+キャッシュ（M14）③ 時事ネタ織り込み・賞味期限 1 週間の二段失効（M14）④ 負債返済（M15）。②③ は spec 未達の解消。音声入力は不採用（完成度を極める必要があり時期尚早）。**実機確認で発見・修正した実バグ 2 件**: keyring 3 の store feature 未指定で **API キーが一度も永続化されていなかった**（advanced が丸ごと死んでいた）／補充タイムアウト 20 秒が短すぎ**ローカル LLM では必ず失敗**していた（→120 秒） |
+| **v0.3** | 定例会話 + 天気（spec §4.7、2026-07-18 スコープ確定） | spec v1.2.2 + docs/regular-talk-design.md v1.1（M11〜M12 実装済み）+ docs/release-notes/v0.3.0.md | ✅ **v0.3.0 タグ済み**（2026-07-24、`feat/v0.3-regular-talk` の `b9bf981`・タグ `v0.3.0`・**lightweight**。M11 天気基盤 + M12 定例会話。リリース監査 GO: cargo test 248 / tsc green・ライブ API・実機 UI 目視・**インストール版起動確認**まで PASS・SHA-256 記録済み）。**master へマージ済み**（2026-08-17、v0.4 と同時）。`origin` へは未 push |
 
 ## 採用済みの技術選定（Phase 1〜2 で再調査しない）
 
@@ -91,9 +91,9 @@ v0.0.3 で得た主な負債:
 | ファイル | 役割 | 状態 |
 |---|---|---|
 | docs/spec.md | 要件の正本 | v1.3 ✅（**§6.0 に v0.4 スコープ**＝表示モニタ選択・advanced 独り言 LLM・時事ネタ織り込み・負債返済。音声入力は不採用と理由を記録） |
-| docs/architecture.md | モジュール構成・契約・設計判断 | v1.9 ✅（M7〜M13。**表示モニタ選択**の契約反映済み） |
-| docs/foundation-design.md | **基盤・完成度（v0.4）の Phase 2 設計書**（§4.1.6 / §4.4.4 / §4.4.6 実装契約・M13〜M15） | 設計 v1 ✅（**M13・M15 実装済み**、M14 未実装） |
-| docs/test-plan.md | テスト戦略・手動チェックリスト | v1.5 ✅（§5 F 節に天気 F-1〜8 + 定例会話 F-9〜15、§5.8 実機検証記録。A-3/B-4/B-6 を具体化。Tier S §4.6 手動項目は未追加の負債あり） |
+| docs/architecture.md | モジュール構成・契約・設計判断 | v2.0 ✅（M7〜M14。**表示モニタ選択**と **advanced 独り言 + 時事ネタ**（DB v9 `monologue_cache`）の契約反映済み） |
+| docs/foundation-design.md | **基盤・完成度（v0.4）の Phase 2 設計書**（§4.1.6 / §4.4.4 / §4.4.6 実装契約・M13〜M15） | 設計 v1 ✅（**M13・M14・M15 すべて実装済み**。§7 に未決の決着、§7.1 に実装が設計から意図的に外れた点を記録） |
+| docs/test-plan.md | テスト戦略・手動チェックリスト | v1.8 ✅（§5 に A〜G 全節。天気/定例会話 F、日常支援 G、**モニタ選択 A-12〜14（M13）**、**advanced 独り言 D-4b〜e / 時事ネタ D-6b〜c（M14）**、§5.9 実機検証記録） |
 | docs/daily-support-design.md | **日常支援 Tier S の Phase 2 設計書**（§4.6 実装契約・DB・M7〜M10） | 設計 v2 ✅（**M7〜M10 実装済み**、Tier S 完了） |
 | docs/regular-talk-design.md | **定例会話と天気（v0.3）の Phase 2 設計書**（§4.7 実装契約・天気 API 選定・M11〜M12） | 設計 v1 ✅（**M11・M12 実装済み** 2026-07-24） |
 | [docs/_legacy-v003/baseline-v0.0.3.md](docs/_legacy-v003/baseline-v0.0.3.md) | **v0.0.3 機能・契約・残課題の網羅スナップショット**（v0.0.3 の生 docs は 2026-07-24 の docs 整理で削除。原本はプロトタイプ `C:\claude\ugga` と git 履歴に現存） | 参照用 |

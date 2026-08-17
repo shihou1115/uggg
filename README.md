@@ -2,7 +2,7 @@
 
 「伺か」コンセプトを **Tauri v2 (Rust + TypeScript)** で再構築したデスクトップマスコット。透過ウインドウ上でメイン/サブ 2 体のキャラクターが掛け合い対話する。Windows 専用。
 
-> v0.0.3 プロトタイプ (`C:\claude\ugga`) を経て、本リポジトリは **本開発** (`C:\claude\uggg`)。M0〜M12 完了、**最新は v0.3.0 (定例会話 + 天気)**。v0.2.0 (タグ `v0.2.0`) で日常支援 Tier S (リマインダー / ToDo・日課 / 状況発話 / カレンダー参照)、v0.3.0 で朝・夜の定例会話と天気・降雨の一言を追加。
+> v0.0.3 プロトタイプ (`C:\claude\ugga`) を経て、本リポジトリは **本開発** (`C:\claude\uggg`)。M0〜M15 完了、**最新は v0.4.0 (基盤・完成度)**。v0.2.0 (タグ `v0.2.0`) で日常支援 Tier S (リマインダー / ToDo・日課 / 状況発話 / カレンダー参照)、v0.3.0 で朝・夜の定例会話と天気・降雨の一言、v0.4.0 で表示モニタ選択と advanced 独り言の LLM 生成 (時事ネタ織り込み) を追加。
 >
 > **使い方は [取扱説明書 (docs/manual.md)](docs/manual.md) を参照。** 以下は開発者向けの情報。
 
@@ -37,7 +37,7 @@ npm run tauri dev
 
 ```pwsh
 npm run tauri build
-# → src-tauri/target/release/bundle/nsis/ugg_0.3.0_x64-setup.exe
+# → src-tauri/target/release/bundle/nsis/ugg_0.4.0_x64-setup.exe
 ```
 
 検証:
