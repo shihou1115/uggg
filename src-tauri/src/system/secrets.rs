@@ -42,3 +42,40 @@ pub fn delete_api_key(provider: &str) -> Result<()> {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **keyring の feature 未指定に対する回帰テスト**（2026-08-17 に実機で発覚）。
+    ///
+    /// keyring 3.x は `windows-native` 等のストア feature を明示しないと、OS の資格情報
+    /// ストアを組み込まず**メモリ上のモック**にフォールバックする。その状態でも
+    /// `set_password` は成功を返すため、UI は「保存しました」と出るのに、次に作られた
+    /// `Entry` からは読めず（設定を開き直すと「未保存」）、LLM 呼び出しには鍵が乗らない
+    /// （401 "You didn't provide an API key"）。**advanced モードが丸ごと機能しない**のに
+    /// テストは 1 本も落ちなかった。
+    ///
+    /// 本テストは `get_api_key` が**別の `Entry` を作り直して**読むことを利用し、
+    /// 「プロセス内のメモリではなく実ストアに載ったか」を検査する。
+    #[test]
+    fn api_key_round_trips_through_a_new_entry() {
+        const PROVIDER: &str = "ugg-selftest-roundtrip";
+        const VALUE: &str = "dummy-value-not-a-real-key";
+        let _ = delete_api_key(PROVIDER); // 前回の残骸を掃除
+
+        set_api_key(PROVIDER, VALUE).expect("set_api_key");
+        let got = get_api_key(PROVIDER).expect("get_api_key");
+        let has = has_api_key(PROVIDER).expect("has_api_key");
+        let cleanup = delete_api_key(PROVIDER); // assert より先に必ず片付ける
+
+        assert_eq!(
+            got.as_deref(),
+            Some(VALUE),
+            "別 Entry から読み戻せない = 実ストアに載っていない (モックへのフォールバック)"
+        );
+        assert!(has, "has_api_key が false = 設定 UI が「未保存」と表示する状態");
+        cleanup.expect("delete_api_key");
+        assert_eq!(get_api_key(PROVIDER).expect("get after delete"), None);
+    }
+}

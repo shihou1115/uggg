@@ -25,7 +25,12 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "now"] }
 rand = "0.8"
 tokio = { version = "1", features = ["sync", "macros", "time", "rt", "process", "io-util"] }
-keyring = "3"
+# keyring 3.x は **プラットフォームの feature を明示しないと OS の資格情報ストアを
+# 組み込まず、メモリ上のモックにフォールバックする**。その状態では set_password が
+# 成功を返すのに次の Entry から読めず、API キーが永続化されない (UI は「保存しました」
+# → 再表示で「未保存」、LLM 呼び出しは 401「You didn't provide an API key」)。
+# 本アプリは Windows 専用なので windows-native のみ有効化する。
+keyring = { version = "3", features = ["windows-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 libloading = "0.8"
 dirs = "5"
