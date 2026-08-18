@@ -52,12 +52,12 @@ grep -rln "<ファイル名の stem>" --include="*.md" --include="*.rs" --includ
 | **完遂した計画** | 実装計画・移行手順で、対象がすべて出荷済み | implementation-plan.md（M0〜M6） | 削除（git 履歴が記録） |
 | **消費済みインプット** | 検討材料として持ち込まれ、成果物（spec 等）に消化済み | _legacy-v003 の生 docs | 削除（蒸留版・原本の所在を残す側に注記） |
 | **重複索引・乖離した写し** | 正本と同じ役割で更新が止まっている | docs/README.md（索引の正本は CLAUDE.md） | 削除 |
-| **正本の外に生えた記録** | 既存正本の一節であるべき内容が独立ファイル化 | quality_checklist.md → test-plan §5.8 | 正本へ統合（出自を見出しに注記） |
+| **正本の外に生えた記録** | 既存正本の一節であるべき内容が独立ファイル化 | quality_checklist.md → test-plan §5.9 | 正本へ統合（出自を見出しに注記） |
 
 ### 不可侵リスト（消さない・動かさない。増えたらここに追記）
 
 - 正本 4: `spec.md` / `architecture.md` / `test-plan.md` / `ai_model_routing.md`
-- コード被参照の機能設計書: `daily-support-design.md` / `regular-talk-design.md` / `text-reader-spec.md` / `script-reader-spec.md`
+- コード被参照の機能設計書: `daily-support-design.md` / `regular-talk-design.md` / `foundation-design.md` / `text-reader-spec.md` / `script-reader-spec.md`
 - `manual.md`（**インストーラ同梱**）と `samples/`（manual から参照）
 - `release-notes/`（歴史記録。削除も編集もしない）
 - `_legacy-v003/baseline-v0.0.3.md`（CLAUDE.md「採用済み技術選定」の根拠参照先）
