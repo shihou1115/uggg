@@ -514,18 +514,29 @@ fn mutate_sources(
     state: &Arc<AppState>,
     edit: impl FnOnce(&mut Vec<CalendarSource>),
 ) -> Result<Vec<CalendarSource>, String> {
+    // **DB へコミットしてからメモリへ反映する** (Codex レビュー指摘 8、2026-08-23)。
+    // 旧実装はメモリを先に書き換えたうえで、DB 保存と clear_calendar の失敗を `let _ =` で
+    // 握り潰し、それでも常に Ok を返していた。保存に失敗するとメモリと DB が食い違い、
+    // しかも呼び出し側は成功と誤認する (再起動すると設定が黙って元に戻る)。
     let next = {
-        let mut s = state.settings.lock().expect("settings poisoned");
-        edit(&mut s.calendar_sources);
-        s.clone()
+        let s = state.settings.lock().expect("settings poisoned");
+        let mut candidate = s.clone();
+        edit(&mut candidate.calendar_sources);
+        candidate
     };
-    if let Ok(json) = serde_json::to_string(&next) {
-        let _ = state
-            .db
-            .set_setting(crate::commands::settings::SETTINGS_KEY, &json);
-    }
+    let json = serde_json::to_string(&next)
+        .map_err(|e| format!("Settings の JSON シリアライズ失敗: {e}"))?;
+    state
+        .db
+        .set_setting(crate::commands::settings::SETTINGS_KEY, &json)
+        .map_err(|err| format!("{err:#}"))?;
     // index ベースの source_id が変わるので全 clear（次回 watcher / refresh で再構築）
-    let _ = state.db.clear_calendar();
+    state.db.clear_calendar().map_err(|err| format!("{err:#}"))?;
+    // ここまで成功して初めてメモリへ反映する。
+    {
+        let mut s = state.settings.lock().expect("settings poisoned");
+        *s = next.clone();
+    }
     let _ = app.emit("settings-changed", &next);
     let _ = app.emit("calendar-changed", ());
     Ok(next.calendar_sources)

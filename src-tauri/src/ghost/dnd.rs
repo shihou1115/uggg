@@ -55,6 +55,8 @@ pub enum DndError {
     ForbiddenFile(String),
     #[error("再帰深さ {MAX_DIR_DEPTH} を超えました")]
     TooDeep,
+    #[error("manifest の id が不正です (単一のフォルダ名のみ許可): {0}")]
+    InvalidId(String),
     #[error("I/O エラー: {0}")]
     Io(String),
 }
@@ -165,11 +167,58 @@ fn read_manifest_bytes(path: &Path, kind: AssetKind) -> Result<Vec<u8>, DndError
     Err(DndError::UnsupportedFormat)
 }
 
+/// manifest の `id` を**単一の安全なパス成分**に限定する。
+///
+/// `id` は `ghosts/<id>` / `shells/<id>` という**展開先ディレクトリそのもの**を決めるため、
+/// ここを通さないと zip 内エントリの zip slip 対策 (`sanitize_zip_path`) をすり抜けて
+/// アセット領域の外へ書き込める。`Path::join` は引数が絶対パスなら base を丸ごと置換し、
+/// `..` も正規化せずに OS へ渡すので、`id: ".."` や `id: "C:\\Users\\Public"` が成立してしまう。
+/// 到達点は `create_dir_all` + 展開 (確認なし) と、上書き承認時の `remove_dir_all`。
+///
+/// 同種の検証は `tts::voice_ref::ref_path_in_dir` の slot 検証に前例がある。
+fn validate_asset_id(id: &str) -> Result<(), DndError> {
+    let bad = |why: &str| Err(DndError::InvalidId(format!("{id} ({why})")));
+    if id.is_empty() {
+        return bad("空文字");
+    }
+    if id.len() > 64 {
+        return bad("長すぎます");
+    }
+    if id == "." || id == ".." {
+        return bad("相対パス指定");
+    }
+    // 区切り文字・ドライブレター・NUL・制御文字・前後空白を拒否する。
+    if id.contains(['/', '\\', '\0', ':']) {
+        return bad("パス区切り文字またはドライブ指定");
+    }
+    if id.chars().any(|c| c.is_control()) {
+        return bad("制御文字");
+    }
+    if id != id.trim() {
+        return bad("前後の空白");
+    }
+    // Windows の予約デバイス名 (拡張子を付けても予約されたまま)。
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = id.split('.').next().unwrap_or(id).to_ascii_uppercase();
+    if RESERVED.contains(&stem.as_str()) {
+        return bad("Windows 予約名");
+    }
+    // 末尾のドット/空白は Windows が黙って落とすため、別 id と衝突しうる。
+    if id.ends_with('.') {
+        return bad("末尾のドット");
+    }
+    Ok(())
+}
+
 fn parse_manifest(bytes: &[u8], kind: AssetKind) -> Result<ManifestPeek, DndError> {
     match kind {
         AssetKind::Ghost => {
             let m: GhostManifest = serde_json::from_slice(bytes)
                 .map_err(|e| DndError::ManifestParse(format!("ghost.json: {e}")))?;
+            validate_asset_id(&m.id)?;
             Ok(ManifestPeek {
                 id: m.id,
                 name: m.name,
@@ -178,6 +227,7 @@ fn parse_manifest(bytes: &[u8], kind: AssetKind) -> Result<ManifestPeek, DndErro
         AssetKind::Shell => {
             let m: ShellManifest = serde_json::from_slice(bytes)
                 .map_err(|e| DndError::ManifestParse(format!("shell.json: {e}")))?;
+            validate_asset_id(&m.id)?;
             Ok(ManifestPeek {
                 id: m.id,
                 name: m.name,
@@ -449,6 +499,56 @@ mod tests {
         std::fs::write(dir.path().join("random.txt"), b"hi").unwrap();
         let err = detect_asset_kind(dir.path()).unwrap_err();
         assert!(matches!(err, DndError::NoManifest));
+    }
+
+    /// **manifest の id による展開先の脱出**に対する回帰テスト（Codex レビュー指摘 1、2026-08-23）。
+    ///
+    /// zip 内エントリ名の zip slip 対策 (`reject_path_traversal_in_zip`) は既にあったが、
+    /// 展開先ディレクトリ自体を決める `id` は無検証だった。`ghosts/<id>` の `id` に
+    /// `..` や絶対パスを入れると、確認なしの `create_dir_all` + 展開、および上書き承認時の
+    /// `remove_dir_all` がアセット領域の外へ到達しうる。
+    #[test]
+    fn reject_path_escape_in_manifest_id() {
+        for bad in [
+            "..",
+            ".",
+            "",
+            "../escape",
+            "..\\escape",
+            "sub/dir",
+            "sub\\dir",
+            "C:\\Users\\Public",
+            "\\\\server\\share",
+            "CON",
+            "nul.txt",
+            "trailing.",
+            " leading",
+            "trailing ",
+        ] {
+            assert!(
+                validate_asset_id(bad).is_err(),
+                "id {bad:?} は拒否されるべき"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_normal_manifest_id() {
+        for ok in ["default", "my-ghost", "my_ghost2", "ゴースト", "a.b", "CONSOLE"] {
+            assert!(validate_asset_id(ok).is_ok(), "id {ok:?} は許可されるべき");
+        }
+    }
+
+    /// 検証が `parse_manifest` に入っていること（呼び出し側 assets.rs ではなく
+    /// manifest を読む唯一の入口で弾く = 経路が増えても漏れない）。
+    #[test]
+    fn parse_manifest_rejects_escaping_id() {
+        let json = br#"{"schema_version":1,"id":"..","name":"x","characters":{"main":{"name":"m"}},"dictionaries":[]}"#;
+        let err = parse_manifest(json, AssetKind::Ghost).unwrap_err();
+        assert!(
+            matches!(err, DndError::InvalidId(_)),
+            "InvalidId が返るべきだった: {err:?}"
+        );
     }
 
     #[test]

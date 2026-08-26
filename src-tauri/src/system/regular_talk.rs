@@ -280,7 +280,7 @@ pub async fn polish_script(state: &Arc<AppState>, script: &str) -> String {
     if until != 0 && Utc::now().timestamp() < until {
         return script.to_string();
     }
-    let api_key = match secrets::get_api_key(&settings.llm_provider) {
+    let api_key = match secrets::get_api_key_async(&settings.llm_provider).await {
         Ok(k) => k,
         Err(err) => {
             eprintln!("[regular_talk] get_api_key failed: {err:#}");

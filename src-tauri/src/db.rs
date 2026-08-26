@@ -796,7 +796,8 @@ impl Db {
     pub fn get_reminder(&self, id: i64) -> Result<Option<ReminderRow>> {
         let conn = self.conn.lock().expect("db poisoned");
         let sql = format!("SELECT {} FROM reminders WHERE id = ?1", Self::REMINDER_COLS);
-        let row = conn.query_row(&sql, params![id], Self::map_reminder).ok();
+        let row = conn.query_row(&sql, params![id], Self::map_reminder).optional()
+            .context("get_reminder")?;
         Ok(row)
     }
 
@@ -1004,7 +1005,8 @@ impl Db {
     pub fn get_todo(&self, id: i64) -> Result<Option<TodoRow>> {
         let conn = self.conn.lock().expect("db poisoned");
         let sql = format!("SELECT {} FROM todos WHERE id = ?1", Self::TODO_COLS);
-        let row = conn.query_row(&sql, params![id], Self::map_todo).ok();
+        let row = conn.query_row(&sql, params![id], Self::map_todo).optional()
+            .context("get_todo")?;
         Ok(row)
     }
 
@@ -1569,7 +1571,8 @@ impl Db {
                     })
                 },
             )
-            .ok();
+            .optional()
+            .context("get_voice_ref")?;
         Ok(row)
     }
 
@@ -1613,7 +1616,8 @@ impl Db {
                 params![key],
                 |row| row.get::<_, String>(0),
             )
-            .ok();
+            .optional()
+            .context("get_setting")?;
         Ok(value)
     }
 

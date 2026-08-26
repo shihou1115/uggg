@@ -116,6 +116,10 @@ export async function renderResponse(resp: DialogueResponse): Promise<void> {
     await speakSlot(token, t.charSlot, t.balloonSlot, t.turn);
   }
   if (token.cancelled) return;
+  // 保険: speakSlot が各ターンで再生完了を待つので通常は即座に解決するが、
+  // 将来 fire-and-forget が再び混入しても spec §4.1.3 (発話完了後に消去) を守れるようにする。
+  await ttsSpeaker?.whenIdle();
+  if (token.cancelled) return;
   await sleep(holdDuration(resp));
   if (token.cancelled) return;
   // 全ターンの描画+発話完了後に一括消去 (spec §4.1.3)。extra を含め、表示していない
@@ -192,10 +196,17 @@ async function speakSlot(
 ): Promise<void> {
   if (turn.pose) setPose(charSlot, turn.pose);
   const textEl = showBalloon(balloonSlot, charSlot);
-  // TTS フック: 描画開始と同時に再生開始 (順序保証は speaker 側のキュー)。
-  // 失敗は内部で握りつぶされる (声なし継続)。
-  void ttsSpeaker?.speak(charSlot, turn.text);
+  // TTS フック: 描画と再生を**同時に開始し、両方の完了を待つ** (spec §4.1.3)。
+  //
+  // 以前は `void` で Promise を捨てて描画だけを待っていたため、main の音声が鳴っている
+  // 最中に sub の文字表示が始まり、長文・低速 TTS では音声の途中で吹き出しが消えていた
+  // (Codex レビュー指摘 5、2026-08-23)。speaker 側の Promise は実際の再生終了で解決する。
+  //
+  // 待っても声なし運用のテンポは落ちない: TTS 無効時と空文字は `speak` が即 resolve し、
+  // 合成失敗・中断 (interrupt による世代交代) でも必ず resolve される設計になっている。
+  const spoken = ttsSpeaker?.speak(charSlot, turn.text);
   await typeInto(textEl, turn.text, talkSpeed, token, () => reposition(balloonSlot));
+  await spoken;
 }
 
 function holdDuration(resp: DialogueResponse): number {

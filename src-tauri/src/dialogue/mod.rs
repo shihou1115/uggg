@@ -345,7 +345,7 @@ async fn try_advanced(
         let s = state.settings.lock().expect("settings poisoned");
         s.clone()
     };
-    let api_key = secrets::get_api_key(&settings.llm_provider)?;
+    let api_key = secrets::get_api_key_async(&settings.llm_provider).await?;
     // std::sync::MutexGuard を await を跨いで保持できないので、ブロックで握り→外す。
     let bundle = {
         let guard = state.ghost.lock().expect("ghost poisoned");

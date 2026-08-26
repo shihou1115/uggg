@@ -158,7 +158,7 @@ async fn refill_once(
     // API キーは None も許容する: base_url を差し替えたローカル LLM (LMStudio/Ollama) は
     // キー無しで動き、対話チャット (`try_advanced`) も同じく None を通している。
     // ここだけ None を拒むと、advanced チャットが動く環境で独り言だけ補充されない。
-    let api_key = match secrets::get_api_key(&settings.llm_provider) {
+    let api_key = match secrets::get_api_key_async(&settings.llm_provider).await {
         Ok(k) => k,
         Err(err) => {
             eprintln!("[monologue] API キー取得に失敗、補充を見送り: {err:#}");

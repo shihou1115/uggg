@@ -29,6 +29,21 @@ pub fn get_api_key(provider: &str) -> Result<Option<String>> {
     }
 }
 
+/// `get_api_key` の**非同期経路向け**ラッパ。
+///
+/// keyring (Windows Credential Manager) の同期 API は環境次第で稀にハングする
+/// (keyring-rs の Microsoft アカウント環境問題)。`commands/secrets.rs` は早くから
+/// これを認識して `spawn_blocking` に逃がしていたが、**LLM 経路 3 本が同期版を
+/// `async fn` から直接呼んでいた** (Codex レビュー指摘 6、2026-08-23)。
+/// そこでハングすると tokio のワーカースレッドごと止まり、しかも停止するのは
+/// LLM 呼び出しの**前**なので `tokio::time::timeout` でも救済されない。
+pub async fn get_api_key_async(provider: &str) -> Result<Option<String>> {
+    let provider = provider.to_string();
+    tauri::async_runtime::spawn_blocking(move || get_api_key(&provider))
+        .await
+        .map_err(|e| anyhow::anyhow!("keyring task 起動失敗: {e}"))?
+}
+
 pub fn has_api_key(provider: &str) -> Result<bool> {
     Ok(get_api_key(provider)?.is_some())
 }
