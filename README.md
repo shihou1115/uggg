@@ -82,4 +82,8 @@ docs/                 # spec / architecture / test-plan / 機能別設計書 等
 
 ## ライセンス
 
-ugg 本体: MIT (予定)。同梱ゴースト/シェル/辞書の権利は同梱資産の `LICENSE` に従う。VOICEVOX 音声モデルおよび Aratako/Irodori-TTS は別ライセンス (利用規約遵守、本体起動時に同意フロー)。
+**MIT License** ([LICENSE](LICENSE))。ugg 本体のソースコードに加え、同梱の既定資産
+(`ghosts/default/` のキャラクター辞書、`shells/default/` のシェル画像) にも適用される。
+
+対象外: VOICEVOX 音声モデルおよび Aratako/Irodori-TTS は別ライセンス (利用規約遵守、本体起動時に同意フロー)。いずれもユーザーが実行時に取得するもので同梱していない。
+ユーザーが追加した第三者製のゴースト/シェルは、それぞれの作者が定めたライセンスに従う。

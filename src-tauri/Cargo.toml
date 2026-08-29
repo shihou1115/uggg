@@ -2,7 +2,8 @@
 name = "ugg"
 version = "0.4.1"
 description = "ugg — desktop companion"
-authors = ["ugg"]
+authors = ["ugg Project"]
+license = "MIT"
 edition = "2021"
 rust-version = "1.77"
 
