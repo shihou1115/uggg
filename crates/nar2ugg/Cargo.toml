@@ -1,0 +1,40 @@
+# nar2ugg — 「伺か」シェル (.nar) を ugg シェル形式へ変換する CLI。
+#
+# **ugg 本体 (src-tauri) の Cargo workspace には属さない独立 crate。**
+# リリース手順書 (.claude/skills/releasing-ugg) と scripts/dev-ready.ps1 が
+# `src-tauri\target\` を直に参照しており、workspace 化すると target が共有側へ
+# 移動して両方壊れる。下の空の [workspace] は、将来リポジトリ直下に Cargo.toml が
+# 置かれてもこの crate が巻き込まれないための保険。
+[workspace]
+
+[package]
+name = "nar2ugg"
+version = "0.1.0"
+description = "「伺か」シェル (.nar) を ugg シェル形式へ変換する"
+authors = ["ugg Project"]
+license = "MIT"
+edition = "2021"
+# image 0.25 の MSRV に合わせる (ugg 本体は 1.77 だが、この crate は本体と
+# 独立にビルドされるので揃える必要がない)。
+rust-version = "1.88"
+
+[dependencies]
+# ugg 本体 (src-tauri/Cargo.toml) と同じ行。.nar は実体が zip で、圧縮方式は
+# 事実上すべて deflate。default-features を切らないと bzip2 (C の libbzip2) /
+# zstd / lzma のバックエンドが入り、ライセンス表記の対象とビルド依存が増える。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# 伺かのテキストは既定 Shift_JIS (実体は CP932)。zip エントリ名も UTF-8 フラグが
+# 立っていない CP932 のことが多い。ugg 本体と同一バージョン系列。
+encoding_rs = "0.8"
+# PNG のみ。to_rgba8() が palette / 8bit / 16bit / grayscale を一律 RGBA8 へ
+# 正規化するので、実シェルに混在する各種 PNG を分岐なしで扱える。
+# default-features を切らないと jpeg/gif/tiff/webp/exr のデコーダが全部入る。
+image = { version = "0.25", default-features = false, features = ["png"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+strip = true

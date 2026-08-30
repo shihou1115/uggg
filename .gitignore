@@ -7,6 +7,8 @@ dist/
 # ---- Cargo / Tauri ----
 src-tauri/target/
 src-tauri/gen/schemas/
+# crates/ は ugg 本体の workspace に属さない独立 crate 群。target も個別に持つ。
+crates/*/target/
 **/*.rs.bk
 
 # ---- ログ・実行時生成物 ----
