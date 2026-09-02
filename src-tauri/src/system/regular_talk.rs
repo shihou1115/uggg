@@ -280,6 +280,12 @@ pub async fn polish_script(state: &Arc<AppState>, script: &str) -> String {
     if until != 0 && Utc::now().timestamp() < until {
         return script.to_string();
     }
+    // 月額上限も LLM を呼ぶ前に見る (spec §4.2.7)。この経路だけ判定が無く、
+    // 上限超過後も朝夜の定例会話で課金が続いていた。告知は AppHandle を持つ
+    // チャット / 独り言補充の経路が行うので、ここでは黙って言い換えを諦める。
+    if crate::dialogue::cost_exceeded(state, &settings) {
+        return script.to_string();
+    }
     let api_key = match secrets::get_api_key_async(&settings.llm_provider).await {
         Ok(k) => k,
         Err(err) => {

@@ -683,10 +683,10 @@ pub struct DialogueState {
     pub degraded_until: AtomicI64,
     /// 連続 API エラー回数。閾値超過で降格させる。
     pub error_streak: AtomicI64,
-    /// コスト 80% 警告告知済みフラグ (月内一度きり)。
-    pub cost_warning_80_emitted: AtomicBool,
-    /// コスト上限超過の告知済みフラグ (月内一度きり告知のため)。
-    pub cost_limited_emitted: AtomicBool,
+    // コストの告知済みフラグは AtomicBool から app_settings の月次タグへ移した
+    // (2026-09-02)。プロセス内フラグでは再起動で消え、しかも月が替わっても戻らず、
+    // 翌月の警告が二度と鳴らなかった。現在は system::cost の
+    // KEY_WARNED_80 / KEY_LIMIT_NOTIFIED を参照する。
     /// 起動挨拶済みフラグ (二重発火防止)。
     pub greeted: AtomicBool,
     /// M14: advanced 独り言のキャッシュ補充を最後に試みた unix 秒 (0 = 未実施)。
@@ -703,8 +703,6 @@ impl Default for DialogueState {
             last_interaction: AtomicI64::new(0),
             degraded_until: AtomicI64::new(0),
             error_streak: AtomicI64::new(0),
-            cost_warning_80_emitted: AtomicBool::new(false),
-            cost_limited_emitted: AtomicBool::new(false),
             greeted: AtomicBool::new(false),
             monologue_refill_ts: AtomicI64::new(0),
         }

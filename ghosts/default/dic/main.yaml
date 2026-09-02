@@ -595,6 +595,19 @@ events:
 
 # システムメッセージ (notify() 経由でゴーストが告知)
 system_messages:
+  # コスト系 2 キー。notify.rs は以前からこのキーを引きに来ていたが辞書側に
+  # 定義が無く、月額上限の 80% 到達も超過もキャラクターが黙っていた (spec §4.2.7 は
+  # 「ゴースト発話で通知（黙って降格しない）」と要求している)。
+  cost_warning_80:
+    - main: { text: "ねえ、今月のAIのお小遣い、そろそろ8割使っちゃったって", pose: troubled }
+      sub: { text: "上限まで残りわずかだ。設定から確認しておけ", pose: normal }
+    - main: { text: "そろそろ節約モードが近いかも。教えておくね", pose: troubled }
+      sub: { text: "8割だ。今月の残りは考えて使え", pose: normal }
+  cost_limit_exceeded:
+    - main: { text: "今月のぶん、使い切っちゃった。来月まで辞書でおしゃべりするね", pose: troubled }
+      sub: { text: "上限に達した。来月まではこのままだ", pose: normal }
+    - main: { text: "あー、上限に届いちゃった。でも普通におしゃべりはできるよ！", pose: normal }
+      sub: { text: "課金は止めた。次の月まで待て", pose: normal }
   mode_degraded:
     - main: { text: "ごめん、ちょっと頭がぼーっとして通信できないみたい", pose: troubled }
       sub: { text: "回線かAPIキーの調子が悪いようだ。しばらく省エネで話すよ", pose: normal }

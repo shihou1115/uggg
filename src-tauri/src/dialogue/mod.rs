@@ -226,8 +226,15 @@ async fn run_dispatch(
         }
     }
 
+    // 上限超過は LLM を呼ぶ「前」に弾く (spec §4.2.7)。
+    // 以前は try_advanced の成功後にしか判定しておらず、超過後も呼び続けていた。
+    let over_limit = cost_exceeded(state, &settings);
+    if over_limit {
+        announce_cost_limit_once(app, state, &settings).await;
+    }
     let want_advanced = matches!(settings.mode, DialogueMode::Advanced)
-        && !is_degraded(&state.dialogue);
+        && !is_degraded(&state.dialogue)
+        && !over_limit;
 
     if want_advanced {
         match try_advanced(state, user_text).await {
@@ -261,6 +268,45 @@ async fn run_dispatch(
 /// 当月コストを評価し、80% 警告 / 上限超過 (降格 + 告知) を月内一度きりで出す。
 /// M14: advanced 独り言の補充 (`system::monologue`) も**同じ関数**を通す
 /// (背景処理だけが上限を素通りする穴を作らない、foundation-design §3.5)。
+/// 上限超過の告知を **その月に 1 回だけ** 出す。
+///
+/// 以前は非永続の `AtomicBool` を使っており、(1) 再起動で消える
+/// (2) **月が替わっても戻らない**ため翌月の警告が二度と鳴らない、という 2 つの穴があった。
+/// 当月タグを `app_settings` に保存して判定する（spec §4.2.7「次月リセットで復帰。」）。
+///
+/// **降格タイマーは張らない。** 超過の判定は `cost_exceeded` が毎回 DB を見て行うので、
+/// タイマーで解除されると「5 分後に課金が再開する」という以前の穴に戻る。
+pub(crate) async fn announce_cost_limit_once(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    settings: &crate::state::Settings,
+) {
+    if cost::notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED) {
+        return;
+    }
+    cost::mark_notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED);
+    notify::notify(
+        app,
+        state,
+        NoticeKind::CostLimitExceeded {
+            provider: settings.llm_provider.clone(),
+        },
+    )
+    .await;
+    notify::notify(
+        app,
+        state,
+        NoticeKind::ModeDegraded {
+            reason: DegradeReason::CostLimit,
+        },
+    )
+    .await;
+}
+
+/// 80% 到達の警告。呼び出し後のコスト記録を見て、その月に 1 回だけ出す。
+///
+/// 上限超過そのものの判定は `cost_exceeded` ゲートが LLM 呼び出しの前に行うので、
+/// ここは 80% 警告と、超過に「今まさに乗った」場合の告知だけを担当する。
 pub(crate) async fn evaluate_cost_status(
     app: &AppHandle,
     state: &Arc<AppState>,
@@ -277,35 +323,9 @@ pub(crate) async fn evaluate_cost_status(
         return;
     }
     if status.exceeded {
-        if !state
-            .dialogue
-            .cost_limited_emitted
-            .swap(true, Ordering::SeqCst)
-        {
-            degrade(&state.dialogue);
-            notify::notify(
-                app,
-                state,
-                NoticeKind::CostLimitExceeded {
-                    provider: settings.llm_provider.clone(),
-                },
-            )
-            .await;
-            notify::notify(
-                app,
-                state,
-                NoticeKind::ModeDegraded {
-                    reason: DegradeReason::CostLimit,
-                },
-            )
-            .await;
-        }
-    } else if status.reached_80
-        && !state
-            .dialogue
-            .cost_warning_80_emitted
-            .swap(true, Ordering::SeqCst)
-    {
+        announce_cost_limit_once(app, state, settings).await;
+    } else if status.reached_80 && !cost::notified_this_month(&state.db, cost::KEY_WARNED_80) {
+        cost::mark_notified_this_month(&state.db, cost::KEY_WARNED_80);
         notify::notify(
             app,
             state,
@@ -314,6 +334,27 @@ pub(crate) async fn evaluate_cost_status(
             },
         )
         .await;
+    }
+}
+
+/// 月額上限に達しているか。**LLM を呼ぶ前に必ず通す唯一のゲート** (spec §4.2.7)。
+///
+/// `cost::check_status` は毎回 `api_usage` の当月分を DB から集計するので、
+/// プロセスを跨いでも月が替わっても正しい。以前は「超過 → 300 秒の一時降格」
+/// だったため、実質「5 分の一時停止」でその月ずっと課金が続いていた。
+/// 降格タイマー (`degraded_until`) は **API エラー由来専用**とし、コスト超過は
+/// このゲートで毎回判定する。
+pub(crate) fn cost_exceeded(state: &Arc<AppState>, settings: &crate::state::Settings) -> bool {
+    if settings.monthly_limit_usd <= 0.0 {
+        return false;
+    }
+    match cost::check_status(&state.db, settings.monthly_limit_usd) {
+        Ok(st) => st.exceeded,
+        Err(err) => {
+            // 集計できないときに課金を止めるのは過剰なので通す（記録は残す）。
+            eprintln!("[cost] check_status failed: {err:#}");
+            false
+        }
     }
 }
 
