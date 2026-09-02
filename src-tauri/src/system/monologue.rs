@@ -318,6 +318,22 @@ fn select_topic_materials(
 fn build_system_prompt(bundle: &GhostBundle, materials: &[TopicMaterial], count: usize) -> String {
     let main_name = bundle.ghost.characters.main.name.as_str();
     let poses = available_pose_names(bundle);
+    // ghost.json の persona を載せる (spec §4.2)。独り言も同じ人格で書かせる。
+    let persona_line = match bundle
+        .ghost
+        .characters
+        .main
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        Some(t) => format!("
+{main_name} の人物像: {t}
+上の設定に従って書き、設定文そのものを独り言で説明しない。
+"),
+        None => String::new(),
+    };
     let topics_block = if materials.is_empty() {
         String::new()
     } else {
@@ -336,7 +352,7 @@ fn build_system_prompt(bundle: &GhostBundle, materials: &[TopicMaterial], count:
     format!(
         r#"あなたはデスクトップマスコットアプリ「{ghost}」のメインキャラ「{main}」です。
 ユーザーの画面の片隅にいて、誰に向けるでもなく**ふと漏らす独り言**を書いてください。
-{topics_block}
+{persona_line}{topics_block}
 独り言のルール:
 - 1 件につき 1〜2 行の短い独り言。キャラクターの口調を保つ。
 - 相手に質問しない・返事を促さない・呼びかけない (独り言なので会話にしない)。
@@ -350,6 +366,7 @@ fn build_system_prompt(bundle: &GhostBundle, materials: &[TopicMaterial], count:
 - pose に使えるのは次のいずれか: {poses}
 "#,
         ghost = bundle.ghost.name,
+        persona_line = persona_line,
         main = main_name,
         topics_block = topics_block,
         count = count,
@@ -445,10 +462,12 @@ mod tests {
                 characters: GhostCharacters {
                     main: GhostCharacter {
                         name: "ミミ".into(),
+                        persona: Some("元気で好奇心旺盛な女の子。一人称は「あたし」。".into()),
                     },
                     sub: None,
                 },
                 dictionaries: vec!["dic/main.yaml".into()],
+                prompt: None,
             },
             shell: ShellManifest {
                 schema_version: 1,
@@ -568,12 +587,31 @@ mod tests {
 
     // ===== プロンプト =====
 
+    /// 名前と pose 語彙しか検査しておらず、**persona が丸ごと欠けていても通っていた**
+    /// テストの是正 (2026-09-02)。テスト名が主張する内容を実際に検証する。
     #[test]
     fn system_prompt_includes_persona_and_poses() {
         let p = build_system_prompt(&make_bundle(), &[], REFILL_BATCH);
         assert!(p.contains("ミミとクロ"), "{p}");
         assert!(p.contains("ミミ"), "{p}");
         assert!(p.contains("happy") && p.contains("normal"), "pose 語彙: {p}");
+        // 本題: ghost.json の persona がプロンプトに載ること。
+        assert!(
+            p.contains("元気で好奇心旺盛な女の子"),
+            "persona 本文がプロンプトに無い: {p}"
+        );
+        // persona 文を台詞で復唱させない歯止めも載せる。
+        assert!(p.contains("設定文そのものを"), "自己申告の抑止が無い: {p}");
+    }
+
+    /// persona 未指定のゴースト (第三者製で書いていない場合) でも壊れないこと。
+    #[test]
+    fn system_prompt_omits_persona_block_when_absent() {
+        let mut bundle = make_bundle();
+        bundle.ghost.characters.main.persona = None;
+        let p = build_system_prompt(&bundle, &[], REFILL_BATCH);
+        assert!(!p.contains("人物像"), "persona 不在なのにブロックが出た: {p}");
+        assert!(p.contains("ミミ"), "名前は残る: {p}");
     }
 
     #[test]

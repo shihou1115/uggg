@@ -227,13 +227,30 @@ fn system_prompt(bundle: &GhostBundle, pattern: u8, profile_block: &str, tools_b
         .as_ref()
         .map(|s| s.name.as_str())
         .unwrap_or("sub");
+    // ghost.json の persona を載せる (spec §4.2)。無ければ従来の役割だけの既定文。
+    // persona 不在だと LLM は 2 人を区別できず、掛け合い (§4.2.4) が
+    // 「同調役が 2 人いる」状態に潰れる (2026-09-02 の実測で確認)。
+    let main_desc = bundle.ghost.characters.main.describe("メインキャラ。");
     let sub_block = match &bundle.ghost.characters.sub {
         Some(sub) => format!(
-            "- 「{}」(sub): デスクトップに住む相方キャラ。",
-            sub.name
+            "- 「{}」(sub): {}",
+            sub.name,
+            sub.describe("デスクトップに住む相方キャラ。")
         ),
         None => String::new(),
     };
+    // prompt.max_chars_per_line / style_notes も同様に作者指定を優先する。
+    let gp = bundle.ghost.prompt.as_ref();
+    let main_len_line = match gp.and_then(|p| p.max_chars_per_line) {
+        Some(n) => format!("main は {n} 文字以内、sub は 1 行程度。"),
+        None => "main は 1-2 行、sub は 1 行程度。".to_string(),
+    };
+    let style_line = gp
+        .and_then(|p| p.style_notes.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("2 人で掛け合うように自然な会話にする。説教くさい長文は禁止。")
+        .to_string();
     let available_poses = available_pose_names(bundle);
     let sub_required_line = if bundle.sub_available() {
         format!(
@@ -284,12 +301,13 @@ fn system_prompt(bundle: &GhostBundle, pattern: u8, profile_block: &str, tools_b
     format!(
         r#"あなたはデスクトップマスコットアプリ「{ghost}」のキャラクターです。
 登場人物:
-- 「{main}」(main): メインキャラ。
+- 「{main}」(main): {main_desc}
 {sub_block}
 {profile_block}{tools_block}
 応答ルール:
-- 1 ターンは短く: main は 1-2 行、sub は 1 行程度。
-- 2 人で掛け合うように自然な会話にする。説教くさい長文は禁止。
+- 1 ターンは短く: {main_len_line}
+- {style_line}
+- 上の人物設定に従って話す。設定文そのものを台詞で説明しない。
 - 既存ユーザー情報を尊重し、それを基に親密に話す。
 - 新しく覚えるべきユーザー情報があれば memory に 1 文だけ書く。無ければ memory は空文字。
 {turn_structure_line}
@@ -305,7 +323,10 @@ fn system_prompt(bundle: &GhostBundle, pattern: u8, profile_block: &str, tools_b
 "#,
         ghost = bundle.ghost.name,
         main = main_name,
+        main_desc = main_desc,
         sub_block = sub_block,
+        main_len_line = main_len_line,
+        style_line = style_line,
         profile_block = profile_block,
         tools_block = tools_block,
         turn_structure_line = turn_structure_line,
@@ -473,10 +494,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use crate::ghost::manifest::{
-        BaseSize, GhostCharacter, GhostCharacters, GhostManifest, ShellCharacterDef,
-        ShellCharacters, ShellManifest,
-    };
+    use crate::ghost::manifest::{BaseSize, GhostCharacter, GhostCharacters, GhostManifest, GhostPrompt, ShellCharacterDef, ShellCharacters, ShellManifest};
 
     fn make_bundle(with_sub: bool) -> GhostBundle {
         let mut poses = BTreeMap::new();
@@ -505,14 +523,24 @@ mod tests {
             id: "default".into(),
             name: "ミミとクロ".into(),
             characters: GhostCharacters {
-                main: GhostCharacter { name: "ミミ".into() },
+                main: GhostCharacter {
+                    name: "ミミ".into(),
+                    persona: Some("元気で好奇心旺盛な女の子。一人称は「あたし」。".into()),
+                },
                 sub: if with_sub {
-                    Some(GhostCharacter { name: "クロ".into() })
+                    Some(GhostCharacter {
+                        name: "クロ".into(),
+                        persona: Some("冷静でちょっと毒舌な黒猫。一人称は「ボク」。".into()),
+                    })
                 } else {
                     None
                 },
             },
             dictionaries: vec!["dic/main.yaml".into()],
+            prompt: Some(GhostPrompt {
+                max_chars_per_line: Some(60),
+                style_notes: Some("二人の掛け合いとして自然に。".into()),
+            }),
         };
         let shell = ShellManifest {
             schema_version: 1,
@@ -822,6 +850,39 @@ mod tests {
         assert!(r4.extra.is_none());
     }
 
+    /// persona / style_notes / max_chars_per_line が system prompt に載ること。
+    ///
+    /// これが無いと LLM は 2 人を名前でしか区別できず、掛け合い (spec §4.2.4) が
+    /// 「同調役が 2 人いる」状態に潰れる。2026-09-02 の実測 (ローカル LLM・8 往復 x2)
+    /// では、persona 不在だと一人称の一致が main/sub とも 0/8 だった。
+    #[test]
+    fn system_prompt_carries_ghost_persona_and_prompt_hints() {
+        let bundle = make_bundle(true);
+        let p = system_prompt(&bundle, 1, "", "");
+        assert!(p.contains("元気で好奇心旺盛な女の子"), "main の persona が無い: {p}");
+        assert!(p.contains("冷静でちょっと毒舌な黒猫"), "sub の persona が無い: {p}");
+        assert!(p.contains("60 文字以内"), "max_chars_per_line が効いていない: {p}");
+        assert!(p.contains("二人の掛け合いとして自然に"), "style_notes が無い: {p}");
+        // 人格を台詞で復唱させない歯止め。
+        assert!(p.contains("設定文そのものを台詞で説明しない"), "自己申告の抑止が無い: {p}");
+        // 旧ハードコード文が残っていないこと。
+        assert!(!p.contains("(main): メインキャラ。"), "ハードコードが残っている: {p}");
+        assert!(!p.contains("デスクトップに住む相方キャラ。"), "ハードコードが残っている: {p}");
+    }
+
+    /// persona / prompt を書いていないゴーストでも既定文で成立すること。
+    #[test]
+    fn system_prompt_falls_back_when_ghost_omits_persona() {
+        let mut bundle = make_bundle(true);
+        bundle.ghost.characters.main.persona = None;
+        bundle.ghost.characters.sub.as_mut().unwrap().persona = None;
+        bundle.ghost.prompt = None;
+        let p = system_prompt(&bundle, 1, "", "");
+        assert!(p.contains("(main): メインキャラ。"), "既定文が出ない: {p}");
+        assert!(p.contains("デスクトップに住む相方キャラ。"), "既定文が出ない: {p}");
+        assert!(p.contains("main は 1-2 行"), "既定の長さ指示が出ない: {p}");
+    }
+
     #[test]
     fn assemble_advanced_keeps_pattern4_when_sub_and_extra_present() {
         let line = DialogueLine {
@@ -833,3 +894,4 @@ mod tests {
         assert_eq!(resp.extra.unwrap().text, "sub2");
     }
 }
+

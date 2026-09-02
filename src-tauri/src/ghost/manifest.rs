@@ -14,6 +14,23 @@ pub struct GhostManifest {
     pub name: String,
     pub characters: GhostCharacters,
     pub dictionaries: Vec<String>,
+    /// advanced (LLM) 経路のプロンプト調整 (spec §4.2)。省略可。
+    #[serde(default)]
+    pub prompt: Option<GhostPrompt>,
+}
+
+/// ゴースト作者が指定する、LLM への文体指示 (spec §4.2)。
+///
+/// **ここに書かれたものを読むだけで、生成はしない。** 第三者ゴーストの人格記述を
+/// 機械生成して LLM に演じさせる導線は spec §6.4 のレッドラインで禁止している。
+#[derive(Debug, Clone, Deserialize)]
+pub struct GhostPrompt {
+    /// 1 発話あたりの目安文字数。プロンプトに指示として載せるだけで、強制はしない。
+    #[serde(default)]
+    pub max_chars_per_line: Option<u32>,
+    /// 掛け合い全体のトーン指示。
+    #[serde(default)]
+    pub style_notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,6 +43,21 @@ pub struct GhostCharacters {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GhostCharacter {
     pub name: String,
+    /// キャラクターの人格記述 (spec §4.2)。advanced 経路の system prompt に載る。
+    /// 省略時はキャラ名だけが LLM に渡る。
+    #[serde(default)]
+    pub persona: Option<String>,
+}
+
+impl GhostCharacter {
+    /// system prompt に載せる 1 行分の説明。
+    /// persona があればそれを、無ければ役割だけの既定文を返す。
+    pub fn describe(&self, fallback: &str) -> String {
+        match self.persona.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(p) => p.to_string(),
+            None => fallback.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

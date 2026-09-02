@@ -288,11 +288,29 @@ pub async fn polish_script(state: &Arc<AppState>, script: &str) -> String {
         }
     };
     let client = LlmClient::new(settings.llm_base_url.clone(), api_key);
+    // ghost.json の persona を載せる (spec §4.2)。言い換えがキャラの口調から外れないようにする。
+    // ロックは 1 行取り出すだけで即座に手放す (LLM 呼び出しをロック下で待たない)。
+    let persona_line = {
+        let guard = state.ghost.lock().expect("ghost poisoned");
+        match guard.as_ref() {
+            Ok(bundle) => {
+                let main = &bundle.ghost.characters.main;
+                match main.persona.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    Some(t) => format!(
+                        "話者は「{}」。人物像: {}\n上の設定に沿った口調にし、設定文そのものを本文に混ぜないでください。\n",
+                        main.name, t
+                    ),
+                    None => String::new(),
+                }
+            }
+            Err(_) => String::new(),
+        }
+    };
     let messages = vec![
-        ChatMessage::system(
-            "次の一言を、意味と情報量を変えずに自然な会話調へ短く言い換えてください。\
+        ChatMessage::system(&format!(
+            "{persona_line}次の一言を、意味と情報量を変えずに自然な会話調へ短く言い換えてください。\
              前置き・後置き・引用符・改行・マークダウンは付けず、言い換えた本文だけを返してください。",
-        ),
+        )),
         ChatMessage::user(script.to_string()),
     ];
     let result = tokio::time::timeout(
