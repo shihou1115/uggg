@@ -1606,7 +1606,7 @@ async function renderCostStatus(): Promise<void> {
   try {
     st = await invoke<CostStatusView>("get_cost_status");
   } catch (err) {
-    el.textContent = `利用状況を取得できませんでした (${String(err)})`;
+    el.textContent = `今月の利用: 取得できませんでした (${String(err)})`;
     return;
   }
   const used = `$${st.current_usd.toFixed(2)}`;
@@ -1628,7 +1628,7 @@ async function renderCostStatus(): Promise<void> {
       "⚠ このモデルは料金表に無いため利用額を計算できません。上限は機能しません。",
     );
   }
-  el.textContent = lines.join(" ");
+  el.textContent = `今月の利用: ${lines.join(" ")}`;
 }
 
 /** spec §4.2.5 の長期記憶 1 件。Rust 側 `ProfileEntry` に対応する。 */
