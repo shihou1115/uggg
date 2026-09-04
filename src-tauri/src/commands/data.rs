@@ -42,17 +42,48 @@ pub fn export_data(
         None
     };
 
+    // v0.5.1: 12 テーブル中 3 つしか出しておらず、**リマインダー・ToDo・設定が
+    // 持ち出せなかった**。DB の退避・作り直しを入れる前提として全件出せるようにする。
+    // 除くのは再生成できるキャッシュ 3 つ (calendar_cache / topics_cache /
+    // monologue_cache) だけ。
+    let reminders = state
+        .db
+        .list_reminders(crate::db::ReminderFilter::All)
+        .map_err(|e| format!("{e:#}"))?;
+    let reminder_log = state
+        .db
+        .list_all_reminder_log(10000)
+        .map_err(|e| format!("{e:#}"))?;
+    let todos = state.db.list_todos(None).map_err(|e| format!("{e:#}"))?;
+    let interests = state.db.list_interests().map_err(|e| format!("{e:#}"))?;
+    let voice_refs = state.db.list_voice_refs().map_err(|e| format!("{e:#}"))?;
+    let app_settings = state
+        .db
+        .list_all_settings()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let payload = json!({
-        "schema": "ugg-export-v1",
+        "schema": "ugg-export-v2",
         "exported_at": ts,
         "include_profile": include_profile,
+        // 再生成できるキャッシュ (calendar_cache / topics_cache / monologue_cache) は
+        // 意図的に含めない。持ち出す価値のあるユーザーデータだけを出す。
+        "omitted_caches": ["calendar_cache", "topics_cache", "monologue_cache"],
         "chat_log": chat,
         "api_usage": usage,
         "user_profile": profile,
+        "reminders": reminders,
+        "reminder_log": reminder_log,
+        "todos": todos,
+        "interest_topics": interests,
+        "voice_refs": voice_refs,
+        "app_settings": app_settings,
     });
 
     let dir = dirs::download_dir()
@@ -119,4 +150,13 @@ pub async fn check_update_now(
     crate::system::update::check_update_once(&app, &state_arc)
         .await
         .map_err(|e| format!("{e:#}"))
+}
+
+/// 起動時の DB 整合性検査の結果 (v0.5.1、spec §4.5.5)。
+///
+/// 破損していても DB は作り直さない（リマインダー・ToDo・記憶が消えるため）。
+/// 検知した事実と退避先をユーザーに見せ、どうするかは本人が決める。
+#[tauri::command]
+pub fn get_db_health(state: State<'_, Arc<AppState>>) -> crate::db::DbIntegrity {
+    state.db.integrity().clone()
 }

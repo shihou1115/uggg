@@ -125,6 +125,7 @@ fn main() {
             commands::boot::get_boot_payload,
             commands::data::get_chat_log,
             commands::data::export_data,
+            commands::data::get_db_health,
             commands::data::clear_history,
             commands::data::check_update_now,
             commands::dialogue::send_user_message,

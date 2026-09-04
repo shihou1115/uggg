@@ -215,6 +215,7 @@ export async function openSettingsPanel(): Promise<void> {
   await refreshIrodoriState();
   await refreshAssetLists(current);
   await loadProfile();
+  await renderDbHealth();
   await refreshInterests();
   await refreshMonitors();
   inputs.panel.classList.add("visible");
@@ -1724,4 +1725,47 @@ function mountProfileControls(): void {
       void onAddProfile();
     }
   });
+}
+
+/** 起動時の DB 整合性検査の結果 (spec §4.5.5)。Rust 側 `DbIntegrity` に対応。 */
+type DbIntegrity = {
+  ok: boolean;
+  detail: string;
+  backup_path: string | null;
+  salvaged_path: string | null;
+};
+
+/**
+ * DB が壊れていたことをユーザーに伝える。**正常なら何も出さない。**
+ *
+ * 壊れていても ugg は DB を作り直さない（リマインダー・ToDo・記憶が消えるため）。
+ * 検知した事実と退避先を見せ、どうするかは本人が決める。
+ */
+async function renderDbHealth(): Promise<void> {
+  const el = document.getElementById("settings-db-health");
+  if (!el) return;
+  let h: DbIntegrity;
+  try {
+    h = await invoke<DbIntegrity>("get_db_health");
+  } catch {
+    el.hidden = true;
+    return;
+  }
+  if (h.ok) {
+    el.hidden = true;
+    return;
+  }
+  const parts = [
+    "⚠ データベースの整合性検査に失敗しています。",
+    "ugg は自動で作り直しません（リマインダー・ToDo・記憶が消えるため）。",
+  ];
+  if (h.backup_path) parts.push(`現状のコピー: ${h.backup_path}`);
+  if (h.salvaged_path) {
+    parts.push(`読み出せた分の救出コピー: ${h.salvaged_path}`);
+  } else {
+    parts.push("救出コピーは作れませんでした（読み出せない範囲があります）。");
+  }
+  parts.push("下の「エクスポート」で中身を書き出してから対処してください。");
+  el.textContent = parts.join(" ");
+  el.hidden = false;
 }

@@ -6,6 +6,25 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 pub struct Db {
     conn: Mutex<Connection>,
+    /// 起動時に 1 回だけ行う整合性検査の結果 (v0.5.1)。
+    integrity: DbIntegrity,
+}
+
+/// `PRAGMA quick_check` の結果と、破損時に作った退避ファイル。
+///
+/// **破損しても DB は作り直さない。** 作り直すとリマインダー・ToDo・記憶が消える。
+/// 検知して記録し、原本のコピーと（可能なら）救出コピーを残すところまでを行い、
+/// どうするかはユーザーが決める。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DbIntegrity {
+    /// `quick_check` が "ok" を返したか。検査できなかった場合も false。
+    pub ok: bool,
+    /// 検査の生の結果（"ok" またはエラー本文）。
+    pub detail: String,
+    /// 破損時に作った原本のコピー。
+    pub backup_path: Option<String>,
+    /// 破損時に `VACUUM INTO` で救出できた分のコピー（成功した場合のみ）。
+    pub salvaged_path: Option<String>,
 }
 
 // ===== Domain types =====
@@ -269,9 +288,16 @@ impl Db {
             .context("set WAL journal mode")?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enable foreign keys")?;
+        let integrity = check_integrity_and_preserve(&conn, path);
         Ok(Self {
             conn: Mutex::new(conn),
+            integrity,
         })
+    }
+
+    /// 起動時の `PRAGMA quick_check` の結果。`None` = 検査自体ができなかった。
+    pub fn integrity(&self) -> &DbIntegrity {
+        &self.integrity
     }
 
     pub fn migrate(&self) -> Result<()> {
@@ -1576,6 +1602,54 @@ impl Db {
         Ok(row)
     }
 
+    /// `app_settings` の全キー。エクスポート（データの持ち出し・DB 退避）専用。
+    ///
+    /// v0.4.1 まで export は 12 テーブル中 3 つしか出しておらず、
+    /// **リマインダー・ToDo・設定が持ち出せなかった**。DB を退避・作り直す機能を
+    /// 入れる前提として全件出せるようにする。
+    pub fn list_all_settings(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM app_settings ORDER BY key")
+            .context("list_all_settings prepare")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .context("list_all_settings query")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("list_all_settings row")?);
+        }
+        Ok(out)
+    }
+
+    /// `reminder_log` の全件（新しい順、上限つき）。エクスポート専用。
+    /// 既存の `list_reminder_log` は 1 件のリマインダーに紐づく分しか返さない。
+    pub fn list_all_reminder_log(&self, limit: u32) -> Result<Vec<ReminderLogRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, reminder_id, fired_ts, ack, ack_ts, delivery FROM reminder_log ORDER BY id DESC LIMIT ?1",
+            )
+            .context("list_all_reminder_log prepare")?;
+        let rows = stmt
+            .query_map([limit], |r| {
+                Ok(ReminderLogRow {
+                    id: r.get(0)?,
+                    reminder_id: r.get(1)?,
+                    fired_ts: r.get(2)?,
+                    ack: r.get(3)?,
+                    ack_ts: r.get(4)?,
+                    delivery: r.get(5)?,
+                })
+            })
+            .context("list_all_reminder_log query")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("list_all_reminder_log row")?);
+        }
+        Ok(out)
+    }
+
     pub fn list_voice_refs(&self) -> Result<Vec<VoiceRefRow>> {
         let conn = self.conn.lock().expect("db poisoned");
         let mut stmt = conn
@@ -1630,6 +1704,55 @@ impl Db {
         )
         .with_context(|| format!("set_setting('{key}') 失敗"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+
+    /// 健全な DB では ok=true、退避ファイルを作らないこと。
+    /// （正常時に毎起動コピーを撒き散らすと、それ自体が容量問題になる）
+    #[test]
+    fn healthy_db_reports_ok_and_leaves_no_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        let db = Db::open(&path).unwrap();
+        db.migrate().unwrap();
+        let h = db.integrity();
+        assert!(h.ok, "健全な DB が ok でない: {}", h.detail);
+        assert_eq!(h.detail, "ok");
+        assert!(h.backup_path.is_none(), "正常時に退避を作ってはいけない");
+        assert!(h.salvaged_path.is_none(), "正常時に救出コピーを作ってはいけない");
+        // ディレクトリに余計なファイルが増えていないこと
+        let extra: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("corrupt-") || n.contains("salvaged-"))
+            .collect();
+        assert!(extra.is_empty(), "余計なファイル: {extra:?}");
+    }
+
+    /// **破損しても DB を作り直さない**こと（既存データが消えない）。
+    ///
+    /// v0.5.1 の設計判断。破損を理由に消すとリマインダー・ToDo・記憶が一緒に消える。
+    #[test]
+    fn open_never_recreates_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.set_setting("marker", "keep-me").unwrap();
+        }
+        // 開き直しても中身が残っていること。
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.get_setting("marker").unwrap().as_deref(),
+            Some("keep-me"),
+            "再オープンで既存データが失われた"
+        );
     }
 }
 
@@ -2072,5 +2195,68 @@ mod tests {
         assert_eq!(list2.len(), 1);
         assert_eq!(list2[0].slot, "sub");
         assert!(db.get_voice_ref("main").unwrap().is_none());
+    }
+}
+
+/// 起動時の整合性検査と、破損時の非破壊的な保全 (v0.5.1)。
+///
+/// **DB は作り直さない。** 破損を理由に消すと、リマインダー・ToDo・記憶・設定が
+/// 一緒に消える。ここでやるのは次の 3 つだけ:
+/// 1. `PRAGMA quick_check` で破損を検知して記録する（以前は誰も気づけなかった）
+/// 2. 原本をタイムスタンプ付きでコピーする（以後の操作で悪化しても戻せる）
+/// 3. `VACUUM INTO` で読み出せた分だけの健全なコピーを作る（救出。失敗しても続行）
+///
+/// どう復旧するかはユーザーが決める。アプリは通常どおり起動を続ける
+/// （起動できないより、壊れたまま動くほうがデータを取り出せる）。
+fn check_integrity_and_preserve(conn: &Connection, path: &Path) -> DbIntegrity {
+    let detail = match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
+        Ok(v) => v,
+        Err(err) => format!("quick_check を実行できませんでした: {err}"),
+    };
+    if detail == "ok" {
+        return DbIntegrity {
+            ok: true,
+            detail,
+            ..Default::default()
+        };
+    }
+
+    crate::ulog!("[db] 整合性検査に失敗しました: {detail}");
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+
+    // 1) 原本のコピー。壊れていても「今の状態」を保全する。
+    let backup = path.with_extension(format!("corrupt-{stamp}.db"));
+    let backup_path = match std::fs::copy(path, &backup) {
+        Ok(_) => {
+            crate::ulog!("[db] 原本を退避しました: {}", backup.display());
+            Some(backup.to_string_lossy().into_owned())
+        }
+        Err(err) => {
+            crate::ulog!("[db] 原本の退避に失敗: {err}");
+            None
+        }
+    };
+
+    // 2) 読み出せた分だけの健全なコピー。VACUUM INTO は元 DB を書き換えない。
+    let salvaged = path.with_extension(format!("salvaged-{stamp}.db"));
+    let salvaged_path = match conn.execute(
+        "VACUUM INTO ?1",
+        [salvaged.to_string_lossy().as_ref()],
+    ) {
+        Ok(_) => {
+            crate::ulog!("[db] 救出コピーを作成しました: {}", salvaged.display());
+            Some(salvaged.to_string_lossy().into_owned())
+        }
+        Err(err) => {
+            crate::ulog!("[db] 救出コピーの作成に失敗 (読み出せない範囲がある): {err}");
+            None
+        }
+    };
+
+    DbIntegrity {
+        ok: false,
+        detail,
+        backup_path,
+        salvaged_path,
     }
 }
