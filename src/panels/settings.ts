@@ -152,6 +152,7 @@ export async function mountSettingsPanel(): Promise<void> {
   buildWeekdayToggles(inputs.regularMorningDays);
   buildWeekdayToggles(inputs.regularEveningDays);
   attachHandlers(inputs);
+  mountProfileControls();
   // 外部 (トレイ・notify) からの設定変更を反映するため
   await listen<Settings>("settings-changed", (ev) => {
     current = ev.payload;
@@ -213,6 +214,7 @@ export async function openSettingsPanel(): Promise<void> {
   await refreshTtsState();
   await refreshIrodoriState();
   await refreshAssetLists(current);
+  await loadProfile();
   await refreshInterests();
   await refreshMonitors();
   inputs.panel.classList.add("visible");
@@ -1627,4 +1629,99 @@ async function renderCostStatus(): Promise<void> {
     );
   }
   el.textContent = lines.join(" ");
+}
+
+/** spec §4.2.5 の長期記憶 1 件。Rust 側 `ProfileEntry` に対応する。 */
+type ProfileEntry = {
+  id: number;
+  content: string;
+  /** manual = 手入力 / onboarding = 初回の聞き取り / auto = 会話から自動抽出 */
+  origin: "manual" | "onboarding" | "auto";
+  source_keywords: string | null;
+  ts: number;
+};
+
+const PROFILE_ORIGIN_LABEL: Record<ProfileEntry["origin"], string> = {
+  manual: "手入力",
+  onboarding: "初回",
+  auto: "自動",
+};
+
+/**
+ * 覚えていることの一覧・追加・削除 (spec §4.2.5)。
+ *
+ * `get_profile` / `add_profile` / `delete_profile` は以前から実装され
+ * invoke_handler にも登録されていたが、**フロントからの呼び出しが 0 件**だった。
+ * origin を出すのは「これは会話から自動で覚えたもの」を区別できて初めて
+ * プライバシー上の価値が立つため。
+ */
+function renderProfileList(entries: ProfileEntry[]): void {
+  const list = document.getElementById("settings-profile-list");
+  if (!list) return;
+  list.innerHTML = "";
+  if (entries.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "panel-hint";
+    empty.textContent = "まだ何も覚えていません。";
+    list.appendChild(empty);
+    return;
+  }
+  for (const e of entries) {
+    const item = document.createElement("div");
+    item.className = "row";
+    const label = document.createElement("span");
+    label.textContent = `[${PROFILE_ORIGIN_LABEL[e.origin] ?? e.origin}] ${e.content}`;
+    label.style.overflow = "hidden";
+    label.style.textOverflow = "ellipsis";
+    const del = document.createElement("button");
+    del.type = "button";
+    del.textContent = "削除";
+    del.addEventListener("click", () => void onDeleteProfile(e.id));
+    item.appendChild(label);
+    item.appendChild(del);
+    list.appendChild(item);
+  }
+}
+
+async function loadProfile(): Promise<void> {
+  try {
+    renderProfileList(await invoke<ProfileEntry[]>("get_profile"));
+  } catch (err) {
+    const list = document.getElementById("settings-profile-list");
+    if (list) list.textContent = `記憶を読み込めませんでした (${String(err)})`;
+  }
+}
+
+async function onAddProfile(): Promise<void> {
+  const input = document.getElementById("settings-profile-input") as HTMLInputElement | null;
+  if (!input) return;
+  const content = input.value.trim();
+  if (!content) return;
+  try {
+    renderProfileList(await invoke<ProfileEntry[]>("add_profile", { content }));
+    input.value = "";
+  } catch (err) {
+    window.alert(`追加できませんでした: ${String(err)}`);
+  }
+}
+
+async function onDeleteProfile(id: number): Promise<void> {
+  try {
+    renderProfileList(await invoke<ProfileEntry[]>("delete_profile", { id }));
+  } catch (err) {
+    window.alert(`削除できませんでした: ${String(err)}`);
+  }
+}
+
+/** 記憶 UI のイベント配線。設定パネルの初期化から 1 回だけ呼ぶ。 */
+function mountProfileControls(): void {
+  const add = document.getElementById("settings-profile-add");
+  const input = document.getElementById("settings-profile-input");
+  add?.addEventListener("click", () => void onAddProfile());
+  input?.addEventListener("keydown", (ev) => {
+    if ((ev as KeyboardEvent).key === "Enter") {
+      ev.preventDefault();
+      void onAddProfile();
+    }
+  });
 }

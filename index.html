@@ -219,6 +219,21 @@
               <span>今月の利用</span>
               <div class="hint" id="settings-cost-status">—</div>
             </div>
+            <!-- 長期記憶の閲覧・追加・削除 (spec §4.2.5)。
+                 コマンドは以前から実装済みだったが、呼び出す UI が無かった。 -->
+            <h3>覚えていること</h3>
+            <div id="settings-profile-list" class="daily-list"></div>
+            <label class="row">
+              <span>覚えてほしいことを追加</span>
+              <span class="key-cell daily-add-cell">
+                <input type="text" id="settings-profile-input" placeholder="例: コーヒーはブラック派" />
+                <button type="button" id="settings-profile-add">追加</button>
+              </span>
+            </label>
+            <p class="panel-hint">
+              「自動」はチャット中に AI が覚えたものです。削除しても、同じ話題が出れば
+              また覚えることがあります。会話履歴を消すとまとめて削除されます。
+            </p>
             <div class="row">
               <span>API キー</span>
               <div class="key-cell">
