@@ -15,6 +15,7 @@ use crate::dialogue::{banter, DialogueResponse};
 use crate::ghost::dict::{DialogueLine, SpeechTurn};
 use crate::ghost::GhostBundle;
 use crate::state::Settings;
+use crate::ghost::dict::keywords_of;
 
 /// 1 ターン分のユーザー入力 → DialogueResponse。
 /// `usage` は記録目的で AdvancedReply に同梱するが、現状は cost.rs 側で `api_usage` テーブルへ
@@ -121,7 +122,7 @@ async fn parse_and_record(
     if let Some(memory) = parsed.memory {
         let memory = memory.trim();
         if !memory.is_empty() {
-            db.insert_profile(memory, ProfileOrigin::Auto, None, now)?;
+            db.insert_profile(memory, ProfileOrigin::Auto, keywords_of(memory).as_deref(), now)?;
             // 容量管理 (low モードと同じ件数上限ベースで簡易実装)。
             // 要約サイクル (advanced 用) は将来課題。
             enforce_profile_capacity(db, settings.profile_max_count)?;

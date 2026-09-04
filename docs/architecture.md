@@ -807,6 +807,17 @@ fallback:
 #### recall（v2 recall_talk 相当）
 - user_profile の `source_keywords` と入力のキーワード一致時にトリガー
 - `{summary}` プレースホルダで user_profile.content を埋める
+- **★v0.5.1 実装**: `Dictionary::pick_recall`。`low::reply` が `pick_reply` より
+  **先に**評価する（想起が通常応答より優先）。一致が無ければ従来どおり。
+  - **`source_keywords` は `ghost::dict::extract_keywords` が記憶本文から自動生成**する
+    （`insert_profile` の全 5 呼び出しが通る）。形態素解析器は入れず、漢字・カタカナ・
+    英数の連なりを 2 文字以上・最大 8 語まで拾う素朴な方式。取りこぼすが、拾ったものは
+    概ね名詞なので想起のトリガーとして実用になる。1 文字語は誤爆するので拾わない。
+  - v0.4.1 までは `pick_recall` が存在せず、`insert_profile` の全呼び出しが
+    `source_keywords` に `None` を渡していたため、**契約が 4 箇所に揃っているのに
+    一度も発火しなかった**（`#[allow(dead_code)]` が警告も消していた）。
+  - **low モードで効く**のが要点。記憶は advanced が貯めるが、想起は無料・
+    オフラインの既定モードでも起きる（spec §4.2.1 の二モード）。
 
 #### monologue（v2 random_talk 相当）
 - 既定 10 分間隔（D-4）、advanced ではキャッシュ補充も併用

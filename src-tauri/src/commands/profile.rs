@@ -5,6 +5,7 @@ use tauri::State;
 
 use crate::db::{ProfileEntry, ProfileOrigin};
 use crate::state::AppState;
+use crate::ghost::dict::keywords_of;
 
 #[tauri::command]
 pub fn get_profile(state: State<'_, Arc<AppState>>) -> Result<Vec<ProfileEntry>, String> {
@@ -22,7 +23,7 @@ pub fn add_profile(
     }
     state
         .db
-        .insert_profile(trimmed, ProfileOrigin::Manual, None, Utc::now().timestamp())
+        .insert_profile(trimmed, ProfileOrigin::Manual, keywords_of(trimmed).as_deref(), Utc::now().timestamp())
         .map_err(|err| format!("{err:#}"))?;
     state.db.list_profile().map_err(|err| format!("{err:#}"))
 }

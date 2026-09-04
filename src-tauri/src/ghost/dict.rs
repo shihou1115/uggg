@@ -466,6 +466,43 @@ impl Dictionary {
         pick_random(&rule.responses).map(|line| project_line(line, sub_available))
     }
 
+    /// 記憶想起 (architecture §6.2 recall)。
+    ///
+    /// `user_profile.source_keywords` のいずれかが入力に含まれていたら、
+    /// `recall` セクションの候補を 1 つ選び `{summary}` を記憶本文で埋めて返す。
+    /// 一致が無い / `recall` が空なら None（通常の応答へ落ちる）。
+    ///
+    /// **low モードで効く**のが要点。長期記憶は advanced が貯めるが、
+    /// 想起は無料・オフラインの既定モードでも起きる（spec §4.2.1 の二モード）。
+    pub fn pick_recall(
+        &self,
+        user_text: &str,
+        profile: &[(String, Option<String>)],
+        sub_available: bool,
+    ) -> Option<DialogueLine> {
+        if self.recall.is_empty() {
+            return None;
+        }
+        // 最初に一致した記憶を採る（新しい順に渡す想定）。
+        let hit = profile.iter().find(|(_, keywords)| {
+            keywords
+                .as_deref()
+                .map(|kw| {
+                    kw.split(',')
+                        .map(str::trim)
+                        .any(|k| !k.is_empty() && user_text.contains(k))
+                })
+                .unwrap_or(false)
+        })?;
+        let mut line = pick_random(&self.recall).map(|l| project_line(l, sub_available))?;
+        // {summary} を記憶本文で埋める。
+        line.main.text = line.main.text.replace("{summary}", &hit.0);
+        if let Some(sub) = line.sub.as_mut() {
+            sub.text = sub.text.replace("{summary}", &hit.0);
+        }
+        Some(line)
+    }
+
     pub fn pick_fallback(&self, sub_available: bool) -> Option<DialogueLine> {
         pick_random(&self.fallback).map(|line| project_line(line, sub_available))
     }
@@ -729,6 +766,109 @@ fn validate_dictionary(dict: &Dictionary, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- recall (architecture §6.2、v0.5.1) ----
+
+    /// recall のテスト用に最小の Dictionary を作る。
+    fn empty_dictionary() -> Dictionary {
+        Dictionary {
+            schema_version: 3,
+            input_match: vec![],
+            fallback: vec![],
+            recall: vec![],
+            monologue: vec![],
+            events: Default::default(),
+            system_messages: Default::default(),
+            input_prompt_main: vec![],
+            input_prompt_sub: vec![],
+            menu_prompt_main: vec![],
+            menu_prompt_sub: vec![],
+        }
+    }
+
+    /// main のみの Line。
+    fn line_with(text: &str) -> Line {
+        Line {
+            main: SpeechTurn { text: text.to_string(), pose: None },
+            sub: None,
+        }
+    }
+
+
+    #[test]
+    fn extract_keywords_picks_nouns_from_japanese() {
+        assert_eq!(extract_keywords("コーヒーはブラック派"), ["コーヒー", "ブラック"]);
+        // **1 文字の語は拾わない**（「時」「起」「6」が一致トリガーになると誤爆する）。
+        assert_eq!(extract_keywords("朝型で、6 時に起きる"), ["朝型"]);
+        assert!(extract_keywords("犬が好き").is_empty(), "1 文字語だけの文からは何も拾わない");
+    }
+
+    #[test]
+    fn extract_keywords_is_bounded_and_deduped() {
+        let long = "アアアイイイウウウエエエオオオカカカキキキククク".to_string()
+            + "ケケケコココサササシシシスススセセセソソソ";
+        assert!(extract_keywords(&long).len() <= 8, "上限を超えた");
+        assert_eq!(extract_keywords("ギターとギター"), ["ギター"], "重複を落とす");
+    }
+
+    #[test]
+    fn keywords_of_returns_none_when_nothing_extractable() {
+        assert!(keywords_of("あ、うん。").is_none());
+        // 「好」は 1 文字なので落ちる。
+        assert_eq!(keywords_of("コーヒー好き").as_deref(), Some("コーヒー"));
+    }
+
+    /// **記憶のキーワードが入力に含まれていたら想起する**（recall の本体）。
+    #[test]
+    fn pick_recall_fires_on_keyword_hit_and_fills_summary() {
+        let dict = Dictionary {
+            schema_version: 3,
+            recall: vec![line_with("そういえばさっき、{summary}って話してたよね")],
+            ..empty_dictionary()
+        };
+        let profile = vec![(
+            "コーヒーはブラック派".to_string(),
+            Some("コーヒー,ブラック".to_string()),
+        )];
+        let hit = dict
+            .pick_recall("コーヒー飲みたいな", &profile, false)
+            .expect("キーワードが一致したのに想起しない");
+        assert!(
+            hit.main.text.contains("コーヒーはブラック派"),
+            "{{summary}} が埋まっていない: {}",
+            hit.main.text
+        );
+        assert!(!hit.main.text.contains("{summary}"), "プレースホルダが残った");
+    }
+
+    #[test]
+    fn pick_recall_is_silent_without_hit_or_without_section() {
+        let profile = vec![("紅茶派".to_string(), Some("紅茶".to_string()))];
+        let dict = Dictionary {
+            schema_version: 3,
+            recall: vec![line_with("{summary}")],
+            ..empty_dictionary()
+        };
+        assert!(
+            dict.pick_recall("今日は寒いね", &profile, false).is_none(),
+            "一致していないのに想起した"
+        );
+        // recall セクションが無いゴーストでは何も起きない。
+        let bare = Dictionary { schema_version: 3, ..empty_dictionary() };
+        assert!(bare.pick_recall("紅茶", &profile, false).is_none());
+    }
+
+    /// キーワード未設定の記憶（v0.5.1 より前に保存されたもの）で誤爆しないこと。
+    #[test]
+    fn pick_recall_ignores_entries_without_keywords() {
+        let dict = Dictionary {
+            schema_version: 3,
+            recall: vec![line_with("{summary}")],
+            ..empty_dictionary()
+        };
+        let profile = vec![("むかしの記憶".to_string(), None)];
+        assert!(dict.pick_recall("むかしの記憶", &profile, false).is_none());
+    }
     use super::*;
 
     fn ctx(hour: u32, month: u32, day: u32) -> WhenContext {
@@ -935,4 +1075,70 @@ fallback: []
         assert!(parse_md("01-32").is_err());
         assert!(parse_md("12-31").is_ok());
     }
+}
+
+/// 記憶からキーワードを抽出する（`user_profile.source_keywords` を作る、v0.5.1）。
+///
+/// architecture §6.2 は「`source_keywords` と入力のキーワード一致時にトリガー」と
+/// 定めているが、**その `source_keywords` を作る手段がリポジトリに 1 つも無かった**
+/// （`insert_profile` の全呼び出しが `None` を渡していた）ため recall は死んでいた。
+///
+/// 形態素解析器は入れない（辞書数十 MB を配布物に足す価値が無い）。日本語の記憶文から
+/// 「漢字・カタカナの連なり」を語として拾う素朴な方式にする。**取りこぼしはするが、
+/// 拾ったものは概ね名詞**なので、想起のトリガーとしては実用になる。
+///
+/// 例: 「コーヒーはブラック派」→ ["コーヒー", "ブラック"]
+pub fn extract_keywords(content: &str) -> Vec<String> {
+    /// これ未満の語は一致がノイズになるので捨てる。
+    const MIN_LEN: usize = 2;
+    /// 1 記憶あたりの上限（長文から大量に拾って誤爆させない）。
+    const MAX_KEYWORDS: usize = 8;
+
+    fn is_kanji(c: char) -> bool {
+        matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3005}')
+    }
+    fn is_katakana(c: char) -> bool {
+        matches!(c, '\u{30A0}'..='\u{30FF}')
+    }
+    fn is_latin_or_digit(c: char) -> bool {
+        c.is_ascii_alphanumeric()
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut kind: Option<u8> = None;
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
+        if cur.chars().count() >= MIN_LEN && !out.iter().any(|w| w == cur) {
+            out.push(cur.clone());
+        }
+        cur.clear();
+    };
+    for c in content.chars() {
+        let k = if is_kanji(c) {
+            Some(1)
+        } else if is_katakana(c) {
+            Some(2)
+        } else if is_latin_or_digit(c) {
+            Some(3)
+        } else {
+            None
+        };
+        if k != kind {
+            flush(&mut cur, &mut out);
+            kind = k;
+        }
+        if k.is_some() {
+            cur.push(c);
+        }
+    }
+    flush(&mut cur, &mut out);
+    out.truncate(MAX_KEYWORDS);
+    out
+}
+
+/// `extract_keywords` の結果を `user_profile.source_keywords` の格納形
+/// （カンマ区切り）にする。抽出できなければ None。
+pub fn keywords_of(content: &str) -> Option<String> {
+    let kws = extract_keywords(content);
+    (!kws.is_empty()).then(|| kws.join(","))
 }

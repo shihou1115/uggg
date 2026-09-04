@@ -5,6 +5,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::db::ProfileOrigin;
 use crate::state::AppState;
+use crate::ghost::dict::keywords_of;
 
 const ONBOARDED_KEY: &str = "profile_onboarded";
 /// 興味キーワードの上限 (設定パネルの `parseInterestList` と同値)。
@@ -34,7 +35,7 @@ pub fn complete_onboarding(
         let content = format!("ユーザーの呼び名は「{nick}」");
         state
             .db
-            .insert_profile(&content, ProfileOrigin::Onboarding, None, now)
+            .insert_profile(&content, ProfileOrigin::Onboarding, keywords_of(&content).as_deref(), now)
             .map_err(|err| format!("{err:#}"))?;
     }
 
@@ -46,7 +47,7 @@ pub fn complete_onboarding(
         let content = format!("話し方の希望: {style}");
         state
             .db
-            .insert_profile(&content, ProfileOrigin::Onboarding, None, now)
+            .insert_profile(&content, ProfileOrigin::Onboarding, keywords_of(&content).as_deref(), now)
             .map_err(|err| format!("{err:#}"))?;
     }
 
@@ -56,7 +57,7 @@ pub fn complete_onboarding(
         let content = format!("興味のあること: {}", interests.join("、"));
         state
             .db
-            .insert_profile(&content, ProfileOrigin::Onboarding, None, now)
+            .insert_profile(&content, ProfileOrigin::Onboarding, keywords_of(&content).as_deref(), now)
             .map_err(|err| format!("{err:#}"))?;
         // (2) 時事ネタ RSS のキーワードへ (spec §4.4.6)。
         //     topics_enabled が false ならフェッチ自体が走らないので外部送信は起きない。

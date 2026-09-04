@@ -430,7 +430,17 @@ fn fallback_low(
     let bundle_guard = state.ghost.lock().expect("ghost poisoned");
     let bundle = bundle_guard.as_ref().map_err(|s| s.clone())?;
     let sub_available = bundle.sub_available();
-    let resp = low::reply(&bundle.dictionary, user_text, sub_available);
+    // 記憶想起 (architecture §6.2) の材料。新しい順に見て最初に一致したものを使う。
+    // 取得に失敗しても応答自体は続ける（記憶が無いのと同じ扱い）。
+    let profile: Vec<(String, Option<String>)> = state
+        .db
+        .list_profile()
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .map(|e| (e.content, e.source_keywords))
+        .collect();
+    let resp = low::reply(&bundle.dictionary, user_text, &profile, sub_available);
     let now = Utc::now().timestamp();
     let _ = state.db.append_chat(now, "low", ChatRole::User, user_text, None);
     let _ = state.db.append_chat(

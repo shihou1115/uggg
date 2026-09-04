@@ -3,9 +3,21 @@ use crate::ghost::dict::{DialogueLine, Dictionary, SpeechTurn, WhenContext};
 
 /// ユーザー入力に対する辞書ベース応答を組み立てる。
 /// マッチも fallback も無ければ汎用文「…」を返してフロントに「沈黙」を見せない。
-pub fn reply(dict: &Dictionary, text: &str, sub_available: bool) -> DialogueResponse {
+/// ユーザー入力に対する辞書ベース応答。
+///
+/// `profile` は長期記憶 `(content, source_keywords)`。記憶のキーワードが入力に
+/// 含まれていれば **recall（記憶想起）を優先**する（architecture §6.2）。
+/// 長期記憶は advanced が貯めるが、想起は無料・オフラインの low でも起きる
+/// （spec §4.2.1 の二モード。v0.4.1 まで `pick_recall` 自体が存在しなかった）。
+pub fn reply(
+    dict: &Dictionary,
+    text: &str,
+    profile: &[(String, Option<String>)],
+    sub_available: bool,
+) -> DialogueResponse {
     let line = dict
-        .pick_reply(text, sub_available)
+        .pick_recall(text, profile, sub_available)
+        .or_else(|| dict.pick_reply(text, sub_available))
         .unwrap_or_else(|| default_silence_line());
     banter::pattern_1("reply", "low", line)
 }
