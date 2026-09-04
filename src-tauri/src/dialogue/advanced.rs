@@ -260,6 +260,18 @@ fn system_prompt(bundle: &GhostBundle, pattern: u8, profile_block: &str, tools_b
         "- sub: null (サブキャラ無しゴーストのため必ず null)".to_string()
     };
     // 掛け合いパターン (spec §4.2.4)。パターン3/4 のみ3ターン目 (extra) を要求する。
+    // 問いかけパターン (spec §4.2.4)。構造はパターン1 と同じで、**内容が
+    // ユーザーへの問いかけで終わる**点だけが違う。ターン数を増やさないので
+    // 組み立て (banter::assemble_advanced) は 1 と共通のまま使える。
+    //
+    // ユーザーが答えたあとの処理 (user_profile への反映・follow-up) は
+    // spec §4.2.4 が Phase 2 送りにしている。advanced では次のターンで LLM が
+    // 会話として自然に受けるため、専用の応答経路は作らない。
+    let question_line = if pattern == banter::PATTERN_QUESTION {
+        "- **この応答はユーザーへの問いかけで締めること。** 相手が答えたくなる短い質問を 1 つだけ添える(例:「最近どんなことに興味あるの？」)。尋問にならないよう、質問は 1 つに留める。\n"
+    } else {
+        ""
+    };
     let turn_structure_line = if bundle.sub_available() {
         match pattern {
             2 => format!(
@@ -311,6 +323,7 @@ fn system_prompt(bundle: &GhostBundle, pattern: u8, profile_block: &str, tools_b
 - 既存ユーザー情報を尊重し、それを基に親密に話す。
 - 新しく覚えるべきユーザー情報があれば memory に 1 文だけ書く。無ければ memory は空文字。
 {turn_structure_line}
+{question_line}
 
 出力形式: 必ず次の JSON のみを返す。前置き / 後置き / マークダウン禁止。
 {{
@@ -330,6 +343,7 @@ fn system_prompt(bundle: &GhostBundle, pattern: u8, profile_block: &str, tools_b
         profile_block = profile_block,
         tools_block = tools_block,
         turn_structure_line = turn_structure_line,
+        question_line = question_line,
         sub_required_line = sub_required_line,
         extra_field = extra_field,
         extra_required_line = extra_required_line,
@@ -848,6 +862,29 @@ mod tests {
         let r4 = banter::assemble_advanced(4, line_without_sub(), extra());
         assert_eq!(r4.pattern, 2, "sub 欠落時のパターン4 は 2 へ縮退する");
         assert!(r4.extra.is_none());
+    }
+
+    /// 問いかけパターン (spec §4.2.4) のときだけ、ユーザーへ尋ねる指示が載ること。
+    #[test]
+    fn question_pattern_adds_the_directive() {
+        let bundle = make_bundle(true);
+        let p = system_prompt(&bundle, crate::dialogue::banter::PATTERN_QUESTION, "", "");
+        assert!(p.contains("問いかけで締める"), "問いかけの指示が無い: {p}");
+        assert!(p.contains("質問は 1 つに留める"), "尋問化の歯止めが無い: {p}");
+    }
+
+    /// 通常のパターンでは問いかけの指示が載らないこと
+    /// （常に載ると「聞いてばかりのキャラ」になる）。
+    #[test]
+    fn normal_patterns_have_no_question_directive() {
+        let bundle = make_bundle(true);
+        for pattern in 1..=4u8 {
+            let p = system_prompt(&bundle, pattern, "", "");
+            assert!(
+                !p.contains("問いかけで締める"),
+                "pattern {pattern} に問いかけの指示が載った"
+            );
+        }
     }
 
     /// persona / style_notes / max_chars_per_line が system prompt に載ること。

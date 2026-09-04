@@ -91,7 +91,12 @@ src-tauri/src/
 │   ├── low.rs               -- 辞書ベース
 │   ├── advanced.rs          -- LLM 経由
 │   ├── llm.rs               -- OpenAI 互換クライアント（プロバイダ抽象なし）
-│   └── banter.rs            -- 掛け合いパターン制御 (1-4 + question_curiosity)
+│   └── banter.rs            -- 掛け合いパターン制御 (1-4 + 問いかけ 5)
+│                             -- ★v0.5.1: 問いかけパターンは spec §4.2.4 のとおり
+│                                **advanced の掛け合いパターン 5**として実装した。
+│                                辞書の events キーではない（辞書系は常にパターン1）。
+│                                発生確率 5%、構造はパターン1 と同じで内容が
+│                                ユーザーへの問いかけで終わる。
 │                               ※ 独り言は M7 で専用ヘルパを廃し、deliver_event が dict.pick_monologue を直接引く
 │                               ※ ★M14 advanced では deliver_event が先に monologue_cache を pop し、
 │                                  空・失効・low なら従来どおり dict.pick_monologue へ落ちる
@@ -844,7 +849,6 @@ events:
   nade_sub_body: [ ... ]
 
   # 問いかけ（B-4）
-  question_curiosity: [ ... ]
 
   # 存在感
   idle: [ ... ]
@@ -934,7 +938,7 @@ when:                                        # ⑤ 直近 N 回中の出現抑�
     count: 3
 
 when:                                        # ⑥ 確率
-  probability: 0.05                          # question_curiosity 用、低確率発生
+  probability: 0.05                          # events の when 条件用（低確率発生）
 ```
 
 評価結果はマッチ可否と「特異度」を返し、特異度の高いものから候補抽選（v2 互換、複合条件は加算）。

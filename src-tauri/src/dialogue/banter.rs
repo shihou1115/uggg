@@ -25,11 +25,26 @@ pub fn pattern_1(kind: &'static str, mode: &'static str, line: DialogueLine) -> 
 /// 重み付け (architecture §4.2.4 「番号が小さいほど高確率」):
 ///   1: 50%, 2: 25%, 3: 15%, 4: 10%
 /// サブ無しゴーストは常に 1。
+/// 問いかけパターンの発生確率 (spec §4.2.4「極低確率発生」、architecture §6.3)。
+pub const QUESTION_PROBABILITY: f64 = 0.05;
+
+/// 問いかけパターンの識別子。
+///
+/// 構造はパターン1 (main → sub) と同じで、**内容が「ユーザーへの問いかけ」で
+/// 終わる**点だけが違う。ターン数を増やさないので組み立ては 1 と共通。
+pub const PATTERN_QUESTION: u8 = 5;
+
 pub fn pick_advanced_pattern(sub_available: bool) -> u8 {
+    let r: f64 = rand::thread_rng().gen_range(0.0..1.0);
+    // 問いかけパターンは相方の有無に関係なく出せる (main がユーザーに尋ねるだけ)。
+    if r < QUESTION_PROBABILITY {
+        return PATTERN_QUESTION;
+    }
     if !sub_available {
         return 1;
     }
-    let r: f64 = rand::thread_rng().gen_range(0.0..1.0);
+    // 残り 95% を従来の重み (50/25/15/10) で配分する。
+    let r = (r - QUESTION_PROBABILITY) / (1.0 - QUESTION_PROBABILITY);
     if r < 0.50 {
         1
     } else if r < 0.75 {
@@ -93,18 +108,54 @@ mod tests {
     }
 
     #[test]
-    fn pick_advanced_pattern_without_sub_is_always_1() {
-        for _ in 0..50 {
-            assert_eq!(pick_advanced_pattern(false), 1);
+    /// サブ無しゴーストでは 2/3/4 を使わない (spec §4.2.4)。
+    /// 問いかけパターン (5) は main がユーザーに尋ねるだけなので許可する。
+    fn pick_advanced_pattern_without_sub_is_1_or_question() {
+        for _ in 0..500 {
+            let p = pick_advanced_pattern(false);
+            assert!(
+                p == 1 || p == PATTERN_QUESTION,
+                "サブ無しで pattern {p} が出た (2/3/4 は使えない)"
+            );
         }
     }
 
     #[test]
-    fn pick_advanced_pattern_stays_within_1_to_4() {
+    fn pick_advanced_pattern_stays_within_known_values() {
         for _ in 0..500 {
             let p = pick_advanced_pattern(true);
-            assert!((1..=4).contains(&p), "pattern {p} out of range");
+            assert!((1..=5).contains(&p), "pattern {p} out of range");
         }
+    }
+
+    /// 問いかけパターンが「極低確率」であること (spec §4.2.4)。
+    /// 常時出ると「聞いてばかりのキャラ」になり体験が壊れる。
+    #[test]
+    fn question_pattern_is_rare() {
+        let n = 4000;
+        let hits = (0..n)
+            .filter(|_| pick_advanced_pattern(true) == PATTERN_QUESTION)
+            .count();
+        let rate = hits as f64 / n as f64;
+        assert!(
+            (0.01..0.10).contains(&rate),
+            "問いかけの発生率が想定 (5%) から外れている: {rate}"
+        );
+    }
+
+    /// 問いかけを除いた分布が従来の重み (50/25/15/10) を保つこと。
+    #[test]
+    fn non_question_distribution_keeps_original_weights() {
+        let n = 8000;
+        let mut counts = [0usize; 6];
+        for _ in 0..n {
+            counts[pick_advanced_pattern(true) as usize] += 1;
+        }
+        let non_q = (counts[1] + counts[2] + counts[3] + counts[4]) as f64;
+        let p1 = counts[1] as f64 / non_q;
+        assert!((0.44..0.56).contains(&p1), "パターン1 の比率が崩れた: {p1}");
+        assert!(counts[1] > counts[2] && counts[2] > counts[3] && counts[3] > counts[4],
+            "番号が小さいほど高確率、が崩れた: {counts:?}");
     }
 
     #[test]
