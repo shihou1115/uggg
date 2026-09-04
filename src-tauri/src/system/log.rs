@@ -29,13 +29,22 @@ pub fn init(dir: &std::path::Path) {
         eprintln!("[log] ログディレクトリを作れません {}: {err}", dir.display());
         return;
     }
-    *LOG_PATH.lock().expect("log path poisoned") = Some(dir.join("ugg.log"));
+    match LOG_PATH.lock() {
+        Ok(mut g) => *g = Some(dir.join("ugg.log")),
+        Err(poisoned) => *poisoned.into_inner() = Some(dir.join("ugg.log")),
+    }
     write_line(&format!("=== ugg {} 起動 ===", env!("CARGO_PKG_VERSION")));
 }
 
 /// 1 行書く。**失敗しても何もしない** (ログのためにアプリを壊さない)。
 pub fn write_line(line: &str) {
-    let guard = LOG_PATH.lock().expect("log path poisoned");
+    // **poison しても panic しない。** ここで panic すると、パニックフックが
+    // write_line を呼ぶ構造上「フック内 panic → abort」になり、起動時 panic の
+    // ダイアログごと失われる。診断のための機構が診断を殺してはいけない。
+    let guard = match LOG_PATH.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     let Some(path) = guard.as_ref() else {
         return;
     };

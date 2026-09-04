@@ -229,7 +229,17 @@ async fn run_dispatch(
     // 上限超過は LLM を呼ぶ「前」に弾く (spec §4.2.7)。
     // 以前は try_advanced の成功後にしか判定しておらず、超過後も呼び続けていた。
     let over_limit = cost_exceeded(state, &settings);
-    if over_limit {
+    if over_limit && !cost::notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED) {
+        // **この turn の返答そのものを告知にする。**
+        // emit で別発話として流すと、直後に返る low 応答が同じ吹き出しへ描画され
+        // (フロントの listen コールバックは並行する)、月 1 回しか出ない告知が
+        // 視認前に消えうる。しかも告知済みフラグは立つので二度と出ない。
+        // 返答として返せば必ず表示される。
+        if let Some(resp) = cost_limit_reply(state) {
+            cost::mark_notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED);
+            return Ok(resp);
+        }
+        // 辞書にキーが無いゴースト向けの保険 (既定辞書には v0.5 で追加済み)。
         announce_cost_limit_once(app, state, &settings).await;
     }
     let want_advanced = matches!(settings.mode, DialogueMode::Advanced)
@@ -356,6 +366,19 @@ pub(crate) fn cost_exceeded(state: &Arc<AppState>, settings: &crate::state::Sett
             false
         }
     }
+}
+
+/// 上限超過の告知を「この turn の返答」として組み立てる。
+///
+/// 辞書 `system_messages.cost_limit_exceeded` を引く。キーが無ければ None。
+fn cost_limit_reply(state: &Arc<AppState>) -> Option<DialogueResponse> {
+    let guard = state.ghost.lock().expect("ghost poisoned");
+    let bundle = guard.as_ref().ok()?;
+    let ctx = crate::ghost::dict::WhenContext::now();
+    let line = bundle
+        .dictionary
+        .pick_system_message("cost_limit_exceeded", &ctx, bundle.sub_available())?;
+    Some(banter::pattern_1("event", "low", line))
 }
 
 fn degrade(d: &crate::state::DialogueState) {

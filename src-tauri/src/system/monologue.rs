@@ -27,7 +27,7 @@ use crate::dialogue::advanced::available_pose_names;
 use crate::dialogue::llm::{estimate_cost_usd, extract_json_blob, ChatMessage, LlmClient};
 use crate::ghost::GhostBundle;
 use crate::state::{AppState, DialogueMode, Settings};
-use crate::system::{cost, secrets};
+use crate::system::secrets;
 
 /// この件数を下回ったら補充する (foundation-design §3.3 の初期値 3)。
 const REFILL_THRESHOLD: u64 = 3;
@@ -121,18 +121,11 @@ pub async fn maybe_refill(app: &AppHandle, state: &Arc<AppState>) {
     // **月額上限を補充の前に必ず見る** (foundation-design §3.5)。
     // これが無いと、チャットを使わず常駐しているだけのユーザーで上限が素通りする
     // (補充は無人で 30 分ごとに走り、降格は 5 分で自動復帰するので歯止めにならない)。
-    match cost::check_status(&state.db, settings.monthly_limit_usd) {
-        Ok(status) if status.exceeded => {
-            // 超過はチャット経路と同じ扱い (降格・告知) に合流させる。
-            // 背景処理だけが上限を素通りする穴を作らない。
-            crate::dialogue::evaluate_cost_status(app, state, &settings).await;
-            return;
-        }
-        Ok(_) => {}
-        Err(err) => {
-            crate::ulog!("[monologue] コスト確認に失敗、補充を見送り: {err:#}");
-            return;
-        }
+    // 判定はチャット経路と同じ単一のゲート (spec §4.2.7)。
+    // 背景処理だけが上限を素通りする穴を作らない。
+    if crate::dialogue::cost_exceeded(state, &settings) {
+        crate::dialogue::evaluate_cost_status(app, state, &settings).await;
+        return;
     }
 
     // ここから先は LLM を叩く。成否によらず最短間隔を消費させる (失敗の連打を防ぐ)。

@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.0）
+# ugg アーキテクチャ設計書（architecture.md v2.1）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -98,7 +98,9 @@ src-tauri/src/
 │
 ├── ghost/                   -- ゴースト/シェル/辞書ロード
 │   ├── mod.rs
-│   ├── manifest.rs          -- ghost.json / shell.json パース
+│   ├── manifest.rs          -- ghost.json / shell.json パース（★v0.5 `characters.*.persona` と
+│   │                          `prompt.{max_chars_per_line,style_notes}` を追加。省略可、既定文へフォールバック。
+│   │                          出荷資産のキーと構造体の突合は同ファイルの契約テストが担保）
 │   ├── dict.rs              -- 辞書スキーマ v3 パース、when 条件評価
 │   └── dnd.rs               -- ★ DnD 展開（zip/フォルダ、zip slip 対策・サイズ/深さ上限）
 │
@@ -249,6 +251,7 @@ CREATE TABLE app_settings (
 - 個別キー: `window_pos`（{x,y}。ステージのドック先モニタの記憶に使う）, `char_pos`（{main,sub} キャラごとの X 位置 CSS px）, `first_boot_done`（"1"）, `last_update_check`（unix秒）, `profile_onboarded`（"1"）, `update_notice_seen:<version>`（"1"）等
 - ★M11 天気: `weather_cache`（WeatherCache を JSON。専用テーブルを持たず app_settings に保存。「解除」= 空文字で消去、§4.7.2）, `weather_rain_date`（降雨の一言の 1 日 1 回 dedup。`*_date` 系と同型）
 - ★M12 定例会話: `regular_morning_date` / `regular_evening_date`（朝・夜の定例会話の 1 日 1 回 dedup、`*_date` 系と同型）
+- ★v0.5 コスト告知: `cost_warned_80_month` / `cost_limit_notified_month`（値は当月タグ `YYYY-MM`。非永続の AtomicBool では再起動で消え、**月が替わっても戻らない**ため翌月の警告が鳴らなかった。spec §4.2.7「次月リセットで復帰。」）
 - ★M13 表示モニタ: `monitor_pref`（ユーザーが選んだモニタ = `{name, x, y}` の JSON。**`window_pos`（前回位置）とは別物**で、選択があるときは `window_pos` を参照しない。空文字 = 選択なし）
 
 #### `chat_log`
@@ -596,6 +599,7 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
+| `get_cost_status` | なし | `CostStatusView` | ★v0.5 当月の LLM 利用額 / 上限 / 比率 / 80%・超過フラグ / 料金表に載っているか（`pricing_unknown_remote` = 未掲載かつ base_url がリモート = **上限が発動しない構成**）。spec §4.2.7 |
 | `get_profile` | なし | `ProfileEntry[]` | |
 | `add_profile` | `content: String` | `ProfileEntry[]` | origin="manual" |
 | `delete_profile` | `id: i64` | `ProfileEntry[]` | |

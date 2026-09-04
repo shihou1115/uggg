@@ -894,7 +894,10 @@ async fn fire_morning_regular(
     // 材料集約 (天気取得) と LLM 整形を走らせない。抑制中に条件成立が続くと、date キーが
     // 進まないまま毎 tick この重い列が反復するため (最長 6h の失効窓 × 毎分 LLM 呼び出し)。
     // 正式判定と会計は従来どおり deliver_event 内の gate が行う (これはゲートではない)。
-    if governance::ambient_quiet_now(state) {
+    // v0.5: 可視性ゲート (deliver.rs) の導入で、非表示中も Deferred になり date キーが
+    // 進まなくなった。ambient_quiet_now は可視性を見ないため、同じ穴が新しい入口から
+    // 開いていた (毎 tick 天気取得 + LLM 課金が無言で走る)。プリフィルタにも可視性を足す。
+    if governance::ambient_quiet_now(state) || !deliver::window_is_visible(app) {
         return false;
     }
     let materials = regular_talk::build_morning_materials(state).await;
@@ -955,7 +958,7 @@ async fn fire_evening_regular(
         return;
     }
     // 静音プリフィルタ (朝と同じ。fire_morning_regular のコメント参照)
-    if governance::ambient_quiet_now(state) {
+    if governance::ambient_quiet_now(state) || !deliver::window_is_visible(app) {
         return;
     }
     let materials = regular_talk::build_evening_materials(state).await;
@@ -993,7 +996,7 @@ async fn fire_rain_once(app: &AppHandle, state: &Arc<AppState>, today: chrono::N
         return;
     }
     // 静音プリフィルタ (定例会話と同じ省力化): 抑制中は取得・判定ごと次 tick へ見送る
-    if governance::ambient_quiet_now(state) {
+    if governance::ambient_quiet_now(state) || !deliver::window_is_visible(app) {
         return;
     }
     let Some(cache) = weather::ensure_fresh(state).await else {

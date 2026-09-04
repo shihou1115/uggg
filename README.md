@@ -2,7 +2,7 @@
 
 「伺か」コンセプトを **Tauri v2 (Rust + TypeScript)** で再構築したデスクトップマスコット。透過ウインドウ上でメイン/サブ 2 体のキャラクターが掛け合い対話する。Windows 専用。
 
-> v0.0.3 プロトタイプ (`C:\claude\ugga`) を経て、本リポジトリは **本開発** (`C:\claude\uggg`)。M0〜M15 完了、**最新は v0.4.1**。v0.2.0 (タグ `v0.2.0`) で日常支援 Tier S (リマインダー / ToDo・日課 / 状況発話 / カレンダー参照)、v0.3.0 で朝・夜の定例会話と天気・降雨の一言、v0.4.0 で表示モニタ選択と advanced 独り言の LLM 生成 (時事ネタ織り込み) を追加。v0.4.1 は外部レビュー指摘への対応 (DnD アセット id のパス検証ほか)。
+> v0.0.3 プロトタイプ (`C:\claude\ugga`) を経て、本リポジトリは **本開発** (`C:\claude\uggg`)。M0〜M15 完了、**最新は v0.5.0**。v0.2.0 (タグ `v0.2.0`) で日常支援 Tier S (リマインダー / ToDo・日課 / 状況発話 / カレンダー参照)、v0.3.0 で朝・夜の定例会話と天気・降雨の一言、v0.4.0 で表示モニタ選択と advanced 独り言の LLM 生成 (時事ネタ織り込み) を追加。v0.4.1 は外部レビュー指摘への対応 (DnD アセット id のパス検証ほか)。v0.5.0 は「宣言どおりに動く」— 契約は宣言されているのに実装が繋がっていなかった5 件 (persona の配線 / 月額上限 / 記憶 UI / 配達の可視性 / ログと契約テスト) の解消。
 >
 > **使い方は [取扱説明書 (docs/manual.md)](docs/manual.md) を参照。** 以下は開発者向けの情報。
 
@@ -37,7 +37,7 @@ npm run tauri dev
 
 ```pwsh
 npm run tauri build
-# → src-tauri/target/release/bundle/nsis/ugg_0.4.1_x64-setup.exe
+# → src-tauri/target/release/bundle/nsis/ugg_0.5.0_x64-setup.exe
 ```
 
 検証:

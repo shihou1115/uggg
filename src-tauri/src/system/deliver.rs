@@ -222,13 +222,19 @@ fn pop_advanced_monologue(state: &Arc<AppState>) -> Option<DialogueLine> {
 /// 間に期限が来た単発リマインダーが **画面に何も出ないまま完了扱いで消えていた**。
 ///
 /// 見えていないなら未達 (`Deferred`) とし、呼び出し側の再試行に委ねる。
-fn window_is_visible(app: &AppHandle) -> bool {
-    match app.get_webview_window("main") {
-        // 取得できない/判定できないときは「見えている」に倒す。
-        // ここで false に倒すと、判定不能なだけで通知が永久に滞留する。
-        Some(w) => w.is_visible().unwrap_or(true),
-        None => true,
+pub(crate) fn window_is_visible(app: &AppHandle) -> bool {
+    let Some(w) = app.get_webview_window("main") else {
+        // 取得できないときは「見えている」に倒す。ここで false に倒すと、
+        // 判定不能なだけで通知が永久に滞留する。
+        return true;
+    };
+    // `is_visible` の実体は Win32 `IsWindowVisible` で、**最小化中も true を返す**。
+    // `skipTaskbar: false` なのでタスクバーからも Win+D でも最小化でき、その状態では
+    // アプリ内トーストも吹き出しも見えない。最小化も「届かない」に含める。
+    if w.is_minimized().unwrap_or(false) {
+        return false;
     }
+    w.is_visible().unwrap_or(true)
 }
 
 fn toast_fallback(app: &AppHandle, fallback: Option<String>) -> DeliveryOutcome {
@@ -302,6 +308,21 @@ mod tests {
         // Toast はアプリ内の帯なので、可視性ゲートを通った後だけ到達になる
         // (ゲートは deliver_event 側にあり、この列挙の意味は「表示までは行った」)。
         assert!(DeliveryOutcome::Toast.reached());
+    }
+
+    /// 出荷辞書に `cost_limit_exceeded` があること（上限告知を「その turn の返答」に
+    /// する経路が辞書を引くため。無いと保険の emit 経路へ落ちる）。
+    #[test]
+    fn cost_limit_key_exists_for_turn_reply() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri の親")
+            .join("ghosts/default/dic/main.yaml");
+        let raw = std::fs::read_to_string(&path).expect("既定辞書を読めない");
+        assert!(
+            raw.contains("cost_limit_exceeded:"),
+            "既定辞書に cost_limit_exceeded が無い"
+        );
     }
 
     /// `reminder_log.delivery` に入る表記の固定。保留が他の値に化けると
