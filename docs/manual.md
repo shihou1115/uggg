@@ -614,6 +614,7 @@ A. 同じ「覚えていること」の一覧で確認できます。`[自動]` 
 ## 11. データの保存場所
 
 - 会話履歴・設定など: `%APPDATA%\ugg\`（`C:\Users\ユーザー名\AppData\Roaming\ugg\`）
+- 動作ログ: `%APPDATA%\ugg\ugg.log`（不具合を報告するときは、この中身を添えてもらえると原因が分かりやすくなります）
 - 音声（VOICEVOX）の資産: `%APPDATA%\ugg\voicevox\`
 - 高品質モード（Irodori-TTS）の実行環境とモデル: `%APPDATA%\ugg\irodori\`
 - アプリ本体: `%LOCALAPPDATA%\ugg\`（`C:\Users\ユーザー名\AppData\Local\ugg\`）

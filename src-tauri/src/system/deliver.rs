@@ -192,7 +192,7 @@ fn pop_advanced_monologue(state: &Arc<AppState>) -> Option<DialogueLine> {
         .db
         .pop_monologue_cache(&ghost_id, Utc::now().timestamp())
         .unwrap_or_else(|err| {
-            eprintln!("[deliver] 独り言ストックの取り出しに失敗、辞書へ: {err:#}");
+            crate::ulog!("[deliver] 独り言ストックの取り出しに失敗、辞書へ: {err:#}");
             None
         })?;
     // pose はシェル依存で、生成時と今とでシェルが違いうる。存在しない pose を渡すと

@@ -301,3 +301,160 @@ pub fn build_shell_character(def: &ShellCharacterDef, shell_dir: &Path) -> Resul
         poke_regions: def.poke_regions,
     })
 }
+
+/// 出荷資産と Deserialize 構造体の**契約テスト**。
+///
+/// v0.4.1 まで `ghost.json` は `persona` / `prompt` を出荷しているのに
+/// `GhostManifest` がフィールドを宣言しておらず、**serde が黙って捨てていた**。
+/// 同じ型の見落とし (`cost_warning_80` の辞書キー欠落など) が計 12 件あり、
+/// いずれも「コンパイルも通るしテストも緑」のまま出荷されていた。
+///
+/// ここでは **出荷している JSON の実キー集合**を構造体が受け取れるかを検査する。
+/// 検査対象は同梱の既定資産に限定する（第三者ゴーストや DnD で入れた資産は
+/// 未知キーを持ってよく、ここで落とすと取り込みが壊れる）。
+#[cfg(test)]
+mod shipped_asset_contract {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    /// リポジトリ直下からの相対パスを解決する。`CARGO_MANIFEST_DIR` は
+    /// `src-tauri/` を指すので 1 つ上へ上がる。
+    fn repo_path(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri の親")
+            .join(rel)
+    }
+
+    fn read_json(rel: &str) -> serde_json::Value {
+        let p = repo_path(rel);
+        let raw = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("出荷資産を読めない {}: {e}", p.display()));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("出荷資産が JSON として壊れている {}: {e}", p.display()))
+    }
+
+    fn keys(v: &serde_json::Value) -> BTreeSet<String> {
+        v.as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// **構造体が実際に読むキー。** 増やしたらここも増やす。
+    /// 「読む」ことの裏は `default_ghost_json_parses_with_persona` が取る
+    /// （リストに書いただけで実際は読んでいない、を防ぐ）。
+    const GHOST_READ: &[&str] = &[
+        "schema_version", "id", "name", "characters", "dictionaries", "prompt",
+    ];
+
+    /// **出荷しているが意図的に読まないキー。** 理由を必ず書くこと。
+    ///
+    /// - `author`: ファイルを人が読むときの表示用。UI にもプロンプトにも出さない
+    ///   （出すなら spec に要件が要る）。
+    /// - `default_shell`: 読むと「ゴースト切替でシェルも変わる」挙動になり、
+    ///   現在の「シェルは `settings.shell_id` で独立」という仕様と衝突する。
+    ///   採否は spec の判断が要るため v0.5 では読まない。
+    const GHOST_IGNORED: &[&str] = &["author", "default_shell"];
+
+    /// 既定ゴーストの JSON が持つキーが、**読む**か**意図的に無視する**かの
+    /// どちらかに分類されていること。どちらでもないキーは
+    /// 「宣言し忘れて serde が黙って捨てている」状態なので落とす。
+    ///
+    /// **これがあれば persona の取りこぼしは出荷前に落ちていた。**
+    #[test]
+    fn default_ghost_json_keys_are_all_accounted_for() {
+        let v = read_json("ghosts/default/ghost.json");
+        let accounted: BTreeSet<String> = GHOST_READ
+            .iter()
+            .chain(GHOST_IGNORED.iter())
+            .map(|s| s.to_string())
+            .collect();
+        let shipped = keys(&v);
+        let unaccounted: Vec<_> = shipped.difference(&accounted).collect();
+        assert!(
+            unaccounted.is_empty(),
+            "ghost.json が出荷しているのに、読むとも無視するとも決めていないキー: {unaccounted:?}
+             serde は未知キーを黙って捨てるので、宣言し忘れても誰も気づけない。
+             構造体に足すか、GHOST_IGNORED に理由つきで足すこと。"
+        );
+
+        // キャラクター側。persona はここで守られる。
+        let chars = v.get("characters").expect("characters が無い");
+        for slot in ["main", "sub"] {
+            let Some(c) = chars.get(slot) else { continue };
+            let known_c: BTreeSet<String> =
+                ["name", "persona"].iter().map(|s| s.to_string()).collect();
+            let shipped_c = keys(c);
+            let ignored_c: Vec<_> = shipped_c.difference(&known_c).collect();
+            assert!(
+                ignored_c.is_empty(),
+                "characters.{slot} の未受領キー: {ignored_c:?}"
+            );
+        }
+
+        if let Some(p) = v.get("prompt") {
+            let known_p: BTreeSet<String> = ["max_chars_per_line", "style_notes"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let shipped_p = keys(p);
+            let ignored_p: Vec<_> = shipped_p.difference(&known_p).collect();
+            assert!(ignored_p.is_empty(), "prompt の未受領キー: {ignored_p:?}");
+        }
+    }
+
+    /// 出荷している既定ゴーストが、実際に構造体へパースできること。
+    /// かつ **persona が実際に入っている**こと（空の JSON でも上のテストは通るため）。
+    #[test]
+    fn default_ghost_json_parses_with_persona() {
+        let raw = std::fs::read_to_string(repo_path("ghosts/default/ghost.json")).unwrap();
+        let g: GhostManifest = serde_json::from_str(&raw).expect("ghost.json のパースに失敗");
+        assert_eq!(g.schema_version, 1);
+        assert!(
+            g.characters.main.persona.is_some(),
+            "既定ゴーストの main に persona が無い"
+        );
+        assert!(
+            g.characters.sub.as_ref().and_then(|s| s.persona.as_ref()).is_some(),
+            "既定ゴーストの sub に persona が無い"
+        );
+        let p = g.prompt.as_ref().expect("prompt が無い");
+        assert!(p.max_chars_per_line.is_some() && p.style_notes.is_some());
+    }
+
+    /// shell.json 側も同じ扱い。`author` は ghost.json と同じ理由で意図的に読まない。
+    #[test]
+    fn default_shell_json_keys_are_all_accounted_for() {
+        let v = read_json("shells/default/shell.json");
+        const SHELL_READ: &[&str] = &["schema_version", "id", "name", "characters"];
+        const SHELL_IGNORED: &[&str] = &["author"];
+        let accounted: BTreeSet<String> = SHELL_READ
+            .iter()
+            .chain(SHELL_IGNORED.iter())
+            .map(|s| s.to_string())
+            .collect();
+        let shipped = keys(&v);
+        let unaccounted: Vec<_> = shipped.difference(&accounted).collect();
+        assert!(
+            unaccounted.is_empty(),
+            "shell.json の未分類キー: {unaccounted:?}"
+        );
+    }
+
+    /// **`GHOST_READ` に並べたキーが、実際に構造体へ入ること。**
+    /// リストに書いただけで実は読んでいない、という嘘を防ぐ。
+    #[test]
+    fn keys_listed_as_read_are_actually_populated() {
+        let raw = std::fs::read_to_string(repo_path("ghosts/default/ghost.json")).unwrap();
+        let g: GhostManifest = serde_json::from_str(&raw).expect("ghost.json のパースに失敗");
+        // GHOST_READ の各キーに対応する値が実際に入っていること。
+        assert_eq!(g.schema_version, 1, "schema_version");
+        assert!(!g.id.is_empty(), "id");
+        assert!(!g.name.is_empty(), "name");
+        assert!(!g.characters.main.name.is_empty(), "characters");
+        assert!(!g.dictionaries.is_empty(), "dictionaries");
+        assert!(g.prompt.is_some(), "prompt");
+        assert_eq!(GHOST_READ.len(), 6, "GHOST_READ を増やしたらここの検査も増やす");
+    }
+}

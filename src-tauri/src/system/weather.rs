@@ -156,7 +156,7 @@ pub async fn ensure_fresh(state: &Arc<AppState>) -> Option<WeatherCache> {
             Some(fresh)
         }
         Err(err) => {
-            eprintln!("[weather] ensure_fresh の取得に失敗: {err:#}");
+            crate::ulog!("[weather] ensure_fresh の取得に失敗: {err:#}");
             None
         }
     }
@@ -179,7 +179,7 @@ pub async fn refresh_cache(state: &Arc<AppState>) -> bool {
             true
         }
         Err(err) => {
-            eprintln!("[weather] 定期取得に失敗: {err:#}");
+            crate::ulog!("[weather] 定期取得に失敗: {err:#}");
             false
         }
     }

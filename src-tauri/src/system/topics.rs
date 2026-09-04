@@ -73,7 +73,7 @@ pub async fn fetch_all_into_cache(state: &Arc<AppState>) -> Result<()> {
                 }
             }
             Err(err) => {
-                eprintln!("[topics] '{topic}' の RSS 取得失敗: {err:#}");
+                crate::ulog!("[topics] '{topic}' の RSS 取得失敗: {err:#}");
             }
         }
     }

@@ -731,6 +731,8 @@ impl AppState {
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("create app data dir: {}", data_dir.display()))?;
 
+        // ログの出力先を最初に確定させる (以降の ulog! がファイルにも残る)。
+        crate::system::log::init(&data_dir);
         let db = Db::open(&data_dir.join("companion.db"))?;
         db.migrate()?;
 

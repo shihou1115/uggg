@@ -68,7 +68,7 @@ pub fn persist_and_speak(app: &AppHandle, state: &Arc<AppState>, resp: &Dialogue
             .append_chat(now, resp.mode, ChatRole::Sub, &sub.text, sub.pose.as_deref());
     }
     if let Err(err) = app.emit("dialogue", resp) {
-        eprintln!("[persist_and_speak] dialogue emit failed: {err}");
+        crate::ulog!("[persist_and_speak] dialogue emit failed: {err}");
         return false;
     }
     true
@@ -246,7 +246,7 @@ async fn run_dispatch(
             }
             Err(err) => {
                 let streak = state.dialogue.error_streak.fetch_add(1, Ordering::SeqCst) + 1;
-                eprintln!("[advanced] error_streak={streak}: {err:#}");
+                crate::ulog!("[advanced] error_streak={streak}: {err:#}");
                 if streak >= ERROR_STREAK_THRESHOLD {
                     degrade(&state.dialogue);
                     notify::notify(
@@ -315,7 +315,7 @@ pub(crate) async fn evaluate_cost_status(
     let status = match cost::check_status(&state.db, settings.monthly_limit_usd) {
         Ok(s) => s,
         Err(err) => {
-            eprintln!("[cost] check_status failed: {err:#}");
+            crate::ulog!("[cost] check_status failed: {err:#}");
             return;
         }
     };
@@ -352,7 +352,7 @@ pub(crate) fn cost_exceeded(state: &Arc<AppState>, settings: &crate::state::Sett
         Ok(st) => st.exceeded,
         Err(err) => {
             // 集計できないときに課金を止めるのは過剰なので通す（記録は残す）。
-            eprintln!("[cost] check_status failed: {err:#}");
+            crate::ulog!("[cost] check_status failed: {err:#}");
             false
         }
     }

@@ -158,7 +158,7 @@ pub fn spawn_reminder_watcher(app: AppHandle, state: Arc<AppState>) {
             let due = match state.db.due_active_reminders(now) {
                 Ok(v) => v,
                 Err(err) => {
-                    eprintln!("[reminder] due_active_reminders failed: {err:#}");
+                    crate::ulog!("[reminder] due_active_reminders failed: {err:#}");
                     continue;
                 }
             };
@@ -207,12 +207,12 @@ fn advance_after_delivery(
 ) {
     const LOG_KEEP: u32 = 500;
     if let Err(err) = state.db.log_fire(r.id, now, outcome.as_str()) {
-        eprintln!("[reminder] log_fire({}) failed: {err:#}", r.id);
+        crate::ulog!("[reminder] log_fire({}) failed: {err:#}", r.id);
     }
     match r.kind {
         ReminderKind::Once => {
             if let Err(err) = state.db.deactivate_reminder(r.id) {
-                eprintln!("[reminder] deactivate({}) failed: {err:#}", r.id);
+                crate::ulog!("[reminder] deactivate({}) failed: {err:#}", r.id);
             }
         }
         ReminderKind::Daily | ReminderKind::Weekly => {
@@ -220,20 +220,20 @@ fn advance_after_delivery(
             match next_recurring_due_ts(r.kind, r.weekday_mask, r.time_of_day, now_local) {
                 Some(next_due) => {
                     if let Err(err) = state.db.reschedule_reminder(r.id, next_due) {
-                        eprintln!("[reminder] reschedule({}) failed: {err:#}", r.id);
+                        crate::ulog!("[reminder] reschedule({}) failed: {err:#}", r.id);
                     }
                 }
                 // weekly で mask=0 等、次回が計算できない行は無限再発火を避けて停止
                 None => {
                     if let Err(err) = state.db.deactivate_reminder(r.id) {
-                        eprintln!("[reminder] deactivate({}) failed: {err:#}", r.id);
+                        crate::ulog!("[reminder] deactivate({}) failed: {err:#}", r.id);
                     }
                 }
             }
         }
     }
     if let Err(err) = state.db.prune_reminder_log(LOG_KEEP) {
-        eprintln!("[reminder] prune_reminder_log failed: {err:#}");
+        crate::ulog!("[reminder] prune_reminder_log failed: {err:#}");
     }
     let _ = app.emit("reminders-changed", ());
 }
@@ -249,7 +249,7 @@ async fn recover_overdue_on_boot(app: &AppHandle, state: &Arc<AppState>) {
     let due = match state.db.due_active_reminders(now) {
         Ok(v) => v,
         Err(err) => {
-            eprintln!("[reminder] boot recover query failed: {err:#}");
+            crate::ulog!("[reminder] boot recover query failed: {err:#}");
             return;
         }
     };
@@ -483,7 +483,7 @@ async fn follow_open_todos(
         Ok(v) => v,
         Err(err) => {
             // 取得失敗は消化せず次 tick で再試行
-            eprintln!("[context] list_todos failed: {err:#}");
+            crate::ulog!("[context] list_todos failed: {err:#}");
             return;
         }
     };
@@ -552,7 +552,7 @@ pub fn spawn_calendar_watcher(app: AppHandle, state: Arc<AppState>) {
                     // prune（前日より前の過去発生行）
                     let cutoff = now - 86_400;
                     if let Err(err) = state.db.prune_calendar(cutoff) {
-                        eprintln!("[calendar] prune failed: {err:#}");
+                        crate::ulog!("[calendar] prune failed: {err:#}");
                     }
                 }
                 // 開始前通知（毎 tick 判定）
@@ -578,7 +578,7 @@ async fn fetch_all_calendars(state: &Arc<AppState>, display_days: i64) -> usize 
             .await
         {
             Ok(n) => total += n,
-            Err(err) => eprintln!("[calendar] source {idx} fetch failed: {err:#}"),
+            Err(err) => crate::ulog!("[calendar] source {idx} fetch failed: {err:#}"),
         }
     }
     total
@@ -604,7 +604,7 @@ async fn notify_upcoming(app: &AppHandle, state: &Arc<AppState>) {
     let candidates = match state.db.upcoming_calendar(now, horizon) {
         Ok(v) => v,
         Err(err) => {
-            eprintln!("[calendar] upcoming query failed: {err:#}");
+            crate::ulog!("[calendar] upcoming query failed: {err:#}");
             return;
         }
     };
@@ -631,7 +631,7 @@ async fn notify_upcoming(app: &AppHandle, state: &Arc<AppState>) {
         .await;
         if outcome.reached() {
             if let Err(err) = state.db.mark_calendar_notified(ev.source_id, &ev.uid, ev.start_ts) {
-                eprintln!("[calendar] mark_notified failed: {err:#}");
+                crate::ulog!("[calendar] mark_notified failed: {err:#}");
             }
             let _ = app.emit("calendar-changed", ());
         }
@@ -698,7 +698,7 @@ pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
                         }
                         last_date = Some(today);
                     }
-                    Err(err) => eprintln!("[daily] reset_recurring failed: {err:#}"),
+                    Err(err) => crate::ulog!("[daily] reset_recurring failed: {err:#}"),
                 }
             }
 
@@ -744,7 +744,7 @@ pub fn spawn_daily_watcher(app: AppHandle, state: Arc<AppState>) {
                 if !announced {
                     // 件数取得の失敗は消化せず次 tick で再試行 (「0 件の朝」と混同しない)
                     match state.db.count_open_todos(Some("today")) {
-                        Err(err) => eprintln!("[daily] count_open_todos failed: {err:#}"),
+                        Err(err) => crate::ulog!("[daily] count_open_todos failed: {err:#}"),
                         Ok(0) => {
                             // 0 件の朝は告知なしで消化 (昼に追加された分で鳴らさない)
                             let _ = state.db.set_setting(MORNING_DATE_KEY, &today.to_string());
@@ -1046,7 +1046,7 @@ fn today_has_timed_event(state: &Arc<AppState>, today: chrono::NaiveDate) -> boo
     match state.db.list_calendar(from, to) {
         Ok(events) => events.iter().any(|e| !e.all_day),
         Err(err) => {
-            eprintln!("[daily] list_calendar (降雨判定) failed: {err:#}");
+            crate::ulog!("[daily] list_calendar (降雨判定) failed: {err:#}");
             false
         }
     }
@@ -1063,7 +1063,7 @@ pub fn spawn_topics_watcher(state: Arc<AppState>) {
             let enabled = state.settings.lock().expect("settings poisoned").topics_enabled;
             if enabled {
                 if let Err(err) = crate::system::topics::fetch_all_into_cache(&state).await {
-                    eprintln!("[topics] fetch failed: {err:#}");
+                    crate::ulog!("[topics] fetch failed: {err:#}");
                 }
             }
             tokio::time::sleep(Duration::from_secs(PERIOD_SECS)).await;
@@ -1081,7 +1081,7 @@ pub fn spawn_update_watcher(app: AppHandle, state: Arc<AppState>) {
         tokio::time::sleep(Duration::from_secs(ONCE_DELAY_SECS)).await;
         loop {
             if let Err(err) = crate::system::update::check_update_once(&app, &state).await {
-                eprintln!("[update] check failed: {err:#}");
+                crate::ulog!("[update] check failed: {err:#}");
             }
             tokio::time::sleep(Duration::from_secs(PERIOD_SECS)).await;
         }

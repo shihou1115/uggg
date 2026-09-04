@@ -74,7 +74,7 @@ pub fn notified_this_month(db: &Db, key: &str) -> bool {
 /// 当月ぶんの告知済みを記録する。
 pub fn mark_notified_this_month(db: &Db, key: &str) {
     if let Err(err) = db.set_setting(key, &current_month_tag()) {
-        eprintln!("[cost] mark_notified_this_month({key}) failed: {err:#}");
+        crate::ulog!("[cost] mark_notified_this_month({key}) failed: {err:#}");
     }
 }
 

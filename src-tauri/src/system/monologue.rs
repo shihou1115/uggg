@@ -110,7 +110,7 @@ pub async fn maybe_refill(app: &AppHandle, state: &Arc<AppState>) {
     let stock = match state.db.count_monologue_cache(&ghost_id, now) {
         Ok(n) => n,
         Err(err) => {
-            eprintln!("[monologue] ストック件数の取得に失敗、補充を見送り: {err:#}");
+            crate::ulog!("[monologue] ストック件数の取得に失敗、補充を見送り: {err:#}");
             return;
         }
     };
@@ -130,7 +130,7 @@ pub async fn maybe_refill(app: &AppHandle, state: &Arc<AppState>) {
         }
         Ok(_) => {}
         Err(err) => {
-            eprintln!("[monologue] コスト確認に失敗、補充を見送り: {err:#}");
+            crate::ulog!("[monologue] コスト確認に失敗、補充を見送り: {err:#}");
             return;
         }
     }
@@ -161,7 +161,7 @@ async fn refill_once(
     let api_key = match secrets::get_api_key_async(&settings.llm_provider).await {
         Ok(k) => k,
         Err(err) => {
-            eprintln!("[monologue] API キー取得に失敗、補充を見送り: {err:#}");
+            crate::ulog!("[monologue] API キー取得に失敗、補充を見送り: {err:#}");
             return false;
         }
     };
@@ -171,7 +171,7 @@ async fn refill_once(
         match guard.as_ref() {
             Ok(b) => b.clone(),
             Err(err) => {
-                eprintln!("[monologue] ゴースト未読込のため補充を見送り: {err}");
+                crate::ulog!("[monologue] ゴースト未読込のため補充を見送り: {err}");
                 return false;
             }
         }
@@ -195,12 +195,12 @@ async fn refill_once(
     let response = match result {
         Ok(Ok(resp)) => resp,
         Ok(Err(err)) => {
-            eprintln!("[monologue] 補充の API エラー、次の周期で再試行: {err:#}");
+            crate::ulog!("[monologue] 補充の API エラー、次の周期で再試行: {err:#}");
             // 呼びには行ったので上限評価は回す (課金が発生している可能性がある)。
             return true;
         }
         Err(_) => {
-            eprintln!("[monologue] 補充がタイムアウト、次の周期で再試行");
+            crate::ulog!("[monologue] 補充がタイムアウト、次の周期で再試行");
             return true;
         }
     };
@@ -227,7 +227,7 @@ async fn refill_once(
     let generated = match parse_monologue_batch(raw) {
         Ok(lines) => lines,
         Err(err) => {
-            eprintln!("[monologue] 応答が壊れているため 1 件も積まない: {err:#}");
+            crate::ulog!("[monologue] 応答が壊れているため 1 件も積まない: {err:#}");
             return true;
         }
     };
@@ -244,12 +244,12 @@ async fn refill_once(
             topic_fetched_ts,
             now,
         ) {
-            eprintln!("[monologue] ストックの保存に失敗: {err:#}");
+            crate::ulog!("[monologue] ストックの保存に失敗: {err:#}");
             break;
         }
         pushed += 1;
     }
-    eprintln!(
+    crate::ulog!(
         "[monologue] 補充: {pushed} 件 (在庫 {stock} → {}、時事ネタ材料 {} 件)",
         stock + pushed as u64,
         materials.len()
@@ -269,14 +269,14 @@ fn topic_materials(state: &Arc<AppState>, settings: &Settings, now: i64) -> Vec<
     let rows = match state.db.list_recent_topics(TOPIC_SCAN_LIMIT) {
         Ok(rows) => rows,
         Err(err) => {
-            eprintln!("[monologue] 時事ネタの読み出しに失敗、独り言のみで生成: {err:#}");
+            crate::ulog!("[monologue] 時事ネタの読み出しに失敗、独り言のみで生成: {err:#}");
             return Vec::new();
         }
     };
     // 興味分野から外したキーワードの見出しは `topics_cache` に最大 7 日残るので、
     // **いま有効なトピックの見出しだけ**に絞る (外した興味の話題を喋り続けない)。
     let enabled = state.db.list_enabled_topics().unwrap_or_else(|err| {
-        eprintln!("[monologue] 有効トピックの読み出しに失敗、時事ネタ無しで生成: {err:#}");
+        crate::ulog!("[monologue] 有効トピックの読み出しに失敗、時事ネタ無しで生成: {err:#}");
         Vec::new()
     });
     select_topic_materials(settings.topics_enabled, &enabled, rows, now)

@@ -44,7 +44,7 @@ pub fn set_settings(
         match state.db.clear_monologue_cache_with_topics() {
             Ok(n) if n > 0 => println!("[settings] 時事ネタ入りの独り言ストックを {n} 件削除"),
             Ok(_) => {}
-            Err(err) => eprintln!("[settings] 独り言ストックの掃除に失敗: {err:#}"),
+            Err(err) => crate::ulog!("[settings] 独り言ストックの掃除に失敗: {err:#}"),
         }
     }
 

@@ -2,6 +2,7 @@ pub mod calendar;
 pub mod cost;
 pub mod deliver;
 pub mod governance;
+pub mod log;
 pub mod manual;
 pub mod monologue;
 pub mod notify;

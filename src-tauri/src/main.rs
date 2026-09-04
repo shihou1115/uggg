@@ -37,6 +37,8 @@ fn install_panic_dialog_hook() {
             .location()
             .map(|l| format!("\n\n({}:{})", l.file(), l.line()))
             .unwrap_or_default();
+        // パニックこそログに残したいもの。log::init 前なら no-op になる。
+        crate::system::log::write_line(&format!("[panic] {msg}{location}"));
         let text: Vec<u16> = format!("ugg の起動または実行中にエラーが発生しました:\n\n{msg}{location}\0")
             .encode_utf16()
             .collect();
@@ -98,7 +100,7 @@ fn main() {
             tasks::spawn_calendar_watcher(app.handle().clone(), state.clone());
             // タスクトレイ
             if let Err(err) = window::tray::install(app.handle(), state.clone()) {
-                eprintln!("[tray] install failed: {err:#}");
+                crate::ulog!("[tray] install failed: {err:#}");
             }
             // TTS が有効 & 資産あり なら背景で voicevox engine を事前 init (初発話のラグ解消)
             {

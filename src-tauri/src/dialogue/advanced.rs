@@ -71,7 +71,7 @@ async fn parse_and_record(
         Err(err) => {
             let fallback = plaintext_fallback(&raw)
                 .ok_or_else(|| anyhow!("LLM 応答が JSON でもテキストでもありません: {err:#}"))?;
-            eprintln!("[advanced] JSON パース失敗、プレーンテキストとして表示: {err:#}");
+            crate::ulog!("[advanced] JSON パース失敗、プレーンテキストとして表示: {err:#}");
             fallback
         }
     };

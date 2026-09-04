@@ -57,6 +57,12 @@ pub enum DegradeReason {
 }
 
 impl NoticeKind {
+    /// 辞書 `system_messages` のキー。
+    ///
+    /// **変種を増やすとこの match がコンパイルエラーになる**ので、キーの割り当て漏れは
+    /// 起きない。一方「割り当てたキーが既定辞書に無い」は静かに起きる
+    /// (`cost_warning_80` / `cost_limit_exceeded` が実際にそうだった) ため、
+    /// 下の `dict_key_contract` テストが出荷辞書との突合を行う。
     fn dict_key(&self) -> &'static str {
         match self {
             NoticeKind::CostWarning80 { .. } => "cost_warning_80",
@@ -121,14 +127,84 @@ pub async fn notify(app: &AppHandle, state: &Arc<AppState>, kind: NoticeKind) {
         Some(line) => {
             let resp: DialogueResponse = banter::pattern_1("system_message", "low", line);
             if let Err(err) = app.emit("dialogue", &resp) {
-                eprintln!("[notify] dialogue emit failed: {err}");
+                crate::ulog!("[notify] dialogue emit failed: {err}");
             }
         }
         None => {
             // 辞書未定義 → トースト fallback。フロントが拾わなければ console.error 相当。
             if let Err(err) = app.emit("system-toast", kind.fallback_text()) {
-                eprintln!("[notify] toast emit failed: {err}");
+                crate::ulog!("[notify] toast emit failed: {err}");
             }
         }
+    }
+}
+
+/// `NoticeKind` が引く辞書キーが、**出荷している既定辞書に実在する**ことの契約テスト。
+///
+/// `cost_warning_80` / `cost_limit_exceeded` は `dict_key()` が以前から引きに来て
+/// いたのに `ghosts/default/dic/main.yaml` に定義が無く、月額上限の 80% 到達も
+/// 超過もキャラクターが黙っていた。コンパイルもテストも緑のまま出荷されていた。
+#[cfg(test)]
+mod dict_key_contract {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// 全変種のサンプル。**変種を増やしたらここにも足すこと。**
+    ///
+    /// 足し忘れは `sample_covers_every_variant` が件数で捕まえる
+    /// （変種を増やすと `dict_key` の match がコンパイルエラーになるので、
+    /// そこを直した開発者は必ずテストを走らせることになる）。
+    fn all_kinds() -> Vec<NoticeKind> {
+        vec![
+            NoticeKind::CostWarning80 { provider: "openai".into() },
+            NoticeKind::CostLimitExceeded { provider: "openai".into() },
+            NoticeKind::ModeDegraded { reason: DegradeReason::ApiError },
+            NoticeKind::ModeRecovered,
+            NoticeKind::VoicevoxDlComplete,
+            NoticeKind::VoicevoxDlFailed { reason: "x".into() },
+            NoticeKind::IrodoriUnavailable { reason: "x".into() },
+            NoticeKind::IrodoriDlComplete,
+            NoticeKind::IrodoriDlFailed { reason: "x".into() },
+            NoticeKind::UpdateAvailable { version: "1.0".into() },
+        ]
+    }
+
+    /// サンプルが全変種を覆っていること（件数での歯止め）。
+    #[test]
+    fn sample_covers_every_variant() {
+        let keys: BTreeSet<_> = all_kinds().iter().map(|k| k.dict_key()).collect();
+        assert_eq!(
+            keys.len(),
+            10,
+            "NoticeKind の変種を増やしたら all_kinds() にも足すこと（現在のキー: {keys:?}）"
+        );
+    }
+
+    /// **全変種の辞書キーが既定辞書の system_messages に存在すること。**
+    #[test]
+    fn every_dict_key_exists_in_default_dictionary() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri の親")
+            .join("ghosts/default/dic/main.yaml");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("既定辞書を読めない {}: {e}", path.display()));
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&raw).expect("既定辞書が YAML として壊れている");
+        let sysmsgs = doc
+            .get("system_messages")
+            .and_then(|v| v.as_mapping())
+            .expect("既定辞書に system_messages が無い");
+
+        let missing: Vec<&str> = all_kinds()
+            .iter()
+            .map(|k| k.dict_key())
+            .filter(|key| !sysmsgs.contains_key(serde_yaml::Value::from(*key)))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "Rust が引くのに既定辞書に無い system_messages キー: {missing:?}\n\
+             （引けないとゴーストが黙る。辞書に足すこと）"
+        );
     }
 }

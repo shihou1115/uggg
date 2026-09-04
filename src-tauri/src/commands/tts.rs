@@ -190,7 +190,7 @@ async fn synthesize_irodori(
     // voicevox 資産が未 DL 等で前処理ができない場合は warning ログを出して raw text を渡す。
     // (Irodori は漢字の発話精度が不安定だが、合成失敗より「読みが多少不自然」のほうがマシ)。
     let preprocessed = preprocess_for_irodori(&state, text).unwrap_or_else(|err| {
-        eprintln!("[irodori] kana preprocess fell back to raw text: {err}");
+        crate::ulog!("[irodori] kana preprocess fell back to raw text: {err}");
         text.to_string()
     });
     let (speed, use_real) = {
@@ -460,7 +460,7 @@ pub fn voice_ref_delete(
         let path = std::path::PathBuf::from(&row.file_path);
         if let Err(err) = voice_ref::delete_file(&path) {
             // ファイル削除失敗でも DB 行は削除する (パスがずれている場合の救済)。
-            eprintln!("[voice_ref] file delete failed: {err:#}");
+            crate::ulog!("[voice_ref] file delete failed: {err:#}");
         }
     }
     state

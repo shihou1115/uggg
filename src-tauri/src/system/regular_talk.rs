@@ -93,7 +93,7 @@ fn calendar_summary(
     let from_ts = local_to_utc_ts(from_date.and_hms_opt(0, 0, 0)?);
     let to_ts = local_to_utc_ts(to_date_exclusive.and_hms_opt(0, 0, 0)?);
     let events = state.db.list_calendar(from_ts, to_ts).unwrap_or_else(|err| {
-        eprintln!("[regular_talk] list_calendar failed: {err:#}");
+        crate::ulog!("[regular_talk] list_calendar failed: {err:#}");
         Vec::new()
     });
     let first = events.first()?;
@@ -113,7 +113,7 @@ fn calendar_summary(
 /// (= 直近に発火したもの優先) で先頭 1 件 + 総件数にする (§5.3)。
 fn pending_reminder_summary(state: &Arc<AppState>) -> Option<ReminderSummary> {
     let all = state.db.list_reminders(ReminderFilter::Active).unwrap_or_else(|err| {
-        eprintln!("[regular_talk] list_reminders failed: {err:#}");
+        crate::ulog!("[regular_talk] list_reminders failed: {err:#}");
         Vec::new()
     });
     let mut pending: Vec<_> = all.into_iter().filter(|r| r.pending).collect();
@@ -134,7 +134,7 @@ pub async fn build_morning_materials(state: &Arc<AppState>) -> MorningMaterials 
     let tomorrow = today + chrono::Duration::days(1);
     let calendar = calendar_summary(state, today, tomorrow);
     let todo_count = state.db.count_open_todos(Some("today")).unwrap_or_else(|err| {
-        eprintln!("[regular_talk] count_open_todos failed: {err:#}");
+        crate::ulog!("[regular_talk] count_open_todos failed: {err:#}");
         0
     });
     let reminder = pending_reminder_summary(state);
@@ -160,13 +160,13 @@ pub async fn build_evening_materials(state: &Arc<AppState>) -> EveningMaterials 
             .db
             .count_done_todos_since(local_to_utc_ts(midnight))
             .unwrap_or_else(|err| {
-                eprintln!("[regular_talk] count_done_todos_since failed: {err:#}");
+                crate::ulog!("[regular_talk] count_done_todos_since failed: {err:#}");
                 0
             }),
         None => 0,
     };
     let open_count = state.db.count_open_todos(Some("today")).unwrap_or_else(|err| {
-        eprintln!("[regular_talk] count_open_todos failed: {err:#}");
+        crate::ulog!("[regular_talk] count_open_todos failed: {err:#}");
         0
     });
     let calendar = calendar_summary(state, tomorrow, day_after);
@@ -289,7 +289,7 @@ pub async fn polish_script(state: &Arc<AppState>, script: &str) -> String {
     let api_key = match secrets::get_api_key_async(&settings.llm_provider).await {
         Ok(k) => k,
         Err(err) => {
-            eprintln!("[regular_talk] get_api_key failed: {err:#}");
+            crate::ulog!("[regular_talk] get_api_key failed: {err:#}");
             return script.to_string();
         }
     };
@@ -343,11 +343,11 @@ pub async fn polish_script(state: &Arc<AppState>, script: &str) -> String {
             }
         }
         Ok(Err(err)) => {
-            eprintln!("[regular_talk] advanced 整形 API エラー、low の script を使用: {err:#}");
+            crate::ulog!("[regular_talk] advanced 整形 API エラー、low の script を使用: {err:#}");
             script.to_string()
         }
         Err(_) => {
-            eprintln!("[regular_talk] advanced 整形がタイムアウト、low の script を使用");
+            crate::ulog!("[regular_talk] advanced 整形がタイムアウト、low の script を使用");
             script.to_string()
         }
     }
