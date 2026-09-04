@@ -1,31 +1,68 @@
-//! 口パク (architecture §A-4)。
-//! TTS 発話中は WAV の振幅に応じて開口フレームを切り替える。無音時 (TTS 無効) は
-//! 描画中だけ機械的に約 120ms 間隔でパクパクさせる。
+//! 口パク (spec §4.1.4)。
 //!
-//! 開口フレームは shell の `<pose>_talk.png` 形式 (M4 以降、talk_poses 機能を追加するなら)。
-//! M4a 段階の本実装は「シェルに talk フレームが無いケースをグレースフルに扱う」シンプル版。
+//! **TTS 有効時のみ、再生振幅 (AnalyserNode の RMS) でリアルタイム駆動する。**
+//! v0.0.3 のタイマー近似 (120ms 間隔の機械的パクパク) は spec §4.1.4 が明文で
+//! 廃止しており、本実装はその置き換え。
+//!
+//! 開口フレームは pose 画像の隣の `<pose>_talk.png` を Rust 側が自動検出して
+//! boot payload の `talk_poses` に載せる。無いシェルでは `setMouthOpen` が
+//! 何もしないため、自動的に「口パクなし」になる。
+//!
+//! 背景: v0.4.1 まで本モジュールの `startFlap` / `stopFlap` は**呼び出し元が
+//! ゼロ**で、既定シェルに `_talk.png` が 8 枚あるのに一度も使われていなかった。
 
+import { setMouthOpen } from "../stage/character";
 import type { SlotName } from "../types";
 
-const FLAP_INTERVAL_MS = 120;
-const flapTimers: Partial<Record<SlotName, number>> = {};
+/** この値を超える RMS を「口が開いている」とみなす。 */
+const OPEN_THRESHOLD = 0.02;
+/** 解析の粒度。小さすぎると口がバタつく。 */
+const FFT_SIZE = 512;
 
-/// 描画中の機械的口パク開始。終了時に stopFlap を必ず呼ぶこと。
-export function startFlap(slot: SlotName, setMouth: (open: boolean) => void): void {
-  stopFlap(slot, setMouth);
-  let open = false;
-  const id = window.setInterval(() => {
-    open = !open;
-    setMouth(open);
-  }, FLAP_INTERVAL_MS);
-  flapTimers[slot] = id;
+type Session = { raf: number; analyser: AnalyserNode; buf: Float32Array<ArrayBuffer> };
+
+const sessions: Partial<Record<SlotName, Session>> = {};
+
+/**
+ * 再生ノードに解析器を挿し込み、振幅で口を駆動する。
+ *
+ * 戻り値は「解析器を経由した接続先」。呼び出し側はこれを destination へ繋ぐ。
+ * 解析器は信号を素通しするので音は変わらない。
+ */
+export function attachMouth(
+  slot: SlotName,
+  ctx: AudioContext,
+  source: AudioNode,
+): AudioNode {
+  stopMouth(slot);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = FFT_SIZE;
+  source.connect(analyser);
+  // SharedArrayBuffer 由来にならないよう ArrayBuffer を明示する
+  // (getFloatTimeDomainData の型が Float32Array<ArrayBuffer> を要求する)。
+  const buf = new Float32Array(new ArrayBuffer(analyser.fftSize * 4));
+
+  const tick = (): void => {
+    const s = sessions[slot];
+    if (!s) return;
+    s.analyser.getFloatTimeDomainData(s.buf);
+    let sum = 0;
+    for (let i = 0; i < s.buf.length; i++) sum += s.buf[i] * s.buf[i];
+    const rms = Math.sqrt(sum / s.buf.length);
+    setMouthOpen(slot, rms > OPEN_THRESHOLD);
+    s.raf = window.requestAnimationFrame(tick);
+  };
+  sessions[slot] = { raf: window.requestAnimationFrame(tick), analyser, buf };
+  return analyser;
 }
 
-export function stopFlap(slot: SlotName, setMouth?: (open: boolean) => void): void {
-  const id = flapTimers[slot];
-  if (id !== undefined) {
-    clearInterval(id);
-    delete flapTimers[slot];
+/** 口パクを止め、口を閉じる。再生終了・中断のたびに必ず呼ぶ。 */
+export function stopMouth(slot: SlotName): void {
+  const s = sessions[slot];
+  if (s) {
+    window.cancelAnimationFrame(s.raf);
+    s.analyser.disconnect();
+    delete sessions[slot];
   }
-  setMouth?.(false);
+  setMouthOpen(slot, false);
 }

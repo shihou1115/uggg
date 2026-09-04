@@ -114,6 +114,12 @@ pub struct ShellCharacter {
     pub base_size: BaseSize,
     pub default_pose: String,
     pub poses: BTreeMap<String, String>,
+    /// 開口フレーム (spec §4.1.4)。pose 画像の隣に `<stem>_talk.<ext>` があれば
+    /// **自動で拾う**（`shell.json` に書かせない）。キーは pose 名。
+    ///
+    /// `poses` と分けているのは、`poses` のキーが advanced の LLM に提示される
+    /// pose 語彙そのものだから。ここに `normal_talk` を混ぜると LLM が選んでしまう。
+    pub talk_poses: BTreeMap<String, String>,
     pub poke_regions: PokeRegions,
 }
 
@@ -272,8 +278,17 @@ mod tests {
     }
 }
 
+/// `foo.png` -> `foo_talk.png`。実在する場合のみ Some (spec §4.1.4)。
+fn talk_frame_path(pose_abs: &Path) -> Option<std::path::PathBuf> {
+    let stem = pose_abs.file_stem()?.to_str()?;
+    let ext = pose_abs.extension()?.to_str()?;
+    let candidate = pose_abs.with_file_name(format!("{stem}_talk.{ext}"));
+    candidate.is_file().then_some(candidate)
+}
+
 pub fn build_shell_character(def: &ShellCharacterDef, shell_dir: &Path) -> Result<ShellCharacter> {
     let mut poses = BTreeMap::new();
+    let mut talk_poses = BTreeMap::new();
     for (name, rel) in &def.poses {
         let abs = shell_dir.join(rel);
         let bytes = std::fs::read(&abs)
@@ -293,11 +308,22 @@ pub fn build_shell_character(def: &ShellCharacterDef, shell_dir: &Path) -> Resul
         let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
         let data_url = format!("data:{mime};base64,{b64}");
         poses.insert(name.clone(), data_url);
+
+        // 開口フレーム: 同じディレクトリの `<stem>_talk.<ext>`。無ければ何もしない
+        // (spec §4.1.4「無いシェルは口パクなし」)。読めない場合も黙って諦める
+        // ため、talk フレームの不備で起動を壊さない。
+        if let Some(talk_abs) = talk_frame_path(&abs) {
+            if let Ok(talk_bytes) = std::fs::read(&talk_abs) {
+                let tb64 = base64::engine::general_purpose::STANDARD.encode(talk_bytes);
+                talk_poses.insert(name.clone(), format!("data:{mime};base64,{tb64}"));
+            }
+        }
     }
     Ok(ShellCharacter {
         base_size: def.base_size,
         default_pose: def.default_pose.clone(),
         poses,
+        talk_poses,
         poke_regions: def.poke_regions,
     })
 }
@@ -357,6 +383,60 @@ mod shipped_asset_contract {
     ///   `commands::settings::default_shell_of` が切替時にファイルから直接読むため、
     ///   構造体の充填検査（`keys_listed_as_read_are_actually_populated`）の対象外。
     const GHOST_IGNORED: &[&str] = &["author", "default_shell"];
+
+    /// 既定シェルの全 pose に開口フレームがあり、**自動検出できる**こと (spec §4.1.4)。
+    ///
+    /// v0.4.1 まで `_talk.png` は 8 枚あるのに boot payload に載らず、
+    /// `mouth.ts` の呼び出し元もゼロだった（口パクが一度も動いていなかった）。
+    #[test]
+    fn default_shell_talk_frames_are_detected() {
+        let shell_dir = repo_path("shells/default");
+        let raw = std::fs::read_to_string(shell_dir.join("shell.json")).unwrap();
+        let m: ShellManifest = serde_json::from_str(&raw).unwrap();
+        for (slot, def) in [
+            ("main", Some(&m.characters.main)),
+            ("sub", m.characters.sub.as_ref()),
+        ] {
+            let Some(def) = def else { continue };
+            let ch = build_shell_character(def, &shell_dir).unwrap();
+            assert_eq!(
+                ch.talk_poses.len(),
+                ch.poses.len(),
+                "{slot}: 開口フレームが揃っていない (poses={:?} talk={:?})",
+                ch.poses.keys().collect::<Vec<_>>(),
+                ch.talk_poses.keys().collect::<Vec<_>>()
+            );
+            for (name, url) in &ch.talk_poses {
+                assert!(url.starts_with("data:image/"), "{slot}.{name} が data URL でない");
+            }
+        }
+    }
+
+    /// 開口フレームが無いシェルでも壊れないこと（spec §4.1.4「無いシェルは口パクなし」）。
+    #[test]
+    fn missing_talk_frames_are_tolerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("normal.png");
+        // 1x1 の最小 PNG
+        std::fs::write(
+            &img,
+            [
+                0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D',
+                b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 0,
+                b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+            ],
+        )
+        .unwrap();
+        let def = ShellCharacterDef {
+            base_size: BaseSize { width: 1, height: 1 },
+            default_pose: "normal".into(),
+            poses: [("normal".to_string(), "normal.png".to_string())].into(),
+            poke_regions: Default::default(),
+        };
+        let ch = build_shell_character(&def, dir.path()).unwrap();
+        assert_eq!(ch.poses.len(), 1);
+        assert!(ch.talk_poses.is_empty(), "無いのに開口フレームが生えた");
+    }
 
     /// 既定ゴーストの JSON が持つキーが、**読む**か**意図的に無視する**かの
     /// どちらかに分類されていること。どちらでもないキーは

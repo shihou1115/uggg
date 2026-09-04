@@ -246,6 +246,13 @@ export interface ShellCharacter {
   base_size: BaseSize;
   default_pose: string;
   poses: Record<string, string>;
+  /**
+   * 開口フレーム (spec §4.1.4)。キーは pose 名。`<pose>_talk.png` が
+   * シェルにあるぶんだけ入る（無いシェルは空 = 口パクなし）。
+   * `poses` と分かれているのは、`poses` のキーが advanced の LLM に渡る
+   * pose 語彙そのものだから。
+   */
+  talk_poses: Record<string, string>;
   poke_regions: PokeRegions;
 }
 

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type { SlotName, TalkSpeed } from "../types";
+import { attachMouth, stopMouth } from "./mouth";
 
 /// TTS スピーカー: テキストを WAV (base64) として取得し、Web Audio で再生する。
 /// **全 slot 直列の単一キュー**: main/sub を問わず enqueue 順に 1 つずつ再生し、
@@ -110,7 +111,7 @@ async function pump(): Promise<void> {
       // 再生中に次アイテムの合成を進めておく (先読み 1)
       prefetched = dequeueAndSynth();
       if (wav !== null) {
-        await playBase64Wav(wav);
+        await playBase64Wav(wav, entry.item.slot);
       }
       entry.item.resolve();
     }
@@ -145,7 +146,9 @@ export async function previewWavBase64(b64: string): Promise<void> {
   }
 }
 
-async function playBase64Wav(b64: string): Promise<void> {
+/// 本発話の再生。**口パク (spec §4.1.4) はここだけ**。設定画面のプレビューは
+/// キャラが喋っているわけではないので駆動しない。
+async function playBase64Wav(b64: string, slot: SlotName): Promise<void> {
   try {
     const bytes = base64ToBytes(b64);
     const ctx = ensureAudioCtx();
@@ -158,10 +161,12 @@ async function playBase64Wav(b64: string): Promise<void> {
     source.playbackRate.value = ttsSpeed;
     const gain = ctx.createGain();
     gain.gain.value = ttsVolume;
-    source.connect(gain).connect(ctx.destination);
+    // 解析器を挟んで振幅で口を動かす。解析器は素通しなので音は変わらない。
+    attachMouth(slot, ctx, source).connect(gain).connect(ctx.destination);
     currentSource = source;
     await new Promise<void>((resolve) => {
       source.onended = () => {
+        stopMouth(slot);
         if (currentSource === source) {
           currentSource = null;
         }
@@ -179,6 +184,9 @@ function stopAll(): void {
   for (const item of queue) item.resolve();
   queue.length = 0;
   if (currentSource) {
+    // 中断でも必ず口を閉じる。stop() は onended を確実には発火しない。
+    stopMouth("main");
+    stopMouth("sub");
     try {
       currentSource.stop();
     } catch {
