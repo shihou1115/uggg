@@ -23,7 +23,8 @@
         "skipTaskbar": false,
         "resizable": false,
         "shadow": false,
-        "visible": true
+        "visible": true,
+      "additionalBrowserArgs": "--autoplay-policy=no-user-gesture-required"
       }
     ],
     "security": {

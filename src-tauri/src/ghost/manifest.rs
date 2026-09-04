@@ -352,9 +352,10 @@ mod shipped_asset_contract {
     ///
     /// - `author`: ファイルを人が読むときの表示用。UI にもプロンプトにも出さない
     ///   （出すなら spec に要件が要る）。
-    /// - `default_shell`: 読むと「ゴースト切替でシェルも変わる」挙動になり、
-    ///   現在の「シェルは `settings.shell_id` で独立」という仕様と衝突する。
-    ///   採否は spec の判断が要るため v0.5 では読まない。
+    /// - `default_shell` は v0.5.1 で**読むようになった**（ゴースト切替でシェルが追従。
+    ///   spec §4.5.6）。ただし `GhostManifest` のフィールドではなく
+    ///   `commands::settings::default_shell_of` が切替時にファイルから直接読むため、
+    ///   構造体の充填検査（`keys_listed_as_read_are_actually_populated`）の対象外。
     const GHOST_IGNORED: &[&str] = &["author", "default_shell"];
 
     /// 既定ゴーストの JSON が持つキーが、**読む**か**意図的に無視する**かの

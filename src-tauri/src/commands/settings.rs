@@ -48,6 +48,28 @@ pub fn set_settings(
         }
     }
 
+    // v0.5.1: ゴーストを切り替えたら、そのゴーストが `ghost.json` で宣言している
+    // `default_shell` へシェルも追従させる (spec §4.5.6)。
+    //
+    // v0.4.1 まで `default_shell` は出荷されているのに `GhostManifest` が宣言して
+    // おらず、serde が黙って捨てていた。DnD で入れたゴーストが自前シェルを
+    // 連れてこず、ユーザーが手でシェルも選び直す必要があった。
+    //
+    // **ユーザーが同じ操作でシェルも明示的に変えた場合は、そちらを優先する**
+    // (設定画面はゴーストとシェルを同時に保存するため、両方変えたときに
+    // ゴースト側の宣言で上書きすると手動選択が握り潰される)。
+    if next.ghost_id != prev.ghost_id && next.shell_id == prev.shell_id {
+        if let Some(shell) = default_shell_of(&app, &next.ghost_id) {
+            if shell != next.shell_id {
+                crate::ulog!(
+                    "[settings] ゴースト {} の default_shell に追従: {} -> {}",
+                    next.ghost_id, next.shell_id, shell
+                );
+                next.shell_id = shell;
+            }
+        }
+    }
+
     // 永続化 (app_settings."settings" に JSON で保存)
     let json = serde_json::to_string(&next)
         .map_err(|e| format!("Settings の JSON シリアライズ失敗: {e}"))?;
@@ -184,5 +206,53 @@ mod cost_status_tests {
         ] {
             assert!(!base_url_is_local(Some(u)), "{u}");
         }
+    }
+}
+
+/// 指定ゴーストの `ghost.json` が宣言する `default_shell`。
+///
+/// 起動中のゴーストとは限らない（切替先を先読みする）ため、`state.ghost` の
+/// ロード済み bundle ではなくファイルを直接読む。読めない・宣言が無い・
+/// 実体のシェルが無い場合は None（追従しない）。
+fn default_shell_of(app: &AppHandle, ghost_id: &str) -> Option<String> {
+    let assets = crate::state::resolve_assets_dir(app).ok()?;
+    let raw = std::fs::read_to_string(assets.join("ghosts").join(ghost_id).join("ghost.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let shell = v.get("default_shell")?.as_str()?.trim().to_string();
+    if shell.is_empty() {
+        return None;
+    }
+    // 実体が無いシェルへ切り替えると起動できなくなるので、存在確認してから採用する。
+    assets
+        .join("shells")
+        .join(&shell)
+        .join("shell.json")
+        .is_file()
+        .then_some(shell)
+}
+
+#[cfg(test)]
+mod default_shell_tests {
+    /// 出荷している既定ゴーストが `default_shell` を宣言していること。
+    ///
+    /// v0.5.1 でこの値を読むようになった（ゴースト切替でシェルが追従、spec §4.5.6）。
+    /// v0.4.1 までは出荷されているのに `GhostManifest` が宣言しておらず、serde が
+    /// 黙って捨てていた。
+    #[test]
+    fn default_ghost_declares_default_shell_that_exists() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri の親")
+            .to_path_buf();
+        let raw = std::fs::read_to_string(root.join("ghosts/default/ghost.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let shell = v
+            .get("default_shell")
+            .and_then(|x| x.as_str())
+            .expect("既定ゴーストに default_shell が無い");
+        assert!(
+            root.join("shells").join(shell).join("shell.json").is_file(),
+            "default_shell '{shell}' の実体が無い（追従先が存在しないと切替で壊れる）"
+        );
     }
 }

@@ -273,9 +273,15 @@ function sleepCancellable(ms: number, token: ReadToken): Promise<void> {
   });
 }
 
+/** speaker.ts の同名関数と同じ理由で resume を試みる (spec §4.5.1)。 */
 function ensureAudioCtx(): AudioContext {
   if (!audioCtx) {
     audioCtx = new AudioContext();
+  }
+  if (audioCtx.state === "suspended") {
+    void audioCtx.resume().catch((err) => {
+      console.warn("[reader] AudioContext.resume 失敗 (無音になる可能性):", err);
+    });
   }
   return audioCtx;
 }

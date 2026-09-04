@@ -188,9 +188,25 @@ function stopAll(): void {
   }
 }
 
+/**
+ * AudioContext を取り出し、**suspended なら resume を試みる**（spec §4.5.1 の
+ * 「ウォッチドッグ」）。
+ *
+ * WebView2 の自動再生ポリシーにより、ユーザー操作を伴わない発話（起動挨拶・
+ * ランダムトーク・リマインダー）では AudioContext が `suspended` のまま作られる
+ * ことがある。その状態でも `start()` は例外を投げず Promise も解決するため、
+ * **正常に喋ったように見えて音だけ出ない**。`--autoplay-policy` を渡していても
+ * 起動タイミングによっては suspended になりうるので、再生のたびに確認する。
+ */
 function ensureAudioCtx(): AudioContext {
-  if (audioCtx) return audioCtx;
-  audioCtx = new AudioContext();
+  if (!audioCtx) audioCtx = new AudioContext();
+  if (audioCtx.state === "suspended") {
+    // resume は Promise だが待たない: 失敗しても再生自体は試みる
+    // (待つと発話が数百 ms 遅れ、しかも失敗時に無音なのは変わらない)。
+    void audioCtx.resume().catch((err) => {
+      console.warn("[tts] AudioContext.resume 失敗 (無音になる可能性):", err);
+    });
+  }
   return audioCtx;
 }
 
