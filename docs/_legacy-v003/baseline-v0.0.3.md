@@ -2,8 +2,8 @@
 
 > 「伺か」コンセプトを Tauri v2 (Rust + TypeScript) で再構築したデスクトップマスコット。
 > **v0.0.3 をプロトタイピング完成版**とし、以降の本開発の出発点とする。
-> 本書は実装済みの現状を網羅するスナップショットであり、設計の正本は [spec.md](spec.md) /
-> モジュール契約の正本は [architecture.md](architecture.md) に置く。本書はそれらへの索引と
+> 本書は実装済みの現状を網羅するスナップショットであり、設計の正本は [spec.md](../spec.md) /
+> モジュール契約の正本は [architecture.md](../architecture.md) に置く。本書はそれらへの索引と
 > v0.0.3 で確定した内容・残課題のサマリを兼ねる。
 
 ---
@@ -157,7 +157,7 @@ v0.0.3 の architecture.md / context_index.md を参照（**2026-07-24 の docs 
 ## 4. データ・契約（v0.0.3 確定スナップショット）
 
 ### 4.1 Settings（永続化フィールド）
-詳細は [architecture.md §共有型](architecture.md#共有型-rust-serde--ts-srctypests--名前形を一致させる) を参照。v0.0.3 で追加されたフィールド:
+詳細は [architecture.md §共有型](../architecture.md#共有型-rust-serde--ts-srctypests--名前形を一致させる) を参照。v0.0.3 で追加されたフィールド:
 
 - `tts_engine: "voicevox_core" | "voicevox_http" | "openai_compat"`（既定 `voicevox_core`）
 - `tts_oai_base_url / tts_oai_model / tts_oai_caption_main / tts_oai_caption_sub`（openai_compat 用）
@@ -166,7 +166,7 @@ v0.0.3 の architecture.md / context_index.md を参照（**2026-07-24 の docs 
 schema_version=1 据え置き。
 
 ### 4.2 Tauri コマンド一覧（v0.0.3 時点 — 全 35）
-網羅は [architecture.md §Tauri コマンド契約](architecture.md#tauri-コマンド契約フロント--バック) を参照。
+網羅は [architecture.md §Tauri コマンド契約](../architecture.md#tauri-コマンド契約フロント--バック) を参照。
 v0.0.3 で追加・変更されたもの:
 
 | カテゴリ | コマンド | 変更点 |
@@ -191,7 +191,7 @@ v0.0.3 で追加・変更されたもの:
 | `voicevox-download` | `string` | v0.0.3 追加。資産DLの進捗行 |
 
 ### 4.4 辞書 schema v2
-構造は [architecture.md §events](architecture.md#つつきの部位判定-フロントが押した位置キャラ要素矩形に対する相対-xy-で縦-vheadchestbody横-hleftcenterright) と
+構造は [architecture.md §events](../architecture.md#つつきの部位判定-フロントが押した位置キャラ要素矩形に対する相対-xy-で縦-vheadchestbody横-hleftcenterright) と
 [ghosts/default/dic/main.yaml](../ghosts/default/dic/main.yaml) を実例として参照。
 
 ### 4.5 ファイル配置（実行時）
