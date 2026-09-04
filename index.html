@@ -214,6 +214,11 @@
               <span>月次上限 (USD, 0=無制限)</span>
               <input type="number" id="settings-cost-limit" min="0" step="0.1" />
             </label>
+            <!-- 当月の利用状況。manual.md が以前から案内していた表示先 (spec §4.2.7)。 -->
+            <div class="row">
+              <span>今月の利用</span>
+              <div class="hint" id="settings-cost-status">—</div>
+            </div>
             <div class="row">
               <span>API キー</span>
               <div class="key-cell">

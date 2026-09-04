@@ -177,6 +177,7 @@ fn main() {
             commands::secrets::delete_api_key,
             commands::settings::get_settings,
             commands::settings::set_settings,
+            commands::settings::get_cost_status,
             commands::tts::voicevox_assets_ready,
             commands::tts::download_voicevox_assets,
             commands::tts::list_voices,

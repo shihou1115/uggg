@@ -1332,6 +1332,7 @@ function applySettingsToForm(s: Settings): void {
   inputs.model.value = s.llm_model;
   inputs.baseUrl.value = s.llm_base_url ?? "";
   inputs.costLimit.value = String(s.monthly_limit_usd);
+  void renderCostStatus();
   inputs.displayScale.value = String(s.display_scale);
   inputs.talkSpeed.value = s.talk_speed;
   inputs.quietMode.checked = s.quiet_mode;
@@ -1576,4 +1577,54 @@ function formatErr(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+/** spec §4.2.7 の当月コスト状況。Rust 側 `get_cost_status` の戻り値。 */
+type CostStatusView = {
+  current_usd: number;
+  limit_usd: number;
+  unlimited: boolean;
+  ratio: number;
+  reached_80: boolean;
+  exceeded: boolean;
+  pricing_known: boolean;
+  pricing_unknown_remote: boolean;
+};
+
+/**
+ * 当月の利用額を設定画面に出す。
+ *
+ * manual.md は以前から「設定 → AI・拡張ページで上限と現在の状況を確認して
+ * ください」と案内していたが、**表示先が存在しなかった**。
+ */
+async function renderCostStatus(): Promise<void> {
+  const el = document.getElementById("settings-cost-status");
+  if (!el) return;
+  let st: CostStatusView;
+  try {
+    st = await invoke<CostStatusView>("get_cost_status");
+  } catch (err) {
+    el.textContent = `利用状況を取得できませんでした (${String(err)})`;
+    return;
+  }
+  const used = `$${st.current_usd.toFixed(2)}`;
+  const lines: string[] = [];
+  if (st.unlimited) {
+    lines.push(`${used}（上限なし）`);
+  } else {
+    lines.push(`${used} / $${st.limit_usd.toFixed(2)}（${Math.round(st.ratio * 100)}%）`);
+    if (st.exceeded) {
+      lines.push("上限に達したため、今月は辞書モードで応答します（来月リセット）。");
+    } else if (st.reached_80) {
+      lines.push("上限の 8 割を超えました。");
+    }
+  }
+  // 未掲載モデルはコスト 0 で記録されるため上限が発動しない。
+  // ローカル LLM なら 0 が正しいので、リモートのときだけ警告する。
+  if (st.pricing_unknown_remote) {
+    lines.push(
+      "⚠ このモデルは料金表に無いため利用額を計算できません。上限は機能しません。",
+    );
+  }
+  el.textContent = lines.join(" ");
 }

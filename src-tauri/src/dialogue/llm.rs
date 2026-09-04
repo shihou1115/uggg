@@ -137,6 +137,16 @@ pub fn estimate_cost_usd(model: &str, prompt_tokens: u64, completion_tokens: u64
         + (completion_tokens as f64 / 1_000_000.0) * output_per_m
 }
 
+/// モデルが料金表に載っているか。
+///
+/// 載っていないモデルはコスト 0 として記録されるため、**月額上限が構造的に
+/// 発動しない**。ローカル LLM なら 0 が正しいが、リモートの未掲載モデル
+/// (OpenAI 互換プロキシ経由の Claude / Gemini 等) では課金が青天井になる。
+/// 呼び出し側が `llm_base_url` と組み合わせて警告を出すために公開する。
+pub fn is_priced(model: &str) -> bool {
+    pricing_for(model) != (0.0, 0.0)
+}
+
 fn pricing_for(model: &str) -> (f64, f64) {
     // 2026 初頭の公式価格を概算で反映。誤差は ±20% を想定し UI でも実費ではなく目安と注釈する。
     let m = model.to_ascii_lowercase();
