@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::dialogue::{self, banter, DialogueResponse};
 use crate::ghost::dict::{DialogueLine, SpeechTurn, WhenContext};
@@ -73,6 +73,13 @@ pub async fn deliver_event(
 
     // ガバナンス判定はここで 1 回だけ (純粋判定・副作用なし)。
     if !governance::can_deliver(state, category, priority) {
+        return DeliveryOutcome::Deferred;
+    }
+
+    // 可視性は **到達判定** であってガバナンスではないので、can_deliver には
+    // 段を足さずここで見る (二重ゲート禁止の維持)。隠している間の発話は
+    // 誰にも届かないため、喋ったことにしない。
+    if !window_is_visible(app) {
         return DeliveryOutcome::Deferred;
     }
 
@@ -206,6 +213,24 @@ fn pop_advanced_monologue(state: &Arc<AppState>) -> Option<DialogueLine> {
     })
 }
 
+/// メインウインドウがユーザーに見えているか。
+///
+/// **なぜ必要か**: spec §4.6.1 は「発話不能時のフォールバックとして Windows トースト」
+/// と書いているが、実装のトーストは OS 通知ではなく**アプリ内の 6 秒帯**
+/// (`src/system/toast.ts` が `#system-toast` に出す) で、OS 通知プラグインは無い。
+/// `app.emit` はウインドウが hide されていても `Ok` を返すため、トレイに隠している
+/// 間に期限が来た単発リマインダーが **画面に何も出ないまま完了扱いで消えていた**。
+///
+/// 見えていないなら未達 (`Deferred`) とし、呼び出し側の再試行に委ねる。
+fn window_is_visible(app: &AppHandle) -> bool {
+    match app.get_webview_window("main") {
+        // 取得できない/判定できないときは「見えている」に倒す。
+        // ここで false に倒すと、判定不能なだけで通知が永久に滞留する。
+        Some(w) => w.is_visible().unwrap_or(true),
+        None => true,
+    }
+}
+
 fn toast_fallback(app: &AppHandle, fallback: Option<String>) -> DeliveryOutcome {
     match fallback {
         Some(text) => {
@@ -263,6 +288,31 @@ fn apply_placeholders(text: &str, placeholders: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **未達は「届いた」に数えない。**
+    ///
+    /// `tasks.rs` は `outcome.reached()` が真のときだけ `advance_after_delivery` を
+    /// 呼ぶ (= 単発リマインダーを完了扱いにする)。ここが崩れると、ウインドウを
+    /// 隠している間に期限が来たリマインダーが画面に何も出ないまま消える。
+    #[test]
+    fn deferred_and_failed_are_not_reached() {
+        assert!(!DeliveryOutcome::Deferred.reached(), "保留を到達扱いにしてはいけない");
+        assert!(!DeliveryOutcome::Failed.reached());
+        assert!(DeliveryOutcome::Ghost.reached());
+        // Toast はアプリ内の帯なので、可視性ゲートを通った後だけ到達になる
+        // (ゲートは deliver_event 側にあり、この列挙の意味は「表示までは行った」)。
+        assert!(DeliveryOutcome::Toast.reached());
+    }
+
+    /// `reminder_log.delivery` に入る表記の固定。保留が他の値に化けると
+    /// 「届かなかった」の追跡ができなくなる。
+    #[test]
+    fn outcome_strings_are_stable() {
+        assert_eq!(DeliveryOutcome::Ghost.as_str(), "ghost");
+        assert_eq!(DeliveryOutcome::Toast.as_str(), "toast");
+        assert_eq!(DeliveryOutcome::Deferred.as_str(), "deferred");
+        assert_eq!(DeliveryOutcome::Failed.as_str(), "failed");
+    }
 
     #[test]
     fn placeholders_replace_known_keys() {

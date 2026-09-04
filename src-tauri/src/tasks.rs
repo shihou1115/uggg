@@ -162,12 +162,7 @@ pub fn spawn_reminder_watcher(app: AppHandle, state: Arc<AppState>) {
                     continue;
                 }
             };
-            for r in due {
-                let outcome = fire_reminder(&app, &state, &r).await;
-                if outcome.reached() {
-                    advance_after_delivery(&app, &state, &r, now, outcome);
-                }
-            }
+            deliver_due_reminders(&app, &state, &due, now).await;
         }
     });
 }
@@ -258,6 +253,22 @@ async fn recover_overdue_on_boot(app: &AppHandle, state: &Arc<AppState>) {
             return;
         }
     };
+    deliver_due_reminders(app, state, &due, now).await;
+}
+
+/// 期限切れリマインダーを配達する。1 件ならそのまま、2 件以上は
+/// 「『X』ほか N-1 件」に集約して 1 発話にまとめる。
+///
+/// 起動時の取りこぼし回収と通常の監視ループの**両方**がここを通る。
+/// 可視性ゲート (deliver.rs) の導入でウインドウを隠している間は未達として
+/// 保留されるようになったため、**再表示時に保留分がまとめて溜まる**。
+/// 個別に連打すると鬱陶しいので、起動時回収と同じ集約に合流させる。
+async fn deliver_due_reminders(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    due: &[ReminderRow],
+    now: i64,
+) {
     if due.is_empty() {
         return;
     }
@@ -284,11 +295,11 @@ async fn recover_overdue_on_boot(app: &AppHandle, state: &Arc<AppState>) {
     )
     .await;
     if outcome.reached() {
-        for r in &due {
+        for r in due {
             advance_after_delivery(app, state, r, now, outcome);
         }
     }
-    // 未達なら何もしない: active のまま残り、通常ループが個別に再試行する
+    // 未達なら何もしない: active のまま残り、次の tick で再試行する
 }
 
 /// M9 (spec §4.6.3): context watcher。OS 状況検知 → 状況発話 4 カテゴリ。
