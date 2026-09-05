@@ -1850,6 +1850,59 @@ mod integrity_tests {
         assert_eq!(std::fs::read(&old_backup).unwrap(), b"older-generation");
     }
 
+    /// **破損 DB でも起動を止めない (spec §4.5.5)。**
+    /// `Db::open` は成功し整合性は false を返す一方、**`migrate()` は失敗する**。
+    /// `AppState::initialize` はこの組み合わせを見て続行を選ぶので、条件そのものを固定する
+    /// (v0.5.1 はここで `migrate()?` がそのまま伝播し、setup フックが panic して
+    /// 起動できなかった。検知は非致命なのに次の行がアプリを殺していた)。
+    #[test]
+    fn corrupt_db_opens_but_migrate_fails_which_startup_must_tolerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        make_corrupt_db(&path);
+
+        let db = Db::open(&path).expect("破損していても open は成功すること");
+        assert!(!db.integrity().ok, "破損を検知できていない");
+        assert!(
+            db.migrate().is_err(),
+            "この前提が崩れたら state.rs の続行判定を見直すこと"
+        );
+    }
+
+    /// **救出に失敗したら残骸を残さない。**
+    /// `VACUUM INTO` は失敗しても 0 バイトのファイルを残すことがあり、放置すると
+    /// 次回起動で `find_preserved` が「救出済み」と誤認して二度と再試行しない。
+    #[test]
+    fn failed_salvage_leaves_no_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        make_badly_corrupt_db(&path);
+
+        let h = Db::open(&path).unwrap().integrity().clone();
+        assert!(!h.ok);
+        assert!(
+            h.salvaged_path.is_none(),
+            "この破損度では救出は失敗する想定 (成功したなら破損を強めること)"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".salvaged-"))
+            .collect();
+        assert!(leftovers.is_empty(), "失敗した救出コピーが残っている: {leftovers:?}");
+    }
+
+    /// `VACUUM INTO` が通らない程度まで潰す。
+    fn make_badly_corrupt_db(path: &std::path::Path) {
+        make_corrupt_db(path);
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.seek(SeekFrom::Start(4096)).unwrap();
+        f.write_all(&[0xA5u8; 4096 * 10]).unwrap();
+        f.flush().unwrap();
+    }
+
     /// **退避は WAL サイドカーも運ぶ。** 実機では -wal が本体より大きいことがあり、
     /// 本体だけコピーすると直近のコミット済みデータが退避から丸ごと抜ける。
     #[test]
@@ -2387,6 +2440,15 @@ fn check_integrity_and_preserve(conn: &Connection, path: &Path) -> DbIntegrity {
                 }
                 Err(err) => {
                     crate::ulog!("[db] 救出コピーの作成に失敗 (読み出せない範囲がある): {err}");
+                    // **失敗した残骸を消す。** `VACUUM INTO` は失敗しても 0 バイトの
+                    // ファイルを残すことがあり、放置すると次回起動で `find_preserved`
+                    // がそれを拾って「救出済み」と誤認し、二度と再試行しなくなる
+                    // (「保全は 1 回だけ」のガードが、失敗を成功として固定してしまう)。
+                    if let Err(e) = std::fs::remove_file(&salvaged) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            crate::ulog!("[db] 失敗した救出コピーの削除に失敗: {e}");
+                        }
+                    }
                     None
                 }
             }

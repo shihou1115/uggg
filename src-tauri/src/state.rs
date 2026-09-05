@@ -734,7 +734,20 @@ impl AppState {
         // ログの出力先を最初に確定させる (以降の ulog! がファイルにも残る)。
         crate::system::log::init(&data_dir);
         let db = Db::open(&data_dir.join("companion.db"))?;
-        db.migrate()?;
+        // spec §4.5.5:「破損しても DB は作り直さない。起動も止めない
+        // (起動できないより、壊れたまま動くほうがデータを取り出せる)」。
+        //
+        // `Db::open` の整合性検査は非致命に作ってあるのに、**その直後の
+        // `migrate()?` がアプリを殺していた** (v0.5.1 の実機確認で発覚。破損 DB では
+        // `db_schema_version` の書き込みが失敗し、setup フックが panic して起動しない)。
+        // 健全な DB でのマイグレーション失敗は従来どおり致命のまま
+        // (見逃すと以後の全機能が壊れる)、破損が検知されている場合だけ続行する。
+        if let Err(err) = db.migrate() {
+            if db.integrity().ok {
+                return Err(err);
+            }
+            crate::ulog!("[db] 破損 DB のためマイグレーションを中断して続行します: {err:#}");
+        }
 
         // 永続化された Settings を優先。無ければデフォルトを使う。
         let settings = crate::commands::settings::load_persisted_settings(&db, Settings::default());
