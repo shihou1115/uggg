@@ -1754,6 +1754,122 @@ mod integrity_tests {
             "再オープンで既存データが失われた"
         );
     }
+
+    /// 破損した DB を作る。ヘッダ (1 ページ目) は壊さず、データが載っている
+    /// 後続ページを潰す。こうしないと `Connection::open` 自体が失敗して
+    /// 「破損したまま起動を続ける」という検証対象の経路に入れない。
+    fn make_corrupt_db(path: &std::path::Path) {
+        {
+            let db = Db::open(path).unwrap();
+            db.migrate().unwrap();
+            // 複数ページに跨る量を書く（1 ページ目だけだと潰す先が無い）。
+            for i in 0..400 {
+                db.set_setting(&format!("k{i}"), &"v".repeat(200)).unwrap();
+            }
+        }
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let len = f.metadata().unwrap().len();
+        assert!(len > 4096 * 4, "テスト用 DB が小さすぎる: {len}");
+        f.seek(SeekFrom::Start(4096 * 2)).unwrap();
+        f.write_all(&[0xA5u8; 4096 * 2]).unwrap();
+        f.flush().unwrap();
+    }
+
+    /// **破損を検知しても DB は作り直さない。** テスト名が主張している内容を
+    /// 実際に破損経路で確かめる（v0.5.1 のリリース前監査で、破損を一度も
+    /// 作らないまま「作り直さない」を名乗っていたのを是正）。
+    #[test]
+    fn corrupt_db_is_detected_preserved_and_never_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        make_corrupt_db(&path);
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        let db = Db::open(&path).unwrap();
+        let h = db.integrity().clone();
+        assert!(!h.ok, "破損を検知できていない: {}", h.detail);
+        assert_ne!(h.detail, "ok");
+        let backup = h.backup_path.clone().expect("原本の退避が作られていない");
+        assert!(std::path::Path::new(&backup).is_file());
+
+        // 原本は消されても作り直されてもいない。
+        assert!(path.is_file(), "原本が消えた");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            before,
+            "原本が作り直された（サイズが変わった）"
+        );
+    }
+
+    /// **保全は破損 1 件につき 1 回だけ。** 実ユーザーの DB は既に破損しており、
+    /// 毎起動コピーすると起動のたびにディスクを食い潰す。
+    #[test]
+    fn corrupt_db_is_preserved_only_once_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        make_corrupt_db(&path);
+
+        let count = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.contains(".corrupt-") || n.contains(".salvaged-")
+                })
+                .count()
+        };
+
+        // **既存の退避を先に置く。** 同一プロセス内で連続オープンしても
+        // タイムスタンプが秒単位で同じになり、guard が無くても同じファイル名を
+        // 上書きするだけで件数が増えない = 素通りする（実際に変異テストで
+        // 素通りした）。日をまたいだ再起動を再現するため、古い世代を先に置く。
+        let old_backup = dir.path().join("companion.corrupt-20200101-000000.db");
+        let old_salvaged = dir.path().join("companion.salvaged-20200101-000000.db");
+        std::fs::write(&old_backup, b"older-generation").unwrap();
+        std::fs::write(&old_salvaged, b"older-generation").unwrap();
+        assert_eq!(count(), 2);
+
+        for _ in 0..3 {
+            let h = Db::open(&path).unwrap().integrity().clone();
+            assert!(!h.ok, "破損を検知できていない");
+            assert_eq!(
+                h.backup_path.as_deref(),
+                Some(old_backup.to_string_lossy().as_ref()),
+                "既存の退避があるのに新しく作っている"
+            );
+            assert_eq!(
+                h.salvaged_path.as_deref(),
+                Some(old_salvaged.to_string_lossy().as_ref()),
+                "既存の救出コピーがあるのに作り直している"
+            );
+            assert_eq!(count(), 2, "再起動のたびに退避が増えている");
+        }
+        // 先に作られた世代のほうが原本に近いので、上書きもしない。
+        assert_eq!(std::fs::read(&old_backup).unwrap(), b"older-generation");
+    }
+
+    /// **退避は WAL サイドカーも運ぶ。** 実機では -wal が本体より大きいことがあり、
+    /// 本体だけコピーすると直近のコミット済みデータが退避から丸ごと抜ける。
+    #[test]
+    fn corrupt_db_backup_includes_wal_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        make_corrupt_db(&path);
+        // クリーンに閉じた後なので -wal は残っていない。中身の分かる印を置く。
+        let wal = dir.path().join("companion.db-wal");
+        std::fs::write(&wal, b"sentinel-wal").unwrap();
+
+        let h = Db::open(&path).unwrap().integrity().clone();
+        let backup = h.backup_path.expect("原本の退避が作られていない");
+        let backup_wal = format!("{backup}-wal");
+        assert!(
+            std::path::Path::new(&backup_wal).is_file(),
+            "WAL が退避されていない: {backup_wal}"
+        );
+        assert_eq!(std::fs::read(&backup_wal).unwrap(), b"sentinel-wal");
+    }
 }
 
 #[cfg(test)]
@@ -2203,11 +2319,16 @@ mod tests {
 /// **DB は作り直さない。** 破損を理由に消すと、リマインダー・ToDo・記憶・設定が
 /// 一緒に消える。ここでやるのは次の 3 つだけ:
 /// 1. `PRAGMA quick_check` で破損を検知して記録する（以前は誰も気づけなかった）
-/// 2. 原本をタイムスタンプ付きでコピーする（以後の操作で悪化しても戻せる）
+/// 2. 原本を **WAL/SHM ごと** タイムスタンプ付きでコピーする（以後の操作で悪化しても戻せる）
 /// 3. `VACUUM INTO` で読み出せた分だけの健全なコピーを作る（救出。失敗しても続行）
 ///
 /// どう復旧するかはユーザーが決める。アプリは通常どおり起動を続ける
 /// （起動できないより、壊れたまま動くほうがデータを取り出せる）。
+///
+/// **保全は破損 1 件につき 1 回だけ。** 既に退避がある場合は作り直さず、その
+/// パスを返す。毎起動コピーすると、破損した DB を抱えたまま使い続けるユーザー
+/// （＝まさにこの機能が対象にしている人）のディスクを起動のたびに食い潰す。
+/// 先に作られたコピーのほうが原本に近いので、古いものを残すのが正しい。
 fn check_integrity_and_preserve(conn: &Connection, path: &Path) -> DbIntegrity {
     let detail = match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
         Ok(v) => v,
@@ -2225,31 +2346,50 @@ fn check_integrity_and_preserve(conn: &Connection, path: &Path) -> DbIntegrity {
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
 
     // 1) 原本のコピー。壊れていても「今の状態」を保全する。
-    let backup = path.with_extension(format!("corrupt-{stamp}.db"));
-    let backup_path = match std::fs::copy(path, &backup) {
-        Ok(_) => {
-            crate::ulog!("[db] 原本を退避しました: {}", backup.display());
-            Some(backup.to_string_lossy().into_owned())
+    let backup_path = match find_preserved(path, "corrupt-") {
+        Some(existing) => {
+            crate::ulog!("[db] 退避済みのため作り直しません: {}", existing.display());
+            Some(existing.to_string_lossy().into_owned())
         }
-        Err(err) => {
-            crate::ulog!("[db] 原本の退避に失敗: {err}");
-            None
+        None => {
+            let backup = path.with_extension(format!("corrupt-{stamp}.db"));
+            match std::fs::copy(path, &backup) {
+                Ok(_) => {
+                    // **WAL / SHM も一緒に運ぶ。** これが無いと、まだ本体へ
+                    // チェックポイントされていない書き込みが退避から丸ごと抜ける
+                    // (実測で -wal が本体の数倍あることがある)。命名を
+                    // `<backup>-wal` に揃えてあるので、退避 DB をそのまま開ける。
+                    copy_sidecars(path, &backup);
+                    crate::ulog!("[db] 原本を退避しました: {}", backup.display());
+                    Some(backup.to_string_lossy().into_owned())
+                }
+                Err(err) => {
+                    crate::ulog!("[db] 原本の退避に失敗: {err}");
+                    None
+                }
+            }
         }
     };
 
     // 2) 読み出せた分だけの健全なコピー。VACUUM INTO は元 DB を書き換えない。
-    let salvaged = path.with_extension(format!("salvaged-{stamp}.db"));
-    let salvaged_path = match conn.execute(
-        "VACUUM INTO ?1",
-        [salvaged.to_string_lossy().as_ref()],
-    ) {
-        Ok(_) => {
-            crate::ulog!("[db] 救出コピーを作成しました: {}", salvaged.display());
-            Some(salvaged.to_string_lossy().into_owned())
+    //    開いている接続を通すので WAL の内容も反映される。
+    let salvaged_path = match find_preserved(path, "salvaged-") {
+        Some(existing) => {
+            crate::ulog!("[db] 救出済みのため作り直しません: {}", existing.display());
+            Some(existing.to_string_lossy().into_owned())
         }
-        Err(err) => {
-            crate::ulog!("[db] 救出コピーの作成に失敗 (読み出せない範囲がある): {err}");
-            None
+        None => {
+            let salvaged = path.with_extension(format!("salvaged-{stamp}.db"));
+            match conn.execute("VACUUM INTO ?1", [salvaged.to_string_lossy().as_ref()]) {
+                Ok(_) => {
+                    crate::ulog!("[db] 救出コピーを作成しました: {}", salvaged.display());
+                    Some(salvaged.to_string_lossy().into_owned())
+                }
+                Err(err) => {
+                    crate::ulog!("[db] 救出コピーの作成に失敗 (読み出せない範囲がある): {err}");
+                    None
+                }
+            }
         }
     };
 
@@ -2259,4 +2399,46 @@ fn check_integrity_and_preserve(conn: &Connection, path: &Path) -> DbIntegrity {
         backup_path,
         salvaged_path,
     }
+}
+
+/// 既に作られている退避/救出コピー (`<stem>.<prefix><stamp>.db`) を探す。
+/// 複数あればファイル名順で最も古いもの＝最初に作られたものを返す
+/// (原本に最も近い世代を正とする)。
+fn find_preserved(path: &Path, prefix: &str) -> Option<std::path::PathBuf> {
+    let dir = path.parent()?;
+    let stem = path.file_stem()?.to_str()?;
+    let head = format!("{stem}.{prefix}");
+    let mut hits: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&head) && n.ends_with(".db"))
+        })
+        .collect();
+    hits.sort();
+    hits.into_iter().next()
+}
+
+/// SQLite のサイドカー (`-wal` / `-shm`) を退避先へ同じ規則でコピーする。
+/// 無ければ何もしない。失敗しても本体の退避は成立しているので続行する。
+fn copy_sidecars(src_db: &Path, dst_db: &Path) {
+    for suffix in ["-wal", "-shm"] {
+        let src = sidecar(src_db, suffix);
+        if !src.is_file() {
+            continue;
+        }
+        let dst = sidecar(dst_db, suffix);
+        if let Err(err) = std::fs::copy(&src, &dst) {
+            crate::ulog!("[db] {suffix} の退避に失敗 (本体は退避済み): {err}");
+        }
+    }
+}
+
+fn sidecar(db: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = db.as_os_str().to_os_string();
+    s.push(suffix);
+    std::path::PathBuf::from(s)
 }

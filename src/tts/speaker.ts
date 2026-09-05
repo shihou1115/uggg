@@ -162,7 +162,16 @@ async function playBase64Wav(b64: string, slot: SlotName): Promise<void> {
     const gain = ctx.createGain();
     gain.gain.value = ttsVolume;
     // 解析器を挟んで振幅で口を動かす。解析器は素通しなので音は変わらない。
-    attachMouth(slot, ctx, source).connect(gain).connect(ctx.destination);
+    //
+    // 解析器は **gain の前** に置く。後ろに置くと音量を下げただけで RMS が
+    // しきい値を下回り、聞こえているのに口が動かなくなる。
+    // ただし音量 0 は「消音」なので、そのときは口も動かさない
+    // (無音なのに喋って見える。設定の音量スライダは min="0")。
+    if (ttsVolume > 0) {
+      attachMouth(slot, ctx, source).connect(gain).connect(ctx.destination);
+    } else {
+      source.connect(gain).connect(ctx.destination);
+    }
     currentSource = source;
     await new Promise<void>((resolve) => {
       source.onended = () => {

@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.1）
+# ugg アーキテクチャ設計書（architecture.md v2.3）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -615,8 +615,9 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `get_chat_log` | `limit: u32` | `LogEntry[]` | 新しい順 |
 | `clear_history` | `include_profile: bool` | `ClearResult` | |
-| `export_data` | `include_profile: bool` | `String` | 保存パス返却 |
+| `export_data` | `include_profile: bool` | `String` | 保存パス返却。**★v0.5.1: キャッシュ 3 つ（`calendar_cache` / `topics_cache` / `monologue_cache`）を除く全 9 テーブル**（schema `ugg-export-v2`）。除外したことは payload の `omitted_caches` に明記 |
 | `check_update_now` | なし | `()` | 設定パネル「いますぐチェック」。`update_feed_url` 未設定なら Err、結果は notify 経由で発話 |
+| `get_db_health` | なし | `DbIntegrity` | **★v0.5.1**（spec §4.5.5）。起動時 `PRAGMA quick_check` の結果と、破損時に作った退避先（原本コピー / `VACUUM INTO` 救出コピー）を返す。**正常時は何も検知せず退避コピーも作らない。破損しても DB は作り直さず起動も止めない**（データを取り出せる状態を優先）。**保全は破損 1 件につき 1 回**（既存の退避があれば作り直さずそのパスを返す。毎起動コピーは、まさに対象ユーザーのディスクを食い潰す）。原本コピーは `-wal` / `-shm` も同じ規則で運ぶ（本体だけだと未チェックポイント分が抜ける）|
 
 **注**: 旧設計の `open_log_dir` は不採用（ログ閲覧はアプリ内チャットログパネル + `export_data` で代替）。
 
@@ -813,6 +814,7 @@ fallback:
     （`insert_profile` の全 5 呼び出しが通る）。形態素解析器は入れず、漢字・カタカナ・
     英数の連なりを 2 文字以上・最大 8 語まで拾う素朴な方式。取りこぼすが、拾ったものは
     概ね名詞なので想起のトリガーとして実用になる。1 文字語は誤爆するので拾わない。
+    **キーワードはユーザーが入力した語からのみ作る**（`complete_onboarding` は定型文ではなく nickname / talk_style / interests の値を渡す）。定型文ごと渡すと「ユーザー」「希望」「興味」が想起のトリガーになり、`pick_recall` が `pick_reply` より先に評価される以上、**low モードの通常応答を無関係な入力まで奪う**（v0.5.1 の監査で検出）。
   - v0.4.1 までは `pick_recall` が存在せず、`insert_profile` の全呼び出しが
     `source_keywords` に `None` を渡していたため、**契約が 4 箇所に揃っているのに
     一度も発火しなかった**（`#[allow(dead_code)]` が警告も消していた）。
@@ -859,7 +861,8 @@ events:
   nade_sub_chest: [ ... ]
   nade_sub_body: [ ... ]
 
-  # 問いかけ（B-4）
+  # 問いかけ（B-4）は events キーではない
+  #   → advanced の掛け合いパターン 5（spec §4.2.4・★v0.5.1）。辞書系は常にパターン1
 
   # 存在感
   idle: [ ... ]
@@ -980,6 +983,29 @@ when:                                        # ⑥ 確率
 ---
 
 ## 7. TTS パイプライン
+
+### 7.0 再生の前提: WebView2 の自動再生ポリシー（★v0.5.1）
+
+ユーザー操作を伴わない発話（起動挨拶・ランダムトーク・リマインダー）では
+`AudioContext` が `suspended` のままになりうる。この状態で `start()` を呼んでも
+**例外を投げず Promise も解決する**ため、`speaker.ts` が decode/play の失敗を
+`console.warn` で握り潰すこととあわせて、**「正常に喋ったように見えて音だけ出ない」**
+という形でしか現れない。
+
+対策は 2 段:
+
+1. `tauri.conf.json` の `app.windows[].additionalBrowserArgs`。
+   **この値は wry の既定引数を「追加」ではなく「置換」する**
+   （`wry::webview2` は `additional_browser_args.unwrap_or_else(既定を組み立てる)`）。
+   既定は `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection` に、
+   `WebViewAttributes::autoplay` が既定 `true`（Tauri は上書きしない）のため
+   `--autoplay-policy=no-user-gesture-required` を足したもの。
+   **つまり自動再生ポリシーは元から効いており**、ここに自前の値だけを書くと
+   得るものが無いまま既定の抑止だけを失う。**必ず既定分も併記する。**
+2. `speaker.ts` / `reader.ts` の `ensureAudioCtx` で `state === "suspended"` なら
+   `resume()` を試みる（**待たない**。待つと発話が遅れ、失敗時に無音なのは変わらない）。
+
+
 
 ### 7.1 全体フロー
 
@@ -1704,5 +1730,8 @@ async fn install_asset(
 | 2026-07-24 | v1.5 | M11（天気基盤 §4.7.2）を反映。`system/weather.rs`（Open-Meteo forecast 取得・`app_settings["weather_cache"]` JSON キャッシュ = 新テーブルなし・schema v8 維持・WMO→日本語ラベル・降雨判定、§1.2/§2.2）/ 天気コマンド `search_location`・`get_weather`（§4.11、新規イベントなし §5）/ daily watcher に天気 3h 定期取得 + 降雨の一言（`weather_rain`/`weather_rain_outing`、§6.2・§11.4）/ SpeechCategory 9→12（`SituationRain` + M12 用 `RegularMorning`/`RegularEvening` を一括追加）+ `feedback_target()` で Regular* を間隔バックオフ非適用のまま 🔕 対象化、🔕 の is_situation ゲートを `deliver.rs` と `feedback_speech` の 2 箇所差し替え（§3.1）/ Settings 11 フィールド（weather_*4・situation_rain・regular_*6）+ 座標の小数 1 桁丸め clamp / 設定に天気節 + `#weather-credit` 出典表示（CC-BY 4.0）。**§4.7.1 定例会話（M12）は未実装**。 |
 | 2026-08-10 | v1.7 | 掛け合いパターン3/4「3つ目の吹き出し」（spec §4.1.3 / §4.2.4）の未実装を解消。`banter::assemble_advanced` の無条件 3→1・4→2 フォールバックを廃止し、パターン抽選 (`pick_advanced_pattern`) を LLM 呼び出し前に前倒し、`advanced::system_prompt` がパターン別に出力形式を出し分け（§10.4）。`DialogueResponse.extra: Option<SpeechTurn>` 追加（§5）。フロントは `BalloonSlot`（"main"\|"sub"\|"extra"）を `SlotName`（"main"\|"sub"）と分離し `#balloon-extra` を静的配置、`balloon.ts` の `reposition` を吹き出し枠 + 基準キャラの一般化に書き換え、`repositionAll()`（main → sub → extra の固定順で全枠を再配置。**extra が常に退避する側**という一方向の規則で循環を避ける）を新設（§10.3・§10.4、配置は案A = 話者キャラの横・さらに外側へ退避）。新規コマンド・イベント・DB テーブルなし。**リリース前レビューの反映**: 安全縮退の条件に `sub` 欠落を追加（3ターン構成が成立しない応答で 3/4 を維持すると spec §4.2.4 違反の表示になる）／パターン4 の3ターン目の pose 語彙を sub の集合に是正（提示と検証の食い違い）／`chat_log` が最大 4 行になる旨を §2.2 に明記。 |
 | 2026-08-16 | v2.0 | **M14 advanced 独り言 + 時事ネタ織り込み**（spec §4.4.4 / §4.4.6 / foundation-design §3）。長らく未達だった「advanced では LLM 生成 + キャッシュ補充」を解消。**DB v9 `monologue_cache`**（§2.1・§2.2）+ Db メソッド 5（push/pop/count/clear/clear_with_topics）。**新規モジュール `system/monologue.rs`**（補充・プロンプト組み立て・応答パース、§1.2）。消費は `deliver::resolve_line` の Monologue 分岐で、**ghost ロックの外で pop → その後 pose 検証のためにロック**（DB I/O 中のロック保持を避ける）。補充は `spawn_random_talk` の tick の**発話判定の後**に回す（LLM 待ちで発話を遅らせない）。**二段失効**: 織り込み時 7 日（材料選別）+ 発話時 7 日（pop）、時事ネタ無しは 30 日。しきい値は 在庫 3 / バッチ 5 / 最短間隔 30 分 / 上限 20。**補充の前後で月額上限を評価**し、超過はチャット経路と同じ降格・告知（`dialogue::evaluate_cost_status` を `pub(crate)` 化して合流。これが無いと**チャットを使わず常駐するユーザーで上限が素通りする**）。会計は `api_usage` へ advanced 会話と同じ形で記録。`DialogueState.monologue_refill_ts`（§3.2）で最短間隔を管理。無効化契機 2 つ: 履歴クリア（全件、§4.5.5）/ 時事ネタ同意の撤回（該当行のみ）。**新規コマンド・イベント・Settings フィールドなし**。プロンプトに会話履歴・`user_profile` は渡さない（独り言は応答ではない）。LLM 経路の全失敗（low/降格/キー無し/API エラー/タイムアウト/応答破損/上限超過/在庫空/全件失効/ゴースト未読込/DB エラー）は辞書の `pick_monologue` に落ちる（spec §4.2.1 AI 非依存）。**レビューで是正した 5 点**（foundation-design §7.1 に記録）: ① 独り言 OFF（`monologue_interval_min == 0`）でも補充が課金していた → ゲート追加 ② ストックの鍵を `settings.ghost_id` から**読み込み済み `bundle.ghost.id`** へ（ゴースト切替は再起動が要るため、切替直後は settings 側が先行して人格とズレ、旧人格の文を新ゴースト行として積んでいた）③ **降格中は pop せず辞書へ**（spec §4.4.4 の明文）④ 織り込む見出しに**残り寿命 24 時間**を要求（期限ぎりぎりの材料が「積んでは即失効」の有料ループを作る）⑤ 材料を**現に有効な `interest_topics`** に絞る（外した興味の見出しが最大 7 日残って喋られる）。 |
+| 2026-09-02 | v2.1 | **v0.5「宣言どおりに動く」**（spec §6.0）。契約表への反映のみで新規設計なし: コマンド `get_cost_status`（§4）/ `app_settings` の月次告知キー 2 つ`cost_warned_80_month`・`cost_limit_notified_month`（§2.2）/ `ghost.json` の `characters.*.persona` と `prompt.{max_chars_per_line,style_notes}`（§6.1）。あわせて配達の可視性判定（`deliver::window_is_visible`。最小化を `is_minimized` で先に見る）とログ基盤 `system/log.rs`（§1.2）を追記。**この行は v0.5.0 のタグ時に書き漏らしていたものを v0.5.1 で補記した**（ヘッダは v2.1 になっていたが履歴が無かった）。 |
+| 2026-09-04 | v2.2 | **v0.5.1 — 棚卸しの残り 7 件**。① **問いかけパターンの記述矛盾を解消**: 本書は §6.2/§6.3 で「辞書の events キー `question_curiosity` + `probability: 0.05`」と書いていたが、spec §4.2.4 は「掛け合いパターンの 5 番目」と定めており実装が変わるレベルで食い違っていた。CLAUDE.md が spec を要件の正本としているため **spec に従い本書を訂正**（`banter.rs` の責務・events キー一覧・`probability` の説明）。② **`recall` の実装契約を §6.2 に追記**: `Dictionary::pick_recall` を `low::reply` が `pick_reply` より先に評価する。`source_keywords` は `ghost::dict::extract_keywords` が記憶本文から自動生成（形態素解析器なし・2 文字以上・最大 8 語）。v0.4.1 までは実装が 1 行も無く、契約が 4 箇所に揃っているのに一度も発火しなかった。③ `talk_poses`（口パクの開口フレーム自動検出）/ `get_db_health` / export schema `ugg-export-v2` / `default_shell` 追従を契約に反映。**新規イベント・DB テーブルなし。** |
+| 2026-09-05 | v2.3 | **v0.5.1 のリリース前監査を受けた是正**。① `get_db_health` の契約に「保全は破損 1 件につき 1 回」「原本コピーは `-wal`/`-shm` も運ぶ」を追加（監査が「毎起動 2 本ずつ無限に増える」「WAL を含まない＝実機では本体より大きい」を検出）。② §6.2 の `recall` に「トリガー語はユーザー入力語のみ」を追加（アプリの定型文から作ると汎用語が low の応答を奪う）。③ `additionalBrowserArgs` は wry の既定引数を**置換**する旨を **§7.0（新設）** に記録。**契約表の追加・削除なし（挙動の明文化のみ）。** |
 | 2026-08-10 | v1.9 | **M13 表示モニタ選択**（spec §4.1.6 / foundation-design §2）。`presence/window_pos.rs` にモニタ決定の単一関数 `resolve_target_monitor` を導入し、`dock` と 1 秒監視の両方をそこ経由に（**明示選択が常に優先、選択時は現在位置を見ない**）。`MonitorPref{name,x,y}` を `app_settings.monitor_pref` に永続化（§2.2）。同一性判定は name+position の一致のみ（`pref_matches` は純関数でテスト 6 件）。選択が解決できないときは主モニタへ退避しつつ選択は保持。`apply_dock` を `set_position` → `set_size` の順に変更（DPI 混在対策）。コマンド `list_monitors` / `set_monitor_pref` を追加（§4.10、新規イベント・DB 変更なし）。設定「基本」→「表示」にモニタ選択の select と、退避中を示す注記を追加。 |
 | 2026-08-10 | v1.8 | オンボーディングの聞き取り（spec §4.2.5）の未達を解消。`complete_onboarding` が M2 以降捨てていた `interests` / `topics_enabled` を結線: 興味 → `user_profile`（origin=onboarding）+ `interest_topics`（RSS キーワード、空白・重複を除き上限 20）、`topics_enabled` → `Settings.topics_enabled` を書き換えて `settings-changed` を emit（**時事ネタの明示同意**。spec §3.3/§4.4.6「既定オフ・オンボーディング同意必須」がチェックボックスの捨てられにより機能していなかった）。コマンド引数に `AppHandle` を追加（§4.9）。フロントは onboarding パネルに興味入力（カンマ区切り、設定パネルと同規則）を追加。 |

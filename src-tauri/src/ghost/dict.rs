@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 // "将来のために" のフィールドは入れない。M1 のスコープは:
 //   - input_match による低負荷モード会話
 //   - events.first_boot / events.boot (時間帯別 when)
-// それ以外のセクション (recall / monologue / events の他キー / system_messages)
-// は構文的に受理して保持するだけ。実発火は M2+ で行う。
+// それ以外のセクション (monologue / events の他キー / system_messages) も
+// 実発火する。**recall は v0.5.1 で実装済み** (pick_recall。それ以前は構文的に
+// 受理して保持するだけで、一度も発火しなかった)。
 
 #[derive(Debug, Clone)]
 pub struct Dictionary {
@@ -23,8 +24,10 @@ pub struct Dictionary {
     pub schema_version: u32,
     pub input_match: Vec<InputMatchRule>,
     pub fallback: Vec<Line>,
-    /// `recall` キー (記憶想起。M2+ で発火、現状は仕様確定のみ)。
-    #[allow(dead_code)]
+    /// `recall` キー (記憶想起、spec §4.2.6 / architecture §6.2)。
+    /// **v0.5.1 で `pick_recall` が実装され実発火する。** それまでは
+    /// `#[allow(dead_code)]` が付いており、「契約はあるが実装ゼロ」を
+    /// コンパイラ警告からも隠していた。
     pub recall: Vec<Line>,
     pub monologue: Vec<Line>,
     pub events: HashMap<String, Vec<EventLine>>,
@@ -805,10 +808,35 @@ mod tests {
 
     #[test]
     fn extract_keywords_is_bounded_and_deduped() {
-        let long = "アアアイイイウウウエエエオオオカカカキキキククク".to_string()
-            + "ケケケコココサササシシシスススセセセソソソ";
-        assert!(extract_keywords(&long).len() <= 8, "上限を超えた");
+        // **語を「の」で区切って独立した run を 12 個作る。** 連続した 1 本の
+        // カタカナ列にすると run が 1 個しか生まれず、上限の検査が素通りする
+        // （truncate を消しても通ってしまう）。
+        let words = [
+            "アアア", "イイイ", "ウウウ", "エエエ", "オオオ", "カカカ",
+            "キキキ", "ククク", "ケケケ", "ココロ", "ササミ", "シシャモ",
+        ];
+        let long = words.join("の");
+        let got = extract_keywords(&long);
+        assert_eq!(got.len(), 8, "上限 8 に丸めていない (実際: {got:?})");
+        assert_eq!(got[0], "アアア", "先頭から順に採る");
+
         assert_eq!(extract_keywords("ギターとギター"), ["ギター"], "重複を落とす");
+    }
+
+    /// **オンボーディングの定型文をそのままキーワード源にしてはいけない。**
+    /// アプリが書いた「ユーザー」「希望」「興味」が recall のトリガーになり、
+    /// low モードの応答を無関係な入力まで奪う（v0.5.1 のリリース前監査で検出）。
+    /// 実際の防御は `complete_onboarding` がユーザー入力値だけを渡すこと。
+    #[test]
+    fn app_template_words_would_become_triggers_if_passed_whole() {
+        let templated = "ユーザーの呼び名は「まお」";
+        assert!(
+            extract_keywords(templated).contains(&"ユーザー".to_string()),
+            "定型文ごと渡すと定型語が拾われる（だから渡してはいけない）"
+        );
+        // ユーザー入力だけを渡せば、定型語はトリガーにならない。
+        assert!(keywords_of("まお").is_none(), "ひらがなの呼び名からは何も拾わない");
+        assert_eq!(extract_keywords("読書、映画"), ["読書", "映画"]);
     }
 
     #[test]

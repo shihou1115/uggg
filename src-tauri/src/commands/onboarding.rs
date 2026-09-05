@@ -33,9 +33,12 @@ pub fn complete_onboarding(
 
     if let Some(nick) = nickname.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let content = format!("ユーザーの呼び名は「{nick}」");
+        // **キーワードはユーザーが入力した値からだけ採る。** 定型文ごと渡すと
+        // 「ユーザー」「呼び名」がトリガーになり、low モードで無関係な発言まで
+        // recall に奪われる (v0.5.1 のリリース前監査で検出)。
         state
             .db
-            .insert_profile(&content, ProfileOrigin::Onboarding, keywords_of(&content).as_deref(), now)
+            .insert_profile(&content, ProfileOrigin::Onboarding, keywords_of(nick).as_deref(), now)
             .map_err(|err| format!("{err:#}"))?;
     }
 
@@ -45,19 +48,23 @@ pub fn complete_onboarding(
         .filter(|s| !s.is_empty())
     {
         let content = format!("話し方の希望: {style}");
+        // 定型文の「希望」を拾わせない (上と同じ理由)。
         state
             .db
-            .insert_profile(&content, ProfileOrigin::Onboarding, keywords_of(&content).as_deref(), now)
+            .insert_profile(&content, ProfileOrigin::Onboarding, keywords_of(style).as_deref(), now)
             .map_err(|err| format!("{err:#}"))?;
     }
 
     let interests = normalize_interests(interests);
     if !interests.is_empty() {
         // (1) 長期記憶へ (spec §4.2.5「聞き取り → 自動投入」)
-        let content = format!("興味のあること: {}", interests.join("、"));
+        let joined = interests.join("、");
+        let content = format!("興味のあること: {joined}");
+        // 定型文の「興味」を拾わせない (上と同じ理由)。興味の語そのものは
+        // ユーザー入力なので、そちらは想起のトリガーとして正しい。
         state
             .db
-            .insert_profile(&content, ProfileOrigin::Onboarding, keywords_of(&content).as_deref(), now)
+            .insert_profile(&content, ProfileOrigin::Onboarding, keywords_of(&joined).as_deref(), now)
             .map_err(|err| format!("{err:#}"))?;
         // (2) 時事ネタ RSS のキーワードへ (spec §4.4.6)。
         //     topics_enabled が false ならフェッチ自体が走らないので外部送信は起きない。
