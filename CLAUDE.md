@@ -94,10 +94,15 @@ v0.0.3 で得た主な負債:
 
 | ファイル | 役割 | 状態 |
 |---|---|---|
-| docs/spec.md | 要件の正本 | v1.6.7 ✅（**§6.0 は v0.5.1 スコープ**＝契約と実装の一致。**§4.2.2b に persona**、**§4.2.7 に上限の事前ゲート化と月次リセット**、**§4.6.1 に配達の可視性**、**§5 にログ**。**v0.5.1 で §4.1.4 口パク（AnalyserNode 駆動）/ §4.2.4 問いかけパターン / §4.2.6 recall / §4.5.1 自動再生ポリシー / §4.5.5 export 全テーブル化と DB 整合性検査 / §4.5.6 `default_shell` 追従**。§6.4 に伺かゴースト変換の非目標と「他人のキャラの人格記述の自動生成」レッドライン、§6.5 に `crates/nar2ugg/` の凍結） |
-| docs/architecture.md | モジュール構成・契約・設計判断 | v2.2 ✅（M7〜M14 + v0.5 + v0.5.1。`get_cost_status`、`app_settings` の月次告知キー 2 つ、`ghost.json` の persona / prompt / `default_shell`、`talk_poses`、`get_db_health`、export schema v2 を契約表に反映。**問いかけパターンの記述矛盾を spec に合わせて訂正**し、§6.2 に `recall` の実装契約を追記） |
+| docs/spec.md | 要件の正本 | v1.6.8 ✅（**§6.0 は v0.5.1 スコープ**。§4.2.2b persona / §4.2.7 上限の事前ゲート化と月次リセット / §4.6.1 配達の可視性 / §5 ログ。**v0.5.1: §4.1.4 口パク・§4.2.4 問いかけ・§4.2.6 recall・§4.5.1 自動再生ポリシー・§4.5.5 export 全テーブル化と DB 整合性検査・§4.5.6 `default_shell` 追従**。**v0.5.2: §4.5.5 にマイグレーション失敗の扱いと救出残骸の削除**。§6.0 末尾に**配布まわりを載せない裁定**（未署名のまま公開している既知事項）。§6.4 に伺かゴースト変換の非目標とレッドライン、§6.5 に `crates/nar2ugg/` の凍結） |
+| docs/architecture.md | モジュール構成・契約・設計判断 | v2.5 ✅（M7〜M14 + v0.5 系。`get_cost_status`、月次告知キー 2 つ、`ghost.json` の persona / prompt / `default_shell`、`talk_poses`、`get_db_health`、export schema v2 を契約表に反映。**§7.0 に WebView2 自動再生の前提**（`additionalBrowserArgs` は wry 既定を置換する）、§6.2 に `recall` の実装契約。**v2.4 で破損 DB 時のマイグレーション扱いを追記**） |
 | docs/foundation-design.md | **基盤・完成度（v0.4）の Phase 2 設計書**（§4.1.6 / §4.4.4 / §4.4.6 実装契約・M13〜M15） | 設計 v1 ✅（**M13・M14・M15 すべて実装済み**。§7 に未決の決着、§7.1 に実装が設計から意図的に外れた点を記録） |
-| docs/test-plan.md | テスト戦略・手動チェックリスト | v1.12 ✅（§5 に A〜G 全節。モニタ選択 A-12〜14、advanced 独り言 D-4b〜e / 時事ネタ D-6b〜c、**配達の可視性 G-2b / 保留の集約 G-2c（v0.5）**、**v0.5.1: 無音発話 E-0 / recall B-5b / DB 破損検知 E-5b / `default_shell` E-6b、および A-4 口パク・B-4 問いかけ・E-5 エクスポートの具体化**、§5.9 実機検証記録） |
-| docs/daily-support-design.md | **日常支援 Tier S の Phase 2 設計書**（§4.6 実装契約・DB・M7〜M10） | 設計 v2 ✅（**M7〜M10 実装済み**、Tier S 完了） |
-| docs/regular-talk-design.md | **定例会話と天気（v0.3）の Phase 2 設計書**（§4.7 実装契約・天気 API 選定・M11〜M12） | 設計 v1 ✅（**M11・M12 実装済み** 2026-07-24） |
+| docs/test-plan.md | テスト戦略・手動チェックリスト | v1.13 ✅（§5 に A〜G 全節。モニタ選択 A-12〜14、advanced 独り言 D-4b〜e / 時事ネタ D-6b〜c、**配達の可視性 G-2b / 保留の集約 G-2c（v0.5）**、**v0.5.1: 無音発話 E-0 / recall B-5b / DB 破損検知 E-5b / `default_shell` E-6b、および A-4 口パク・B-4 問いかけ・E-5 エクスポートの具体化**、§5.9 実機検証記録） |
+| docs/daily-support-design.md | **日常支援 Tier S の Phase 2 設計書**（§4.6 実装契約・DB・M7〜M10） | 設計 v2.1 ✅（**M7〜M10 実装済み**、Tier S 完了） |
+| docs/regular-talk-design.md | **定例会話と天気（v0.3）の Phase 2 設計書**（§4.7 実装契約・天気 API 選定・M11〜M12） | 設計 v1.2 ✅（**M11・M12 実装済み** 2026-07-24） |
+| docs/manual.md | **取扱説明書（ユーザー向け）**。`tauri.conf.json` の `bundle.resources` で**インストーラに同梱**されるため、移動・改名は配布物を壊す | v0.5.2 時点 ✅ |
+| docs/ai_model_routing.md | **モデル役割分担の正本**（4 モデル体制・例外系・障害時の運用）。本ファイルの Model Routing 節はこの要約 | ✅ |
+| docs/text-reader-spec.md | **テキスト読み上げツールの変更仕様書**（spec §4.5.8 の実装契約） | v0.1.1 で出荷済み ✅ |
+| docs/script-reader-spec.md | **テキスト読み上げ 台本形式対応の変更仕様書**（サンプルは `docs/samples/script-sample.md`。manual から参照） | v0.1.2 で出荷済み ✅ |
+| docs/release-notes/ | 各リリースの記録（v0.1.0〜v0.5.2）。**歴史記録のため削除も編集もしない** | — |
 | [docs/_legacy-v003/baseline-v0.0.3.md](docs/_legacy-v003/baseline-v0.0.3.md) | **v0.0.3 機能・契約・残課題の網羅スナップショット**（v0.0.3 の生 docs は 2026-07-24 の docs 整理で削除。原本はプロトタイプ `C:\claude\ugga` と git 履歴に現存） | 参照用 |

@@ -2,7 +2,7 @@
 
 **対象**: spec.md §4.6 日常支援（v0.2 スコープ）＝ Tier S 4 機能
 **位置付け**: spec §4.6（要件の正本）を実装可能な契約・構造へ具体化する Phase 2 成果物。個別機能の詳細 spec（`text-reader-spec.md` 等）と同列の設計文書。
-**状態**: 設計 v2。**M7〜M10 すべて実装済み**（M7 統合リマインダー / M8 ToDo・日課 / M9 状況発話+ガバナンス / M10 カレンダー参照。2026-07-18、architecture.md v1.4 に契約反映済み。実装時の確定判断は §11.1 と architecture §2/§11.4 の注記参照）。**Tier S 4 機能そろい、v0.2 リリース候補**。
+**状態**: 設計 v2.1。**M7〜M10 すべて実装済み**（M7 統合リマインダー / M8 ToDo・日課 / M9 状況発話+ガバナンス / M10 カレンダー参照。2026-07-18、architecture.md v1.4 に契約反映済み。実装時の確定判断は §11.1 と architecture §2/§11.4 の注記参照）。**Tier S 4 機能そろい、v0.2 リリース候補**。
 **作成日**: 2026-07-12（v2 同日改訂、§13 改訂履歴）
 
 ---
@@ -158,6 +158,7 @@ pub async fn deliver_event(
 2. 辞書ヒット時: `low::event` 相当で `DialogueResponse` を作り `{...}` 置換 → `persist_and_speak`。成功なら `governance::record_delivered(state, category, now)` → `Ghost`。`persist_and_speak` がエラーなら 3 のフォールバックへ。
 3. 辞書未ヒット or 発話失敗時: `fallback` があれば `system-toast` emit → `record_delivered` → `Toast`。無ければ `Failed`（record しない）。
 - **到達保証（外部レビュー指摘）**: gate 通過は「抑制されない」だけで「届いた」保証ではない。実到達は `DeliveryOutcome` で表す。Notice の呼び出し側（リマインダー §7.1）は `Ghost|Toast` 以外（`Deferred|Failed`）を**未達**として扱い、起動時回収・再試行につなぐ。
+- **★v0.5 追記（可視性）**: `app.emit` はウインドウが hide / 最小化されていても `Ok` を返すため、`Toast` を到達扱いにすると**トレイに隠している間に期限が来た単発リマインダーが無言で完了扱いに**なる。v0.5 で `deliver::window_is_visible`（`is_minimized` を先に見る）を到達判定側に置き、不可視なら `Deferred` を返すようにした。判定を `governance::can_deliver` に足していないのは、可視性がガバナンスではなく**到達**の問題であり、二重ゲートを作らないため。再表示時の連打を避ける集約（「『X』ほか N-1 件」）は起動時回収と共通化した。spec §4.6.1 を参照。
 - **record のタイミング**: 最終発話時刻の更新（間隔会計）は `Ghost|Toast` を返す時だけ。`Deferred|Failed` では更新しない（空振りで間隔が狂わない）。
 - **サブ主体**: 辞書 Line は `main` 必須・`sub` 任意（既存構造）。通知系キーは「main が短く受け、sub が本体」を推奨運用としオーサリングガイドに記す（構造変更は不要）。
 
@@ -506,3 +507,4 @@ M7 で「通知配達 + ガバナンス」という 2 つの横断基盤を先�
 |---|---|---|
 | v1 | 2026-07-12 | 初版。共通基盤（DB v6-v8 / deliver / governance / context）+ 4 機能 + 契約サマリ + M7-M10。社内 reviewer 反証で `speech_log` 撤回・gate 単一化・min_speak 適用範囲・Mutex 制約・既定値を反映。 |
 | v2 | 2026-07-12 | 外部レビュー（重大 4 / 高 4 / 中 2）を反映。**発火 ≠ 完了**（reminders＋reminder_log 分離、§2.1）／**到達保証**（DeliveryOutcome＋フォールバック＋起動時回収、§3.1/§3.2/§7.1）／**gate を can_deliver＋record_delivered に分離**し直列化（§4.2）／**カレンダー複合キー・notify_key 差分・RRULE near-term 展開・ファイル/URL 両対応**（§2.3/§7.4、二重ゲート解消）／**時刻・TZ 契約を §2.5 に新設**／**🔕 のフロント payload 契約**（speech_id 等、§4.3）／**夜間静音を独立フラグ化**（§5）。過剰設計（フロント ack・予約トークン・完全 RRULE）は非採用として明記。 |
+| v2.1 | 2026-09-05 | **docs 整理（tidy-docs、v0.5.2 タグ後）**: §3.1 の到達保証に**v0.5 の可視性判定**を追記。`app.emit` は hide / 最小化でも `Ok` を返すため `Toast` を到達扱いにすると単発リマインダーが無言で完了扱いになる問題があり、`deliver::window_is_visible` を到達判定側に置いて不可視なら `Deferred` を返す形に変わった。契約（`DeliveryOutcome` の値・消化規約）そのものは不変。 |
