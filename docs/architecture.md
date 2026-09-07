@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.5）
+# ugg アーキテクチャ設計書（architecture.md v2.6）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -615,9 +615,9 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `get_chat_log` | `limit: u32` | `LogEntry[]` | 新しい順 |
 | `clear_history` | `include_profile: bool` | `ClearResult` | |
-| `export_data` | `include_profile: bool` | `String` | 保存パス返却。**★v0.5.1: キャッシュ 3 つ（`calendar_cache` / `topics_cache` / `monologue_cache`）を除く全 9 テーブル**（schema `ugg-export-v2`）。除外したことは payload の `omitted_caches` に明記 |
+| `export_data` | `include_profile: bool` | `String` | 保存パス返却。**★v0.5.1: キャッシュ 3 つ（`calendar_cache` / `topics_cache` / `monologue_cache`）を除く全 9 テーブル**（schema `ugg-export-v2`）。除外したことは payload の `omitted_caches` に明記。**★v0.5.3: 部分救出**。`build_export_payload` へ切り出し、テーブルごとに `rescue()` で「出せた / 出せなかった」を振り分ける。失敗しても打ち切らず、`failed_tables` に名前と理由を残して値は `null`。schema `ugg-export-v3` |
 | `check_update_now` | なし | `()` | 設定パネル「いますぐチェック」。`update_feed_url` 未設定なら Err、結果は notify 経由で発話 |
-| `get_db_health` | なし | `DbIntegrity` | **★v0.5.1**（spec §4.5.5）。起動時 `PRAGMA quick_check` の結果と、破損時に作った退避先（原本コピー / `VACUUM INTO` 救出コピー）を返す。**正常時は何も検知せず退避コピーも作らない。破損しても DB は作り直さず起動も止めない**（データを取り出せる状態を優先）。**保全は破損 1 件につき 1 回**（既存の退避があれば作り直さずそのパスを返す。毎起動コピーは、まさに対象ユーザーのディスクを食い潰す）。原本コピーは `-wal` / `-shm` も同じ規則で運ぶ（本体だけだと未チェックポイント分が抜ける）。**★v0.5.2: 破損時は `migrate()` の失敗を伝播させない**（`AppState::initialize`。健全な DB での失敗は従来どおり致命）。`VACUUM INTO` 失敗時の 0 バイト残骸は削除する |
+| `get_db_health` | なし | `DbIntegrity` | **★v0.5.1**（spec §4.5.5）。起動時 `PRAGMA quick_check` の結果と、破損時に作った退避先（原本コピー / `VACUUM INTO` 救出コピー）を返す。**正常時は何も検知せず退避コピーも作らない。破損しても DB は作り直さず起動も止めない**（データを取り出せる状態を優先）。**保全は破損 1 件につき 1 回**（既存の退避があれば作り直さずそのパスを返す。毎起動コピーは、まさに対象ユーザーのディスクを食い潰す）。原本コピーは `-wal` / `-shm` も同じ規則で運ぶ（本体だけだと未チェックポイント分が抜ける）。**★v0.5.2: 破損時は `migrate()` の失敗を伝播させない**（`AppState::initialize`。健全な DB での失敗は従来どおり致命）。`VACUUM INTO` 失敗時の 0 バイト残骸は削除する。**★v0.5.3: 整合性検査を pragma より前に実行**し、pragma 失敗は健全時のみ致命。既存の退避・救出コピーは `is_usable_preserved` で妥当性（空でない / 救出コピーは `quick_check` 通過）を確認してから採用する |
 
 **注**: 旧設計の `open_log_dir` は不採用（ログ閲覧はアプリ内チャットログパネル + `export_data` で代替）。
 
@@ -1737,3 +1737,4 @@ async fn install_asset(
 | 2026-09-05 | v2.3 | **v0.5.1 のリリース前監査を受けた是正**。① `get_db_health` の契約に「保全は破損 1 件につき 1 回」「原本コピーは `-wal`/`-shm` も運ぶ」を追加（監査が「毎起動 2 本ずつ無限に増える」「WAL を含まない＝実機では本体より大きい」を検出）。② §6.2 の `recall` に「トリガー語はユーザー入力語のみ」を追加（アプリの定型文から作ると汎用語が low の応答を奪う）。③ `additionalBrowserArgs` は wry の既定引数を**置換**する旨を **§7.0（新設）** に記録。**契約表の追加・削除なし（挙動の明文化のみ）。** |
 | 2026-09-05 | v2.4 | **v0.5.2**。`AppState::initialize` は破損検知時に `migrate()` の失敗を伝播させない（v0.5.1 は `db.migrate()?` がそのまま setup フックへ抜けて panic し、**破損 DB では起動できなかった**）。健全な DB での失敗は従来どおり致命。あわせて `VACUUM INTO` 失敗時の 0 バイト残骸を削除する（残すと `find_preserved` が「救出済み」と誤認して再試行しない）。**契約表の追加・削除なし。** |
 | 2026-09-05 | v2.5 | **docs 整理（tidy-docs、v0.5.2 タグ後）**: 本改訂履歴の並びが版の昇順になっていなかったので整列した（v1.3/v1.4、v1.5/v1.6、v2.3/v2.4 が入れ替わり、v1.8/v1.9 が末尾に取り残されていた）。**設計本文・契約表の変更はなし。** |
+| 2026-09-08 | v2.6 | **v0.5.3 項目 1（復旧導線）**。① `export_data` を `build_export_payload` + `rescue()` に分け、**部分救出**へ（`State` と保存先に依存しない形にして、壊れたテーブルを含む DB で挙動を固定できるようにした）。schema `ugg-export-v3`、`failed_tables` を追加。② `Db::open` の順序を「整合性検査 → pragma」へ入れ替え、pragma 失敗は健全時のみ致命。③ `find_preserved` に `require_healthy` を追加し `is_usable_preserved` で妥当性を確認。**新規コマンド・イベント・DB テーブルなし。** |

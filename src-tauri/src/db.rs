@@ -284,11 +284,27 @@ impl Db {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("open sqlite database: {}", path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .context("set WAL journal mode")?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .context("enable foreign keys")?;
+
+        // **整合性検査と保全を、DB を書き換えうる pragma より先に行う (v0.5.3)。**
+        //
+        // v0.5.2 までは `journal_mode=WAL` がこの前にあり、`?` で伝播していた。
+        // そのためヘッダやスキーマページが壊れていると **pragma の時点で失敗し、
+        // 検知にも保全にも起動継続にも到達しなかった** (spec §4.5.5 の「起動も止めない」は
+        // 無条件では成立していなかった)。加えて `journal_mode` の変更は DB ファイル自体を
+        // 書き換えるので、**退避を取る前に原本へ書いていた**ことにもなる。
         let integrity = check_integrity_and_preserve(&conn, path);
+
+        // 健全な DB での pragma 失敗は従来どおり致命 (見逃すと以後の全機能が壊れる)。
+        // 破損が検知されている場合だけ、既定の journal mode のまま続行する。
+        for (key, value) in [("journal_mode", "WAL"), ("foreign_keys", "ON")] {
+            if let Err(err) = conn.pragma_update(None, key, value) {
+                if integrity.ok {
+                    return Err(anyhow::Error::new(err))
+                        .with_context(|| format!("set pragma {key}={value}"));
+                }
+                crate::ulog!("[db] 破損 DB のため pragma {key}={value} を諦めて続行します: {err}");
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             integrity,
@@ -1827,8 +1843,11 @@ mod integrity_tests {
         // 素通りした）。日をまたいだ再起動を再現するため、古い世代を先に置く。
         let old_backup = dir.path().join("companion.corrupt-20200101-000000.db");
         let old_salvaged = dir.path().join("companion.salvaged-20200101-000000.db");
+        // 退避コピーは壊れた DB のバイト列コピーなので中身は問わない (空でなければよい)。
         std::fs::write(&old_backup, b"older-generation").unwrap();
-        std::fs::write(&old_salvaged, b"older-generation").unwrap();
+        // **救出コピーは「読める DB」であることが存在意義**なので、実物を作る。
+        // (v0.5.3 から `quick_check` が通るものだけ採用する)
+        make_healthy_db(&old_salvaged);
         assert_eq!(count(), 2);
 
         for _ in 0..3 {
@@ -1901,6 +1920,109 @@ mod integrity_tests {
         f.seek(SeekFrom::Start(4096)).unwrap();
         f.write_all(&[0xA5u8; 4096 * 10]).unwrap();
         f.flush().unwrap();
+    }
+
+    /// **ヘッダを潰しても起動できる (v0.5.3)。**
+    ///
+    /// v0.5.2 は `journal_mode=WAL` を整合性検査より**前**で `?` していたため、
+    /// ヘッダやスキーマページが壊れると **pragma の時点で失敗し、検知にも保全にも
+    /// 起動継続にも到達しなかった**。v0.5.2 で追加したテストはページ 3 以降しか
+    /// 壊しておらず、この経路を一度も通していなかった (Codex レビュー 2026-09-06)。
+    #[test]
+    fn header_corrupt_db_still_opens_and_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        make_corrupt_db(&path);
+        // SQLite のマジック "SQLite format 3 " を潰す。以後どのクエリも
+        // "file is not a database" になり、pragma も通らない。
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0x00u8; 16]).unwrap();
+            f.flush().unwrap();
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        let db = Db::open(&path).expect("ヘッダ破損でも open は成功すること");
+        assert!(!db.integrity().ok, "破損として報告されていない");
+        assert!(path.is_file(), "原本が消えた");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            before,
+            "原本が作り直された / 書き換えられた"
+        );
+    }
+
+    /// 採用可能な救出コピーとして通る、健全な小さい DB を作る。
+    fn make_healthy_db(path: &std::path::Path) {
+        let db = Db::open(path).unwrap();
+        db.migrate().unwrap();
+        db.set_setting("marker", "salvaged").unwrap();
+    }
+
+    /// **v0.5.1 が残した 0 バイトの救出コピーを「救出済み」と誤認しない (v0.5.3)。**
+    ///
+    /// v0.5.1 は `VACUUM INTO` 失敗時に空ファイルを残した。v0.5.2 は「今回失敗した分」
+    /// しか消さず、`find_preserved` は名前だけで採用していたため、**v0.5.1 から更新した
+    /// 環境では空ファイルを掴んで二度と救出を再試行しなかった**
+    /// (「保全は 1 回だけ」のガードが、失敗を成功として固定していた)。
+    #[test]
+    fn empty_salvaged_from_v051_is_not_treated_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        make_corrupt_db(&path);
+        // v0.5.1 が残した残骸を再現する。
+        let stale = dir.path().join("companion.salvaged-20200101-000000.db");
+        std::fs::write(&stale, b"").unwrap();
+        assert_eq!(std::fs::metadata(&stale).unwrap().len(), 0);
+
+        let h = Db::open(&path).unwrap().integrity().clone();
+        assert!(!h.ok);
+        assert_ne!(
+            h.salvaged_path.as_deref(),
+            Some(stale.to_string_lossy().as_ref()),
+            "0 バイトの残骸を救出済みとして採用している"
+        );
+        // この破損度では救出は失敗するので None。**再試行はした**ことが要点。
+        assert!(h.salvaged_path.is_none());
+    }
+
+    /// **中身が壊れている救出コピーも採用しない (v0.5.3)。**
+    /// 空でなくても、開けない / `quick_check` が通らないものは救出コピーとして無意味。
+    #[test]
+    fn unreadable_salvaged_copy_is_not_treated_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        make_corrupt_db(&path);
+        let junk = dir.path().join("companion.salvaged-20200101-000000.db");
+        std::fs::write(&junk, b"not a sqlite database at all").unwrap();
+
+        let h = Db::open(&path).unwrap().integrity().clone();
+        assert!(!h.ok);
+        assert_ne!(
+            h.salvaged_path.as_deref(),
+            Some(junk.to_string_lossy().as_ref()),
+            "読めないファイルを救出済みとして採用している"
+        );
+    }
+
+    /// **原本の退避コピーは中身の健全性を要求しない。**
+    /// 壊れた DB のバイト列コピーなので、`quick_check` が通らないのが正常。
+    #[test]
+    fn corrupt_backup_copy_is_reused_even_though_it_is_not_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        make_corrupt_db(&path);
+        let old_backup = dir.path().join("companion.corrupt-20200101-000000.db");
+        std::fs::copy(&path, &old_backup).unwrap(); // 壊れたままのコピー
+
+        let h = Db::open(&path).unwrap().integrity().clone();
+        assert_eq!(
+            h.backup_path.as_deref(),
+            Some(old_backup.to_string_lossy().as_ref()),
+            "壊れた退避コピーを弾いて作り直している (退避は健全性を要求しない)"
+        );
     }
 
     /// **退避は WAL サイドカーも運ぶ。** 実機では -wal が本体より大きいことがあり、
@@ -2399,7 +2521,7 @@ fn check_integrity_and_preserve(conn: &Connection, path: &Path) -> DbIntegrity {
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
 
     // 1) 原本のコピー。壊れていても「今の状態」を保全する。
-    let backup_path = match find_preserved(path, "corrupt-") {
+    let backup_path = match find_preserved(path, "corrupt-", false) {
         Some(existing) => {
             crate::ulog!("[db] 退避済みのため作り直しません: {}", existing.display());
             Some(existing.to_string_lossy().into_owned())
@@ -2426,7 +2548,7 @@ fn check_integrity_and_preserve(conn: &Connection, path: &Path) -> DbIntegrity {
 
     // 2) 読み出せた分だけの健全なコピー。VACUUM INTO は元 DB を書き換えない。
     //    開いている接続を通すので WAL の内容も反映される。
-    let salvaged_path = match find_preserved(path, "salvaged-") {
+    let salvaged_path = match find_preserved(path, "salvaged-", true) {
         Some(existing) => {
             crate::ulog!("[db] 救出済みのため作り直しません: {}", existing.display());
             Some(existing.to_string_lossy().into_owned())
@@ -2466,7 +2588,16 @@ fn check_integrity_and_preserve(conn: &Connection, path: &Path) -> DbIntegrity {
 /// 既に作られている退避/救出コピー (`<stem>.<prefix><stamp>.db`) を探す。
 /// 複数あればファイル名順で最も古いもの＝最初に作られたものを返す
 /// (原本に最も近い世代を正とする)。
-fn find_preserved(path: &Path, prefix: &str) -> Option<std::path::PathBuf> {
+///
+/// **名前だけで採用してはいけない (v0.5.3)。** v0.5.2 までは `starts_with` /
+/// `ends_with(".db")` しか見ておらず、**v0.5.1 が残した 0 バイトの
+/// `salvaged-*.db` を「救出済み」と誤認して二度と再試行しなかった**
+/// (v0.5.2 で入れた「保全は 1 回だけ」のガードが、失敗を成功として固定していた)。
+///
+/// `require_healthy` は救出コピー用。救出コピーは**読める DB であることが存在意義**なので
+/// `quick_check` まで通す。原本の退避コピーは壊れた DB のバイト列コピーなので、
+/// 中身の健全性は要求せず「空でないこと」だけを見る。
+fn find_preserved(path: &Path, prefix: &str, require_healthy: bool) -> Option<std::path::PathBuf> {
     let dir = path.parent()?;
     let stem = path.file_stem()?.to_str()?;
     let head = format!("{stem}.{prefix}");
@@ -2479,9 +2610,30 @@ fn find_preserved(path: &Path, prefix: &str) -> Option<std::path::PathBuf> {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with(&head) && n.ends_with(".db"))
         })
+        .filter(|p| is_usable_preserved(p, require_healthy))
         .collect();
     hits.sort();
     hits.into_iter().next()
+}
+
+/// 退避/救出コピーとして採用してよいか。空ファイルと、
+/// (救出コピーなら) 読めない DB を弾く。
+fn is_usable_preserved(p: &Path, require_healthy: bool) -> bool {
+    match std::fs::metadata(p) {
+        Ok(m) if m.len() > 0 => {}
+        _ => return false,
+    }
+    if !require_healthy {
+        return true;
+    }
+    // 救出コピーは「読み出せた分だけの健全なコピー」なので、開けて検査が通ることまで求める。
+    match Connection::open(p) {
+        Ok(c) => matches!(
+            c.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)),
+            Ok(v) if v == "ok"
+        ),
+        Err(_) => false,
+    }
 }
 
 /// SQLite のサイドカー (`-wal` / `-shm`) を退避先へ同じ規則でコピーする。
