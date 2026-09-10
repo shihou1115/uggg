@@ -1273,12 +1273,30 @@ impl Db {
         Ok(n as u64)
     }
 
-    /// カレンダーキャッシュを全消去する (M10)。ソース構成の変更時に呼ぶ
-    /// (index ベースの source_id がずれるため全 clear して再取得する、§11.1)。
-    pub fn clear_calendar(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("db poisoned");
-        conn.execute("DELETE FROM calendar_cache", [])
+    /// カレンダーソース構成の変更を **1 トランザクション**で適用する (M10 / v0.5.3)。
+    ///
+    /// 設定 JSON の保存と、キャッシュの全消去 (index ベースの `source_id` がずれるため
+    /// 全 clear して再取得する、§11.1) は**両方成立するか、どちらも起きない**でなければ
+    /// ならない。v0.5.2 まではこの 2 つが別々の文で、片方だけ通ると
+    /// **DB は新しいソース構成・キャッシュは旧 index** という組み合わせが残り、
+    /// 呼び出し側 (メモリと UI) は旧構成のまま据え置かれていた。
+    ///
+    /// 2 つを分けて呼べる限り同じ穴が空くので、`clear_calendar` 単体は生やさない。
+    pub fn save_settings_and_clear_calendar(&self, key: &str, value: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db poisoned");
+        let tx = conn
+            .transaction()
+            .context("begin save_settings_and_clear_calendar")?;
+        tx.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .with_context(|| format!("set_setting('{key}') 失敗"))?;
+        tx.execute("DELETE FROM calendar_cache", [])
             .context("clear_calendar")?;
+        tx.commit()
+            .context("commit save_settings_and_clear_calendar")?;
         Ok(())
     }
 
@@ -2465,8 +2483,8 @@ mod tests {
         assert_eq!(db.upcoming_calendar(100 + 86_400, 200_000).unwrap().len(), 0, "翌日には消える");
         // prune: end/start < 1200 の過去分 (a=end1100, c=start1050, d=start100) が消える
         assert_eq!(db.prune_calendar(1200).unwrap(), 3);
-        // clear
-        db.clear_calendar().unwrap();
+        // clear (v0.5.3: 設定の保存と同じ tx にまとめたので単体の clear_calendar は無い)
+        db.save_settings_and_clear_calendar("settings_json", "{}").unwrap();
         assert_eq!(db.list_calendar(0, 99999).unwrap().len(), 0);
     }
 
@@ -2486,6 +2504,72 @@ mod tests {
         assert_eq!(list2.len(), 1);
         assert_eq!(list2[0].slot, "sub");
         assert!(db.get_voice_ref("main").unwrap().is_none());
+    }
+
+    // ===== カレンダーソース更新の原子性 (v0.5.3, Codex 指摘 (2)) =====
+
+    fn make_db_at(dir: &std::path::Path) -> Db {
+        let db = Db::open(&dir.join("companion.db")).expect("open db");
+        db.migrate().expect("migrate");
+        db
+    }
+
+    const SETTINGS_KEY: &str = "settings_json";
+
+    /// 正常系: 設定の保存とキャッシュ全消去が両方効く。
+    #[test]
+    fn calendar_source_update_saves_settings_and_clears_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_at(dir.path());
+        db.set_setting(SETTINGS_KEY, "旧設定").unwrap();
+        db.upsert_calendar_event(
+            1, "uid-1", None, "旧 index の予定", NOW, None, false, "confirmed", "k", false, NOW,
+        )
+        .unwrap();
+
+        db.save_settings_and_clear_calendar(SETTINGS_KEY, "新設定")
+            .unwrap();
+
+        assert_eq!(
+            db.get_setting(SETTINGS_KEY).unwrap().as_deref(),
+            Some("新設定")
+        );
+        assert!(
+            db.list_calendar(0, NOW * 2).unwrap().is_empty(),
+            "source_id が振り直されるので旧 index の行を残してはいけない"
+        );
+    }
+
+    /// **キャッシュ消去に失敗したら設定の保存も巻き戻る。**
+    ///
+    /// v0.5.2 まではこの 2 つが別々の文で、消去だけ失敗すると
+    /// 「DB は新設定 / キャッシュは旧 index / メモリと UI は旧設定」の三者バラバラが
+    /// 残った。呼び出し側は Err を受けて旧設定を保つので、**DB だけが先に進む**。
+    #[test]
+    fn calendar_source_update_rolls_back_when_clearing_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_at(dir.path());
+        db.set_setting(SETTINGS_KEY, "旧設定").unwrap();
+
+        // 消去先を壊す。実機では破損 DB (v0.5.2 以降は起動が続行する) やディスクエラーで
+        // 同じように DELETE だけが失敗しうる。
+        {
+            let other = Connection::open(dir.path().join("companion.db")).unwrap();
+            other.execute("DROP TABLE calendar_cache", []).unwrap();
+        }
+
+        let err = db
+            .save_settings_and_clear_calendar(SETTINGS_KEY, "新設定")
+            .expect_err("キャッシュ消去に失敗したら Err になる");
+        assert!(
+            format!("{err:#}").contains("clear_calendar"),
+            "失敗した側が分かるコンテキストを返すこと: {err:#}"
+        );
+        assert_eq!(
+            db.get_setting(SETTINGS_KEY).unwrap().as_deref(),
+            Some("旧設定"),
+            "片方だけ成立させない (設定だけ新しくなるとメモリ・UI と食い違う)"
+        );
     }
 }
 

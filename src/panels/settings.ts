@@ -763,14 +763,24 @@ function fillAssetSelect(
     opt.textContent = `${e.name} (${e.id})`;
     select.appendChild(opt);
   }
-  // 現在値が一覧に無ければ "現在の設定" を頭に挿入
-  if (!entries.some((e) => e.id === current)) {
+  ensureAssetSelection(select, current);
+}
+
+/// ゴースト/シェル select を id に合わせる。一覧に無い id なら "現在の設定" を
+/// 頭に挿してでも**その値を選ばせる** (話者 select の ensureSpeakerSelection と同型)。
+///
+/// v0.5.3: `applySettingsToForm` からも呼ぶ。保存後に `default_shell` の追従で
+/// シェルが変わっても select は古い id を表示したままで、そのまま再保存すると
+/// **追従が黙って取り消されていた** (§4.5.6)。select を埋める関数と、保存済みの値を
+/// フォームへ戻す関数が別々だったのが原因なので、値合わせをここに一本化する。
+function ensureAssetSelection(select: HTMLSelectElement, id: string): void {
+  if (!Array.from(select.options).some((o) => o.value === id)) {
     const opt = document.createElement("option");
-    opt.value = current;
-    opt.textContent = `${current} (現在の設定)`;
+    opt.value = id;
+    opt.textContent = `${id} (現在の設定)`;
     select.insertBefore(opt, select.firstChild);
   }
-  select.value = current;
+  select.value = id;
 }
 
 // === M5-E: データエクスポート / 履歴クリア =================================
@@ -1380,6 +1390,10 @@ function applySettingsToForm(s: Settings): void {
   // 話者 select は資産 DL 済みのときだけ list_voices で埋められる。値は文字列で保持。
   ensureSpeakerSelection(inputs.ttsSpeakerMain, s.tts_speaker_main);
   ensureSpeakerSelection(inputs.ttsSpeakerSub, s.tts_speaker_sub);
+  // ゴースト/シェルも「保存済みの値」をフォームへ戻す対象に含める (v0.5.3)。
+  // 一覧の中身は refreshAssetLists が別途埋める。ここは選択値だけを追従させる。
+  ensureAssetSelection(inputs.ghostId, s.ghost_id);
+  ensureAssetSelection(inputs.shellId, s.shell_id);
 }
 
 /// 話者 select に id が無ければ「#<id> (未取得)」項目を作って current を保つ。

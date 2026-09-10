@@ -526,12 +526,15 @@ fn mutate_sources(
     };
     let json = serde_json::to_string(&next)
         .map_err(|e| format!("Settings の JSON シリアライズ失敗: {e}"))?;
+    // **設定の保存とキャッシュ全消去は 1 トランザクション**で行う (v0.5.3)。
+    // index ベースの source_id が変わるので全 clear が要る（次回 watcher / refresh で
+    // 再構築）が、v0.5.2 まではこれが保存の「次の文」だった。clear だけ失敗すると
+    // DB は新しいソース構成・キャッシュは旧 index、メモリと UI は旧構成、という
+    // 三者バラバラの状態が残る。
     state
         .db
-        .set_setting(crate::commands::settings::SETTINGS_KEY, &json)
+        .save_settings_and_clear_calendar(crate::commands::settings::SETTINGS_KEY, &json)
         .map_err(|err| format!("{err:#}"))?;
-    // index ベースの source_id が変わるので全 clear（次回 watcher / refresh で再構築）
-    state.db.clear_calendar().map_err(|err| format!("{err:#}"))?;
     // ここまで成功して初めてメモリへ反映する。
     {
         let mut s = state.settings.lock().expect("settings poisoned");
