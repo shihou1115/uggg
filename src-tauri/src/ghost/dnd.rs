@@ -57,6 +57,8 @@ pub enum DndError {
     TooDeep,
     #[error("manifest の id が不正です (単一のフォルダ名のみ許可): {0}")]
     InvalidId(String),
+    #[error("展開結果の id が確認時と違います: {0}")]
+    IdMismatch(String),
     #[error("I/O エラー: {0}")]
     Io(String),
 }
@@ -124,16 +126,21 @@ fn detect_zip_kind(zip_path: &Path) -> Result<AssetKind, DndError> {
 }
 
 /// 入力 (zip or フォルダ) の manifest を読み取って id/name を返す。
+/// manifest のファイル名。種別ごとの分岐をここ 1 箇所に閉じる。
+pub(crate) fn manifest_name(kind: AssetKind) -> &'static str {
+    match kind {
+        AssetKind::Ghost => "ghost.json",
+        AssetKind::Shell => "shell.json",
+    }
+}
+
 pub fn peek_manifest(path: &Path, kind: AssetKind) -> Result<ManifestPeek, DndError> {
     let bytes = read_manifest_bytes(path, kind)?;
     parse_manifest(&bytes, kind)
 }
 
 fn read_manifest_bytes(path: &Path, kind: AssetKind) -> Result<Vec<u8>, DndError> {
-    let target_name = match kind {
-        AssetKind::Ghost => "ghost.json",
-        AssetKind::Shell => "shell.json",
-    };
+    let target_name = manifest_name(kind);
     if path.is_dir() {
         let direct = path.join(target_name);
         if direct.is_file() {
@@ -154,15 +161,15 @@ fn read_manifest_bytes(path: &Path, kind: AssetKind) -> Result<Vec<u8>, DndError
     if has_zip_ext(path) {
         let file = std::fs::File::open(path)?;
         let mut archive = zip::ZipArchive::new(file)?;
-        for i in 0..archive.len() {
-            let mut entry = archive.by_index(i)?;
-            if entry.name().ends_with(target_name) {
-                let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
-                return Ok(buf);
-            }
-        }
-        return Err(DndError::NoManifest);
+        // **展開側と同じ規則で選ぶ (v0.5.3)。** 別々に選ぶと、確認ダイアログに出した id と
+        // 実際に導入される中身が食い違う。
+        let Some((index, _)) = pick_manifest_entry(&mut archive, kind)? else {
+            return Err(DndError::NoManifest);
+        };
+        let mut entry = archive.by_index(index)?;
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf)?;
+        return Ok(buf);
     }
     Err(DndError::UnsupportedFormat)
 }
@@ -427,15 +434,20 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// archive 内で「最も浅い manifest」の親ディレクトリ名を `strip_prefix` として返す。
 /// `<id>/ghost.json` 構造の zip では `<id>/` を剥がして展開できるようにする。
 /// manifest が直下 (`ghost.json` のみ) なら `None`。
-fn find_strip_prefix<R: Read + std::io::Seek>(
+/// zip 内で**採用する manifest** を 1 つ選ぶ。返すのは (エントリ番号, 前置きプレフィックス)。
+///
+/// **選択規則をここ 1 箇所に閉じ込めるのが目的 (v0.5.3)。** v0.5.2 までは
+/// `read_manifest_bytes` が「最初に一致したもの」、展開側が「最も浅いもの」を選んでおり、
+/// 複数の manifest を含む zip で**確認ダイアログに出した id と、実際に導入される中身が
+/// 食い違いうる**状態だった (Codex レビュー 2026-09-06)。
+///
+/// 規則: **最も浅いもの。同じ深さならエントリ順で先に現れたもの。**
+fn pick_manifest_entry<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     kind: AssetKind,
-) -> Result<Option<String>, DndError> {
-    let target = match kind {
-        AssetKind::Ghost => "ghost.json",
-        AssetKind::Shell => "shell.json",
-    };
-    let mut best: Option<(usize, String)> = None;
+) -> Result<Option<(usize, String)>, DndError> {
+    let target = manifest_name(kind);
+    let mut best: Option<(usize, usize, String)> = None; // (depth, index, prefix)
     for i in 0..archive.len() {
         let entry = archive.by_index(i)?;
         let name = entry.name();
@@ -447,11 +459,20 @@ fn find_strip_prefix<R: Read + std::io::Seek>(
         let prefix_end = name.len() - target.len();
         let prefix = name[..prefix_end].to_string();
         match &best {
-            Some((d, _)) if *d <= depth => continue,
-            _ => best = Some((depth, prefix)),
+            Some((d, _, _)) if *d <= depth => continue,
+            _ => best = Some((depth, i, prefix)),
         }
     }
-    Ok(best.and_then(|(_, p)| if p.is_empty() { None } else { Some(p) }))
+    Ok(best.map(|(_, i, p)| (i, p)))
+}
+
+fn find_strip_prefix<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    kind: AssetKind,
+) -> Result<Option<String>, DndError> {
+    Ok(pick_manifest_entry(archive, kind)?
+        .map(|(_, p)| p)
+        .filter(|p| !p.is_empty()))
 }
 
 #[cfg(test)]

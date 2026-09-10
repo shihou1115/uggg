@@ -437,11 +437,21 @@ async fn download_to(url: &str, dest: &Path) -> Result<()> {
 }
 
 /// Windows PowerShell の `Expand-Archive` で zip を展開。追加 crate なし。
+/// PowerShell の単引用符文字列へ埋め込める形にする (v0.5.3)。
+///
+/// 単引用符の中では `'` を `''` と二重にするのが唯一のエスケープ。素通しすると
+/// **`O'Neil` のようにアポストロフィを含むユーザー名のパスで引用が壊れ、導入が失敗する**
+/// (Codex レビュー 2026-09-06)。パスはアプリ側が決めるため実害は限定的だが、
+/// 文字列へ埋め込む以上は正しく引用する。
+fn ps_single_quoted(p: &Path) -> String {
+    p.display().to_string().replace("'", "''")
+}
+
 fn expand_zip_windows(zip: &Path, dest: &Path) -> Result<()> {
     let cmd = format!(
         "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-        zip.display(),
-        dest.display()
+        ps_single_quoted(zip),
+        ps_single_quoted(dest)
     );
     let status = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
@@ -553,5 +563,28 @@ mod tests {
     fn assets_ready_false_when_python_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(!assets_ready(tmp.path()));
+    }
+}
+
+#[cfg(test)]
+mod quoting_tests {
+    use super::*;
+
+    /// **PowerShell の単引用符は 2 つ重ねて escape する (v0.5.3)。**
+    /// 素通しすると `O'` のようなユーザー名のパスで引用が壊れ、導入が失敗する
+    /// (Codex レビュー 2026-09-06)。
+    #[test]
+    fn apostrophe_in_path_is_doubled() {
+        let p = Path::new(r"C:\Users\O'Neil\AppData\Local\ugg");
+        let q = ps_single_quoted(p);
+        assert!(q.contains("O''Neil"), "escape されていない: {q}");
+        // 単引用符が偶数個 = PowerShell の文字列が途中で閉じない。
+        assert_eq!(q.matches('\'').count() % 2, 0, "引用が閉じない: {q}");
+    }
+
+    #[test]
+    fn ordinary_path_is_unchanged() {
+        let p = Path::new(r"C:\Users\shiho\AppData\Local\ugg");
+        assert_eq!(ps_single_quoted(p), r"C:\Users\shiho\AppData\Local\ugg");
     }
 }

@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.6）
+# ugg アーキテクチャ設計書（architecture.md v2.7）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1738,3 +1738,4 @@ async fn install_asset(
 | 2026-09-05 | v2.4 | **v0.5.2**。`AppState::initialize` は破損検知時に `migrate()` の失敗を伝播させない（v0.5.1 は `db.migrate()?` がそのまま setup フックへ抜けて panic し、**破損 DB では起動できなかった**）。健全な DB での失敗は従来どおり致命。あわせて `VACUUM INTO` 失敗時の 0 バイト残骸を削除する（残すと `find_preserved` が「救出済み」と誤認して再試行しない）。**契約表の追加・削除なし。** |
 | 2026-09-05 | v2.5 | **docs 整理（tidy-docs、v0.5.2 タグ後）**: 本改訂履歴の並びが版の昇順になっていなかったので整列した（v1.3/v1.4、v1.5/v1.6、v2.3/v2.4 が入れ替わり、v1.8/v1.9 が末尾に取り残されていた）。**設計本文・契約表の変更はなし。** |
 | 2026-09-08 | v2.6 | **v0.5.3 項目 1（復旧導線）**。① `export_data` を `build_export_payload` + `rescue()` に分け、**部分救出**へ（`State` と保存先に依存しない形にして、壊れたテーブルを含む DB で挙動を固定できるようにした）。schema `ugg-export-v3`、`failed_tables` を追加。② `Db::open` の順序を「整合性検査 → pragma」へ入れ替え、pragma 失敗は健全時のみ致命。③ `find_preserved` に `require_healthy` を追加し `is_usable_preserved` で妥当性を確認。**新規コマンド・イベント・DB テーブルなし。** |
+| 2026-09-10 | v2.7 | **v0.5.3 項目 2（更新でデータを失わない）**。① `install_one` を「`assets/.staging/` へ展開 → `verify_staged` で id を再確認 → `swap_in` で差し替え」に。**失敗しても旧版は無傷**。旧版は `assets/.previous-<種別>-<id>` へ待避してから入れ替え、入れ替え失敗時は戻す。**戻せなければ待避先を消さずログに残す**（作業ディレクトリの掃除で巻き添えにしないよう、待避先は staging の外に置く）。② zip 内 manifest の選択を `pick_manifest_entry` に一本化し、`read_manifest_bytes`（確認側）と `find_strip_prefix`（展開側）の両方をそこへ寄せた。規則は「最も浅いもの。同じ深さならエントリ順で先のもの」。`manifest_name` も 1 箇所へ。③ `DndError::IdMismatch` を追加。④ `ps_single_quoted` で PowerShell 単引用符を escape。**新規コマンド・イベント・DB テーブルなし。** |

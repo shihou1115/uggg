@@ -26,3 +26,8 @@ docs/_scratch/
 
 # Python サイドカーのバイトコードキャッシュ
 src-tauri/python/__pycache__/
+
+# DnD 導入の作業ディレクトリと旧版の待避先 (v0.5.3)。
+# dev では assets_dir がリポジトリ直下になるため、事故で残った分を追跡しない。
+.staging/
+.previous-*/

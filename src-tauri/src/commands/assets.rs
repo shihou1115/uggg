@@ -118,6 +118,7 @@ pub fn dnd_install(
     Ok(result)
 }
 
+#[derive(Debug)]
 enum InstallOutcome {
     Installed {
         id: String,
@@ -131,6 +132,11 @@ enum InstallOutcome {
     },
 }
 
+/// 展開作業用のディレクトリ。`ghosts/` `shells/` の**外**に置く。
+/// 中に有効な manifest を持つ一時ディレクトリが入るため、資産一覧の走査対象に
+/// 見えてはいけない。
+const STAGING_DIR: &str = ".staging";
+
 fn install_one(
     path: &Path,
     overwrite: bool,
@@ -138,30 +144,106 @@ fn install_one(
 ) -> Result<InstallOutcome, DndError> {
     let kind = dnd::detect_asset_kind(path)?;
     let peek = dnd::peek_manifest(path, kind)?;
-    let target_dir = match kind {
-        AssetKind::Ghost => assets_dir.join("ghosts").join(&peek.id),
-        AssetKind::Shell => assets_dir.join("shells").join(&peek.id),
+    let subdir = match kind {
+        AssetKind::Ghost => "ghosts",
+        AssetKind::Shell => "shells",
     };
-    if target_dir.exists() {
-        if !overwrite {
-            return Ok(InstallOutcome::Conflict {
-                id: peek.id,
-                name: peek.name,
-                kind,
-            });
-        }
-        std::fs::remove_dir_all(&target_dir).map_err(DndError::from)?;
+    let target_dir = assets_dir.join(subdir).join(&peek.id);
+    if target_dir.exists() && !overwrite {
+        return Ok(InstallOutcome::Conflict {
+            id: peek.id,
+            name: peek.name,
+            kind,
+        });
     }
-    if path.is_dir() {
-        dnd::install_folder(path, &target_dir, kind)?;
+
+    // **別ディレクトリで展開・検証を終えてから差し替える (v0.5.3)。**
+    //
+    // v0.5.2 までは上書き承認後に `remove_dir_all(&target_dir)` を先に実行してから
+    // 展開していた。そのため展開中に禁止拡張子・zip 破損・容量不足などで失敗すると、
+    // **使えていた旧版まで失われた**。悪意ある入力を必要としない、通常の更新操作の
+    // 問題である (Codex レビュー 2026-09-06)。
+    let staging_root = assets_dir.join(STAGING_DIR);
+    // 前回が異常終了して残っていた分を掃除する (DnD は 1 件ずつ順に処理するので競合しない)。
+    let _ = std::fs::remove_dir_all(&staging_root);
+    let staging = staging_root.join(format!("{subdir}-{}", peek.id));
+    std::fs::create_dir_all(&staging).map_err(DndError::from)?;
+
+    let staged = if path.is_dir() {
+        dnd::install_folder(path, &staging, kind)
     } else {
-        dnd::install_zip(path, &target_dir, kind)?;
+        dnd::install_zip(path, &staging, kind)
     }
+    .and_then(|()| verify_staged(&staging, kind, &peek.id));
+
+    if let Err(err) = staged {
+        // **旧版は無傷のまま**。作業ディレクトリだけ片付けて失敗を返す。
+        let _ = std::fs::remove_dir_all(&staging_root);
+        return Err(err);
+    }
+
+    // 待避先は staging_root の**外**に置く (下の掃除で旧版を巻き添えにしないため)。
+    let previous = assets_dir.join(format!(".previous-{subdir}-{}", peek.id));
+    let swapped = swap_in(&staging, &target_dir, &previous);
+    let _ = std::fs::remove_dir_all(&staging_root);
+    swapped?;
+
     Ok(InstallOutcome::Installed {
         id: peek.id,
         name: peek.name,
         kind,
     })
+}
+
+/// 展開結果が「確認したもの」と一致しているか見る。
+///
+/// 複数の manifest を含む zip では、確認時と展開時で別の manifest を採ると
+/// **確認ダイアログに出した id と実際の中身が食い違う**。選択規則は
+/// `dnd::pick_manifest_entry` に一本化してあるが、差し替え前にもう一度突き合わせる。
+fn verify_staged(staging: &Path, kind: AssetKind, declared_id: &str) -> Result<(), DndError> {
+    let staged = dnd::peek_manifest(staging, kind)?;
+    if staged.id != declared_id {
+        return Err(DndError::IdMismatch(format!(
+            "確認時 {declared_id} / 展開結果 {staged}",
+            staged = staged.id
+        )));
+    }
+    Ok(())
+}
+
+/// 展開済みディレクトリを本番位置へ差し替える。
+///
+/// 旧版は削除ではなく**待避してから**入れ替え、入れ替えに失敗したら戻す。
+/// 待避先を `ghosts/` `shells/` の外に置くのは、有効な manifest を持つ
+/// ディレクトリが資産一覧に一瞬でも現れないようにするため。
+fn swap_in(staging: &Path, target: &Path, previous: &Path) -> Result<(), DndError> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(DndError::from)?;
+    }
+    if !target.exists() {
+        return std::fs::rename(staging, target).map_err(DndError::from);
+    }
+
+    let _ = std::fs::remove_dir_all(previous);
+    std::fs::rename(target, previous).map_err(DndError::from)?;
+    match std::fs::rename(staging, target) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(previous);
+            Ok(())
+        }
+        Err(err) => {
+            // 入れ替えに失敗したら旧版を戻す。**戻せなかったときは待避先を消さず**、
+            // 場所をログに残す (自動で消すと、まさに守ろうとしたデータを失う)。
+            match std::fs::rename(previous, target) {
+                Ok(()) => {}
+                Err(restore) => crate::ulog!(
+                    "[dnd] 差し替えに失敗し、旧版の復元にも失敗しました。旧版は {} に残してあります: {restore}",
+                    previous.display()
+                ),
+            }
+            Err(DndError::from(err))
+        }
+    }
 }
 
 /// `dir` の直下サブディレクトリそれぞれの `manifest_name` を読み込み、`parse` を通せたエントリを集める。
@@ -187,4 +269,135 @@ where
         }
     }
     out
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn zip_with(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {
+        let tmp = tempfile::Builder::new().suffix(".zip").tempfile().unwrap();
+        let mut zw = zip::ZipWriter::new(tmp.reopen().unwrap());
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap();
+        tmp
+    }
+
+    fn ghost_json(id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"schema_version":1,"id":"{id}","name":"{id} のゴースト","characters":{{"main":{{"name":"m"}}}},"dictionaries":[]}}"#
+        )
+        .into_bytes()
+    }
+
+    /// 既に導入済みの状態を作る。
+    fn assets_with_installed(id: &str, marker: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let ghost = dir.path().join("ghosts").join(id);
+        std::fs::create_dir_all(&ghost).unwrap();
+        std::fs::write(ghost.join("ghost.json"), ghost_json(id)).unwrap();
+        std::fs::write(ghost.join("dic.yaml"), marker.as_bytes()).unwrap();
+        dir
+    }
+
+    /// **更新に失敗しても旧版が残る (v0.5.3)。**
+    ///
+    /// v0.5.2 までは上書き承認後に `remove_dir_all` を先に実行してから展開していたため、
+    /// 展開中の失敗 (禁止拡張子・zip 破損・容量不足) で**使えていた旧版まで失われた**。
+    /// 悪意ある入力を必要としない、通常の更新操作の問題 (Codex レビュー 2026-09-06)。
+    #[test]
+    fn failed_update_keeps_the_previous_version() {
+        let assets = assets_with_installed("mimi", "OLD");
+        // ghost では .exe は許可されていないので展開が必ず失敗する。
+        let bad = zip_with(&[
+            ("ghost.json", ghost_json("mimi").as_slice()),
+            ("evil.exe", b"x".as_slice()),
+        ]);
+
+        let err = install_one(bad.path(), true, assets.path()).unwrap_err();
+        assert!(
+            matches!(err, DndError::ForbiddenFile(_)),
+            "想定と違うエラー: {err}"
+        );
+
+        // **旧版が無傷であること**が要点。
+        let old = assets.path().join("ghosts").join("mimi");
+        assert!(old.is_dir(), "旧版のディレクトリごと消えている");
+        assert_eq!(
+            std::fs::read_to_string(old.join("dic.yaml")).unwrap(),
+            "OLD",
+            "旧版の中身が失われている"
+        );
+        // 作業ディレクトリは残さない。
+        assert!(!assets.path().join(STAGING_DIR).exists());
+    }
+
+    /// 成功したときはちゃんと入れ替わり、待避先も残らない。
+    #[test]
+    fn successful_update_replaces_and_leaves_no_leftovers() {
+        let assets = assets_with_installed("mimi", "OLD");
+        let good = zip_with(&[
+            ("ghost.json", ghost_json("mimi").as_slice()),
+            ("dic.yaml", b"NEW".as_slice()),
+        ]);
+
+        let out = install_one(good.path(), true, assets.path()).unwrap();
+        assert!(matches!(out, InstallOutcome::Installed { .. }));
+
+        let dir = assets.path().join("ghosts").join("mimi");
+        assert_eq!(std::fs::read_to_string(dir.join("dic.yaml")).unwrap(), "NEW");
+        assert!(!assets.path().join(STAGING_DIR).exists());
+        assert!(!assets.path().join(".previous-ghosts-mimi").exists());
+        // ghosts/ 直下に作業用の残骸を作っていないこと (資産一覧に紛れ込む)。
+        let stray: Vec<_> = std::fs::read_dir(assets.path().join("ghosts"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "mimi")
+            .collect();
+        assert!(stray.is_empty(), "ghosts/ に残骸: {stray:?}");
+    }
+
+    /// 上書き承認が無ければ従来どおり Conflict を返し、何も触らない。
+    #[test]
+    fn conflict_without_overwrite_touches_nothing() {
+        let assets = assets_with_installed("mimi", "OLD");
+        let good = zip_with(&[
+            ("ghost.json", ghost_json("mimi").as_slice()),
+            ("dic.yaml", b"NEW".as_slice()),
+        ]);
+        let out = install_one(good.path(), false, assets.path()).unwrap();
+        assert!(matches!(out, InstallOutcome::Conflict { .. }));
+        let dir = assets.path().join("ghosts").join("mimi");
+        assert_eq!(std::fs::read_to_string(dir.join("dic.yaml")).unwrap(), "OLD");
+        assert!(!assets.path().join(STAGING_DIR).exists());
+    }
+
+    /// **確認した id と、実際に導入される中身が一致する (v0.5.3)。**
+    ///
+    /// v0.5.2 までは確認が「最初に一致した manifest」、展開が「最も浅い manifest」で、
+    /// 複数 manifest を含む zip で食い違いえた。選択規則を 1 箇所へ寄せて解消した。
+    #[test]
+    fn deep_manifest_first_does_not_decide_the_id() {
+        let assets = tempfile::tempdir().unwrap();
+        // **深い方を先に**置く。旧実装はこちらを採用していた。
+        let z = zip_with(&[
+            ("nested/deep/ghost.json", ghost_json("deep").as_slice()),
+            ("ghost.json", ghost_json("shallow").as_slice()),
+            ("dic.yaml", b"NEW".as_slice()),
+        ]);
+        let out = install_one(z.path(), true, assets.path()).unwrap();
+        match out {
+            InstallOutcome::Installed { id, .. } => assert_eq!(id, "shallow"),
+            InstallOutcome::Conflict { .. } => panic!("Conflict が返った"),
+        }
+        assert!(assets.path().join("ghosts").join("shallow").is_dir());
+        assert!(!assets.path().join("ghosts").join("deep").exists());
+    }
 }
