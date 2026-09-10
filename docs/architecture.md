@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.13）
+# ugg アーキテクチャ設計書（architecture.md v2.14）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1012,6 +1012,9 @@ when:                                        # ⑥ 確率
 
 ```
    synthesize_voice(text, slot, caption?)   ★ caption は Irodori 実モデルのみ使用
+                                            ★v0.5.4 訂正: **v3 では効いていない**
+                                            (本体 checkpoint が use_caption_condition:false)。
+                                            v0.5.5 の v4.1-Small 差し替えで初めて効く
             │
             ▼
    ┌────────────────────┐
@@ -1747,3 +1750,4 @@ async fn install_asset(
 | 2026-09-10 | v2.11 | **v0.5.3 項目 6（問いかけを会話として閉じる）**。`advanced::load_recent_history` を実装（v0.5.2 まで `Ok(Vec::new())` 固定）。`list_recent_chat_log` を時系列へ戻し、連続する同種の行を 1 ブロックへまとめ、`MAX_HISTORY_PAIRS = 8` 往復・`MAX_HISTORY_CHARS = 1200` 文字で古い方から落とす。切り出しの起点は「最初に残すユーザー発言の 1 つ前」= 問いかけ。キャラ発話は `<名前>: <台詞>` 形式で assistant に入れる。`ChatMessage::assistant` の `#[allow(dead_code)]` を解除。**呼び出しは `build_messages`（チャット経路）のみ**で、`system::monologue` は自前のプロンプトを組む。**契約変更なし。** |
 | 2026-09-10 | v2.12 | **v0.5.3 項目 9（操作列テストの常設）**。フロントに Vitest + happy-dom を導入（`vitest.config.ts` / `npm test` / `src/__tests__/`）。DOM は `index.html` の body を読み込んで作る（手書きダミーだと id のずれに気づけないため）。操作列 4 本の内訳と書き方は docs/test-plan.md §3.2b が正本。**プロダクションコードの構成変更なし。** |
 | 2026-09-10 | v2.13 | **v0.5.3 のリリース前監査を受けた是正**。① `Db::list_recent_chat_log_in_mode(mode, limit)` を追加し、`load_recent_history` はこれで **mode="advanced" の行だけ**を読む（バック起点の発話は例外なく mode="low" で記録されるので mode で切り分けられる。取ってから絞ると独り言だけが続いた夜に会話行が LIMIT の窓から押し出されるため **SQL 側で絞る**）。往復が 1 つも無い窓では空を返す。② `monologue::parse_monologue_batch` のエラーから応答本文を外す（項目 7 で `advanced` 側だけを直しており漏れていた）。③ `llm::truncate_for_log` を追加し、HTTP エラーボディを 300 文字で頭打ちにする。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
+| 2026-09-11 | v2.14 | **未計上だった契約⇔実装の乖離を 1 件記載**（v0.5.4 のスコープ検討中に発見）。`synthesize_voice` の `caption` は「Irodori 実モデルのみ使用」と書いてあるが、**v3 本体の checkpoint が `use_caption_condition: false` のため一度も効いていない**（`sidecar.py` は渡しており `cfg_scale_caption=3.0` も設定しているが、条件付けに入らず捨てられる）。台本の行ごとの声質指示は Irodori 経路では無効。**v0.5.5 の v4.1-Small 差し替えで閉じる**（`use_caption_condition: true`）。設計・契約の変更はなし。 |
