@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.9）
+# ugg アーキテクチャ設計書（architecture.md v2.10）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1743,3 +1743,4 @@ async fn install_asset(
 | 2026-09-10 | v2.7 | **v0.5.3 項目 2（更新でデータを失わない）**。① `install_one` を「`assets/.staging/` へ展開 → `verify_staged` で id を再確認 → `swap_in` で差し替え」に。**失敗しても旧版は無傷**。旧版は `assets/.previous-<種別>-<id>` へ待避してから入れ替え、入れ替え失敗時は戻す。**戻せなければ待避先を消さずログに残す**（作業ディレクトリの掃除で巻き添えにしないよう、待避先は staging の外に置く）。② zip 内 manifest の選択を `pick_manifest_entry` に一本化し、`read_manifest_bytes`（確認側）と `find_strip_prefix`（展開側）の両方をそこへ寄せた。規則は「最も浅いもの。同じ深さならエントリ順で先のもの」。`manifest_name` も 1 箇所へ。③ `DndError::IdMismatch` を追加。④ `ps_single_quoted` で PowerShell 単引用符を escape。**新規コマンド・イベント・DB テーブルなし。** |
 | 2026-09-10 | v2.8 | **v0.5.3 項目 3（保存したあとの再保存で巻き戻らない）**。① フロントの `ensureAssetSelection` にゴースト・シェル select の値合わせを一本化し、`fillAssetSelect`（一覧を埋める）と `applySettingsToForm`（保存済みの値をフォームへ戻す）の両方から呼ぶ。**値合わせが 2 か所に分かれていたのが、追従が取り消される原因だった。** ② `Db::clear_calendar` を廃し、`Db::save_settings_and_clear_calendar(key, value)` に置き換え。設定 JSON の保存とキャッシュ全消去を 1 トランザクションで行う。**2 つを分けて呼べる限り同じ穴が空くので、単体の `clear_calendar` は残さない。** **新規コマンド・イベント・DB テーブルなし。** |
 | 2026-09-10 | v2.9 | **v0.5.3 項目 5（課金の保護を異常時にも効かせる）**。`dialogue::cost_exceeded(-> bool)` を `cost_gate(-> CostGate{Allow,Exceeded,Unknown})` に置換。集計失敗は `Unknown` で**止める**（従来は `false` で通していた）。判定本体は `decide_cost_gate(limit, check)` に分けて `AppState` 抜きでテストできるようにした。告知に `NoticeKind::CostUnknown`（辞書キー `cost_unknown`）を追加し、既定辞書へ 2 パターン追加。告知済みは `DialogueState::cost_unknown_notified`（**プロセス内 AtomicBool**。記録先の DB 自体が疑わしいので月次タグを使わない）。call site 3 経路すべて更新。**新規コマンド・イベント・DB テーブルなし。** |
+| 2026-09-10 | v2.10 | **v0.5.3 項目 4（通知を後続の発話で消さない）**。`system/ghost-speech.ts` に通知キューを追加。`renderResponse` は通知なら `noticeQueue` へ積んで即 return し、`pumpNotices` がステージの空きを見て 1 件ずつ `renderNow` する。割り込みは `takeStage()` に一本化し、**打ち切る相手が通知ならキューの先頭へ積み直す**。`renderNow` の後片付けは `currentToken === token`（= ステージの所有者）のときだけ行う — 割り込まれた側が await から戻って解放すると、次の描画中に「空き」と誤認される。判定は `isNotice`（`kind === "system_message"` または `priority === "notice"`）。**契約変更なし**（既存フィールドのみ参照）。 |

@@ -28,6 +28,65 @@ let promptSlot: SlotName | null = null;
 let currentSpeechMeta: { id: string; category: string } | null = null;
 let muteBtn: HTMLElement | null = null;
 
+// === 通知のキュー (spec §4.1.3、v0.5.3) ==================================
+//
+// 「新発話で interrupt」は §4.1.3 の明文だが、**通知はその例外**にする。
+// 通知は「一度出したら記録が残り、二度と出ない」ので、消されると告知済みの記録だけが
+// 残って永久に届かない。実際に起きていたのは次の 2 つ:
+//   - 同じ tick で 2 件のカレンダー通知が配達されると、後の 1 件が前を消す
+//   - 80% コスト警告を emit した直後にチャット応答が返ると、応答が警告を消す
+//
+// 規則は 2 つだけ:
+//   1. 通知は**割り込まない**。描画中なら待ってから 1 件ずつ出す。
+//   2. 通知は**割り込まれても捨てない**。描画中に他の発話が来たらキューの先頭へ戻す
+//      （ユーザーの入力への応答を待たせないため、割り込み自体は許す）。
+
+/// 待機中の通知。先頭から 1 件ずつ描画する。
+const noticeQueue: DialogueResponse[] = [];
+/// いま描画中の通知（割り込まれたら積み直す対象）。通常発話の描画中は null。
+let renderingNotice: DialogueResponse | null = null;
+/// ステージ（吹き出し + 音声）を誰かが使っているか。通知はこれが空くまで待つ。
+let stageBusy = false;
+/// pumpNotices の再入防止。
+let pumping = false;
+
+/// この発話は通知か。
+/// - `kind === "system_message"`: `notify()` 経由（コスト警告・降格告知・DL 完了など）
+/// - `priority === "notice"`: `deliver_event` の Notice（リマインダー・カレンダー）
+///
+/// Ambient（状況発話・独り言・定例会話）は含めない。**消えても記録が残らず、
+/// また出る**ので守る必要が無く、含めるとユーザーの操作を待たせるだけになる。
+function isNotice(resp: DialogueResponse): boolean {
+  return resp.kind === "system_message" || resp.priority === "notice";
+}
+
+/// 進行中の描画を打ち切ってステージを空ける。
+/// **打ち切る相手が通知ならキューの先頭へ積み直す**（消すと二度と出ない）。
+function takeStage(): void {
+  if (currentToken) currentToken.cancelled = true;
+  ttsSpeaker?.interrupt();
+  if (renderingNotice) {
+    noticeQueue.unshift(renderingNotice);
+    renderingNotice = null;
+  }
+  stageBusy = false;
+}
+
+/// ステージが空いている間、通知を 1 件ずつ描画する。
+async function pumpNotices(): Promise<void> {
+  if (pumping) return;
+  pumping = true;
+  try {
+    while (noticeQueue.length > 0 && !stageBusy) {
+      const next = noticeQueue.shift();
+      if (!next) break;
+      await renderNow(next);
+    }
+  } finally {
+    pumping = false;
+  }
+}
+
 export function setSpeaker(s: SpeakerLike): void {
   ttsSpeaker = s;
 }
@@ -101,37 +160,61 @@ function buildTurns(resp: DialogueResponse): Turn[] {
 
 /// DialogueResponse を 1 件レンダリングする。
 /// 連続呼び出しは前ターンを cancel して即座に新ターンを開始する。
+/// **通知だけは割り込まず、ステージが空いてから 1 件ずつ出す** (spec §4.1.3、v0.5.3)。
 export async function renderResponse(resp: DialogueResponse): Promise<void> {
-  if (currentToken) currentToken.cancelled = true;
-  ttsSpeaker?.interrupt();
+  if (isNotice(resp)) {
+    noticeQueue.push(resp);
+    void pumpNotices();
+    return;
+  }
+  await renderNow(resp);
+  // 割り込みで積み直した分・待たせていた分を、ステージが空いたここで出す。
+  void pumpNotices();
+}
+
+/// 実際の描画。呼び出した時点でステージを奪う。
+async function renderNow(resp: DialogueResponse): Promise<void> {
+  takeStage();
   const token = newToken();
   currentToken = token;
+  stageBusy = true;
+  const notice = isNotice(resp) ? resp : null;
+  renderingNotice = notice;
 
-  promptSlot = null; // 促し表示は新しい応答で置き換えられる
-  setSpeechMeta(resp); // M9 🔕: フィードバック可能発話なら 🔕 を出す
-  hideAllBalloons();
+  try {
+    promptSlot = null; // 促し表示は新しい応答で置き換えられる
+    setSpeechMeta(resp); // M9 🔕: フィードバック可能発話なら 🔕 を出す
+    hideAllBalloons();
 
-  for (const t of buildTurns(resp)) {
+    for (const t of buildTurns(resp)) {
+      if (token.cancelled) return;
+      await speakSlot(token, t.charSlot, t.balloonSlot, t.turn);
+    }
     if (token.cancelled) return;
-    await speakSlot(token, t.charSlot, t.balloonSlot, t.turn);
+    // 保険: speakSlot が各ターンで再生完了を待つので通常は即座に解決するが、
+    // 将来 fire-and-forget が再び混入しても spec §4.1.3 (発話完了後に消去) を守れるようにする。
+    await ttsSpeaker?.whenIdle();
+    if (token.cancelled) return;
+    await sleep(holdDuration(resp));
+    if (token.cancelled) return;
+    // 全ターンの描画+発話完了後に一括消去 (spec §4.1.3)。extra を含め、表示していない
+    // 枠を隠しても無害 (hideBalloon は冪等)。
+    hideAllBalloons();
+  } finally {
+    // **ステージの所有者だけが後片付けをする。** 割り込まれた側は await から戻った
+    // 時点で既に所有者が交代しており、ここで解放すると次の描画中に「空き」と
+    // 誤認されて通知が割り込む。
+    if (currentToken === token) {
+      stageBusy = false;
+      renderingNotice = null;
+    }
   }
-  if (token.cancelled) return;
-  // 保険: speakSlot が各ターンで再生完了を待つので通常は即座に解決するが、
-  // 将来 fire-and-forget が再び混入しても spec §4.1.3 (発話完了後に消去) を守れるようにする。
-  await ttsSpeaker?.whenIdle();
-  if (token.cancelled) return;
-  await sleep(holdDuration(resp));
-  if (token.cancelled) return;
-  // 全ターンの描画+発話完了後に一括消去 (spec §4.1.3)。extra を含め、表示していない
-  // 枠を隠しても無害 (hideBalloon は冪等)。
-  hideAllBalloons();
 }
 
 /// 入力促し (spec §4.3.1): クリックされたキャラ単独の短い発話。
 /// 通常の応答と違い自動では消さず、入力欄が閉じるとき clearPrompt() で消す。
 export async function renderPrompt(slot: SlotName, turn: SpeechTurn): Promise<void> {
-  if (currentToken) currentToken.cancelled = true;
-  ttsSpeaker?.interrupt();
+  takeStage();
   const token = newToken();
   currentToken = token;
 
@@ -146,6 +229,8 @@ export function clearPrompt(): void {
   if (promptSlot === null) return;
   hideBalloon(promptSlot);
   promptSlot = null;
+  // 促しが消えてステージが空いたので、待たせていた通知があれば出す。
+  void pumpNotices();
 }
 
 /// メニュー導線 (spec §4.3.5): sub の誘導セリフ (任意) → main の前口上、の順に発話する。
@@ -156,8 +241,7 @@ export async function renderMenuPrompt(
   subTurn: SpeechTurn | null,
   mainTurn: SpeechTurn | null,
 ): Promise<boolean> {
-  if (currentToken) currentToken.cancelled = true;
-  ttsSpeaker?.interrupt();
+  takeStage();
   const token = newToken();
   currentToken = token;
 
@@ -178,11 +262,14 @@ export async function renderMenuPrompt(
 
 /// 進行中の発話・促し表示を打ち切って全バルーンを隠す (メニュークローズ等から呼ぶ)。
 export function cancelSpeech(): void {
-  if (currentToken) currentToken.cancelled = true;
-  ttsSpeaker?.interrupt();
+  takeStage();
+  // 所有者を残さない。残すと、打ち切られた描画が await から戻ったときに
+  // 自分をまだ所有者と見なして後片付けをしてしまう。
+  currentToken = null;
   promptSlot = null;
   setSpeechMeta(null);
   hideAllBalloons();
+  void pumpNotices();
 }
 
 /// `charSlot` = 発話するキャラ (pose・TTS 話者)、`balloonSlot` = 表示先の吹き出し枠。
