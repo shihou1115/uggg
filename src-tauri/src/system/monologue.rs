@@ -123,8 +123,11 @@ pub async fn maybe_refill(app: &AppHandle, state: &Arc<AppState>) {
     // (補充は無人で 30 分ごとに走り、降格は 5 分で自動復帰するので歯止めにならない)。
     // 判定はチャット経路と同じ単一のゲート (spec §4.2.7)。
     // 背景処理だけが上限を素通りする穴を作らない。
-    if crate::dialogue::cost_exceeded(state, &settings) {
-        crate::dialogue::evaluate_cost_status(app, state, &settings).await;
+    // v0.5.3: 集計できないときも止める (fail-closed)。無人で 30 分ごとに走る経路なので、
+    // ここが素通りすると「上限を守れないまま無人で叩き続ける」最悪の形になる。
+    let gate = crate::dialogue::cost_gate(state, &settings);
+    if gate.blocks() {
+        crate::dialogue::announce_cost_block(app, state, &settings, gate).await;
         return;
     }
 

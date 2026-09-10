@@ -608,6 +608,13 @@ system_messages:
       sub: { text: "上限に達した。来月まではこのままだ", pose: normal }
     - main: { text: "あー、上限に届いちゃった。でも普通におしゃべりはできるよ！", pose: normal }
       sub: { text: "課金は止めた。次の月まで待て", pose: normal }
+  # v0.5.3: 集計不能で止めたときの告知。「上限に達した」ではなく「今いくら使ったか
+  # 分からない」状態なので、cost_limit_exceeded とは別のキーにしている。
+  cost_unknown:
+    - main: { text: "あれ、今月いくら使ったか数えられないや。安全側に倒して辞書でおしゃべりするね", pose: troubled }
+      sub: { text: "集計ができない。上限を守れない以上、課金は止めておく", pose: normal }
+    - main: { text: "お小遣い帳が読めなくなっちゃった…とりあえず節約しておくね", pose: troubled }
+      sub: { text: "使用量が読めないなら使わない。それでいい", pose: normal }
   mode_degraded:
     - main: { text: "ごめん、ちょっと頭がぼーっとして通信できないみたい", pose: troubled }
       sub: { text: "回線かAPIキーの調子が悪いようだ。しばらく省エネで話すよ", pose: normal }

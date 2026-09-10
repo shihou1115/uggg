@@ -19,6 +19,12 @@ pub enum NoticeKind {
     CostLimitExceeded {
         provider: String,
     },
+    /// **当月コストを集計できない** (v0.5.3、spec §4.2.7)。
+    /// 上限が有限なら、集計不能の間は LLM を呼ばずに止める (fail-closed) ので、
+    /// 黙って low に落ちたように見えないよう告知する。
+    CostUnknown {
+        provider: String,
+    },
     ModeDegraded {
         reason: DegradeReason,
     },
@@ -67,6 +73,7 @@ impl NoticeKind {
         match self {
             NoticeKind::CostWarning80 { .. } => "cost_warning_80",
             NoticeKind::CostLimitExceeded { .. } => "cost_limit_exceeded",
+            NoticeKind::CostUnknown { .. } => "cost_unknown",
             NoticeKind::ModeDegraded { .. } => "mode_degraded",
             NoticeKind::ModeRecovered => "mode_recovered",
             NoticeKind::VoicevoxDlComplete => "voicevox_dl_complete",
@@ -85,6 +92,9 @@ impl NoticeKind {
             }
             NoticeKind::CostLimitExceeded { provider } => {
                 format!("LLM 月次コストが上限を超過しました ({provider})。低負荷モードに降格します")
+            }
+            NoticeKind::CostUnknown { provider } => {
+                format!("LLM 月次コストを集計できません ({provider})。上限を守れないため低負荷モードで動きます")
             }
             NoticeKind::ModeDegraded { reason } => match reason {
                 DegradeReason::ApiError => "API エラーが続いたので一時的に低負荷モードへ切り替えました".to_string(),
@@ -158,6 +168,7 @@ mod dict_key_contract {
         vec![
             NoticeKind::CostWarning80 { provider: "openai".into() },
             NoticeKind::CostLimitExceeded { provider: "openai".into() },
+            NoticeKind::CostUnknown { provider: "openai".into() },
             NoticeKind::ModeDegraded { reason: DegradeReason::ApiError },
             NoticeKind::ModeRecovered,
             NoticeKind::VoicevoxDlComplete,
@@ -175,7 +186,7 @@ mod dict_key_contract {
         let keys: BTreeSet<_> = all_kinds().iter().map(|k| k.dict_key()).collect();
         assert_eq!(
             keys.len(),
-            10,
+            11,
             "NoticeKind の変種を増やしたら all_kinds() にも足すこと（現在のキー: {keys:?}）"
         );
     }

@@ -228,23 +228,41 @@ async fn run_dispatch(
 
     // 上限超過は LLM を呼ぶ「前」に弾く (spec §4.2.7)。
     // 以前は try_advanced の成功後にしか判定しておらず、超過後も呼び続けていた。
-    let over_limit = cost_exceeded(state, &settings);
-    if over_limit && !cost::notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED) {
+    let gate = cost_gate(state, &settings);
+    if gate == CostGate::Exceeded && !cost::notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED)
+    {
         // **この turn の返答そのものを告知にする。**
         // emit で別発話として流すと、直後に返る low 応答が同じ吹き出しへ描画され
         // (フロントの listen コールバックは並行する)、月 1 回しか出ない告知が
         // 視認前に消えうる。しかも告知済みフラグは立つので二度と出ない。
         // 返答として返せば必ず表示される。
-        if let Some(resp) = cost_limit_reply(state) {
+        if let Some(resp) = system_message_reply(state, "cost_limit_exceeded") {
             cost::mark_notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED);
             return Ok(resp);
         }
         // 辞書にキーが無いゴースト向けの保険 (既定辞書には v0.5 で追加済み)。
         announce_cost_limit_once(app, state, &settings).await;
     }
+    // v0.5.3: 集計できずに止めた場合も、同じ理由（吹き出しの取り合い）で
+    // この turn の返答として出す。こちらはプロセス内フラグで 1 回だけ。
+    if gate == CostGate::Unknown
+        && !state
+            .dialogue
+            .cost_unknown_notified
+            .load(Ordering::SeqCst)
+    {
+        if let Some(resp) = system_message_reply(state, "cost_unknown") {
+            state
+                .dialogue
+                .cost_unknown_notified
+                .store(true, Ordering::SeqCst);
+            return Ok(resp);
+        }
+        announce_cost_unknown_once(app, state, &settings).await;
+    }
     let want_advanced = matches!(settings.mode, DialogueMode::Advanced)
         && !is_degraded(&state.dialogue)
-        && !over_limit;
+        && !gate.blocks();
 
     if want_advanced {
         match try_advanced(state, user_text).await {
@@ -347,38 +365,116 @@ pub(crate) async fn evaluate_cost_status(
     }
 }
 
-/// 月額上限に達しているか。**LLM を呼ぶ前に必ず通す唯一のゲート** (spec §4.2.7)。
+/// LLM を呼ぶ前のコストゲートの判定結果 (spec §4.2.7)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CostGate {
+    /// 呼んでよい（上限が無制限、または当月の使用が上限内）。
+    Allow,
+    /// 当月上限を超えている。
+    Exceeded,
+    /// **当月コストを集計できなかった。**
+    Unknown,
+}
+
+impl CostGate {
+    /// LLM 呼び出しを止めるか。
+    pub(crate) fn blocks(self) -> bool {
+        !matches!(self, CostGate::Allow)
+    }
+}
+
+/// 月額上限のゲート。**LLM を呼ぶ前に必ず通す唯一のゲート** (spec §4.2.7)。
 ///
 /// `cost::check_status` は毎回 `api_usage` の当月分を DB から集計するので、
 /// プロセスを跨いでも月が替わっても正しい。以前は「超過 → 300 秒の一時降格」
 /// だったため、実質「5 分の一時停止」でその月ずっと課金が続いていた。
 /// 降格タイマー (`degraded_until`) は **API エラー由来専用**とし、コスト超過は
 /// このゲートで毎回判定する。
-pub(crate) fn cost_exceeded(state: &Arc<AppState>, settings: &crate::state::Settings) -> bool {
-    if settings.monthly_limit_usd <= 0.0 {
-        return false;
+///
+/// **集計に失敗したら止める (fail-closed、v0.5.3)。** v0.5.2 まではここで
+/// `false` を返して通していた（「集計できないときに課金を止めるのは過剰」）。
+/// だが v0.5.2 で**破損 DB でも起動を続ける**ようにしたことで `sum_cost_since` の
+/// 失敗が現実の経路になり、「上限を設定しているのに無制限に課金される」という
+/// 組み合わせが生まれた。上限が有限＝ユーザーが「ここまで」と言っている以上、
+/// 守れないなら使わない。止めたことは `CostGate::Unknown` として呼び出し側へ返し、
+/// **黙って low に落ちたように見えないよう告知する**。
+pub(crate) fn cost_gate(state: &Arc<AppState>, settings: &crate::state::Settings) -> CostGate {
+    let limit = settings.monthly_limit_usd;
+    decide_cost_gate(limit, || cost::check_status(&state.db, limit))
+}
+
+/// `cost_gate` の判定そのもの。`AppState` を組み立てずにテストできるよう分けてある。
+fn decide_cost_gate(
+    limit_usd: f64,
+    check: impl FnOnce() -> anyhow::Result<cost::CostStatus>,
+) -> CostGate {
+    if limit_usd <= 0.0 {
+        // 無制限は「守るべき上限が無い」ので、集計できるかどうかと無関係に通す。
+        return CostGate::Allow;
     }
-    match cost::check_status(&state.db, settings.monthly_limit_usd) {
-        Ok(st) => st.exceeded,
+    match check() {
+        Ok(st) if st.exceeded => CostGate::Exceeded,
+        Ok(_) => CostGate::Allow,
         Err(err) => {
-            // 集計できないときに課金を止めるのは過剰なので通す（記録は残す）。
-            crate::ulog!("[cost] check_status failed: {err:#}");
-            false
+            crate::ulog!("[cost] check_status failed (上限を守れないので止めます): {err:#}");
+            CostGate::Unknown
         }
     }
 }
 
-/// 上限超過の告知を「この turn の返答」として組み立てる。
+/// システムメッセージを「この turn の返答」として組み立てる。
 ///
-/// 辞書 `system_messages.cost_limit_exceeded` を引く。キーが無ければ None。
-fn cost_limit_reply(state: &Arc<AppState>) -> Option<DialogueResponse> {
+/// 辞書 `system_messages.<key>` を引く。キーが無ければ None。
+fn system_message_reply(state: &Arc<AppState>, key: &str) -> Option<DialogueResponse> {
     let guard = state.ghost.lock().expect("ghost poisoned");
     let bundle = guard.as_ref().ok()?;
     let ctx = crate::ghost::dict::WhenContext::now();
     let line = bundle
         .dictionary
-        .pick_system_message("cost_limit_exceeded", &ctx, bundle.sub_available())?;
+        .pick_system_message(key, &ctx, bundle.sub_available())?;
     Some(banter::pattern_1("event", "low", line))
+}
+
+/// 「集計できないので止めている」告知を **このプロセスで 1 回だけ**出す。
+///
+/// 月次タグ (`cost::KEY_LIMIT_NOTIFIED` 等) を使わないのは意図的で、理由は
+/// `DialogueState::cost_unknown_notified` のコメントに書いた（記録先の DB 自体が
+/// 疑わしい状態なので、永続フラグに頼ると毎ターン告知しかねない）。
+pub(crate) async fn announce_cost_unknown_once(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    settings: &crate::state::Settings,
+) {
+    if state
+        .dialogue
+        .cost_unknown_notified
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    notify::notify(
+        app,
+        state,
+        NoticeKind::CostUnknown {
+            provider: settings.llm_provider.clone(),
+        },
+    )
+    .await;
+}
+
+/// 背景経路（独り言補充など）で、ゲートが止めた理由に応じた告知を出す。
+/// チャット経路は「この turn の返答」として出すので、こちらは通らない。
+pub(crate) async fn announce_cost_block(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    settings: &crate::state::Settings,
+    gate: CostGate,
+) {
+    match gate {
+        CostGate::Allow => {}
+        CostGate::Exceeded => evaluate_cost_status(app, state, settings).await,
+        CostGate::Unknown => announce_cost_unknown_once(app, state, settings).await,
+    }
 }
 
 fn degrade(d: &crate::state::DialogueState) {
@@ -469,4 +565,86 @@ fn is_degraded(d: &crate::state::DialogueState) -> bool {
     }
     let now = Utc::now().timestamp();
     now < until
+}
+
+
+#[cfg(test)]
+mod cost_gate_tests {
+    use super::*;
+    use crate::db::Db;
+    use crate::system::cost;
+
+    fn db_with_cost(dir: &std::path::Path, cost_usd: f64) -> Db {
+        let db = Db::open(&dir.join("companion.db")).expect("open");
+        db.migrate().expect("migrate");
+        if cost_usd > 0.0 {
+            db.append_api_usage(&crate::db::ApiUsageRow {
+                provider: "openai".into(),
+                model: "gpt-4o-mini".into(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cost_usd,
+                ts: cost::month_start_unix() + 1,
+            })
+            .expect("append");
+        }
+        db
+    }
+
+    #[test]
+    fn within_limit_allows_and_over_limit_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_with_cost(dir.path(), 0.5);
+        assert_eq!(
+            decide_cost_gate(1.0, || cost::check_status(&db, 1.0)),
+            CostGate::Allow
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let db2 = db_with_cost(dir2.path(), 2.0);
+        assert_eq!(
+            decide_cost_gate(1.0, || cost::check_status(&db2, 1.0)),
+            CostGate::Exceeded
+        );
+    }
+
+    /// **集計できないときは止める (fail-closed、v0.5.3)。**
+    ///
+    /// v0.5.2 まではここで通していた。v0.5.2 が「破損 DB でも起動を続ける」ように
+    /// したことで `sum_cost_since` の失敗が現実の経路になり、**上限を設定して
+    /// いるのに無制限に課金される**組み合わせが生まれた。
+    #[test]
+    fn unaggregatable_cost_blocks_when_a_limit_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_with_cost(dir.path(), 0.0);
+        // 集計元を壊す。実機では破損 DB が同じ Err を出す。
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("companion.db")).unwrap();
+            conn.execute("DROP TABLE api_usage", []).unwrap();
+        }
+        assert!(cost::check_status(&db, 1.0).is_err(), "前提: 集計が失敗する");
+
+        assert_eq!(
+            decide_cost_gate(1.0, || cost::check_status(&db, 1.0)),
+            CostGate::Unknown,
+            "上限があるのに集計できないなら止める"
+        );
+        assert!(decide_cost_gate(1.0, || cost::check_status(&db, 1.0)).blocks());
+    }
+
+    /// 無制限 (上限 0) では集計できなくても止めない。
+    /// **守るべき上限が無いのに機能を落とすのは、ただの機能低下**になるため。
+    #[test]
+    fn unaggregatable_cost_does_not_block_when_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_with_cost(dir.path(), 0.0);
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("companion.db")).unwrap();
+            conn.execute("DROP TABLE api_usage", []).unwrap();
+        }
+        assert_eq!(
+            decide_cost_gate(0.0, || cost::check_status(&db, 0.0)),
+            CostGate::Allow
+        );
+    }
 }

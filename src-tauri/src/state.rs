@@ -694,6 +694,14 @@ pub struct DialogueState {
     /// (foundation-design §3.3)。LLM 呼び出しのペース制御なので degraded_until と
     /// 同じ DialogueState に置く。永続化しない (再起動後はストックの有無で決まる)。
     pub monologue_refill_ts: AtomicI64,
+    /// v0.5.3: 「当月コストを集計できない」告知をこのプロセスで出したか。
+    ///
+    /// **これは意図的にプロセス内フラグ。** 月次タグ (`KEY_LIMIT_NOTIFIED` 等) を
+    /// 使わないのは、集計不能の主因が DB 側の異常で、`app_settings` への読み書きも
+    /// 同時に失敗しうるため（記録できないと毎ターン告知して吹き出しを占有する）。
+    /// 「上限に達した」は月単位の予算の話なので月次タグが正しいが、こちらは
+    /// **その時点で壊れているかどうか**なので、セッションごとに 1 回で足りる。
+    pub cost_unknown_notified: AtomicBool,
 }
 
 impl Default for DialogueState {
@@ -705,6 +713,7 @@ impl Default for DialogueState {
             error_streak: AtomicI64::new(0),
             greeted: AtomicBool::new(false),
             monologue_refill_ts: AtomicI64::new(0),
+            cost_unknown_notified: AtomicBool::new(false),
         }
     }
 }
