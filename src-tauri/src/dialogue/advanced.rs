@@ -15,7 +15,7 @@ use crate::dialogue::{banter, DialogueResponse};
 use crate::ghost::dict::{DialogueLine, SpeechTurn};
 use crate::ghost::GhostBundle;
 use crate::state::Settings;
-use crate::ghost::dict::keywords_of;
+use crate::ghost::dict::keywords_from_user_input;
 
 /// 1 ターン分のユーザー入力 → DialogueResponse。
 /// `usage` は記録目的で AdvancedReply に同梱するが、現状は cost.rs 側で `api_usage` テーブルへ
@@ -119,10 +119,17 @@ async fn parse_and_record(
     })?;
 
     // 自動抽出: LLM が memory を返したら user_profile に origin=auto で保存。
+    // **トリガー語は要約文からではなく、ユーザーの入力から採る** (spec §4.2.6、v0.5.3)。
+    // 要約文にかけると LLM の言葉づかいが recall のトリガーになり、low の通常応答を奪う。
     if let Some(memory) = parsed.memory {
         let memory = memory.trim();
         if !memory.is_empty() {
-            db.insert_profile(memory, ProfileOrigin::Auto, keywords_of(memory).as_deref(), now)?;
+            db.insert_profile(
+                memory,
+                ProfileOrigin::Auto,
+                keywords_from_user_input(memory, user_text).as_deref(),
+                now,
+            )?;
             // 容量管理 (low モードと同じ件数上限ベースで簡易実装)。
             // 要約サイクル (advanced 用) は将来課題。
             enforce_profile_capacity(db, settings.profile_max_count)?;
@@ -440,8 +447,12 @@ fn plaintext_fallback(raw: &str) -> Option<ParsedAdvanced> {
 /// (LLM が誤って含めても捨てる)。
 fn parse_dialogue_json(raw: &str, bundle: &GhostBundle, pattern: u8) -> Result<ParsedAdvanced> {
     let json = extract_json_blob(raw);
+    // **会話本文をエラーに載せない** (spec §5、v0.5.3)。この Err は `{err:#}` で
+    // `ugg.log` へ流れ、ログは履歴クリアの対象外なので LLM の応答本文が溜まり続けていた。
+    // serde 側のエラー（想定した型・行・列）は with_context の source として残るので、
+    // 診断に必要な情報は本文を出さなくても得られる。
     let parsed: ParsedResponse = serde_json::from_str(json)
-        .with_context(|| format!("JSON 構造が想定と違います: {json}"))?;
+        .with_context(|| format!("JSON 構造が想定と違います ({} 文字)", json.chars().count()))?;
 
     let main = SpeechTurn {
         text: parsed.main.text.trim().to_string(),
@@ -588,6 +599,32 @@ mod tests {
             menu_prompt_main: vec![],
             menu_prompt_sub: vec![],
         }
+    }
+
+    /// **診断ログに会話本文を残さない** (spec §5、v0.5.3)。
+    ///
+    /// この Err は `{err:#}` で `ugg.log` へ流れる。ログは履歴クリアの対象外なので、
+    /// LLM の応答本文がユーザーの与り知らぬところで溜まり続けていた。
+    #[test]
+    fn parse_error_does_not_carry_the_response_body() {
+        let raw = r#"{"main": {"text": 通院の予定を秘密のあいことばで話した}}"#;
+        let err = match parse_dialogue_json(raw, &make_bundle(true), 1) {
+            Ok(_) => panic!("この入力はパースできてはいけない"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("秘密のあいことば"),
+            "応答本文がエラー文言に載っている: {msg}"
+        );
+        assert!(
+            msg.contains("JSON 構造が想定と違います"),
+            "何が起きたかは分かること: {msg}"
+        );
+        assert!(
+            msg.contains("column") || msg.contains("line"),
+            "serde 側の位置情報は診断のために残すこと: {msg}"
+        );
     }
 
     #[test]

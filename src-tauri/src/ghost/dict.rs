@@ -839,6 +839,45 @@ mod tests {
         assert_eq!(extract_keywords("読書、映画"), ["読書", "映画"]);
     }
 
+    /// **自動記憶のトリガー語は LLM の要約文からではなくユーザー入力から採る**
+    /// (spec §4.2.6、v0.5.3)。v0.5.1 で塞いだのはオンボーディングの定型文だけで、
+    /// 自動抽出経路には同じ穴が残っていた。
+    #[test]
+    fn auto_memory_keywords_come_from_user_input_only() {
+        let memory = "ユーザーは猫のミケを飼っている。写真を見せたい希望あり";
+        let user_text = "うちの猫、ミケっていうんだ";
+
+        // 要約文をそのままかけると LLM 側の語が拾われる（だからかけてはいけない）。
+        assert!(
+            extract_keywords(memory).contains(&"ユーザー".to_string()),
+            "前提: 要約文には汎用語が混ざる"
+        );
+
+        assert_eq!(
+            keywords_from_user_input(memory, user_text).as_deref(),
+            Some("ミケ"),
+            "ユーザーが実際に言った語だけがトリガーになる"
+        );
+    }
+
+    /// 言い換えられて一致しなければトリガーを作らない。**誤爆より不発を選ぶ**
+    /// （誤爆は毎回 low の応答を奪うが、不発は静かなだけ）。
+    #[test]
+    fn no_keywords_when_the_summary_shares_no_user_word() {
+        // 要約文だけ見れば「珈琲」「話題」「記録」が拾えてしまう組み合わせにして、
+        // 「要約文から採る」実装に戻したら落ちるようにしてある。
+        let memory = "珈琲の話題を記録";
+        let user_text = "コーヒーはブラック派";
+        assert!(
+            !extract_keywords(memory).is_empty(),
+            "前提: 要約文単体からは語が拾える"
+        );
+        assert!(
+            keywords_from_user_input(memory, user_text).is_none(),
+            "言い換えられて一致しないならトリガーを作らない"
+        );
+    }
+
     #[test]
     fn keywords_of_returns_none_when_nothing_extractable() {
         assert!(keywords_of("あ、うん。").is_none());
@@ -1168,5 +1207,24 @@ pub fn extract_keywords(content: &str) -> Vec<String> {
 /// （カンマ区切り）にする。抽出できなければ None。
 pub fn keywords_of(content: &str) -> Option<String> {
     let kws = extract_keywords(content);
+    (!kws.is_empty()).then(|| kws.join(","))
+}
+
+/// 記憶のトリガー語を **ユーザーが入力した語からのみ**作る (spec §4.2.6、v0.5.3)。
+///
+/// `content` は記憶の本文で、advanced の自動抽出では **LLM が書いた要約文**。
+/// そこから直接拾うと LLM の言葉づかい（「ユーザー」「希望」等）がトリガーになり、
+/// `pick_recall` は `pick_reply` より先に評価されるので **low モードの通常応答を
+/// 無関係な入力まで奪う**。v0.5.1 で塞いだのはオンボーディングの定型文だけで、
+/// 自動抽出経路には同じ穴が残っていた。
+///
+/// 規則は「ユーザー入力から拾った語のうち、記憶本文にも現れるもの」。
+/// LLM が言い換えて一致しなければトリガーを作らない
+/// （**誤爆より不発を選ぶ**。誤爆は毎回ユーザーの邪魔をするが、不発は静かなだけ）。
+pub fn keywords_from_user_input(content: &str, user_text: &str) -> Option<String> {
+    let kws: Vec<String> = extract_keywords(user_text)
+        .into_iter()
+        .filter(|w| content.contains(w.as_str()))
+        .collect();
     (!kws.is_empty()).then(|| kws.join(","))
 }
