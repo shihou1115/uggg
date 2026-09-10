@@ -111,7 +111,7 @@ async function pump(): Promise<void> {
       // 再生中に次アイテムの合成を進めておく (先読み 1)
       prefetched = dequeueAndSynth();
       if (wav !== null) {
-        await playBase64Wav(wav, entry.item.slot);
+        await playBase64Wav(wav, entry.item.slot, gen);
       }
       entry.item.resolve();
     }
@@ -148,7 +148,12 @@ export async function previewWavBase64(b64: string): Promise<void> {
 
 /// 本発話の再生。**口パク (spec §4.1.4) はここだけ**。設定画面のプレビューは
 /// キャラが喋っているわけではないので駆動しない。
-async function playBase64Wav(b64: string, slot: SlotName): Promise<void> {
+///
+/// `gen` は呼び出し時点の世代。**デコードを待っている間に interrupt が来たら
+/// 鳴らさない** (v0.5.3)。合成後には世代を見ていたのにデコード後には見ておらず、
+/// デコード中の停止では `currentSource` がまだ null なので `stopAll` の停止対象も
+/// 無く、**停止したあとに音と口パクが始まっていた**。
+async function playBase64Wav(b64: string, slot: SlotName, gen: number): Promise<void> {
   try {
     const bytes = base64ToBytes(b64);
     const ctx = ensureAudioCtx();
@@ -156,6 +161,9 @@ async function playBase64Wav(b64: string, slot: SlotName): Promise<void> {
     const ab = new ArrayBuffer(bytes.byteLength);
     new Uint8Array(ab).set(bytes);
     const buffer = await ctx.decodeAudioData(ab);
+    // **await を跨いだので世代を再確認する。** ここより後は音を出す・口を開ける
+    // 副作用しかないので、失効していたら何もせずに戻る。
+    if (generation !== gen) return;
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.playbackRate.value = ttsSpeed;
