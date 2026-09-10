@@ -113,8 +113,11 @@ impl LlmClient {
             .with_context(|| format!("LLM へ接続できませんでした: {url}"))?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("LLM API エラー: status={status} body={text}"));
+            // ボディは診断に要る（`insufficient_quota` などはここにしか出ない）が、
+            // 丸ごと載せると**プロンプトを反射するサーバ**の応答経由で会話本文が
+            // `ugg.log` に落ちうる (spec §5、v0.5.3)。頭 300 文字だけに切る。
+            let body = truncate_for_log(&resp.text().await.unwrap_or_default());
+            return Err(anyhow!("LLM API エラー: status={status} body={body}"));
         }
         let parsed = resp
             .json::<ChatResponse>()
@@ -186,8 +189,36 @@ pub fn extract_json_blob(raw: &str) -> &str {
     trimmed
 }
 
+/// エラーボディをログへ載せる前に切り詰める (spec §5、v0.5.3)。
+///
+/// ボディそのものは診断に要る（`insufficient_quota` などはここにしか出ない）。
+/// ただし**プロンプトを反射するサーバ**があるため、丸ごと載せると会話本文が
+/// `ugg.log` へ落ちうる。ログは履歴クリアの対象外なので、長さで頭打ちにする。
+pub(crate) fn truncate_for_log(text: &str) -> String {
+    const MAX: usize = 300;
+    if text.chars().count() <= MAX {
+        return text.to_string();
+    }
+    text.chars().take(MAX).collect::<String>() + "…(以下省略)"
+}
+
 #[cfg(test)]
 mod tests {
+    use super::truncate_for_log;
+
+    /// **長いボディはログへ丸ごと載せない** (spec §5、v0.5.3)。
+    /// 短いものは診断のためそのまま残す。
+    #[test]
+    fn error_body_is_truncated_before_logging() {
+        let short = r#"{"error":{"code":"insufficient_quota"}}"#;
+        assert_eq!(truncate_for_log(short), short, "短い API エラーは残す");
+
+        let echoed = "あ".repeat(2000);
+        let cut = truncate_for_log(&echoed);
+        assert!(cut.chars().count() < 320, "切り詰めていない: {} 文字", cut.chars().count());
+        assert!(cut.ends_with("…(以下省略)"), "省略した旨が分からない: {cut}");
+    }
+
     use super::*;
 
     #[test]

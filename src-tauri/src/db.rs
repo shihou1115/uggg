@@ -592,6 +592,57 @@ impl Db {
         Ok(out)
     }
 
+    /// `mode` を絞って新しい順に取り出す (v0.5.3)。
+    ///
+    /// 履歴注入 (`advanced::load_recent_history`) は**会話の行だけ**を対象にする。
+    /// `chat_log` には `persist_and_speak` 経由で独り言・リマインダー通知・
+    /// カレンダー通知・状況発話も入っており、これらを LLM へ送るのは
+    /// spec §3.3 / §4.6.4 が定めた送信物の範囲外になる
+    /// （カレンダーで外部へ出るのは ICS 取得リクエストのみ）。
+    ///
+    /// **SQL 側で絞る。** 取ってから絞ると、独り言だけが続いた静かな夜を挟むだけで
+    /// 会話行が LIMIT の窓から押し出される。
+    pub fn list_recent_chat_log_in_mode(&self, mode: &str, limit: u32) -> Result<Vec<ChatLogRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, ts, mode, role, text, pose FROM chat_log
+                 WHERE mode = ?1
+                 ORDER BY id DESC LIMIT ?2",
+            )
+            .context("prepare list_recent_chat_log_in_mode")?;
+        let rows = stmt
+            .query_map(params![mode, limit as i64], |row| {
+                let role_str: String = row.get(3)?;
+                let role = match role_str.as_str() {
+                    "user" => ChatRole::User,
+                    "main" => ChatRole::Main,
+                    "sub" => ChatRole::Sub,
+                    other => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            format!("unknown role: {other}").into(),
+                        ))
+                    }
+                };
+                Ok(ChatLogRow {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    mode: row.get(2)?,
+                    role,
+                    text: row.get(4)?,
+                    pose: row.get(5)?,
+                })
+            })
+            .context("query_map list_recent_chat_log_in_mode")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("row list_recent_chat_log_in_mode")?);
+        }
+        Ok(out)
+    }
+
     pub fn clear_chat_log(&self) -> Result<()> {
         let conn = self.conn.lock().expect("db poisoned");
         conn.execute("DELETE FROM chat_log", [])

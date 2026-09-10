@@ -392,8 +392,13 @@ struct GeneratedMonologue {
 /// 検証は消費時 (`deliver::resolve_line`) の 1 箇所に寄せる (§3.3)。
 fn parse_monologue_batch(raw: &str) -> Result<Vec<GeneratedMonologue>> {
     let json = extract_json_blob(raw);
+    // **応答本文をエラーに載せない** (spec §5、v0.5.3)。この Err は 1 つ上の
+    // `ulog!` で `%APPDATA%\ugg\ugg.log` に落ちる。ログは履歴クリアの対象外なので、
+    // 生成された独り言バッチが全文で溜まり続けていた。
+    // (項目 7 では `advanced::parse_dialogue_json` だけを直しており、同じ形の
+    //  こちらが漏れていた — リリース前監査で検出。)
     let parsed: Vec<GeneratedMonologue> = serde_json::from_str(json)
-        .with_context(|| format!("JSON 配列として読めません: {json}"))?;
+        .with_context(|| format!("JSON 配列として読めません ({} 文字)", json.chars().count()))?;
     let cleaned: Vec<GeneratedMonologue> = parsed
         .into_iter()
         .filter_map(|m| {
@@ -416,6 +421,24 @@ fn parse_monologue_batch(raw: &str) -> Result<Vec<GeneratedMonologue>> {
 
 #[cfg(test)]
 mod tests {
+    /// **診断ログに応答本文を残さない** (spec §5、v0.5.3)。
+    ///
+    /// この Err は `[monologue] 応答が壊れているため 1 件も積まない: {err:#}` として
+    /// `ugg.log` へ落ちる。ログは履歴クリアの対象外なので、生成された独り言バッチが
+    /// 全文で溜まり続けていた。項目 7 では `advanced` 側だけを直しており、
+    /// 同じ形のこちらが漏れていた（リリース前監査で検出）。
+    #[test]
+    fn monologue_parse_error_does_not_carry_the_response_body() {
+        let raw = r#"[{"text": 通院の予定を秘密のあいことばで話した}]"#;
+        let err = super::parse_monologue_batch(raw).expect_err("パースできてはいけない");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("秘密のあいことば"),
+            "応答本文がエラー文言に載っている: {msg}"
+        );
+        assert!(msg.contains("JSON 配列として読めません"), "{msg}");
+    }
+
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;

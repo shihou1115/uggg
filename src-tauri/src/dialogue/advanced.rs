@@ -406,6 +406,16 @@ const MAX_HISTORY_CHARS: usize = 1200;
 /// 自前でプロンプトを組み立てており、ここは通らない
 /// (spec §4.4.4「独り言は応答ではない」を維持する)。
 ///
+/// **注入するのは advanced の会話行だけ (v0.5.3、リリース前監査の指摘)。**
+/// `chat_log` には `persist_and_speak` 経由で独り言・リマインダー通知・カレンダー通知・
+/// 状況発話も入る。これらまで送ると、**spec §3.3 / §4.6.4 が定めた送信物の範囲を超える**
+/// （カレンダーで外部へ出るのは ICS 取得リクエストのみと明記してある）。
+/// 加えて、常駐しているだけでユーザー発言が 1 件も無い窓では往復数の上限が働かず、
+/// 文字数上限いっぱいまで独り言が assistant として入ってしまう。
+/// バック起点の発話は例外なく mode="low" で記録されるので、mode で切り分けられる。
+/// 問いかけパターンは **advanced の掛け合いパターン 5**（spec §4.2.4）なので、
+/// この絞り込みでも残る — つまりこの機能の目的は保たれる。
+///
 /// キャラの発話は連続する分をまとめて 1 つの assistant にする (掛け合いの 2〜3 行で
 /// 1 応答)。**ユーザー発言の直前のキャラ発話は往復の一部として残す** —
 /// 問いかけがそこにあるので、落とすとこの修正の目的そのものが失われる。
@@ -421,7 +431,7 @@ fn load_recent_history(
 
     // 1 往復は最大 4 行 (user + main + sub + extra)。多めに取って後段で捨てる。
     let limit = (max_pairs.saturating_mul(4) + 4) as u32;
-    let mut rows = db.list_recent_chat_log(limit)?; // 新しい順
+    let mut rows = db.list_recent_chat_log_in_mode("advanced", limit)?; // 新しい順
     rows.reverse(); // 時系列順へ
 
     let main_name = bundle.ghost.characters.main.name.as_str();
@@ -459,6 +469,11 @@ fn load_recent_history(
         .filter(|(_, b)| b.is_user)
         .map(|(i, _)| i)
         .collect();
+    if user_positions.is_empty() {
+        // 往復が 1 つも無いなら閉じるべき会話も無い。ここで返さないと
+        // 「上限は往復数で決まる」が成立しないまま文字数上限まで詰め込むことになる。
+        return Ok(Vec::new());
+    }
     let mut kept: Vec<Block> = if user_positions.len() > max_pairs {
         let first_kept_user = user_positions[user_positions.len() - max_pairs];
         // 直前のキャラ発話 (= 問いかけ) も残す。
@@ -692,10 +707,6 @@ mod tests {
         }
     }
 
-    /// **診断ログに会話本文を残さない** (spec §5、v0.5.3)。
-    ///
-    /// この Err は `{err:#}` で `ugg.log` へ流れる。ログは履歴クリアの対象外なので、
-    /// LLM の応答本文がユーザーの与り知らぬところで溜まり続けていた。
     // ===== 履歴注入 (v0.5.3、spec §4.2.4) =====
 
     fn hist_db() -> Db {
@@ -706,6 +717,62 @@ mod tests {
 
     fn say(db: &Db, ts: i64, role: ChatRole, text: &str) {
         db.append_chat(ts, "advanced", role, text, None).unwrap();
+    }
+
+    /// バック起点の発話 (独り言・リマインダー / カレンダー通知・状況発話)。
+    /// `persist_and_speak` は例外なく mode="low" で記録する。
+    fn say_back_origin(db: &Db, ts: i64, text: &str) {
+        db.append_chat(ts, "low", ChatRole::Main, text, None).unwrap();
+    }
+
+    /// **独り言・通知は LLM へ渡さない** (spec §3.3 / §4.6.4、リリース前監査で検出)。
+    ///
+    /// `chat_log` には通知も独り言も入る。絞らずに注入すると、カレンダーの予定名や
+    /// リマインダー本文が**クラウドの LLM プロバイダへ送られる** — spec §4.6.4 は
+    /// 「外部へ送るのは ICS 取得リクエストのみ」と明記している。
+    #[test]
+    fn back_origin_speech_is_not_injected() {
+        let db = hist_db();
+        say(&db, 1, ChatRole::User, "ただいま");
+        say(&db, 2, ChatRole::Main, "おかえり!");
+        say_back_origin(&db, 3, "10 分後に 通院 の予定だよ"); // カレンダー通知
+        say_back_origin(&db, 4, "ひまだなあ"); // 独り言
+
+        let msgs = load_recent_history(&db, &make_bundle(true), 8).unwrap();
+        let joined = msgs
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        assert!(!joined.contains("通院"), "通知の本文が LLM へ渡っている: {joined}");
+        assert!(!joined.contains("ひまだなあ"), "独り言が混ざっている: {joined}");
+        assert_eq!(msgs.len(), 2, "会話の 1 往復だけが残る: {msgs:?}");
+
+        // バック起点しか無いログでは、そもそも注入する会話が無い。
+        let only_back = hist_db();
+        for i in 0..20i64 {
+            say_back_origin(&only_back, i, &format!("独り言 {i}"));
+        }
+        assert!(load_recent_history(&only_back, &make_bundle(true), 8)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// ユーザー発言が 1 件も無い窓では何も注入しない。
+    ///
+    /// 往復が 1 つも無いなら閉じるべき会話も無い。ここを通すと
+    /// **往復数の上限が一度も適用されないまま文字数上限まで詰め込む**ことになり、
+    /// spec §4.2.4 の「直近 8 往復を上限に注入」と食い違う。
+    /// （キャラ発話だけが並ぶ状態は、履歴クリアの直後などに実際に起きる。）
+    #[test]
+    fn no_history_when_there_is_no_exchange() {
+        let db = hist_db();
+        for i in 0..20i64 {
+            say(&db, i, ChatRole::Main, &format!("キャラの発話 {i}"));
+        }
+        assert!(load_recent_history(&db, &make_bundle(true), 8)
+            .unwrap()
+            .is_empty());
     }
 
     /// **これがこの修正の目的。** 問いかけ → 返答 の順で、
@@ -793,6 +860,10 @@ mod tests {
         assert!(load_recent_history(&db, &make_bundle(true), 8).unwrap().is_empty());
     }
 
+    /// **診断ログに会話本文を残さない** (spec §5、v0.5.3)。
+    ///
+    /// この Err は `{err:#}` で `ugg.log` へ流れる。ログは履歴クリアの対象外なので、
+    /// LLM の応答本文がユーザーの与り知らぬところで溜まり続けていた。
     #[test]
     fn parse_error_does_not_carry_the_response_body() {
         let raw = r#"{"main": {"text": 通院の予定を秘密のあいことばで話した}}"#;

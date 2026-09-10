@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.12）
+# ugg アーキテクチャ設計書（architecture.md v2.13）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1746,3 +1746,4 @@ async fn install_asset(
 | 2026-09-10 | v2.10 | **v0.5.3 項目 4（通知を後続の発話で消さない）**。`system/ghost-speech.ts` に通知キューを追加。`renderResponse` は通知なら `noticeQueue` へ積んで即 return し、`pumpNotices` がステージの空きを見て 1 件ずつ `renderNow` する。割り込みは `takeStage()` に一本化し、**打ち切る相手が通知ならキューの先頭へ積み直す**。`renderNow` の後片付けは `currentToken === token`（= ステージの所有者）のときだけ行う — 割り込まれた側が await から戻って解放すると、次の描画中に「空き」と誤認される。判定は `isNotice`（`kind === "system_message"` または `priority === "notice"`）。**契約変更なし**（既存フィールドのみ参照）。 |
 | 2026-09-10 | v2.11 | **v0.5.3 項目 6（問いかけを会話として閉じる）**。`advanced::load_recent_history` を実装（v0.5.2 まで `Ok(Vec::new())` 固定）。`list_recent_chat_log` を時系列へ戻し、連続する同種の行を 1 ブロックへまとめ、`MAX_HISTORY_PAIRS = 8` 往復・`MAX_HISTORY_CHARS = 1200` 文字で古い方から落とす。切り出しの起点は「最初に残すユーザー発言の 1 つ前」= 問いかけ。キャラ発話は `<名前>: <台詞>` 形式で assistant に入れる。`ChatMessage::assistant` の `#[allow(dead_code)]` を解除。**呼び出しは `build_messages`（チャット経路）のみ**で、`system::monologue` は自前のプロンプトを組む。**契約変更なし。** |
 | 2026-09-10 | v2.12 | **v0.5.3 項目 9（操作列テストの常設）**。フロントに Vitest + happy-dom を導入（`vitest.config.ts` / `npm test` / `src/__tests__/`）。DOM は `index.html` の body を読み込んで作る（手書きダミーだと id のずれに気づけないため）。操作列 4 本の内訳と書き方は docs/test-plan.md §3.2b が正本。**プロダクションコードの構成変更なし。** |
+| 2026-09-10 | v2.13 | **v0.5.3 のリリース前監査を受けた是正**。① `Db::list_recent_chat_log_in_mode(mode, limit)` を追加し、`load_recent_history` はこれで **mode="advanced" の行だけ**を読む（バック起点の発話は例外なく mode="low" で記録されるので mode で切り分けられる。取ってから絞ると独り言だけが続いた夜に会話行が LIMIT の窓から押し出されるため **SQL 側で絞る**）。往復が 1 つも無い窓では空を返す。② `monologue::parse_monologue_batch` のエラーから応答本文を外す（項目 7 で `advanced` 側だけを直しており漏れていた）。③ `llm::truncate_for_log` を追加し、HTTP エラーボディを 300 文字で頭打ちにする。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
