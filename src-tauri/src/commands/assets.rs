@@ -306,6 +306,73 @@ mod install_tests {
         dir
     }
 
+    fn read(p: std::path::PathBuf) -> String {
+        std::fs::read_to_string(p).expect("読めない")
+    }
+
+    /// **操作列テスト 1/4「旧版からの更新」** (spec §6.0 項目 9、v0.5.3)。
+    ///
+    /// 新規導入 → 更新成功 → 更新失敗 → 再更新 を**同じ id へ順に流す**。
+    /// 1 回ずつの単機能テストでは「失敗した更新のあと、まだ使えるか」
+    /// 「そのあと更新し直せるか」が見えない。v0.5.3 で確定した 14 件は
+    /// こういうつなぎ目に集中しており、単機能テストでは 1 件も捕まらなかった。
+    #[test]
+    fn install_then_update_then_failed_update_leaves_a_usable_ghost() {
+        let assets = tempfile::tempdir().unwrap();
+        let dir = assets.path().join("ghosts").join("mimi");
+
+        // 1. 新規導入 (まだ何も無いので上書き承認は要らない)
+        let v1 = zip_with(&[
+            ("ghost.json", ghost_json("mimi").as_slice()),
+            ("dic.yaml", b"V1".as_slice()),
+        ]);
+        assert!(matches!(
+            install_one(v1.path(), false, assets.path()).unwrap(),
+            InstallOutcome::Installed { .. }
+        ));
+        assert_eq!(read(dir.join("dic.yaml")), "V1");
+
+        // 2. 上書き更新 (承認あり)
+        let v2 = zip_with(&[
+            ("ghost.json", ghost_json("mimi").as_slice()),
+            ("dic.yaml", b"V2".as_slice()),
+        ]);
+        assert!(matches!(
+            install_one(v2.path(), true, assets.path()).unwrap(),
+            InstallOutcome::Installed { .. }
+        ));
+        assert_eq!(read(dir.join("dic.yaml")), "V2");
+
+        // 3. 壊れた更新 (禁止拡張子を含む zip)
+        let bad = zip_with(&[
+            ("ghost.json", ghost_json("mimi").as_slice()),
+            ("dic.yaml", b"V3".as_slice()),
+            ("evil.exe", b"x".as_slice()),
+        ]);
+        let err = install_one(bad.path(), true, assets.path()).unwrap_err();
+        assert!(matches!(err, DndError::ForbiddenFile(_)), "{err}");
+
+        // 4. **直前まで使えていた版がそのまま残っている**
+        assert_eq!(read(dir.join("dic.yaml")), "V2", "失敗した更新が旧版を壊した");
+        assert!(dir.join("ghost.json").is_file(), "manifest が消えている");
+        assert!(!assets.path().join(STAGING_DIR).exists(), "作業用の残骸");
+        assert!(
+            !assets.path().join(".previous-ghosts-mimi").exists(),
+            "待避先の残骸 (戻せているので消えるべき)"
+        );
+
+        // 5. そのあと正常な更新をすれば入れ替わる (失敗が経路を詰まらせていない)
+        let v4 = zip_with(&[
+            ("ghost.json", ghost_json("mimi").as_slice()),
+            ("dic.yaml", b"V4".as_slice()),
+        ]);
+        assert!(matches!(
+            install_one(v4.path(), true, assets.path()).unwrap(),
+            InstallOutcome::Installed { .. }
+        ));
+        assert_eq!(read(dir.join("dic.yaml")), "V4");
+    }
+
     /// **更新に失敗しても旧版が残る (v0.5.3)。**
     ///
     /// v0.5.2 までは上書き承認後に `remove_dir_all` を先に実行してから展開していたため、
