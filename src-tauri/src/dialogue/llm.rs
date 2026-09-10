@@ -43,8 +43,7 @@ impl ChatMessage {
             content: content.into(),
         }
     }
-    /// Few-shot 例や履歴をプロンプトに混ぜたいときの公開コンストラクタ。現状未使用。
-    #[allow(dead_code)]
+    /// 履歴注入 (v0.5.3、`advanced::load_recent_history`) が使う。
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".to_string(),

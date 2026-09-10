@@ -177,8 +177,9 @@ fn build_messages(
         &tools_block,
     )));
 
-    // M2 初期: 履歴注入は最小限。中長期記憶は user_profile (system prompt) でカバー。
-    for hist in load_recent_history(db, 8)? {
+    // 直近の会話を注入する (spec §4.2.4、v0.5.3)。中長期記憶は user_profile
+    // (system prompt) が担い、こちらは**その場の会話を閉じる**ためだけに使う。
+    for hist in load_recent_history(db, bundle, MAX_HISTORY_PAIRS)? {
         out.push(hist);
     }
 
@@ -388,11 +389,101 @@ fn sub_pose_names(bundle: &GhostBundle) -> String {
     names.join(" / ")
 }
 
-fn load_recent_history(_db: &Db, _max: usize) -> Result<Vec<ChatMessage>> {
-    // M2 初期: 履歴注入を簡略化し、毎ターンこの場の入力だけで応答させる。
-    // 中長期記憶は user_profile (system prompt に注入予定) でカバーする方針。
-    // 履歴の本格注入は M2-I 完了後に検討。
-    Ok(Vec::new())
+/// 注入する往復数の上限 (spec §4.2.4、ユーザー裁定 2026-09-06)。
+const MAX_HISTORY_PAIRS: usize = 8;
+/// 注入する履歴の合計文字数の上限。超えたら**古い方から落とす**。
+/// 往復数だけで抑えると、長文 1 往復でプロンプトが膨らみコストが跳ねる。
+const MAX_HISTORY_CHARS: usize = 1200;
+
+/// 直近の会話を `ChatMessage` 列にして返す (spec §4.2.4、v0.5.3)。
+///
+/// **v0.5.2 まではここが常に空を返していた。** 契約 (architecture §10) にも
+/// v0.5.1 のリリースノートにも「次のターンで LLM が会話として自然に受ける」と
+/// 書いてあったが、履歴が無い以上受けられない。問いかけパターンでキャラが尋ねて
+/// ユーザーが「それがいい」と答えても、**その「それ」が何を指すのかが渡っていなかった**。
+///
+/// **チャット経路 (`build_messages`) 専用。** 独り言の補充 (`system::monologue`) は
+/// 自前でプロンプトを組み立てており、ここは通らない
+/// (spec §4.4.4「独り言は応答ではない」を維持する)。
+///
+/// キャラの発話は連続する分をまとめて 1 つの assistant にする (掛け合いの 2〜3 行で
+/// 1 応答)。**ユーザー発言の直前のキャラ発話は往復の一部として残す** —
+/// 問いかけがそこにあるので、落とすとこの修正の目的そのものが失われる。
+fn load_recent_history(
+    db: &Db,
+    bundle: &GhostBundle,
+    max_pairs: usize,
+) -> Result<Vec<ChatMessage>> {
+    struct Block {
+        is_user: bool,
+        text: String,
+    }
+
+    // 1 往復は最大 4 行 (user + main + sub + extra)。多めに取って後段で捨てる。
+    let limit = (max_pairs.saturating_mul(4) + 4) as u32;
+    let mut rows = db.list_recent_chat_log(limit)?; // 新しい順
+    rows.reverse(); // 時系列順へ
+
+    let main_name = bundle.ghost.characters.main.name.as_str();
+    let sub_name = bundle
+        .ghost
+        .characters
+        .sub
+        .as_ref()
+        .map(|s| s.name.as_str())
+        .unwrap_or("sub");
+
+    let mut blocks: Vec<Block> = Vec::new();
+    for r in rows {
+        let is_user = matches!(r.role, ChatRole::User);
+        // 誰の発話かを残す。掛け合いを 1 つの assistant にまとめるので、
+        // 名前が無いと 2 人の区別が消えて persona 配線 (§4.2.2b) が無駄になる。
+        let text = match r.role {
+            ChatRole::User => r.text,
+            ChatRole::Main => format!("{main_name}: {}", r.text),
+            ChatRole::Sub => format!("{sub_name}: {}", r.text),
+        };
+        match blocks.last_mut() {
+            Some(b) if b.is_user == is_user => {
+                b.text.push('\n');
+                b.text.push_str(&text);
+            }
+            _ => blocks.push(Block { is_user, text }),
+        }
+    }
+
+    // 直近 max_pairs 往復へ絞る (1 往復 = ユーザー発言 1 つ)。
+    let user_positions: Vec<usize> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.is_user)
+        .map(|(i, _)| i)
+        .collect();
+    let mut kept: Vec<Block> = if user_positions.len() > max_pairs {
+        let first_kept_user = user_positions[user_positions.len() - max_pairs];
+        // 直前のキャラ発話 (= 問いかけ) も残す。
+        blocks.split_off(first_kept_user.saturating_sub(1))
+    } else {
+        blocks
+    };
+
+    // 合計文字数の上限。超えている間、古い方から落とす。
+    let mut total: usize = kept.iter().map(|b| b.text.chars().count()).sum();
+    while total > MAX_HISTORY_CHARS && !kept.is_empty() {
+        total -= kept[0].text.chars().count();
+        kept.remove(0);
+    }
+
+    Ok(kept
+        .into_iter()
+        .map(|b| {
+            if b.is_user {
+                ChatMessage::user(b.text)
+            } else {
+                ChatMessage::assistant(b.text)
+            }
+        })
+        .collect())
 }
 
 // ===== JSON パース =====
@@ -605,6 +696,103 @@ mod tests {
     ///
     /// この Err は `{err:#}` で `ugg.log` へ流れる。ログは履歴クリアの対象外なので、
     /// LLM の応答本文がユーザーの与り知らぬところで溜まり続けていた。
+    // ===== 履歴注入 (v0.5.3、spec §4.2.4) =====
+
+    fn hist_db() -> Db {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        db
+    }
+
+    fn say(db: &Db, ts: i64, role: ChatRole, text: &str) {
+        db.append_chat(ts, "advanced", role, text, None).unwrap();
+    }
+
+    /// **これがこの修正の目的。** 問いかけ → 返答 の順で、
+    /// ユーザー発言の直前のキャラ発話が履歴に残ること。
+    /// 残らないと「それがいい」の「それ」が LLM に届かない。
+    #[test]
+    fn the_question_right_before_the_answer_is_kept() {
+        let db = hist_db();
+        say(&db, 1, ChatRole::Main, "今日は散歩と読書、どっちがいい?");
+        say(&db, 2, ChatRole::User, "それがいい");
+
+        let msgs = load_recent_history(&db, &make_bundle(true), 8).unwrap();
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs[0].role, "assistant");
+        assert!(msgs[0].content.contains("散歩と読書"), "{:?}", msgs[0]);
+        assert!(msgs[0].content.contains("ミミ"), "誰の発言か分かること: {:?}", msgs[0]);
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].content, "それがいい");
+    }
+
+    /// 掛け合いの main + sub は 1 つの assistant にまとまる (1 応答 = 1 メッセージ)。
+    #[test]
+    fn a_banter_turn_becomes_one_assistant_message() {
+        let db = hist_db();
+        say(&db, 1, ChatRole::User, "ただいま");
+        say(&db, 2, ChatRole::Main, "おかえり!");
+        say(&db, 3, ChatRole::Sub, "遅かったな");
+
+        let msgs = load_recent_history(&db, &make_bundle(true), 8).unwrap();
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].content, "ミミ: おかえり!\nクロ: 遅かったな");
+    }
+
+    /// 往復数の上限。**古い方から落ちる**こと。
+    #[test]
+    fn history_is_capped_to_the_recent_pairs() {
+        let db = hist_db();
+        for i in 0..12i64 {
+            say(&db, i * 2, ChatRole::User, &format!("user{i}"));
+            say(&db, i * 2 + 1, ChatRole::Main, &format!("reply{i}"));
+        }
+        let msgs = load_recent_history(&db, &make_bundle(true), 3).unwrap();
+        let users: Vec<&str> = msgs
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(users, ["user9", "user10", "user11"], "直近 3 往復だけ: {msgs:?}");
+        // 切り出しの起点は「最初に残すユーザー発言の 1 つ前」= 直前のキャラ発話。
+        // ここを落とすと、問いかけへの返答が上限のふちに来たときだけ意味を失う。
+        assert!(
+            msgs[0].content.contains("reply8"),
+            "残す往復の直前のキャラ発話も含めること: {msgs:?}"
+        );
+    }
+
+    /// 合計文字数の上限。**往復数が上限内でも、長すぎれば古い方から落とす。**
+    /// 往復数だけで抑えると、長文 1 往復でプロンプトが膨らんでコストが跳ねる。
+    #[test]
+    fn history_is_capped_by_total_chars_even_within_the_pair_limit() {
+        let db = hist_db();
+        let long = "あ".repeat(700);
+        say(&db, 1, ChatRole::User, &long);
+        say(&db, 2, ChatRole::Main, "ふむ");
+        say(&db, 3, ChatRole::User, &long);
+        say(&db, 4, ChatRole::Main, "なるほど");
+
+        let msgs = load_recent_history(&db, &make_bundle(true), 8).unwrap();
+        let total: usize = msgs.iter().map(|m| m.content.chars().count()).sum();
+        assert!(
+            total <= MAX_HISTORY_CHARS,
+            "合計 {total} 文字が上限 {MAX_HISTORY_CHARS} を超えている: {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.content.contains("なるほど")),
+            "落とすのは古い方から: {msgs:?}"
+        );
+    }
+
+    /// 履歴が無ければ何も足さない (初回のターン)。
+    #[test]
+    fn empty_log_yields_no_history() {
+        let db = hist_db();
+        assert!(load_recent_history(&db, &make_bundle(true), 8).unwrap().is_empty());
+    }
+
     #[test]
     fn parse_error_does_not_carry_the_response_body() {
         let raw = r#"{"main": {"text": 通院の予定を秘密のあいことばで話した}}"#;
