@@ -24,6 +24,8 @@ use crate::tts::irodori_download;
 /// [`shutdown_sidecar`] を呼ぶこと (Phase E の `quit_app` フックで一括処理)。
 #[derive(Debug)]
 pub struct SidecarHandle {
+    /// 台帳（`sidecars.json`）の位置を知るために持つ。止めたときに記録を消す。
+    asset_root: PathBuf,
     pub port: u16,
     /// Phase E のヘルスチェック失敗時に PID を出してデバッグログに使う想定。
     #[allow(dead_code)]
@@ -36,6 +38,124 @@ pub struct SidecarHandle {
 struct ReadyFile {
     port: u16,
     pid: u32,
+}
+
+/// 起動したサイドカーの台帳 (v0.5.5 項目 2、spec §6.0)。
+///
+/// **`ready.json` では足りない。** あれは起動のたびに上書き削除される**単一スロット**で、
+/// 孤児が 2 つ以上できると古い方の記録が消えて**到達不能**になる（実機で 2 つ同時に
+/// 走った実績がある）。こちらは終了を見届けるまで消さない追記式。
+const LEDGER_FILE: &str = "sidecars.json";
+
+fn ledger_path(asset_root: &Path) -> PathBuf {
+    asset_root.join(LEDGER_FILE)
+}
+
+fn read_ledger(asset_root: &Path) -> Vec<ReadyFile> {
+    std::fs::read_to_string(ledger_path(asset_root))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Vec<ReadyFile>>(&t).ok())
+        .unwrap_or_default()
+}
+
+fn write_ledger(asset_root: &Path, entries: &[ReadyFile]) {
+    if let Ok(json) = serde_json::to_string(entries) {
+        let _ = std::fs::write(ledger_path(asset_root), json);
+    }
+}
+
+/// 台帳へ 1 件足す（起動直後に呼ぶ）。
+fn ledger_add(asset_root: &Path, entry: ReadyFile) {
+    let mut entries = read_ledger(asset_root);
+    entries.retain(|e| e.port != entry.port);
+    entries.push(entry);
+    write_ledger(asset_root, &entries);
+}
+
+/// 台帳から 1 件消す（正常に止められたときに呼ぶ）。
+fn ledger_remove(asset_root: &Path, port: u16) {
+    let mut entries = read_ledger(asset_root);
+    entries.retain(|e| e.port != port);
+    write_ledger(asset_root, &entries);
+}
+
+/// `/health` の応答が**自分たちのサイドカーのもの**かを判定する (v0.5.5 項目 2)。
+///
+/// **成否では判定できない。** 実モデルモードで GPU が無いと `/health` は **503** を返す
+/// （`sidecar.py`）。一方、無関係なサービスがたまたまそのポートを持っている可能性はある。
+/// **pid も撃たず、ポートだけでも撃たない** — 死んだ記録のポートを今持っている別サービスへ
+/// `/shutdown` を投げてしまう。**応答の形で自分のものだと確かめてから**止める。
+pub(crate) fn looks_like_our_sidecar(body: &serde_json::Value) -> bool {
+    let Some(obj) = body.as_object() else {
+        return false;
+    };
+    obj.get("status").and_then(|v| v.as_str()).is_some()
+        && obj.get("mock").and_then(|v| v.as_bool()).is_some()
+        && obj.contains_key("gpu")
+}
+
+/// 前回の実行が残したサイドカーを止める (v0.5.5 項目 2)。
+///
+/// **サイドカーを 1 つも起動する前に呼ぶこと。** 後から呼ぶと、掃除対象のポートを
+/// 新しいサイドカーが取っている可能性があり、自分で立てたものを止めてしまう。
+///
+/// 台帳に加えて**旧 `ready.json` も 1 度だけ見る** — v0.5.5 より前に導入した環境には
+/// 台帳が無く、孤児の手がかりがそこにしか無いため。
+pub async fn sweep_orphans(asset_root: &Path, client: &reqwest::Client) -> usize {
+    let mut candidates = read_ledger(asset_root);
+    if let Ok(Some(port)) = try_read_port(&ready_path_for(asset_root)) {
+        if !candidates.iter().any(|e| e.port == port) {
+            candidates.push(ReadyFile { port, pid: 0 });
+        }
+    }
+    // **先に台帳を空にする。** そのうえで、掃除の最中に新しく立ったサイドカーの
+    // ポートは対象から外す（掃除対象のポートを新しい子が取っていたら、自分で立てたものを
+    // 止めてしまう）。台帳は起動直後に書かれるので、ここを見れば「いま生きている自分の子」が分かる。
+    write_ledger(asset_root, &[]);
+
+    let mut stopped = 0usize;
+    for entry in &candidates {
+        if read_ledger(asset_root).iter().any(|e| e.port == entry.port) {
+            continue;
+        }
+        match identify_sidecar(client, entry.port).await {
+            true => {
+                let _ = request_shutdown(entry.port, client).await;
+                crate::ulog!(
+                    "[irodori] 前回の実行が残したサイドカーを止めました (port={} pid={})",
+                    entry.port,
+                    entry.pid
+                );
+                stopped += 1;
+            }
+            false => {
+                // 応答が無い / 形が違う = すでに死んでいるか、別のサービスのポート。触らない。
+                crate::ulog!(
+                    "[irodori] 記録のサイドカーは見つかりません (port={}、記録だけ捨てます)",
+                    entry.port
+                );
+            }
+        }
+    }
+    stopped
+}
+
+/// そのポートの相手が自分たちのサイドカーか確かめる。
+async fn identify_sidecar(client: &reqwest::Client, port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let Ok(resp) = client
+        .get(&url)
+        .timeout(Duration::from_millis(800))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    // **status は見ない**（GPU 不在で 503 を返す）。本文の形だけで判断する。
+    match resp.json::<serde_json::Value>().await {
+        Ok(body) => looks_like_our_sidecar(&body),
+        Err(_) => false,
+    }
 }
 
 /// 既定の `ready.json` 配置先 (asset_root/ready.json)。
@@ -148,7 +268,13 @@ where
         }
     };
 
-    Ok(SidecarHandle { port, pid, child })
+    ledger_add(asset_root, ReadyFile { port, pid });
+    Ok(SidecarHandle {
+        asset_root: asset_root.to_path_buf(),
+        port,
+        pid,
+        child,
+    })
 }
 
 /// 子プロセス stderr を行単位で読み、each line を callback に流す。
@@ -165,7 +291,21 @@ where
 }
 
 /// `POST /shutdown` を打って 1 秒待ち、ダメなら `child.kill()` する。
+/// ポートだけで止める（孤児にはハンドルが無いので kill にフォールバックできない）。
+///
+/// **`looks_like_our_sidecar` で自分のものだと確かめてから呼ぶこと。**
+async fn request_shutdown(port: u16, http: &reqwest::Client) -> bool {
+    let url = format!("http://127.0.0.1:{port}/shutdown");
+    http.post(&url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok()
+}
+
 pub async fn shutdown_sidecar(mut handle: SidecarHandle, http: &reqwest::Client) -> Result<()> {
+    // 正常に止めるので台帳から消す（残すと次回の掃除が無駄に叩く）。
+    ledger_remove(&handle.asset_root, handle.port);
     let url = format!("http://127.0.0.1:{}/shutdown", handle.port);
     // shutdown 要求はベストエフォート: 失敗しても kill にフォールバック
     let _ = http
@@ -218,6 +358,67 @@ fn try_read_port(path: &Path) -> Result<Option<u16>> {
 
 #[cfg(test)]
 mod tests {
+    /// **成否では自分のものだと判定できない** (v0.5.5 項目 2)。
+    ///
+    /// 実モデルモードで GPU が無いと `/health` は **503** を返す。`is_success` で弾くと
+    /// 自分のサイドカーを「別物」と誤認して掃除できない。逆に成否だけで通すと、
+    /// たまたまそのポートを持っている無関係なサービスへ `/shutdown` を投げてしまう。
+    /// **応答の形**で判断する。
+    #[test]
+    fn a_sidecar_is_identified_by_the_shape_of_its_answer() {
+        let ours_ok = serde_json::json!({"status": "ok", "gpu": "RTX 5080", "mock": false});
+        let ours_no_gpu = serde_json::json!({"status": "no_gpu", "gpu": null, "mock": false});
+        assert!(super::looks_like_our_sidecar(&ours_ok));
+        assert!(
+            super::looks_like_our_sidecar(&ours_no_gpu),
+            "503 で返る形も自分のもの（GPU 不在でこれを返す）"
+        );
+
+        // 無関係なサービス
+        for other in [
+            serde_json::json!({"status": "ok"}),
+            serde_json::json!({"status": "ok", "gpu": null}),
+            serde_json::json!({"ok": true, "mock": false}),
+            serde_json::json!("ok"),
+            serde_json::json!([1, 2, 3]),
+        ] {
+            assert!(
+                !super::looks_like_our_sidecar(&other),
+                "他人のポートへ shutdown を投げてはいけない: {other}"
+            );
+        }
+    }
+
+    /// 台帳は**複数**持てること (v0.5.5 項目 2)。
+    ///
+    /// `ready.json` は起動のたびに上書き削除される単一スロットなので、孤児が 2 つ以上
+    /// できると古い方が到達不能になる（実機で 2 つ同時に走った実績がある）。
+    #[test]
+    fn the_ledger_keeps_every_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        super::ledger_add(dir.path(), super::ReadyFile { port: 50073, pid: 1 });
+        super::ledger_add(dir.path(), super::ReadyFile { port: 59533, pid: 2 });
+        let got = super::read_ledger(dir.path());
+        assert_eq!(got.len(), 2, "2 つ目で 1 つ目を消してはいけない: {got:?}");
+
+        // 正常に止めた分だけ消える
+        super::ledger_remove(dir.path(), 50073);
+        let got = super::read_ledger(dir.path());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].port, 59533);
+    }
+
+    /// 同じポートを 2 度足しても重複しない（再起動で同じポートを引くことはある）。
+    #[test]
+    fn the_ledger_does_not_duplicate_a_port() {
+        let dir = tempfile::tempdir().unwrap();
+        super::ledger_add(dir.path(), super::ReadyFile { port: 50073, pid: 1 });
+        super::ledger_add(dir.path(), super::ReadyFile { port: 50073, pid: 9 });
+        let got = super::read_ledger(dir.path());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].pid, 9, "新しい方で置き換わること");
+    }
+
     use super::*;
 
     #[test]

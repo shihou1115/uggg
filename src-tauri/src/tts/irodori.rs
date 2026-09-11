@@ -269,6 +269,12 @@ impl IrodoriClient {
         }
     }
 
+    /// 起動時の孤児掃除（`sidecar::sweep_orphans`）が使う HTTP クライアント。
+    /// タイムアウトや proxy 設定を掃除側で作り直さないよう、同じものを貸す。
+    pub fn http_client(&self) -> reqwest::Client {
+        self.client.clone()
+    }
+
     fn current_port(&self) -> Option<u16> {
         let guard = self.sidecar.lock().expect("irodori sidecar poisoned");
         guard.as_ref().map(|h| h.port)

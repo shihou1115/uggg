@@ -115,6 +115,21 @@ fn main() {
                 if let Ok(resource_dir) = app.path().resource_dir() {
                     let _ = crate::tts::sidecar::install_sidecar_script(&resource_dir, &asset_root);
                 }
+                // 前回の実行が残したサイドカーを止める (v0.5.5 項目 2、spec §6.0)。
+                // **強制終了では終了フックが走らず、サイドカーが GPU を掴んだまま残る。**
+                // 1 つで数 GB を占めるので、残ったまま次を立てると合成が入らなくなる。
+                // ここで走らせるのは「まだ自分のサイドカーを 1 つも立てていない」時点だから。
+                let state_for_sweep = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    let stopped = crate::tts::sidecar::sweep_orphans(
+                        &asset_root,
+                        &state_for_sweep.tts.irodori.http_client(),
+                    )
+                    .await;
+                    if stopped > 0 {
+                        crate::ulog!("[irodori] 孤児のサイドカーを {stopped} 件止めました");
+                    }
+                });
             }
             Ok(())
         })
