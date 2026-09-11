@@ -909,6 +909,10 @@ where
     let stamp = read_stamp(asset_root);
     let recorded_pins = stamp.as_ref().map(|s| s.pins.clone()).unwrap_or_default();
     let mut resolved = stamp.map(|s| s.resolved).unwrap_or_default();
+    // **実際に入った版を取り直す。** 記録の要点は「指定した版」ではなく「実際に入った版」
+    // （`huggingface_hub==0.27.0` と書いて実機は 0.36.2 だった）。入れ直したあとに
+    // 古いまま、あるいは記録が無かった環境で空のままにすると、記録の意味が無い。
+    resolved.extend(query_resolved_versions(&py_exe, |l| on_line(l)));
     let py_version = installed_python_version(asset_root);
     let python_matches = py_version.as_deref() == pinned_python_version();
     if let Some(v) = py_version {
@@ -1509,6 +1513,11 @@ mod update_tests {
             say(format!("[after] {pkg}: {}", describe_package(&site_of(&root), pkg)));
         }
         assert!(after_status.has_record, "記録が書かれていること");
+        assert!(
+            after_status.resolved.len() > 1,
+            "実際に入った版を記録しきること（python だけでは記録の意味が無い）: {:?}",
+            after_status.resolved
+        );
         assert!(
             after_status.up_to_date,
             "入れ直しきったら最新になること: outdated={:?}",
