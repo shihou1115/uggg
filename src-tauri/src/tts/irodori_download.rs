@@ -1728,6 +1728,39 @@ mod stamp_tests {
         );
     }
 
+    /// **`current_requirements` と `recorded_distributions` は噛み合っていること**
+    /// （2026-09-11、CLAUDE.md 開発方針 7 の掃討で発見）。
+    ///
+    /// 2 つは同じ定数（`COMMON_REQUIREMENTS` / `TORCH_PACKAGES` /
+    /// `IRODORI_EXTRA_REQUIREMENTS`）から**別々に**作られる対で、片方に足して
+    /// もう片方を忘れられる。忘れた側で起きることが違う:
+    /// - `current_requirements` から漏れる → **更新判定に乗らず、永久に届かない**
+    ///   （v0.5.5 が直した穴が 1 段上で再現する）
+    /// - `recorded_distributions` から漏れる → 実際に入った版が記録されない
+    #[test]
+    fn the_two_requirement_lists_stay_in_sync() {
+        let reqs = current_requirements();
+        let recorded = recorded_distributions();
+        // 固定 URL で入れる 3 本は `recorded_distributions` にしか無い（名前で入れないため）。
+        let git_only = ["silentcipher", "dacvae", "irodori-tts"];
+
+        for name in reqs.keys() {
+            assert!(
+                recorded.iter().any(|n| n == name),
+                "{name} が recorded_distributions に無い（実際に入った版が記録されない）"
+            );
+        }
+        for name in &recorded {
+            if git_only.contains(&name.as_str()) {
+                continue;
+            }
+            assert!(
+                reqs.contains_key(name),
+                "{name} が current_requirements に無い（更新判定に乗らず永久に届かない）"
+            );
+        }
+    }
+
     /// **pin を増やしたら `current_pins` にも足す。** 足し忘れると、その依存だけ
     /// 更新判定から外れて「最新」と誤認する。
     #[test]
