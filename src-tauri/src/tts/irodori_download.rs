@@ -169,15 +169,6 @@ pub fn read_stamp(asset_root: &Path) -> Option<InstalledStamp> {
     (stamp.schema == STAMP_SCHEMA).then_some(stamp)
 }
 
-/// 導入記録を書く。**導入がすべて成功した後にだけ呼ぶ。**
-/// 途中で失敗した状態に記録を残すと、次回「入っている」と誤認する。
-pub fn write_stamp(
-    asset_root: &Path,
-    resolved: std::collections::BTreeMap<String, String>,
-) -> Result<()> {
-    write_stamp_pins(asset_root, current_pins(), resolved)
-}
-
 /// `pins` を明示して記録を書く。
 ///
 /// **部分更新のあとは「入れ直した分だけ」を書き換える。** 全部を現在値にすると、
@@ -277,11 +268,45 @@ pub fn record_installed<F>(asset_root: &Path, mut on_line: F) -> Result<()>
 where
     F: FnMut(&str),
 {
-    let py_exe = asset_root.join("python").join("python.exe");
-    let resolved = query_resolved_versions(&py_exe, |l| on_line(l));
-    write_stamp(asset_root, resolved)?;
+    // 初回導入は「入れ直せる 3 本」を入れたことになる。**`python` をここに含めない** —
+    // `ensure_python_embeddable` は `python.exe` があれば skip するので、
+    // 「入れた」と「入っている」は一致しない。実物に聞いて一致したときだけ記録する。
+    let installed: Vec<String> = current_pins()
+        .keys()
+        .filter(|k| updatable_pin(k).is_some())
+        .cloned()
+        .collect();
+    record_after_install(asset_root, &installed, |l| on_line(l))?;
     on_line("導入内容を記録しました");
     Ok(())
+}
+
+/// 導入・更新のあとに記録を書く（両経路で共通）。
+///
+/// **`python` は実物が pin と一致したときだけ記録する。** 初回導入の経路もここを通す。
+/// 通していなかったため、`ensure_python_embeddable` が skip した古い python を
+/// 「最新」と記録し、以後 `should_ask_python` が実物に聞かなくなって
+/// **永久に見えなくなる**穴が残っていた（更新経路だけ塞いで隣を残していた）。
+fn record_after_install<F>(asset_root: &Path, installed: &[String], mut on_line: F) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    let py_exe = asset_root.join("python").join("python.exe");
+    let stamp = read_stamp(asset_root);
+    let recorded = stamp.as_ref().map(|s| s.pins.clone()).unwrap_or_default();
+    let mut resolved = stamp.map(|s| s.resolved).unwrap_or_default();
+    // 記録の要点は「指定した版」ではなく「実際に入った版」。毎回取り直す。
+    resolved.extend(query_resolved_versions(&py_exe, |l| on_line(l)));
+    let py_version = installed_python_version(asset_root);
+    let python_matches = py_version.as_deref() == pinned_python_version();
+    if let Some(v) = py_version {
+        resolved.insert("python".to_string(), v);
+    }
+    write_stamp_pins(
+        asset_root,
+        merged_pins(&recorded, installed, python_matches),
+        resolved,
+    )
 }
 
 /// 導入状態 (v0.5.4 項目 2)。
@@ -636,6 +661,34 @@ where
 ///
 /// site-packages の中に退避すると、名前次第で import されうるうえ、pip が
 /// dist-info を拾って混乱する。`asset_root` 直下に置いて完全に切り離す。
+/// 導入と更新を同時に走らせないための印。
+///
+/// **同じ `site-packages` を 2 つの経路が同時に触ると、退避 → 入れ直し → 復元の
+/// どの段も守れない中間状態になる。** 記録が無い環境では「ランタイムをダウンロード」と
+/// 「更新する」が両方押せるので、10〜20 分かかる初回 DL の途中で更新を押せてしまう。
+/// 項目 3 の約束（失敗しても動いていた環境を壊さない）はこの排他が前提。
+static IRODORI_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 取れたら作業してよい。drop で自動的に手放す（途中で return しても取り残さない）。
+pub struct IrodoriBusyGuard(());
+
+impl IrodoriBusyGuard {
+    pub fn acquire() -> Result<Self> {
+        if IRODORI_BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(anyhow!(
+                "Irodori ランタイムの導入または更新がすでに進行中です。終わってからもう一度お試しください"
+            ));
+        }
+        Ok(Self(()))
+    }
+}
+
+impl Drop for IrodoriBusyGuard {
+    fn drop(&mut self) {
+        IRODORI_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 const UPDATE_BACKUP_DIR: &str = ".update-backup";
 
 /// pin ごとの「入れ直し方」。
@@ -831,8 +884,30 @@ where
     }
 
     let backup_root = asset_root.join(UPDATE_BACKUP_DIR);
-    // 前回が異常終了して残っていた分を掃除する（更新は 1 件ずつ順に処理する）。
-    let _ = std::fs::remove_dir_all(&backup_root);
+    // **残っている退避を無条件に消さない。** 退避が残っているのは「復元に失敗したので
+    // 消さずに置いた」ときだけで、そこには**唯一残った旧版**が入っている。
+    // まず戻しを試み、戻せたら捨てる。戻せなければ場所を伝えて止まる
+    // （消してから入れ直しに失敗すると、守ろうとしたものを失う）。
+    if backup_root.is_dir() {
+        on_line("前回の入れ直しが中断しています。退避したものを先に戻します…");
+        let mut recovered = true;
+        if let Ok(entries) = std::fs::read_dir(&backup_root) {
+            for e in entries.flatten() {
+                if let Err(err) = restore_package(&site, &e.path()) {
+                    crate::ulog!("[irodori] 退避の復元に失敗: {} ({err:#})", e.path().display());
+                    recovered = false;
+                }
+            }
+        }
+        if !recovered {
+            return Err(anyhow!(
+                "前回の入れ直しで退避したものを戻せません。手動で戻してから再実行してください。退避先: {}",
+                backup_root.display()
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&backup_root);
+        on_line("戻しました。入れ直しを続けます");
+    }
 
     // 入れ直す前に「いま何が使えるか」を控える。ここを控えずに絶対値で判定すると、
     // 元から import できないものを理由に、正常な入れ直しまで巻き戻してしまう。
@@ -853,7 +928,22 @@ where
         on_line(&format!("  site={}", site.display()));
         on_line(&format!("  退避前: {}", describe_package(&site, pkg)));
         let backup = backup_root.join(pkg);
-        move_package_aside(&site, pkg, &backup)?;
+        // 退避は「ディレクトリ」と「dist-info」の 2 段で、前者だけ動いて後者で失敗しうる
+        // （ファイルがロックされている等）。**そのまま返すと site-packages から消えたまま**
+        // になるので、ここでも戻す。
+        if let Err(err) = move_package_aside(&site, pkg, &backup) {
+            if let Err(restore_err) = restore_package(&site, &backup) {
+                crate::ulog!(
+                    "[irodori] 退避中の失敗を戻せません。退避を残します: {} ({restore_err:#})",
+                    backup.display()
+                );
+                return Err(err).with_context(|| {
+                    format!("復元にも失敗しました。退避先: {}", backup.display())
+                });
+            }
+            let _ = std::fs::remove_dir_all(&backup_root);
+            return Err(err);
+        }
         on_line(&format!("  退避後: {}", describe_package(&site, pkg)));
 
         let installed = run_python(
@@ -906,24 +996,8 @@ where
 
     // **記録は更新の一部。** これをコマンド層に置いていたためテストから到達できず、
     // 「入れ直したのに `up_to_date` が false のまま」を自動で検出できなかった。
-    let stamp = read_stamp(asset_root);
-    let recorded_pins = stamp.as_ref().map(|s| s.pins.clone()).unwrap_or_default();
-    let mut resolved = stamp.map(|s| s.resolved).unwrap_or_default();
-    // **実際に入った版を取り直す。** 記録の要点は「指定した版」ではなく「実際に入った版」
-    // （`huggingface_hub==0.27.0` と書いて実機は 0.36.2 だった）。入れ直したあとに
-    // 古いまま、あるいは記録が無かった環境で空のままにすると、記録の意味が無い。
-    resolved.extend(query_resolved_versions(&py_exe, |l| on_line(l)));
-    let py_version = installed_python_version(asset_root);
-    let python_matches = py_version.as_deref() == pinned_python_version();
-    if let Some(v) = py_version {
-        resolved.insert("python".to_string(), v);
-    }
-    write_stamp_pins(
-        asset_root,
-        merged_pins(&recorded_pins, &updated, python_matches),
-        resolved,
-    )
-    .context("入れ直しは成功しましたが、導入記録を書けませんでした")?;
+    record_after_install(asset_root, &updated, |l| on_line(l))
+        .context("入れ直しは成功しましたが、導入記録を書けませんでした")?;
 
     Ok(updated)
 }
@@ -1195,7 +1269,7 @@ mod stamp_tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        write_stamp(dir.path(), resolved).unwrap();
+        write_stamp_pins(dir.path(), current_pins(), resolved).unwrap();
 
         let got = read_stamp(dir.path()).expect("読み戻せること");
         assert_eq!(got.pins, current_pins(), "要求した pin をそのまま記録する");
@@ -1215,7 +1289,7 @@ mod stamp_tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        write_stamp(dir.path(), resolved).unwrap();
+        write_stamp_pins(dir.path(), current_pins(), resolved).unwrap();
 
         let got = read_stamp(dir.path()).unwrap();
         assert!(
@@ -1329,6 +1403,35 @@ mod stamp_tests {
         assert!(python_is_stale(Some("3.11.8"), Some("3.11.9")), "違えば古い");
         assert!(!python_is_stale(None, Some("3.11.9")), "聞けないなら古いと言わない");
         assert!(!python_is_stale(Some("3.11.9"), None), "pin を読めないなら古いと言わない");
+    }
+
+    /// **初回導入の経路も、確認できない `python` を「最新」と記録しない**（監査 ④）。
+    ///
+    /// `ensure_python_embeddable` は `python.exe` があれば skip するので、
+    /// 「入れた」と「入っている」は一致しない。ここで無条件に記録すると、以後
+    /// `should_ask_python` が「記録が一致」と判断して実物に聞かなくなり、
+    /// **古い python が永久に見えなくなる**。更新経路だけ直して隣に残していた穴。
+    #[test]
+    fn the_install_path_does_not_claim_an_unverified_python() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("python")).unwrap();
+        // 起動できない python.exe = 版を確かめられない状況
+        std::fs::write(dir.path().join("python").join("python.exe"), b"x").unwrap();
+
+        record_installed(dir.path(), |_| {}).expect("記録は書けること");
+
+        let pins = read_stamp(dir.path()).expect("記録があること").pins;
+        assert!(
+            !pins.contains_key("python"),
+            "確かめられていない python を記録してはいけない: {pins:?}"
+        );
+        for pkg in ["dacvae", "irodori_tts", "silentcipher"] {
+            assert_eq!(pins.get(pkg), current_pins().get(pkg), "{pkg} は記録すること");
+        }
+        assert!(
+            should_ask_python(&pins),
+            "記録していないのだから、次回は実物に聞きにいくこと"
+        );
     }
 
     /// **入れ直せた分だけ**を現在値へ反映する。全部を現在値にすると、入れ直していない
@@ -1602,6 +1705,84 @@ mod update_tests {
                 "{pkg} を入れ直すのに import の見張りが無い"
             );
         }
+    }
+
+    /// 退避が**途中まで**進んだ状態から戻せること（監査 ③）。
+    ///
+    /// 退避は「ディレクトリ」と「dist-info」の 2 段で、前者だけ動いて後者で失敗しうる。
+    /// そのまま返すと site-packages からパッケージが消えたまま戻らない。
+    #[test]
+    fn a_half_done_aside_can_be_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = make_site(dir.path());
+        put_pkg(&site, "dacvae", "1.0.0", "keep");
+        let backup = dir.path().join(UPDATE_BACKUP_DIR).join("dacvae");
+        // dist-info の移動先を中身つきで塞ぐ（Windows の rename はここで失敗する）
+        std::fs::create_dir_all(backup.join("dacvae-1.0.0.dist-info").join("blocker")).unwrap();
+
+        assert!(
+            move_package_aside(&site, "dacvae", &backup).is_err(),
+            "前提: 途中で失敗すること"
+        );
+        assert!(!site.join("dacvae").exists(), "前提: ディレクトリだけ先に動いている");
+
+        restore_package(&site, &backup).expect("戻せること");
+        assert_eq!(
+            std::fs::read_to_string(site.join("dacvae").join("__init__.py")).unwrap(),
+            "keep",
+            "消えたままにしない"
+        );
+    }
+
+    /// **前回「守るために残した」退避を、次の実行が消してはいけない**（監査 ②）。
+    ///
+    /// 復元に失敗したときは退避を残してユーザーに場所を伝える。そこにあるのは
+    /// **唯一残った旧版**なので、次の実行が冒頭で消すと、入れ直しに失敗した瞬間に
+    /// 永久に失われる。残っていたらまず戻す。
+    #[tokio::test]
+    async fn a_leftover_backup_is_restored_before_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = make_site(dir.path());
+        std::fs::write(dir.path().join("python").join("python.exe"), b"x").unwrap();
+
+        // 前回の中断で退避だけが残っている状態を作る
+        let backup = dir.path().join(UPDATE_BACKUP_DIR).join("dacvae");
+        std::fs::create_dir_all(backup.join("dacvae")).unwrap();
+        std::fs::write(backup.join("dacvae").join("__init__.py"), b"old").unwrap();
+        std::fs::create_dir_all(backup.join("dacvae-1.0.0.dist-info")).unwrap();
+        assert!(!site.join("dacvae").exists(), "前提: site からは消えている");
+
+        update_irodori_runtime(dir.path(), &[], |_| {})
+            .await
+            .expect("入れ直す対象が無くても、戻しは行われること");
+
+        assert_eq!(
+            std::fs::read_to_string(site.join("dacvae").join("__init__.py")).unwrap(),
+            "old",
+            "退避していた旧版が site へ戻ること"
+        );
+        assert!(site.join("dacvae-1.0.0.dist-info").is_dir(), "dist-info も戻ること");
+        assert!(
+            !dir.path().join(UPDATE_BACKUP_DIR).exists(),
+            "戻せたら退避は捨てる"
+        );
+    }
+
+    /// 導入と更新を同時に走らせない（監査 ①）。
+    ///
+    /// 同じ `site-packages` を 2 経路が触ると、退避 → 入れ直し → 復元のどの段も守れない。
+    #[test]
+    fn install_and_update_do_not_overlap() {
+        let first = IrodoriBusyGuard::acquire().expect("1 本目は取れる");
+        assert!(
+            IrodoriBusyGuard::acquire().is_err(),
+            "進行中はもう 1 本走らせない"
+        );
+        drop(first);
+        assert!(
+            IrodoriBusyGuard::acquire().is_ok(),
+            "終わったら次が取れる（途中で return しても取り残さない）"
+        );
     }
 
     #[test]

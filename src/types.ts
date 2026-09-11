@@ -296,7 +296,6 @@ export interface ChatLogRow {
 
 // === Irodori-TTS (M4c) ===
 
-/// `irodori_check_gpu` の戻り値。Phase A はスタブで常に available=false。
 /// Irodori ランタイムの導入状態（`get_irodori_status`、v0.5.4）。
 ///
 /// **`present`（使えるか）と `up_to_date`（最新か）は別の質問。**
@@ -314,6 +313,7 @@ export interface IrodoriStatus {
   resolved: Record<string, string>;
 }
 
+/// `irodori_check_gpu` の戻り値。
 export interface IrodoriGpuInfo {
   available: boolean;
   name: string | null;

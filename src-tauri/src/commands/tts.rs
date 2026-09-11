@@ -363,12 +363,21 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 /// 成功したら**入れ直せた分だけ**記録を書き換える（全部を現在値にすると、
 /// 入れ直していない依存まで「最新」と記録してしまう）。
 #[tauri::command]
-pub async fn update_irodori_runtime(app: AppHandle) -> Result<Vec<String>, String> {
+pub async fn update_irodori_runtime(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<String>, String> {
+    // 初回 DL と同時に走ると、同じ site-packages を 2 経路が触って退避も復元も守れない。
+    let _busy = irodori_download::IrodoriBusyGuard::acquire().map_err(|e| format!("{e:#}"))?;
     let root = voice_ref::irodori_root().map_err(|e| format!("{e:#}"))?;
     let status = irodori_download::status(&root);
     if status.up_to_date {
         return Ok(Vec::new());
     }
+    // **稼働中のサイドカーを先に止める。** 止めないと (a) 入れ直しても合成は旧コードの
+    // まま（`ensure_sidecar_running` は版を見ずに既存ポートを返す）(b) 遅延 import する
+    // モジュールを差し替えると動いているプロセスが壊れる。次の合成で新しいコードが起動する。
+    let _ = state.tts.irodori.shutdown().await;
     let emit = {
         let app = app.clone();
         move |line: &str| {
@@ -434,6 +443,8 @@ pub async fn download_irodori_assets(
     if !agreed {
         return Err("利用規約への同意が必要です".to_string());
     }
+    // 更新と同時に走らせない（同じ site-packages を 2 経路が触る）。
+    let _busy = irodori_download::IrodoriBusyGuard::acquire().map_err(|e| format!("{e:#}"))?;
     let asset_root = voice_ref::irodori_root().map_err(|e| format!("{e:#}"))?;
     std::fs::create_dir_all(&asset_root).map_err(|e| format!("資産ルート作成失敗: {e:#}"))?;
 

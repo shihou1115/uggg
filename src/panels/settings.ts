@@ -652,6 +652,9 @@ async function onIrodoriUpdate(): Promise<void> {
   if (!ok) return;
   showIrodoriProgress("更新しています…", false);
   inputs.irodoriUpdateBtn.disabled = true;
+  // 初回 DL と同時に走らせない（同じ site-packages を 2 経路が触る）。
+  // バック側でも弾くが、押せてしまう見た目のほうを先に塞ぐ。
+  inputs.irodoriDownloadBtn.disabled = true;
 
   const unlisten = await listen<string>("irodori-download", (ev) => {
     if (ev.payload === "__done__") return;
@@ -668,11 +671,15 @@ async function onIrodoriUpdate(): Promise<void> {
       false,
     );
   } catch (err) {
-    // 失敗しても元に戻してあるので、いまの環境はそのまま使える。
-    showIrodoriProgress(`更新に失敗しました (元の状態のままです): ${formatErr(err)}`, true);
+    // **「元の状態のまま」と一律に言わない。** 複数を順に入れ直すので、先行分が成功して
+    // 後続で失敗した場合、先行分は戻していない（成功して検証も通ったものを戻す理由が無い）。
+    // 何が起きたかはバック側のメッセージが持っている。
+    showIrodoriProgress(`更新に失敗しました: ${formatErr(err)}`, true);
   } finally {
     unlisten();
     inputs.irodoriUpdateBtn.disabled = false;
+    // DL ボタンの可否は GPU の有無で決まる。状態を取り直して正しい値へ戻す。
+    void refreshIrodoriState();
   }
 }
 
@@ -687,6 +694,8 @@ async function onIrodoriDownload(): Promise<void> {
   if (!ok) return;
   showIrodoriProgress("ダウンロードを開始しています…", false);
   inputs.irodoriDownloadBtn.disabled = true;
+  // 更新と同時に走らせない（同じ site-packages を 2 経路が触る）。
+  inputs.irodoriUpdateBtn.disabled = true;
 
   const unlisten = await listen<string>("irodori-download", (ev) => {
     if (ev.payload === "__done__") return;
@@ -711,7 +720,10 @@ async function onIrodoriDownload(): Promise<void> {
     showIrodoriProgress(`ダウンロード失敗: ${formatErr(err)}`, true);
   } finally {
     unlisten();
-    // 完了後のボタン状態は refreshIrodoriState が GPU/資産に応じて再設定済み
+    // **失敗経路でも状態を取り直す。** 成功側だけ `refreshIrodoriState` を呼んでいたため、
+    // 失敗すると「更新する」を無効にしたまま戻せなくなる（排他のために止めているので、
+    // 解除しないとパネルを開き直すまで押せない）。
+    void refreshIrodoriState();
   }
 }
 
