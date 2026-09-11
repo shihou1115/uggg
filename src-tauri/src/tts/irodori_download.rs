@@ -308,6 +308,69 @@ pub struct IrodoriStatus {
     pub resolved: std::collections::BTreeMap<String, String>,
 }
 
+/// pin されている Python の版（`PYTHON_URL` の `python-3.11.9-embed-amd64.zip` → `3.11.9`）。
+pub fn pinned_python_version() -> Option<&'static str> {
+    PYTHON_URL
+        .rsplit('/')
+        .next()?
+        .strip_prefix("python-")?
+        .split('-')
+        .next()
+}
+
+/// 入っている Python の版を**実物に聞く**（`python.exe --version` → `Python 3.11.9`）。
+///
+/// 記録を当てにしないのは、`ensure_python_embeddable` が `python.exe` があれば skip
+/// するため、**「記録が無い」ことと「版が違う」ことが別物**だから。混同すると、
+/// 直せもしない入れ直しを要求して更新経路そのものが止まる。
+pub fn installed_python_version(asset_root: &Path) -> Option<String> {
+    let py_exe = asset_root.join("python").join("python.exe");
+    let mut found = None;
+    run_python(&py_exe, &["--version"], |line| {
+        if let Some(rest) = line.trim().strip_prefix("Python ") {
+            found = Some(rest.trim().to_string());
+        }
+    })
+    .ok()?;
+    found
+}
+
+/// 版が違うと**言い切れる**ときだけ真。聞けなかったときは偽。
+///
+/// 記録の欠落は「更新ボタンを出す」だけで済むが、python の判定を誤ると
+/// 「全部消して入れ直せ」という数 GB の要求になる。証拠が無い側へ倒す。
+fn python_is_stale(installed: Option<&str>, pinned: Option<&str>) -> bool {
+    matches!((installed, pinned), (Some(i), Some(p)) if i != p)
+}
+
+/// 実物に版を聞く必要があるか。
+///
+/// 記録が現在の pin を主張しているなら、それは初回導入が**実際に入れた**もの。
+/// 聞き直さない（設定パネルを開くたびに python.exe を起動しないため）。
+fn should_ask_python(recorded: &std::collections::BTreeMap<String, String>) -> bool {
+    recorded.get("python") != current_pins().get("python")
+}
+
+/// 入れ直しが要る pin の名前を並べる。**python だけは記録ではなく実物で判定する。**
+fn outdated_list(
+    asset_root: &Path,
+    recorded: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let current = current_pins();
+    let mut out = outdated_pins(recorded, &current);
+    out.retain(|n| n != "python");
+    if should_ask_python(recorded)
+        && python_is_stale(
+            installed_python_version(asset_root).as_deref(),
+            pinned_python_version(),
+        )
+    {
+        out.push("python".to_string());
+        out.sort();
+    }
+    out
+}
+
 /// 導入状態を調べる (v0.5.4 項目 2)。
 pub fn status(asset_root: &Path) -> IrodoriStatus {
     let present = assets_ready(asset_root);
@@ -316,12 +379,19 @@ pub fn status(asset_root: &Path) -> IrodoriStatus {
             present,
             has_record: false,
             up_to_date: false,
-            // 記録が無い環境では、どの pin が古いかまでは言えない。
-            outdated: Vec::new(),
+            // **記録が無くても「入れ直せば済むもの」は名指しできる。** ここを空にすると
+            // 呼び出し側が対象を自前で組み立てることになり、実際それで入れ直せない
+            // python が混ざって、この機能が対象にしている環境がちょうど 1 つも
+            // 更新できなくなっていた。
+            outdated: if present {
+                outdated_list(asset_root, &Default::default())
+            } else {
+                Vec::new()
+            },
             resolved: Default::default(),
         };
     };
-    let outdated = outdated_pins(&stamp.pins, &current_pins());
+    let outdated = outdated_list(asset_root, &stamp.pins);
     IrodoriStatus {
         present,
         has_record: true,
@@ -672,7 +742,7 @@ where
         // ここだけは安全に入れ直せない。黙って部分更新して「最新」と記録するより、
         // 何が要るかを伝えて止まるほうがよい。
         return Err(anyhow!(
-            "Python 本体の版が変わっています。この経路では入れ直せません              (稼働中のインタプリタを差し替えられないため)。             `%APPDATA%\\ugg\\irodori\\python` を削除してから、もう一度導入してください"
+            "Python 本体の版が変わっています。この経路では入れ直せません（稼働中のインタプリタを差し替えられないため）。`%APPDATA%\\ugg\\irodori\\python` を削除してから、もう一度導入してください"
         ));
     }
 
@@ -1081,6 +1151,78 @@ mod stamp_tests {
         assert!(parse_resolved_line("pip install ...").is_none(), "無関係な行は拾わない");
     }
 
+    /// **記録が無いことは「Python の版が違う」ことではない** (v0.5.4、実機検証の直前に発見)。
+    ///
+    /// 記録の欠落を「全 pin が古い」と読み替えて対象に `python` を混ぜていたため、
+    /// 更新経路が冒頭の Err で止まり、**この機能が対象にしている環境
+    /// （= v0.5.4 より前に導入した環境）がちょうど 1 つも更新できなかった**。
+    /// しかもユーザーには「Python 本体の版が変わっています。全部消して入れ直せ」という
+    /// 事実でない案内が出ていた。
+    #[test]
+    fn a_missing_record_does_not_accuse_python() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("python").join("Lib").join("site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        // 起動できない python.exe = 版を聞けない状況。聞けないなら古いとは言わない。
+        std::fs::write(dir.path().join("python").join("python.exe"), b"x").unwrap();
+        for pkg in ["torch", "fastapi", "uvicorn", "huggingface_hub", "irodori_tts"] {
+            std::fs::create_dir_all(site.join(pkg)).unwrap();
+        }
+
+        let st = status(dir.path());
+        assert!(st.present && !st.has_record && !st.up_to_date, "前提: 古い導入");
+        assert!(
+            !st.outdated.iter().any(|n| n == "python"),
+            "聞けなかった python を対象に混ぜてはいけない: {:?}",
+            st.outdated
+        );
+        for pkg in ["silentcipher", "dacvae", "irodori_tts"] {
+            assert!(
+                st.outdated.iter().any(|n| n == pkg),
+                "{pkg} が入れ直しの対象から漏れている: {:?}",
+                st.outdated
+            );
+        }
+    }
+
+    /// pin した URL から版を取り出せる（ここが壊れると python の判定が常に「聞けない」に倒れる）。
+    #[test]
+    fn pinned_python_version_comes_from_the_url() {
+        assert_eq!(pinned_python_version(), Some("3.11.9"));
+        assert!(PYTHON_URL.contains("python-3.11.9-embed-amd64.zip"), "前提が変わったら上も直す");
+    }
+
+    /// **証拠が無いほうへ倒す。** 聞けなかった版を「違う」と扱うと、直せもしない
+    /// 全削除・再導入（数 GB）をユーザーに要求することになる。
+    #[test]
+    fn python_staleness_needs_evidence() {
+        assert!(!python_is_stale(Some("3.11.9"), Some("3.11.9")), "一致なら古くない");
+        assert!(python_is_stale(Some("3.11.8"), Some("3.11.9")), "違えば古い");
+        assert!(!python_is_stale(None, Some("3.11.9")), "聞けないなら古いと言わない");
+        assert!(!python_is_stale(Some("3.11.9"), None), "pin を読めないなら古いと言わない");
+    }
+
+    /// 一致している記録は信じ、**実物に聞かない**。ここが常に真になると、設定パネルを
+    /// 開くたびに python.exe を起動することになる。
+    #[test]
+    fn a_matching_record_means_python_need_not_be_asked() {
+        assert!(!should_ask_python(&current_pins()), "一致している記録は信じる");
+        assert!(should_ask_python(&Default::default()), "記録が無ければ実物に聞く");
+        let mut other = current_pins();
+        other.insert("python".to_string(), "OLD".to_string());
+        assert!(should_ask_python(&other), "記録が違えば実物に聞く");
+    }
+
+    /// 記録どおりなら空、違う pin だけを名指しする。
+    #[test]
+    fn outdated_list_names_only_what_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorded = current_pins();
+        assert!(outdated_list(dir.path(), &recorded).is_empty(), "全部一致なら空");
+        recorded.insert("irodori_tts".to_string(), "OLD".to_string());
+        assert_eq!(outdated_list(dir.path(), &recorded), ["irodori_tts"]);
+    }
+
     /// **pin を増やしたら `current_pins` にも足す。** 足し忘れると、その依存だけ
     /// 更新判定から外れて「最新」と誤認する。
     #[test]
@@ -1117,6 +1259,58 @@ mod update_tests {
     /// `ensure_python_embeddable` は `python.exe` があれば skip するので、
     /// pin を上げても反映されない。稼働中のインタプリタを安全に差し替える方法は
     /// 無いため、黙って部分更新して「最新」と記録するのではなく対象外にする。
+    /// **実機検証用** (v0.5.4 項目 3、test-plan §5 E-7)。**実環境を書き換える**ので
+    /// 既定では走らない。対象を環境変数で明示させ、うっかり実行できないようにしている。
+    ///
+    /// ```powershell
+    /// $env:UGG_IRODORI_REAL_ROOT = "$env:APPDATA\\ugg\\irodori"
+    /// cargo test -- --ignored --nocapture irodori_update_on_a_real_runtime
+    /// ```
+    ///
+    /// 確かめるのは「入った」ではなく「**使える**」まで: `update_irodori_runtime` は
+    /// import 確認を通ってから退避を捨てるので、成功して戻ればその時点で import できている。
+    #[tokio::test]
+    #[ignore = "実環境を書き換える。UGG_IRODORI_REAL_ROOT を指定して明示的に実行する"]
+    async fn irodori_update_on_a_real_runtime() {
+        let Ok(root) = std::env::var("UGG_IRODORI_REAL_ROOT") else {
+            panic!("UGG_IRODORI_REAL_ROOT が未設定です（対象を明示すること）");
+        };
+        let root = PathBuf::from(root);
+        assert!(
+            root.join("python").join("python.exe").is_file(),
+            "python.exe が無い: {}",
+            root.display()
+        );
+
+        let before = status(&root);
+        println!(
+            "[before] present={} has_record={} up_to_date={}",
+            before.present, before.has_record, before.up_to_date
+        );
+        println!("[before] outdated={:?}", before.outdated);
+        println!("[before] python={:?}", installed_python_version(&root));
+        assert!(before.present, "前提: 使える状態であること");
+        assert!(!before.up_to_date, "前提: 更新対象があること（既に最新なら検証にならない）");
+        assert!(
+            !before.outdated.iter().any(|n| n == "python"),
+            "python が対象に混ざっている: {:?}",
+            before.outdated
+        );
+
+        let updated = update_irodori_runtime(&root, &before.outdated, |l| println!("  | {l}"))
+            .await
+            .expect("入れ直しに失敗");
+        println!("[updated] {updated:?}");
+        assert_eq!(updated, before.outdated, "対象が全部入れ直されること");
+        assert!(
+            !root.join(UPDATE_BACKUP_DIR).exists(),
+            "成功したら退避を残さない: {}",
+            root.join(UPDATE_BACKUP_DIR).display()
+        );
+        verify_runtime_imports(&root.join("python").join("python.exe"))
+            .expect("入れ直した後も import できること");
+    }
+
     #[test]
     fn python_is_not_updatable_in_place() {
         assert!(updatable_pin("python").is_none());

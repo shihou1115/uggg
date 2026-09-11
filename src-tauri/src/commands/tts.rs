@@ -375,13 +375,10 @@ pub async fn update_irodori_runtime(app: AppHandle) -> Result<Vec<String>, Strin
             let _ = app.emit("irodori-download", line);
         }
     };
-    // 記録が無い環境では、どれが古いかを名指しできない。**全部を入れ直す対象にする**
-    // （この機能が対象にしているのはまさにその環境なので、何もしないと届かない）。
-    let targets: Vec<String> = if status.has_record {
-        status.outdated
-    } else {
-        irodori_download::current_pins().keys().cloned().collect()
-    };
+    // 対象は `status` が決める。**ここで自前に組み立てない** — 記録が無い環境で
+    // `current_pins()` を丸ごと対象にしたところ、入れ直せない `python` が混ざって
+    // Err で止まり、この機能が対象にしている環境がちょうど 1 つも更新できなかった。
+    let targets = status.outdated;
     let updated = irodori_download::update_irodori_runtime(&root, &targets, &emit)
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -396,9 +393,19 @@ pub async fn update_irodori_runtime(app: AppHandle) -> Result<Vec<String>, Strin
             pins.insert(name.clone(), url.clone());
         }
     }
-    let resolved = irodori_download::read_stamp(&root)
+    let mut resolved = irodori_download::read_stamp(&root)
         .map(|s| s.resolved)
         .unwrap_or_default();
+    // 実物が pin と一致していることを**確認できたときだけ** python も記録する。
+    // 確認せずに書けば記録が嘘になり、確認したのに書かなければ毎回 python.exe に聞き直すことになる。
+    if let Some(v) = irodori_download::installed_python_version(&root) {
+        if Some(v.as_str()) == irodori_download::pinned_python_version() {
+            if let Some(url) = current.get("python") {
+                pins.insert("python".to_string(), url.clone());
+            }
+        }
+        resolved.insert("python".to_string(), v);
+    }
     irodori_download::write_stamp_pins(&root, pins, resolved).map_err(|e| format!("{e:#}"))?;
     let _ = app.emit("irodori-download", "__done__");
     Ok(updated)
