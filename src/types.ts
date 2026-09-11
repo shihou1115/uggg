@@ -297,6 +297,23 @@ export interface ChatLogRow {
 // === Irodori-TTS (M4c) ===
 
 /// `irodori_check_gpu` の戻り値。Phase A はスタブで常に available=false。
+/// Irodori ランタイムの導入状態（`get_irodori_status`、v0.5.4）。
+///
+/// **`present`（使えるか）と `up_to_date`（最新か）は別の質問。**
+/// 古くても動いている環境を「未導入」に落とすと、`canUseReal` が倒れて
+/// `tts_irodori_use_real_model` が黙って false に書き換わる（spec §6.0 項目 2）。
+export interface IrodoriStatus {
+  present: boolean;
+  /// 導入記録があるか。v0.5.4 より前に導入した環境では false。
+  has_record: boolean;
+  /// いまのビルドが要求する pin と一致するか。記録が無ければ false。
+  up_to_date: boolean;
+  /// 一致しなかった pin の名前。
+  outdated: string[];
+  /// 実際に入っている版（記録があれば）。
+  resolved: Record<string, string>;
+}
+
 export interface IrodoriGpuInfo {
   available: boolean;
   name: string | null;

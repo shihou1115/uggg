@@ -191,6 +191,7 @@ fn main() {
             commands::tts::irodori_check_gpu,
             commands::tts::irodori_assets_ready,
             commands::tts::get_irodori_status,
+            commands::tts::update_irodori_runtime,
             commands::tts::download_irodori_assets,
             commands::tts::voice_ref_list,
             commands::tts::voice_ref_delete,

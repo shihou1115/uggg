@@ -68,6 +68,14 @@ vi.mock("@tauri-apps/api/core", () => ({
       case "get_profile":
       case "voice_ref_list":
         return [];
+      case "get_irodori_status":
+        return {
+          present: false,
+          has_record: false,
+          up_to_date: false,
+          outdated: [],
+          resolved: {},
+        };
       case "irodori_check_gpu":
         return { available: false, name: null, reason: "テスト環境" };
       case "list_monitors":

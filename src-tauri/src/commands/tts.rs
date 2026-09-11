@@ -353,6 +353,57 @@ pub async fn irodori_check_gpu() -> GpuInfo {
     }
 }
 
+/// 古くなった Irodori ランタイムを入れ直す (v0.5.4 項目 3、spec §6.0)。
+///
+/// 初回導入 (`download_irodori_assets`) と別経路にしているのは、目的が違うから。
+/// あちらは「何も無いところに一式そろえる」、こちらは「**動いているものを壊さずに
+/// 古い分だけ入れ替える**」。後者は退避してから入れ直し、import できることまで
+/// 確かめてから退避を捨てる。
+///
+/// 成功したら**入れ直せた分だけ**記録を書き換える（全部を現在値にすると、
+/// 入れ直していない依存まで「最新」と記録してしまう）。
+#[tauri::command]
+pub async fn update_irodori_runtime(app: AppHandle) -> Result<Vec<String>, String> {
+    let root = voice_ref::irodori_root().map_err(|e| format!("{e:#}"))?;
+    let status = irodori_download::status(&root);
+    if status.up_to_date {
+        return Ok(Vec::new());
+    }
+    let emit = {
+        let app = app.clone();
+        move |line: &str| {
+            let _ = app.emit("irodori-download", line);
+        }
+    };
+    // 記録が無い環境では、どれが古いかを名指しできない。**全部を入れ直す対象にする**
+    // （この機能が対象にしているのはまさにその環境なので、何もしないと届かない）。
+    let targets: Vec<String> = if status.has_record {
+        status.outdated
+    } else {
+        irodori_download::current_pins().keys().cloned().collect()
+    };
+    let updated = irodori_download::update_irodori_runtime(&root, &targets, &emit)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+
+    // 記録の更新: 入れ直せた分だけ現在値へ。
+    let mut pins = irodori_download::read_stamp(&root)
+        .map(|s| s.pins)
+        .unwrap_or_default();
+    let current = irodori_download::current_pins();
+    for name in &updated {
+        if let Some(url) = current.get(name) {
+            pins.insert(name.clone(), url.clone());
+        }
+    }
+    let resolved = irodori_download::read_stamp(&root)
+        .map(|s| s.resolved)
+        .unwrap_or_default();
+    irodori_download::write_stamp_pins(&root, pins, resolved).map_err(|e| format!("{e:#}"))?;
+    let _ = app.emit("irodori-download", "__done__");
+    Ok(updated)
+}
+
 /// Irodori 資産の導入状態 (v0.5.4 項目 2、spec §6.0)。
 ///
 /// `irodori_assets_ready` が「**使えるか**」だけを返すのに対し、こちらは

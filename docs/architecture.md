@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.15）
+# ugg アーキテクチャ設計書（architecture.md v2.16）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -635,6 +635,7 @@ pub struct GhostBundle {
 | `delete_github_token` | なし | `()` | |
 | `irodori_check_gpu` | なし | `GpuInfo` | ★ 起動時 GPU 検出（Q3 対応） |
 | `irodori_assets_ready` | なし | `bool` | ★ **「使えるか」だけを返す**（★v0.5.4 で意味を明確化）。最新かどうかは混ぜない — 混ぜるとフロントの `canUseReal = gpuOk && assetsOk` が倒れ、古いが動いている環境で `tts_irodori_use_real_model` が黙って false に書き換わって永続化される |
+| `update_irodori_runtime` | なし | `String[]`（入れ直せた pin 名） | **★v0.5.4**（spec §6.0 項目 3）。初回導入と**別経路**。古くなった pin だけを「**退避 → 入れ直し → import 確認 → 成功なら退避を捨てる**」で入れ替える（失敗したら戻す。戻せなければ退避を残してログに場所を出す）。**`python` は対象外** — `ensure_python_embeddable` は `python.exe` があれば skip し、稼働中のインタプリタを安全に差し替える方法が無いため、その旨を返して止まる。成功後は**入れ直せた分だけ**記録を書き換える |
 | `get_irodori_status` | なし | `IrodoriStatus { present, has_record, up_to_date, outdated[], resolved{} }` | **★v0.5.4**（spec §6.0 項目 2）。導入記録（`installed.json`）と、いまのビルドが要求する pin を突き合わせる。`present` は `irodori_assets_ready` と同じ意味、`up_to_date` は**別の信号**。**記録が無い環境（v0.5.4 より前の導入）は `up_to_date: false`** — 分からないものを「最新」とは言わない |
 | `download_irodori_assets` | `agreed: bool` | `()` | ★ 進捗 `irodori-download` |
 | `voice_ref_generate` | `slot: String, caption: String` | `VoiceRef[]` | ★ Irodori 参照音声生成（同期完了、進捗イベントなし）。完了後の一覧を返す |
@@ -1754,3 +1755,4 @@ async fn install_asset(
 | 2026-09-10 | v2.13 | **v0.5.3 のリリース前監査を受けた是正**。① `Db::list_recent_chat_log_in_mode(mode, limit)` を追加し、`load_recent_history` はこれで **mode="advanced" の行だけ**を読む（バック起点の発話は例外なく mode="low" で記録されるので mode で切り分けられる。取ってから絞ると独り言だけが続いた夜に会話行が LIMIT の窓から押し出されるため **SQL 側で絞る**）。往復が 1 つも無い窓では空を返す。② `monologue::parse_monologue_batch` のエラーから応答本文を外す（項目 7 で `advanced` 側だけを直しており漏れていた）。③ `llm::truncate_for_log` を追加し、HTTP エラーボディを 300 文字で頭打ちにする。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
 | 2026-09-11 | v2.14 | **未計上だった契約⇔実装の乖離を 1 件記載**（v0.5.4 のスコープ検討中に発見）。`synthesize_voice` の `caption` は「Irodori 実モデルのみ使用」と書いてあるが、**v3 本体の checkpoint が `use_caption_condition: false` のため一度も効いていない**（`sidecar.py` は渡しており `cfg_scale_caption=3.0` も設定しているが、条件付けに入らず捨てられる）。台本の行ごとの声質指示は Irodori 経路では無効。**v0.5.5 の v4.1-Small 差し替えで閉じる**（`use_caption_condition: true`）。設計・契約の変更はなし。 |
 | 2026-09-11 | v2.15 | **v0.5.4 項目 1・2（入っている版を記録する / 「使える」と「最新」を分ける）**。① 導入記録 `%APPDATA%\ugg\irodori\installed.json` を追加（`pins` = 要求した固定 URL、`resolved` = 実際に入った版。**全段成功後にだけ書く**）。② コマンド `get_irodori_status` を追加（`IrodoriStatus`）。**`irodori_assets_ready` の意味は変えない** — 「最新か」を混ぜると、古いが動いている環境でフロントが `tts_irodori_use_real_model` を黙って倒して永続化するため。**記録が無い環境は `up_to_date: false`**（v0.5.4 より前の導入＝この機能の対象そのもの）。**設定フィールド・イベント・DB スキーマの変更なし。** |
+| 2026-09-11 | v2.16 | **v0.5.4 項目 3・4（更新の実行経路 / ユーザーに見える形にする）**。① コマンド `update_irodori_runtime` を追加。**退避 → 入れ直し → import 確認 → 成功なら退避を捨てる**（v0.5.3 項目 2 と同じ規律）。退避先は site-packages の**外**（`%APPDATA%\ugg\irodori\.update-backup`）— 中に置くと import されうるうえ pip が dist-info を拾う。**`python` pin は対象外**（`ensure_python_embeddable` が skip するため既存環境に届かないが、稼働中のインタプリタは差し替えられない。全体の入れ直しが要る旨を返す）。② 設定の Irodori セクションに「**導入済み (更新あり)**」表示と「更新する」ボタン。**`assets_ready` は従来どおり「使えるか」だけ**で、更新の有無は別表示。**設定フィールド・DB スキーマの変更なし。** |

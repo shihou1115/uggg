@@ -14,6 +14,7 @@ import type {
   DndResult,
   InterestTopic,
   IrodoriGpuInfo,
+  IrodoriStatus,
   LocationHit,
   MonitorList,
   Settings,
@@ -59,6 +60,7 @@ interface Inputs {
   irodoriGpuState: HTMLElement;
   irodoriAssetsState: HTMLElement;
   irodoriDownloadBtn: HTMLButtonElement;
+  irodoriUpdateBtn: HTMLButtonElement;
   irodoriUseRealModel: HTMLInputElement;
   irodoriProgress: HTMLElement;
   voiceRefMainState: HTMLElement;
@@ -291,6 +293,7 @@ function collectInputs(): Inputs {
     irodoriGpuState: byId("settings-irodori-gpu-state"),
     irodoriAssetsState: byId("settings-irodori-assets-state"),
     irodoriDownloadBtn: byId<HTMLButtonElement>("settings-irodori-download"),
+    irodoriUpdateBtn: byId<HTMLButtonElement>("settings-irodori-update"),
     irodoriUseRealModel: byId<HTMLInputElement>("settings-irodori-use-real-model"),
     irodoriProgress: byId("settings-irodori-progress"),
     voiceRefMainState: byId("settings-voiceref-main-state"),
@@ -382,6 +385,7 @@ function attachHandlers(i: Inputs): void {
   i.ttsDownloadBtn.addEventListener("click", () => void onTtsDownload());
   i.ghTokenDeleteBtn.addEventListener("click", () => void onDeleteGhToken());
   i.irodoriDownloadBtn.addEventListener("click", () => void onIrodoriDownload());
+  i.irodoriUpdateBtn.addEventListener("click", () => void onIrodoriUpdate());
   i.voiceRefMainGenerate.addEventListener("click", () => void onVoiceRefGenerate("main"));
   i.voiceRefMainPreview.addEventListener("click", () => void onVoiceRefPreview("main"));
   i.voiceRefMainDelete.addEventListener("click", () => void onVoiceRefDelete("main"));
@@ -529,13 +533,25 @@ async function refreshIrodoriState(): Promise<void> {
   }
   // 資産状態
   try {
-    const ready = await invoke<boolean>("irodori_assets_ready");
-    inputs.irodoriAssetsState.textContent = ready ? "導入済み" : "未導入";
-    inputs.irodoriAssetsState.classList.toggle("has-key", ready);
-    assetsOk = ready;
+    const st = await invoke<IrodoriStatus>("get_irodori_status");
+    // **「使える」と「最新」を別々に見せる** (v0.5.4 項目 4、spec §6.0)。
+    // 古いまま黙って使わせない。ただし古いことを理由に「未導入」へ落とさない
+    // （落とすと canUseReal が倒れ、ユーザーの設定が勝手に消える）。
+    inputs.irodoriAssetsState.textContent = !st.present
+      ? "未導入"
+      : st.up_to_date
+        ? "導入済み"
+        : "導入済み (更新あり)";
+    inputs.irodoriAssetsState.classList.toggle("has-key", st.present && st.up_to_date);
+    inputs.irodoriUpdateBtn.hidden = !st.present || st.up_to_date;
+    inputs.irodoriUpdateBtn.title = st.has_record
+      ? `更新対象: ${st.outdated.join(" / ")}`
+      : "いつ導入したかの記録がありません。入れ直して記録を作ります";
+    assetsOk = st.present;
   } catch (err) {
     inputs.irodoriAssetsState.textContent = "確認失敗";
-    console.warn("[irodori] assets check failed", err);
+    inputs.irodoriUpdateBtn.hidden = true;
+    console.warn("[irodori] status check failed", err);
   }
   // 資産の有無を記録する (未導入なら voicevox 選択中でも Irodori セクションを見せて
   // DL 導線を残す)。セクション表示の再適用は、下の自動フリップでエンジン値が確定した
@@ -619,6 +635,44 @@ function applyVoiceRefState(refs: VoiceRef[]): void {
   }
   if (s && !inputs.voiceRefSubCaption.value) {
     inputs.voiceRefSubCaption.value = s.caption;
+  }
+}
+
+/// 古くなったランタイムを入れ直す (v0.5.4 項目 3・4)。
+///
+/// 初回 DL と別のボタンにしているのは、やることも所要時間も違うから。
+/// こちらは **動いているものを壊さずに古い分だけ入れ替える**（数 MB・数十秒）。
+async function onIrodoriUpdate(): Promise<void> {
+  if (!inputs) return;
+  const ok = await uggConfirm(
+    "Irodori-TTS のランタイムに更新があります。古くなった分だけを入れ直します。\n" +
+      "入れ直しに失敗した場合は、いまの状態へ戻します。続行しますか?",
+    "更新確認",
+  );
+  if (!ok) return;
+  showIrodoriProgress("更新しています…", false);
+  inputs.irodoriUpdateBtn.disabled = true;
+
+  const unlisten = await listen<string>("irodori-download", (ev) => {
+    if (ev.payload === "__done__") return;
+    showIrodoriProgress(ev.payload, false);
+  });
+
+  try {
+    const updated = await invoke<string[]>("update_irodori_runtime");
+    await refreshIrodoriState();
+    showIrodoriProgress(
+      updated.length > 0
+        ? `更新しました: ${updated.join(" / ")}`
+        : "更新の必要はありませんでした",
+      false,
+    );
+  } catch (err) {
+    // 失敗しても元に戻してあるので、いまの環境はそのまま使える。
+    showIrodoriProgress(`更新に失敗しました (元の状態のままです): ${formatErr(err)}`, true);
+  } finally {
+    unlisten();
+    inputs.irodoriUpdateBtn.disabled = false;
   }
 }
 

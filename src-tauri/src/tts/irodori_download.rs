@@ -175,10 +175,23 @@ pub fn write_stamp(
     asset_root: &Path,
     resolved: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
+    write_stamp_pins(asset_root, current_pins(), resolved)
+}
+
+/// `pins` を明示して記録を書く。
+///
+/// **部分更新のあとは「入れ直した分だけ」を書き換える。** 全部を現在値にすると、
+/// まだ古いままの依存（`ensure_python_embeddable` が skip する Python 本体など）まで
+/// 「最新」と記録してしまい、記録そのものが嘘になる。
+pub fn write_stamp_pins(
+    asset_root: &Path,
+    pins: std::collections::BTreeMap<String, String>,
+    resolved: std::collections::BTreeMap<String, String>,
+) -> Result<()> {
     let stamp = InstalledStamp {
         schema: STAMP_SCHEMA,
         installed_at: chrono::Utc::now().timestamp(),
-        pins: current_pins(),
+        pins,
         resolved,
     };
     let json = serde_json::to_string_pretty(&stamp).context("導入記録の JSON 化")?;
@@ -549,6 +562,173 @@ where
     Ok(())
 }
 
+/// 更新の作業用ディレクトリ（site-packages の**外**に置く）。
+///
+/// site-packages の中に退避すると、名前次第で import されうるうえ、pip が
+/// dist-info を拾って混乱する。`asset_root` 直下に置いて完全に切り離す。
+const UPDATE_BACKUP_DIR: &str = ".update-backup";
+
+/// pin ごとの「入れ直し方」。
+///
+/// **`python` はここに無い。** `ensure_python_embeddable` は `python.exe` があれば
+/// skip するため、Python 本体の pin を上げても既存環境には反映されない。
+/// 稼働中のインタプリタをその場で差し替える安全な方法は無いので、
+/// **入れ直しの対象にせず、全体の入れ直しが要る旨を伝える**（黙って失敗させない）。
+fn updatable_pin(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        // (site-packages 上のディレクトリ名, 入れ直しに使う URL)
+        "silentcipher" => Some(("silentcipher", SILENTCIPHER_ZIPBALL)),
+        "dacvae" => Some(("dacvae", DACVAE_ZIPBALL)),
+        "irodori_tts" => Some(("irodori_tts", IRODORI_TTS_ZIPBALL)),
+        _ => None,
+    }
+}
+
+/// `site-packages/<pkg>` と `<pkg>-*.dist-info` を退避先へ移す。
+fn move_package_aside(site: &Path, pkg: &str, backup: &Path) -> Result<()> {
+    std::fs::create_dir_all(backup).with_context(|| format!("mkdir {}", backup.display()))?;
+    let mut moved = false;
+    let dir = site.join(pkg);
+    if dir.is_dir() {
+        std::fs::rename(&dir, backup.join(pkg))
+            .with_context(|| format!("退避: {}", dir.display()))?;
+        moved = true;
+    }
+    // dist-info はバージョン番号を含むので走査して拾う。
+    if let Ok(entries) = std::fs::read_dir(site) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&format!("{pkg}-")) && name.ends_with(".dist-info") {
+                std::fs::rename(e.path(), backup.join(&name))
+                    .with_context(|| format!("退避: {name}"))?;
+                moved = true;
+            }
+        }
+    }
+    if !moved {
+        // 入っていなかった場合も更新自体は続行してよい（新規に入る）。
+        crate::ulog!("[irodori] 退避対象が見つかりません (新規導入として続行): {pkg}");
+    }
+    Ok(())
+}
+
+/// 退避したものを元の場所へ戻す。
+fn restore_package(site: &Path, backup: &Path) -> Result<()> {
+    let entries = std::fs::read_dir(backup)
+        .with_context(|| format!("退避先の読み取り: {}", backup.display()))?;
+    for e in entries.flatten() {
+        let dest = site.join(e.file_name());
+        // 失敗した入れ直しが中途半端に残していたら先に退ける。
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::rename(e.path(), &dest)
+            .with_context(|| format!("復元: {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+/// 入れ直したあと、実際に import できるかを確かめる。
+///
+/// pip が成功を返しても、依存の食い違いで import が落ちることはある。
+/// **「入った」ではなく「使える」まで確認してから退避を捨てる。**
+fn verify_runtime_imports(py_exe: &Path) -> Result<()> {
+    run_python(
+        py_exe,
+        &["-c", "import irodori_tts, dacvae, silentcipher"],
+        |_| {},
+    )
+    .context("入れ直したランタイムが import できません")
+}
+
+/// 古くなった分だけを入れ直す (v0.5.4 項目 3、spec §6.0)。
+///
+/// **失敗しても、それまで動いていた環境を壊さない。** pip は「古いものを消してから
+/// 新しいものを入れる」ので、途中で失敗すると消えたままになる。そこで
+/// **退避 → 入れ直し → import 確認 → 成功したら退避を捨てる**の順にし、
+/// どこかで失敗したら退避から戻す（v0.5.3 項目 2 と同じ規律）。
+/// **戻すことにも失敗したら退避先を消さず、場所をログに残す。**
+///
+/// 戻り値は「入れ直せた pin の名前」。呼び出し側はこれで記録を部分的に更新する。
+pub async fn update_irodori_runtime<F>(
+    asset_root: &Path,
+    outdated: &[String],
+    mut on_line: F,
+) -> Result<Vec<String>>
+where
+    F: FnMut(&str),
+{
+    let py_exe = asset_root.join("python").join("python.exe");
+    if !py_exe.is_file() {
+        return Err(anyhow!(
+            "Python ランタイムがありません。先に初回導入を行ってください: {}",
+            py_exe.display()
+        ));
+    }
+    let site = asset_root
+        .join("python")
+        .join("Lib")
+        .join("site-packages");
+
+    if outdated.iter().any(|n| n == "python") {
+        // ここだけは安全に入れ直せない。黙って部分更新して「最新」と記録するより、
+        // 何が要るかを伝えて止まるほうがよい。
+        return Err(anyhow!(
+            "Python 本体の版が変わっています。この経路では入れ直せません              (稼働中のインタプリタを差し替えられないため)。             `%APPDATA%\\ugg\\irodori\\python` を削除してから、もう一度導入してください"
+        ));
+    }
+
+    let backup_root = asset_root.join(UPDATE_BACKUP_DIR);
+    // 前回が異常終了して残っていた分を掃除する（更新は 1 件ずつ順に処理する）。
+    let _ = std::fs::remove_dir_all(&backup_root);
+
+    let mut updated: Vec<String> = Vec::new();
+    for name in outdated {
+        let Some((pkg, url)) = updatable_pin(name) else {
+            on_line(&format!("{name} は入れ直しの対象外です (skip)"));
+            continue;
+        };
+        on_line(&format!("{pkg} を入れ直しています…"));
+        let backup = backup_root.join(pkg);
+        move_package_aside(&site, pkg, &backup)?;
+
+        let installed = run_python(
+            &py_exe,
+            &[
+                "-m",
+                "pip",
+                "install",
+                "--no-warn-script-location",
+                "--no-deps",
+                // 直 URL でも確実に入れ替えるため、キャッシュと既存判定を跨がせない。
+                "--force-reinstall",
+                url,
+            ],
+            |l| on_line(l),
+        )
+        .and_then(|()| verify_runtime_imports(&py_exe));
+
+        if let Err(err) = installed {
+            on_line(&format!("{pkg} の入れ直しに失敗しました。元に戻します: {err:#}"));
+            if let Err(restore_err) = restore_package(&site, &backup) {
+                // **戻せなかったら退避を消さない。** 消すと、まさに守ろうとしたものを失う。
+                crate::ulog!(
+                    "[irodori] 復元に失敗しました。退避を残します: {} ({restore_err:#})",
+                    backup.display()
+                );
+                return Err(err).with_context(|| {
+                    format!("復元にも失敗しました。退避先: {}", backup.display())
+                });
+            }
+            let _ = std::fs::remove_dir_all(&backup_root);
+            return Err(err);
+        }
+        updated.push(name.clone());
+    }
+
+    // ここまで来たら全部成功している。退避を捨てる。
+    let _ = std::fs::remove_dir_all(&backup_root);
+    Ok(updated)
+}
+
 /// 6) HF モデル本体を sidecar.py の `--download-only` モードで取得する (M4c Phase G)。
 ///
 /// 通常のサイドカー起動経路 (`--no-download`) では DL を skip するように切り替えたため、
@@ -911,6 +1091,117 @@ mod stamp_tests {
             assert!(url.starts_with("https://"), "URL でない: {url}");
         }
         assert!(pins.values().any(|u| u == IRODORI_TTS_ZIPBALL));
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    fn make_site(dir: &Path) -> PathBuf {
+        let site = dir.join("python").join("Lib").join("site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        site
+    }
+
+    fn put_pkg(site: &Path, pkg: &str, version: &str, body: &str) {
+        std::fs::create_dir_all(site.join(pkg)).unwrap();
+        std::fs::write(site.join(pkg).join("__init__.py"), body).unwrap();
+        let di = site.join(format!("{pkg}-{version}.dist-info"));
+        std::fs::create_dir_all(&di).unwrap();
+        std::fs::write(di.join("METADATA"), format!("Version: {version}")).unwrap();
+    }
+
+    /// **Python 本体は入れ直しの対象にしない。**
+    ///
+    /// `ensure_python_embeddable` は `python.exe` があれば skip するので、
+    /// pin を上げても反映されない。稼働中のインタプリタを安全に差し替える方法は
+    /// 無いため、黙って部分更新して「最新」と記録するのではなく対象外にする。
+    #[test]
+    fn python_is_not_updatable_in_place() {
+        assert!(updatable_pin("python").is_none());
+        for name in ["silentcipher", "dacvae", "irodori_tts"] {
+            assert!(updatable_pin(name).is_some(), "{name} は入れ直せるはず");
+        }
+        // current_pins の 4 件のうち、入れ直せるのは 3 件。
+        let updatable = current_pins()
+            .keys()
+            .filter(|n| updatable_pin(n).is_some())
+            .count();
+        assert_eq!(updatable, 3, "pin を増やしたら updatable_pin にも足すこと");
+    }
+
+    /// 退避 → 復元で、**中身も dist-info も元どおりになる**。
+    /// pip は「消してから入れる」ので、ここが戻らないと失敗時に環境が壊れる。
+    #[test]
+    fn move_aside_then_restore_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = make_site(dir.path());
+        put_pkg(&site, "irodori_tts", "0.1.0", "OLD");
+        let backup = dir.path().join(UPDATE_BACKUP_DIR).join("irodori_tts");
+
+        move_package_aside(&site, "irodori_tts", &backup).unwrap();
+        assert!(!site.join("irodori_tts").exists(), "退避後は元の場所に無い");
+        assert!(!site.join("irodori_tts-0.1.0.dist-info").exists());
+
+        restore_package(&site, &backup).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(site.join("irodori_tts").join("__init__.py")).unwrap(),
+            "OLD",
+            "中身が戻っていない"
+        );
+        assert!(
+            site.join("irodori_tts-0.1.0.dist-info").join("METADATA").is_file(),
+            "dist-info が戻っていない"
+        );
+    }
+
+    /// **失敗した入れ直しが中途半端に残していても復元できる。**
+    /// pip が新しい版を途中まで書いた状態から、旧版へ戻せること。
+    #[test]
+    fn restore_overwrites_a_half_written_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = make_site(dir.path());
+        put_pkg(&site, "dacvae", "1.0.0", "OLD");
+        let backup = dir.path().join(UPDATE_BACKUP_DIR).join("dacvae");
+        move_package_aside(&site, "dacvae", &backup).unwrap();
+
+        // 入れ直しが途中で落ちて、新しい版の残骸が居座っている状態を作る。
+        std::fs::create_dir_all(site.join("dacvae")).unwrap();
+        std::fs::write(site.join("dacvae").join("__init__.py"), "HALF").unwrap();
+
+        restore_package(&site, &backup).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(site.join("dacvae").join("__init__.py")).unwrap(),
+            "OLD",
+            "残骸を退けて旧版に戻すこと"
+        );
+    }
+
+    /// 入っていないパッケージの退避は失敗にしない（新規に入る場合）。
+    #[test]
+    fn moving_a_missing_package_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = make_site(dir.path());
+        let backup = dir.path().join(UPDATE_BACKUP_DIR).join("silentcipher");
+        move_package_aside(&site, "silentcipher", &backup).expect("失敗にしない");
+    }
+
+    /// 似た名前のパッケージを巻き込まない（`dacvae` の退避が `dacvae_extra` を持っていかない）。
+    #[test]
+    fn move_aside_does_not_touch_similarly_named_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = make_site(dir.path());
+        put_pkg(&site, "dacvae", "1.0.0", "TARGET");
+        put_pkg(&site, "dacvae_extra", "2.0.0", "BYSTANDER");
+        let backup = dir.path().join(UPDATE_BACKUP_DIR).join("dacvae");
+
+        move_package_aside(&site, "dacvae", &backup).unwrap();
+        assert!(
+            site.join("dacvae_extra").join("__init__.py").is_file(),
+            "無関係なパッケージを巻き込んでいる"
+        );
+        assert!(site.join("dacvae_extra-2.0.0.dist-info").is_dir());
     }
 }
 
