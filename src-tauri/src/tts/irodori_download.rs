@@ -112,6 +112,228 @@ pub fn python_exe() -> Result<PathBuf> {
 /// Irodori 資産が「実モデル可」レベルまで揃っているか。
 /// Phase C (python.exe + torch + fastapi + uvicorn + huggingface_hub) + Phase G (irodori_tts) を要求。
 /// この判定が true のときのみ設定パネルの「実モデルを使う (β)」トグルが enable される。
+/// 導入記録のファイル名。`%APPDATA%\ugg\irodori\installed.json`。
+const STAMP_FILE: &str = "installed.json";
+/// 導入記録のスキーマ版。形を変えたら上げる（読めない版は「記録なし」として扱う）。
+const STAMP_SCHEMA: u32 = 1;
+/// 解決済みバージョンを python から受け取るときの目印。
+const VERSIONS_MARKER: &str = "UGG_RESOLVED_VERSIONS ";
+
+/// 「何を入れたか」の記録 (v0.5.4 項目 1)。
+///
+/// **なぜ要るか**: `assets_ready` はパッケージの存在しか見ないため、pin を上げても
+/// 既存環境には永久に届かない。届いていないことに気づく手段が、アプリ側に 1 つも無かった
+/// （pip の `direct_url.json` を読まないと分からない）。
+///
+/// **`pins` と `resolved` を両方持つ理由**は役割が違うから:
+/// - `pins` = このビルドが**要求した**もの。いまの定数と突き合わせて「入れ直しが要るか」を決める
+/// - `resolved` = **実際に入った**もの。指定どおりに入るとは限らない
+///   （`huggingface_hub==0.27.0` と書いてあるのに実機は 0.36.2 だった。transformers の
+///   依存に押し上げられたため）。記録するのは指定値ではなく実測値でなければ意味がない
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InstalledStamp {
+    pub schema: u32,
+    /// 導入が完了した unix 秒。
+    pub installed_at: i64,
+    /// このビルドが要求した固定 URL（名前 → URL）。
+    pub pins: std::collections::BTreeMap<String, String>,
+    /// 実際に入ったバージョン（配布名 → 版。取得できなければ欠落）。
+    pub resolved: std::collections::BTreeMap<String, String>,
+}
+
+/// いまのビルドが要求している固定 URL 一式。
+///
+/// **ここに挙げたものだけが「入れ直しが要るか」の判定材料になる。**
+/// pin を増やしたらここにも足すこと（`pins_cover_every_pinned_url` が件数で見張る）。
+pub fn current_pins() -> std::collections::BTreeMap<String, String> {
+    [
+        ("python", PYTHON_URL),
+        ("silentcipher", SILENTCIPHER_ZIPBALL),
+        ("dacvae", DACVAE_ZIPBALL),
+        ("irodori_tts", IRODORI_TTS_ZIPBALL),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+fn stamp_path(asset_root: &Path) -> PathBuf {
+    asset_root.join(STAMP_FILE)
+}
+
+/// 導入記録を読む。無い・壊れている・スキーマが違う場合は `None`
+/// （= v0.5.4 より前に導入した環境。記録が無いこと自体が「古い」の証拠になる）。
+pub fn read_stamp(asset_root: &Path) -> Option<InstalledStamp> {
+    let text = std::fs::read_to_string(stamp_path(asset_root)).ok()?;
+    let stamp: InstalledStamp = serde_json::from_str(&text).ok()?;
+    (stamp.schema == STAMP_SCHEMA).then_some(stamp)
+}
+
+/// 導入記録を書く。**導入がすべて成功した後にだけ呼ぶ。**
+/// 途中で失敗した状態に記録を残すと、次回「入っている」と誤認する。
+pub fn write_stamp(
+    asset_root: &Path,
+    resolved: std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let stamp = InstalledStamp {
+        schema: STAMP_SCHEMA,
+        installed_at: chrono::Utc::now().timestamp(),
+        pins: current_pins(),
+        resolved,
+    };
+    let json = serde_json::to_string_pretty(&stamp).context("導入記録の JSON 化")?;
+    std::fs::write(stamp_path(asset_root), json)
+        .with_context(|| format!("導入記録の書き出し: {}", stamp_path(asset_root).display()))?;
+    Ok(())
+}
+
+/// 要件文字列から配布名だけを取り出す。
+/// `"uvicorn[standard]==0.32.1"` → `"uvicorn"` / `"torch>=2.10.0,<2.11.0"` → `"torch"`。
+fn requirement_name(spec: &str) -> &str {
+    let end = spec
+        .find(|c: char| matches!(c, '[' | '=' | '<' | '>' | '!' | '~' | ';' | ' '))
+        .unwrap_or(spec.len());
+    spec[..end].trim()
+}
+
+/// 記録対象の配布名（重複を除いた順序保持）。
+/// pip で名前を指定して入れたもの全部 + GitHub アーカイブで入れた 3 本。
+fn recorded_distributions() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let named = COMMON_REQUIREMENTS
+        .iter()
+        .chain(TORCH_PACKAGES.iter())
+        .chain(IRODORI_EXTRA_REQUIREMENTS.iter())
+        .map(|s| requirement_name(s).to_string());
+    for name in named.chain(
+        ["silentcipher", "dacvae", "irodori-tts"]
+            .into_iter()
+            .map(str::to_string),
+    ) {
+        if !out.iter().any(|n| n == &name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// `VERSIONS_MARKER` 付きの行から解決済みバージョンを取り出す。
+fn parse_resolved_line(line: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    let json = line.trim().strip_prefix(VERSIONS_MARKER)?;
+    serde_json::from_str(json).ok()
+}
+
+/// 実際に入ったバージョンを python に聞く。
+///
+/// **失敗しても導入を失敗にしない。** 記録が取れないこと自体は動作に影響しないので、
+/// 空の記録を返して続行する（`pins` だけでも「入れ直しが要るか」は判定できる）。
+fn query_resolved_versions<F>(
+    py_exe: &Path,
+    mut on_line: F,
+) -> std::collections::BTreeMap<String, String>
+where
+    F: FnMut(&str),
+{
+    let names = recorded_distributions();
+    let script = format!(
+        "import json,importlib.metadata as m
+out={{}}
+for n in {names:?}:
+    try: out[n]=m.version(n)
+    except Exception: pass
+print({marker:?}+json.dumps(out,sort_keys=True))",
+        names = names,
+        marker = VERSIONS_MARKER,
+    );
+    let mut found = None;
+    let res = run_python(py_exe, &["-c", &script], |line| {
+        if let Some(map) = parse_resolved_line(line) {
+            found = Some(map);
+        } else {
+            on_line(line);
+        }
+    });
+    if let Err(err) = res {
+        on_line(&format!("導入バージョンの記録に失敗しました (続行します): {err:#}"));
+    }
+    found.unwrap_or_default()
+}
+
+/// 導入記録を残す（`download_irodori_assets` の最後に呼ぶ、v0.5.4 項目 1）。
+pub fn record_installed<F>(asset_root: &Path, mut on_line: F) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    let py_exe = asset_root.join("python").join("python.exe");
+    let resolved = query_resolved_versions(&py_exe, |l| on_line(l));
+    write_stamp(asset_root, resolved)?;
+    on_line("導入内容を記録しました");
+    Ok(())
+}
+
+/// 導入状態 (v0.5.4 項目 2)。
+///
+/// **「使える」と「最新」は別の質問。** `present` が真なら実モデルは使える。
+/// `up_to_date` が偽でも使えることに変わりはない（古いコードで古いモデルを動かしている
+/// だけ）。ここを混ぜて `assets_ready` を偽にすると、フロントの
+/// `canUseReal = gpuOk && assetsOk` が倒れ、**ユーザーの
+/// `tts_irodori_use_real_model` が黙って false に書き換わって永続化される**。
+/// 動いている環境を壊さないために、2 つの信号は分けたままにする。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IrodoriStatus {
+    /// パッケージが一式そろっているか（従来の `assets_ready` と同じ意味）。
+    pub present: bool,
+    /// **導入記録があるか。** v0.5.4 より前に導入した環境では無い
+    /// （記録が無いこと自体が「いつの版か分からない」の証拠）。
+    pub has_record: bool,
+    /// いまのビルドが要求する pin と、記録された pin が一致するか。
+    /// 記録が無ければ `false`（分からないものを「最新」とは言わない）。
+    pub up_to_date: bool,
+    /// 一致しなかった pin の名前。`up_to_date` が偽の理由を示す。
+    pub outdated: Vec<String>,
+    /// 記録されている「実際に入った版」。
+    pub resolved: std::collections::BTreeMap<String, String>,
+}
+
+/// 導入状態を調べる (v0.5.4 項目 2)。
+pub fn status(asset_root: &Path) -> IrodoriStatus {
+    let present = assets_ready(asset_root);
+    let Some(stamp) = read_stamp(asset_root) else {
+        return IrodoriStatus {
+            present,
+            has_record: false,
+            up_to_date: false,
+            // 記録が無い環境では、どの pin が古いかまでは言えない。
+            outdated: Vec::new(),
+            resolved: Default::default(),
+        };
+    };
+    let outdated = outdated_pins(&stamp.pins, &current_pins());
+    IrodoriStatus {
+        present,
+        has_record: true,
+        up_to_date: outdated.is_empty(),
+        outdated,
+        resolved: stamp.resolved,
+    }
+}
+
+/// 記録された pin と、いまのビルドが要求する pin を突き合わせる。
+///
+/// 返すのは**入れ直しが要る名前**。`current` にあって `recorded` と違うもの、および
+/// `current` にあって `recorded` に無いもの（pin を増やした場合）。
+/// 逆に `recorded` にしか無いものは無視する（pin を減らした場合、入れ直しは要らない）。
+fn outdated_pins(
+    recorded: &std::collections::BTreeMap<String, String>,
+    current: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    current
+        .iter()
+        .filter(|(name, url)| recorded.get(*name) != Some(url))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 pub fn assets_ready(asset_root: &Path) -> bool {
     let py = asset_root.join("python").join("python.exe");
     if !py.is_file() {
@@ -520,6 +742,176 @@ where
         return Err(anyhow!("python 異常終了 (code {:?})", status.code()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+
+    fn pins_of(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// **記録が無い環境を「最新」と言わない** (v0.5.4 項目 2)。
+    ///
+    /// v0.5.4 より前に導入した環境には記録が無い。そこを「一致」と読むと、
+    /// **この機能が対象にしている当のユーザー**（pin が届いていない人）を取りこぼす。
+    #[test]
+    fn no_record_is_not_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = status(dir.path());
+        assert!(!st.has_record, "記録が無いこと");
+        assert!(!st.up_to_date, "分からないものを最新とは言わない");
+    }
+
+    /// **「使える」と「最新」は別の信号** (v0.5.4 項目 2 の訂正)。
+    ///
+    /// 古いランタイムでも動いている以上 `present` は真のまま。ここを偽にすると、
+    /// フロントの `canUseReal = gpuOk && assetsOk` が倒れ、ユーザーの
+    /// `tts_irodori_use_real_model` が黙って false に書き換えられて永続化される。
+    #[test]
+    fn present_does_not_depend_on_being_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("python").join("Lib").join("site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::write(dir.path().join("python").join("python.exe"), b"x").unwrap();
+        for pkg in ["torch", "fastapi", "uvicorn", "huggingface_hub", "irodori_tts"] {
+            std::fs::create_dir_all(site.join(pkg)).unwrap();
+        }
+        // 記録は無い（= 古い導入）が、パッケージは揃っている。
+        let st = status(dir.path());
+        assert!(st.present, "揃っているなら使える");
+        assert!(!st.up_to_date, "記録が無いので最新とは言えない");
+    }
+
+    /// 記録した pin が現在の pin と一致すれば最新、違えばその名前を返す。
+    #[test]
+    fn outdated_pins_names_what_changed() {
+        let recorded = pins_of(&[("python", "PY-1"), ("irodori_tts", "IR-1")]);
+        let same = pins_of(&[("python", "PY-1"), ("irodori_tts", "IR-1")]);
+        assert!(outdated_pins(&recorded, &same).is_empty());
+
+        let bumped = pins_of(&[("python", "PY-1"), ("irodori_tts", "IR-2")]);
+        assert_eq!(outdated_pins(&recorded, &bumped), ["irodori_tts"]);
+
+        // pin を増やした場合も「入れ直しが要る」
+        let added = pins_of(&[("python", "PY-1"), ("irodori_tts", "IR-1"), ("newdep", "N-1")]);
+        assert_eq!(outdated_pins(&recorded, &added), ["newdep"]);
+
+        // pin を減らした場合は入れ直し不要（記録側にしか無いものは無視する）
+        let removed = pins_of(&[("python", "PY-1")]);
+        assert!(outdated_pins(&recorded, &removed).is_empty());
+    }
+
+    /// 書いた記録を読み戻せること。**記録できても読めなければ記録ではない。**
+    #[test]
+    fn stamp_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_stamp(dir.path()).is_none(), "書く前は記録なし");
+
+        let resolved = [("transformers", "4.57.6"), ("huggingface_hub", "0.36.2")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        write_stamp(dir.path(), resolved).unwrap();
+
+        let got = read_stamp(dir.path()).expect("読み戻せること");
+        assert_eq!(got.pins, current_pins(), "要求した pin をそのまま記録する");
+        assert_eq!(got.resolved.get("huggingface_hub").map(String::as_str), Some("0.36.2"));
+        assert!(status(dir.path()).up_to_date, "書いた直後は最新");
+    }
+
+    /// **記録するのは「指定した版」ではなく「実際に入った版」** (v0.5.4)。
+    ///
+    /// `huggingface_hub==0.27.0` と指定しているのに実機は 0.36.2 だった
+    /// （transformers の依存に押し上げられた）。この食い違いを記録できなければ、
+    /// 「版を固定して再現性を担保」という宣言が成立していないことに気づけない。
+    #[test]
+    fn resolved_can_differ_from_the_requested_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = [("huggingface_hub", "0.36.2")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        write_stamp(dir.path(), resolved).unwrap();
+
+        let got = read_stamp(dir.path()).unwrap();
+        assert!(
+            COMMON_REQUIREMENTS
+                .iter()
+                .any(|r| *r == "huggingface_hub==0.27.0"),
+            "前提: 指定は 0.27.0"
+        );
+        assert_eq!(
+            got.resolved.get("huggingface_hub").map(String::as_str),
+            Some("0.36.2"),
+            "実測値をそのまま残すこと"
+        );
+    }
+
+    /// スキーマが違う記録は「記録なし」として扱う（読めない形を最新と誤認しない）。
+    #[test]
+    fn unknown_schema_is_treated_as_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(STAMP_FILE),
+            r#"{"schema":999,"installed_at":0,"pins":{},"resolved":{}}"#,
+        )
+        .unwrap();
+        assert!(read_stamp(dir.path()).is_none());
+        assert!(!status(dir.path()).up_to_date);
+    }
+
+    /// 要件文字列から配布名を取り出す。
+    #[test]
+    fn requirement_name_strips_specifiers() {
+        assert_eq!(requirement_name("torch>=2.10.0,<2.11.0"), "torch");
+        assert_eq!(requirement_name("uvicorn[standard]==0.32.1"), "uvicorn");
+        assert_eq!(requirement_name("numpy<2"), "numpy");
+        assert_eq!(requirement_name("einops"), "einops");
+        assert_eq!(requirement_name("descript-audiotools>=0.7.2"), "descript-audiotools");
+    }
+
+    /// 記録対象に、**pip で名前指定して入れたもの全部と GitHub 由来の 3 本**が入る。
+    /// 取りこぼすと「何が入っているか」の記録として欠ける。
+    #[test]
+    fn recorded_distributions_cover_everything_we_install() {
+        let names = recorded_distributions();
+        for expected in ["torch", "transformers", "huggingface_hub", "fastapi", "numpy"] {
+            assert!(names.iter().any(|n| n == expected), "{expected} が記録対象に無い");
+        }
+        for git in ["silentcipher", "dacvae", "irodori-tts"] {
+            assert!(names.iter().any(|n| n == git), "{git} が記録対象に無い");
+        }
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "重複がある: {names:?}");
+    }
+
+    /// python から返る解決済みバージョン行を読める。
+    #[test]
+    fn resolved_line_is_parsed() {
+        let line = format!("{VERSIONS_MARKER}{{\"torch\":\"2.10.0+cu128\"}}");
+        let got = parse_resolved_line(&line).expect("読めること");
+        assert_eq!(got.get("torch").map(String::as_str), Some("2.10.0+cu128"));
+        assert!(parse_resolved_line("pip install ...").is_none(), "無関係な行は拾わない");
+    }
+
+    /// **pin を増やしたら `current_pins` にも足す。** 足し忘れると、その依存だけ
+    /// 更新判定から外れて「最新」と誤認する。
+    #[test]
+    fn pins_cover_every_pinned_url() {
+        let pins = current_pins();
+        assert_eq!(pins.len(), 4, "pin を増減したらここも更新する: {pins:?}");
+        for url in pins.values() {
+            assert!(url.starts_with("https://"), "URL でない: {url}");
+        }
+        assert!(pins.values().any(|u| u == IRODORI_TTS_ZIPBALL));
+    }
 }
 
 #[cfg(test)]

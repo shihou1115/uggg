@@ -353,8 +353,21 @@ pub async fn irodori_check_gpu() -> GpuInfo {
     }
 }
 
-/// Irodori 資産 (Python embeddable / pip / torch / 共通依存) が揃っているか (Phase C 範囲)。
-/// HF モデル本体の判定は Phase D で追加する。
+/// Irodori 資産の導入状態 (v0.5.4 項目 2、spec §6.0)。
+///
+/// `irodori_assets_ready` が「**使えるか**」だけを返すのに対し、こちらは
+/// 「**最新か**」まで返す。2 つを分けているのは、古いが動いているランタイムを
+/// 「未導入」に落とすとフロントが `tts_irodori_use_real_model` を黙って倒して
+/// 永続化してしまうため（spec §6.0 項目 2 の訂正を参照）。
+#[tauri::command]
+pub async fn get_irodori_status() -> Result<irodori_download::IrodoriStatus, String> {
+    let root = voice_ref::irodori_root().map_err(|e| format!("{e:#}"))?;
+    Ok(irodori_download::status(&root))
+}
+
+/// Irodori 資産 (Python embeddable / pip / torch / 共通依存) が揃っているか。
+/// **「使えるか」だけを返す。** 最新かどうかは `get_irodori_status` が返す
+/// （ここに「最新か」を混ぜると、古いが動いている環境の設定を壊す。spec §6.0 項目 2）。
 #[tauri::command]
 pub async fn irodori_assets_ready() -> bool {
     let Ok(root) = voice_ref::irodori_root() else {
@@ -415,6 +428,9 @@ pub async fn download_irodori_assets(
         irodori_download::install_irodori_models(&asset_root, &sidecar_py, &emit)
             .await
             .map_err(|e| format!("{e:#}"))?;
+        // **すべて成功したあとにだけ記録する** (v0.5.4 項目 1)。
+        // 途中で失敗した状態に記録を残すと、次回「入っている」と誤認する。
+        irodori_download::record_installed(&asset_root, &emit).map_err(|e| format!("{e:#}"))?;
         Ok(())
     }
     .await;

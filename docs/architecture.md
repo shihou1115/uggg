@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.14）
+# ugg アーキテクチャ設計書（architecture.md v2.15）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -423,6 +423,7 @@ CREATE INDEX idx_monologue_cache_ghost ON monologue_cache(ghost_id);
 | `%APPDATA%\ugg\companion.db` | SQLite 本体 |
 | `%APPDATA%\ugg\voicevox\` | voicevox_core 資産（c_api / onnxruntime / dict / models） |
 | `%APPDATA%\ugg\irodori\` | Irodori-TTS 資産（python / model / refs） |
+| `%APPDATA%\ugg\irodori\installed.json` | **★v0.5.4 導入記録**。`pins`（このビルドが**要求した**固定 URL）と `resolved`（**実際に入った**版）を持つ。2 つ持つのは役割が違うため — `pins` は入れ直しの要否判定に使い、`resolved` は「指定どおりに入るとは限らない」事実（`huggingface_hub==0.27.0` 指定に対し実機 0.36.2）を残す。**導入が全段成功した後にだけ書く** |
 | `%APPDATA%\ugg\irodori\refs\<id>.wav` | 参照音声本体（voice_refs.file_path から参照） |
 | `%LOCALAPPDATA%\ugg\logs\` | アプリログ（tauri-plugin-log） |
 | keyring `ugg` | API キー（provider 名で索引） |
@@ -633,7 +634,8 @@ pub struct GhostBundle {
 | `has_github_token` | なし | `bool` | |
 | `delete_github_token` | なし | `()` | |
 | `irodori_check_gpu` | なし | `GpuInfo` | ★ 起動時 GPU 検出（Q3 対応） |
-| `irodori_assets_ready` | なし | `bool` | ★ |
+| `irodori_assets_ready` | なし | `bool` | ★ **「使えるか」だけを返す**（★v0.5.4 で意味を明確化）。最新かどうかは混ぜない — 混ぜるとフロントの `canUseReal = gpuOk && assetsOk` が倒れ、古いが動いている環境で `tts_irodori_use_real_model` が黙って false に書き換わって永続化される |
+| `get_irodori_status` | なし | `IrodoriStatus { present, has_record, up_to_date, outdated[], resolved{} }` | **★v0.5.4**（spec §6.0 項目 2）。導入記録（`installed.json`）と、いまのビルドが要求する pin を突き合わせる。`present` は `irodori_assets_ready` と同じ意味、`up_to_date` は**別の信号**。**記録が無い環境（v0.5.4 より前の導入）は `up_to_date: false`** — 分からないものを「最新」とは言わない |
 | `download_irodori_assets` | `agreed: bool` | `()` | ★ 進捗 `irodori-download` |
 | `voice_ref_generate` | `slot: String, caption: String` | `VoiceRef[]` | ★ Irodori 参照音声生成（同期完了、進捗イベントなし）。完了後の一覧を返す |
 | `voice_ref_list` | なし | `VoiceRef[]` | ★ |
@@ -1751,3 +1753,4 @@ async fn install_asset(
 | 2026-09-10 | v2.12 | **v0.5.3 項目 9（操作列テストの常設）**。フロントに Vitest + happy-dom を導入（`vitest.config.ts` / `npm test` / `src/__tests__/`）。DOM は `index.html` の body を読み込んで作る（手書きダミーだと id のずれに気づけないため）。操作列 4 本の内訳と書き方は docs/test-plan.md §3.2b が正本。**プロダクションコードの構成変更なし。** |
 | 2026-09-10 | v2.13 | **v0.5.3 のリリース前監査を受けた是正**。① `Db::list_recent_chat_log_in_mode(mode, limit)` を追加し、`load_recent_history` はこれで **mode="advanced" の行だけ**を読む（バック起点の発話は例外なく mode="low" で記録されるので mode で切り分けられる。取ってから絞ると独り言だけが続いた夜に会話行が LIMIT の窓から押し出されるため **SQL 側で絞る**）。往復が 1 つも無い窓では空を返す。② `monologue::parse_monologue_batch` のエラーから応答本文を外す（項目 7 で `advanced` 側だけを直しており漏れていた）。③ `llm::truncate_for_log` を追加し、HTTP エラーボディを 300 文字で頭打ちにする。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
 | 2026-09-11 | v2.14 | **未計上だった契約⇔実装の乖離を 1 件記載**（v0.5.4 のスコープ検討中に発見）。`synthesize_voice` の `caption` は「Irodori 実モデルのみ使用」と書いてあるが、**v3 本体の checkpoint が `use_caption_condition: false` のため一度も効いていない**（`sidecar.py` は渡しており `cfg_scale_caption=3.0` も設定しているが、条件付けに入らず捨てられる）。台本の行ごとの声質指示は Irodori 経路では無効。**v0.5.5 の v4.1-Small 差し替えで閉じる**（`use_caption_condition: true`）。設計・契約の変更はなし。 |
+| 2026-09-11 | v2.15 | **v0.5.4 項目 1・2（入っている版を記録する / 「使える」と「最新」を分ける）**。① 導入記録 `%APPDATA%\ugg\irodori\installed.json` を追加（`pins` = 要求した固定 URL、`resolved` = 実際に入った版。**全段成功後にだけ書く**）。② コマンド `get_irodori_status` を追加（`IrodoriStatus`）。**`irodori_assets_ready` の意味は変えない** — 「最新か」を混ぜると、古いが動いている環境でフロントが `tts_irodori_use_real_model` を黙って倒して永続化するため。**記録が無い環境は `up_to_date: false`**（v0.5.4 より前の導入＝この機能の対象そのもの）。**設定フィールド・イベント・DB スキーマの変更なし。** |

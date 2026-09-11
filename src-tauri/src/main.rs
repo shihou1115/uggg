@@ -190,6 +190,7 @@ fn main() {
             commands::tts::delete_github_token,
             commands::tts::irodori_check_gpu,
             commands::tts::irodori_assets_ready,
+            commands::tts::get_irodori_status,
             commands::tts::download_irodori_assets,
             commands::tts::voice_ref_list,
             commands::tts::voice_ref_delete,
