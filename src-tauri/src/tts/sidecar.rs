@@ -227,6 +227,10 @@ where
         .arg("0")
         .arg("--log-level")
         .arg("warning")
+        // **モデルの正本は Rust 側** (v0.5.5 項目 3)。`sidecar.py` は毎起動で上書き
+        // コピーされるので、あちらのハードコードを正本にすると「コードだけ新しくなって
+        // 重みが無い」状態を作る。取得側（`--download-only`）と同じ値をここでも渡す。
+        .args(crate::tts::irodori_download::model_args())
         // HF モデル DL は起動 hot path から外し、download_irodori_assets ステップ 6
         // (irodori_download::install_irodori_models) で先に取得する。ここでは常に --no-download。
         // モデル不在のまま実モード起動した場合は RealModelBackend.synth が FileNotFoundError を

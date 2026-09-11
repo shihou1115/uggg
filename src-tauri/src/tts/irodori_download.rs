@@ -150,6 +150,12 @@ pub struct InstalledStamp {
     /// 見たいのは「このビルドが要求するものが変わったか」なので、これで足りる。
     #[serde(default)]
     pub requirements: std::collections::BTreeMap<String, String>,
+    /// このビルドが要求した **HF モデル**（名前 → `repo@revision`）。
+    ///
+    /// v0.5.4 の更新経路はモデルを見ていなかった。`sidecar.py` は毎起動で上書きされるのに
+    /// 重みは初回 DL でしか取らないので、**ID を変えると静かに壊れる**。
+    #[serde(default)]
+    pub models: std::collections::BTreeMap<String, String>,
 }
 
 /// いまのビルドが要求している固定 URL 一式。
@@ -181,6 +187,55 @@ pub fn current_requirements() -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+/// HF モデルの正本 (v0.5.5 項目 3、spec §6.0)。
+///
+/// **`sidecar.py` のハードコードを正本にしない。** あのファイルは
+/// `install_sidecar_script` が**毎起動で無条件に上書きコピー**するのに、重みは
+/// 初回 DL でしか取らない。ID をあちらに置いたまま変えると、**コードだけ新しくなって
+/// 重みが無い**状態になり、`decide_fallback` が全部フォールバックさせるので
+/// **高品質モードが無言で VOICEVOX に落ちる**（「届かない」ではなく「静かに壊れる」）。
+///
+/// `revision` が `main` なのは**現状の追認**であって固定ではない。pip の
+/// `refs/heads/main` と同じく「そのとき最新」なので、上げても届かないし黙って変わる。
+/// **この仕組みが入ったことで、固定値へ変えれば既存環境へ届くようになる。**
+const MODEL_PINS: &[(&str, &str, &str)] = &[
+    ("model_synth", "Aratako/Irodori-TTS-500M-v3", "main"),
+    (
+        "model_voice_design",
+        "Aratako/Irodori-TTS-500M-v2-VoiceDesign",
+        "main",
+    ),
+    ("model_codec", "Aratako/Semantic-DACVAE-Japanese-32dim", "main"),
+];
+
+/// いまのビルドが要求している HF モデル一式（名前 → `repo@revision`）。
+pub fn current_models() -> std::collections::BTreeMap<String, String> {
+    MODEL_PINS
+        .iter()
+        .map(|(name, repo, rev)| (name.to_string(), format!("{repo}@{rev}")))
+        .collect()
+}
+
+/// サイドカーへ渡すモデル指定（起動経路と `--download-only` の両方で使う）。
+///
+/// **2 経路あるので 1 か所にまとめる。** 片方だけに渡すと、取得した先と読む先が食い違う。
+pub fn model_args() -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, repo, rev) in MODEL_PINS {
+        let flag = match *name {
+            "model_synth" => "--model-synth",
+            "model_voice_design" => "--model-voice-design",
+            "model_codec" => "--model-codec",
+            _ => continue,
+        };
+        out.push(flag.to_string());
+        out.push(repo.to_string());
+        out.push(format!("{flag}-revision"));
+        out.push(rev.to_string());
+    }
+    out
+}
+
 fn stamp_path(asset_root: &Path) -> PathBuf {
     asset_root.join(STAMP_FILE)
 }
@@ -203,6 +258,7 @@ pub fn write_stamp_pins(
     pins: std::collections::BTreeMap<String, String>,
     resolved: std::collections::BTreeMap<String, String>,
     requirements: std::collections::BTreeMap<String, String>,
+    models: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     let stamp = InstalledStamp {
         schema: STAMP_SCHEMA,
@@ -210,6 +266,7 @@ pub fn write_stamp_pins(
         pins,
         resolved,
         requirements,
+        models,
     };
     let json = serde_json::to_string_pretty(&stamp).context("導入記録の JSON 化")?;
     std::fs::write(stamp_path(asset_root), json)
@@ -321,6 +378,7 @@ where
     let stamp = read_stamp(asset_root);
     let recorded = stamp.as_ref().map(|s| s.pins.clone()).unwrap_or_default();
     let stamp_reqs = stamp.as_ref().map(|s| s.requirements.clone());
+    let stamp_models = stamp.as_ref().map(|s| s.models.clone());
     let mut resolved = stamp.map(|s| s.resolved).unwrap_or_default();
     // 記録の要点は「指定した版」ではなく「実際に入った版」。毎回取り直す。
     resolved.extend(query_resolved_versions(&py_exe, |l| on_line(l)));
@@ -335,7 +393,24 @@ where
         merged_pins(&recorded, installed, python_matches),
         resolved,
         merged_requirements(&recorded_reqs, installed),
+        merged_models(&stamp_models.unwrap_or_default(), installed),
     )
+}
+
+/// 入れ直せた分だけを現在値へ反映した記録用の `models` を作る。
+/// `merged_pins` / `merged_requirements` と同じ規律（開発方針 7 の「対になる関数」）。
+fn merged_models(
+    recorded: &std::collections::BTreeMap<String, String>,
+    installed: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let current = current_models();
+    let mut out = recorded.clone();
+    for name in installed {
+        if let Some(v) = current.get(name) {
+            out.insert(name.clone(), v.clone());
+        }
+    }
+    out
 }
 
 /// 入れ直せた分だけを現在値へ反映した記録用の `requirements` を作る。
@@ -427,12 +502,14 @@ fn outdated_list(
     asset_root: &Path,
     recorded: &std::collections::BTreeMap<String, String>,
     recorded_reqs: &std::collections::BTreeMap<String, String>,
+    recorded_models: &std::collections::BTreeMap<String, String>,
 ) -> Vec<String> {
     let current = current_pins();
     let mut out = outdated_pins(recorded, &current);
     // **固定 URL だけでは足りない** (v0.5.5 項目 3)。名前付き要件の版を変えても
     // `outdated` が空のままで、更新ボタンすら出なかった。
     out.extend(outdated_pins(recorded_reqs, &current_requirements()));
+    out.extend(outdated_pins(recorded_models, &current_models()));
     out.sort();
     out.dedup();
     out.retain(|n| n != "python");
@@ -461,14 +538,14 @@ pub fn status(asset_root: &Path) -> IrodoriStatus {
             // python が混ざって、この機能が対象にしている環境がちょうど 1 つも
             // 更新できなくなっていた。
             outdated: if present {
-                outdated_list(asset_root, &Default::default(), &Default::default())
+                outdated_list(asset_root, &Default::default(), &Default::default(), &Default::default())
             } else {
                 Vec::new()
             },
             resolved: Default::default(),
         };
     };
-    let outdated = outdated_list(asset_root, &stamp.pins, &stamp.requirements);
+    let outdated = outdated_list(asset_root, &stamp.pins, &stamp.requirements, &stamp.models);
     IrodoriStatus {
         present,
         has_record: true,
@@ -1048,9 +1125,25 @@ where
     }
 
     let mut updated: Vec<String> = Vec::new();
+    let mut models_refreshed = false;
     for name in outdated {
         let Some((pkg, url)) = updatable_pin(name) else {
             // 名前付き pip 要件は URL ではなく名前で入れ直す (v0.5.5 項目 3)。
+            if current_models().contains_key(name) {
+                // モデルは名前ごとではなく一括で確認する（`--download-only` が 3 本まとめて
+                // etag 照合する）。同じ回で 2 本目以降が来ても二重に走らせない。
+                if !models_refreshed {
+                    on_line("HF モデルを確認しています…（差があるときだけ取得します）");
+                    let sidecar_py = asset_root.join("sidecar.py");
+                    if let Err(err) = install_irodori_models(asset_root, &sidecar_py, |l| on_line(l)).await {
+                        let _ = std::fs::remove_dir_all(&backup_root);
+                        return Err(err).context("HF モデルの取得に失敗しました");
+                    }
+                    models_refreshed = true;
+                }
+                updated.push(name.clone());
+                continue;
+            }
             if let Some(spec) = current_requirements().get(name) {
                 match reinstall_requirement(&py_exe, name, spec, &before_imports, |l| on_line(l))
                     .await
@@ -1174,12 +1267,15 @@ where
     on_line("Aratako/Irodori-TTS の HF モデル (約 2〜4GB) を取得しています…");
     let asset_root_str = asset_root.to_string_lossy().into_owned();
     let sidecar_py_str = sidecar_py.to_string_lossy().into_owned();
-    let args: Vec<&str> = vec![
+    let models = model_args();
+    let mut args: Vec<&str> = vec![
         sidecar_py_str.as_str(),
         "--asset-dir",
         asset_root_str.as_str(),
         "--download-only",
     ];
+    // **正本は Rust 側。** ここで渡さないと、取得する先と起動時に読む先が食い違う。
+    args.extend(models.iter().map(String::as_str));
     run_python(&py_exe, &args, |l| on_line(l))?;
     Ok(())
 }
@@ -1422,7 +1518,14 @@ mod stamp_tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        write_stamp_pins(dir.path(), current_pins(), resolved, current_requirements()).unwrap();
+        write_stamp_pins(
+            dir.path(),
+            current_pins(),
+            resolved,
+            current_requirements(),
+            current_models(),
+        )
+        .unwrap();
 
         let got = read_stamp(dir.path()).expect("読み戻せること");
         assert_eq!(got.pins, current_pins(), "要求した pin をそのまま記録する");
@@ -1442,7 +1545,14 @@ mod stamp_tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        write_stamp_pins(dir.path(), current_pins(), resolved, current_requirements()).unwrap();
+        write_stamp_pins(
+            dir.path(),
+            current_pins(),
+            resolved,
+            current_requirements(),
+            current_models(),
+        )
+        .unwrap();
 
         let got = read_stamp(dir.path()).unwrap();
         assert!(
@@ -1667,7 +1777,7 @@ mod stamp_tests {
         let pins = current_pins();
         let mut reqs = current_requirements();
         assert!(
-            outdated_list(dir.path(), &pins, &reqs).is_empty(),
+            outdated_list(dir.path(), &pins, &reqs, &current_models()).is_empty(),
             "全部一致なら空"
         );
 
@@ -1679,7 +1789,7 @@ mod stamp_tests {
             "前提が変わったらこのテストも直す"
         );
         reqs.insert("transformers".to_string(), "transformers<4".to_string());
-        let got = outdated_list(dir.path(), &pins, &reqs);
+        let got = outdated_list(dir.path(), &pins, &reqs, &current_models());
         assert!(
             got.iter().any(|n| n == "transformers"),
             "要件の変更が対象に入らないと、永久に届かない: {got:?}"
@@ -1690,7 +1800,7 @@ mod stamp_tests {
     #[test]
     fn a_missing_record_lists_every_requirement() {
         let dir = tempfile::tempdir().unwrap();
-        let got = outdated_list(dir.path(), &Default::default(), &Default::default());
+        let got = outdated_list(dir.path(), &Default::default(), &Default::default(), &Default::default());
         for name in ["transformers", "huggingface_hub", "torch"] {
             assert!(got.iter().any(|n| n == name), "{name} が漏れている: {got:?}");
         }
@@ -1718,14 +1828,97 @@ mod stamp_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut recorded = current_pins();
         assert!(
-            outdated_list(dir.path(), &recorded, &current_requirements()).is_empty(),
+            outdated_list(dir.path(), &recorded, &current_requirements(), &current_models()).is_empty(),
             "全部一致なら空"
         );
         recorded.insert("irodori_tts".to_string(), "OLD".to_string());
         assert_eq!(
-            outdated_list(dir.path(), &recorded, &current_requirements()),
+            outdated_list(dir.path(), &recorded, &current_requirements(), &current_models()),
             ["irodori_tts"]
         );
+    }
+
+    /// **`sidecar.py` の既定値が Rust の正本と食い違わないこと**
+    /// （2026-09-11、開発方針 7 の掃討で追加）。
+    ///
+    /// モデルの正本は Rust（`MODEL_PINS`）で、`sidecar.py` の定数は
+    /// **引数が渡されなかったとき用の保険**。ただし保険が古いままだと、渡し忘れた
+    /// 経路だけ黙って別のモデルを読む。**正本が 2 つある形は、噛み合わせを見張って初めて安全。**
+    #[test]
+    fn the_sidecar_defaults_match_the_rust_pins() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("sidecar.py");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("sidecar.py を読めない {}: {e}", path.display()));
+        for (name, repo, rev) in MODEL_PINS {
+            assert!(
+                src.contains(&format!("\"{repo}\"")),
+                "{name}: sidecar.py の既定値が Rust の正本と違う（{repo} が無い）"
+            );
+            assert!(
+                src.contains(&format!("\"{rev}\"")),
+                "{name}: revision {rev} が sidecar.py に無い"
+            );
+        }
+        assert!(
+            src.contains("_apply_model_args"),
+            "sidecar.py が Rust からの指定を受け取らなくなっている（正本が 2 つに割れる）"
+        );
+    }
+
+    /// **モデルも更新の対象になる** (v0.5.5 項目 3)。
+    ///
+    /// v0.5.4 の経路はモデルを見ていなかった。`sidecar.py` は毎起動で上書きコピー
+    /// されるのに重みは初回 DL でしか取らないので、**ID を変えると「コードだけ新しく
+    /// なって重みが無い」**状態になり、`decide_fallback` が全部フォールバックさせて
+    /// 高品質モードが無言で消える（「届かない」ではなく「静かに壊れる」）。
+    #[test]
+    fn changing_a_model_makes_it_outdated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut models = current_models();
+        assert!(
+            outdated_list(dir.path(), &current_pins(), &current_requirements(), &models).is_empty(),
+            "全部一致なら空"
+        );
+
+        // revision を上げた ＝ 既存環境へ届けなければならない
+        let old = models.get("model_synth").cloned().unwrap();
+        models.insert("model_synth".to_string(), format!("{old}-old"));
+        let got = outdated_list(dir.path(), &current_pins(), &current_requirements(), &models);
+        assert_eq!(got, ["model_synth"], "モデルの変更が対象に入らないと届かない");
+    }
+
+    /// **サイドカーへ渡す指定は、取得側と起動側で同じであること** (v0.5.5 項目 3)。
+    ///
+    /// 2 経路あるので、片方だけに渡すと**取得した先と読む先が食い違う**。
+    /// `model_args` に一本化し、`--download-only` と通常起動の両方がこれを使う。
+    #[test]
+    fn model_args_cover_every_pin() {
+        let args = model_args();
+        for (_, repo, rev) in MODEL_PINS {
+            assert!(args.iter().any(|a| a == repo), "{repo} を渡していない: {args:?}");
+            assert!(args.iter().any(|a| a == rev), "{repo} の revision を渡していない");
+        }
+        // フラグと値が対になっていること
+        assert_eq!(args.len(), MODEL_PINS.len() * 4, "フラグと値の対が崩れている: {args:?}");
+        for flag in ["--model-synth", "--model-voice-design", "--model-codec"] {
+            assert!(args.iter().any(|a| a == flag), "{flag} が無い");
+            assert!(
+                args.iter().any(|a| a == &format!("{flag}-revision")),
+                "{flag}-revision が無い"
+            );
+        }
+    }
+
+    /// **入れ直せたモデルだけを記録する**（開発方針 7 —「対になる関数」に同じ観点を移植）。
+    #[test]
+    fn only_updated_models_are_recorded() {
+        let updated = vec!["model_synth".to_string()];
+        let got = merged_models(&Default::default(), &updated);
+        assert_eq!(got.len(), 1, "入れ直した 1 本だけ: {got:?}");
+        assert_eq!(got.get("model_synth"), current_models().get("model_synth"));
+        assert!(!got.contains_key("model_codec"), "触っていないものを書かない");
     }
 
     /// **`current_requirements` と `recorded_distributions` は噛み合っていること**

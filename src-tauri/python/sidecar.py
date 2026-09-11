@@ -63,9 +63,48 @@ SAMPLE_RATE = 22050  # モック wav のサンプルレート
 
 # M4c Phase G: 実モデルの HF モデル ID (architecture §8.3)。
 # 実機検証時に Aratako/Irodori-TTS の最新サンプルを見ながら from_pretrained 経路を確定する。
+# 既定のモデル repo（**正本は Rust 側の `irodori_download::current_models()`**）。
+#
+# v0.5.5 項目 3: モデル ID をここに固定したままにすると、`sidecar.py` は
+# **毎起動で無条件に上書きコピーされる**のに重みは初回 DL でしか取らないため、
+# ID を変えた瞬間「コードだけ新しくなって重みが無い」状態になる。
+# Rust から `--model-*` で渡させ、ここの値は**渡されなかったとき用の保険**に留める。
 MODEL_REPO_SYNTH = "Aratako/Irodori-TTS-500M-v3"
 MODEL_REPO_VOICE_DESIGN = "Aratako/Irodori-TTS-500M-v2-VoiceDesign"
 MODEL_REPO_CODEC = "Aratako/Semantic-DACVAE-Japanese-32dim"
+# 取得する revision。`main` は「そのとき最新」なので、pip の `refs/heads/main` と
+# 同じく**上げても届かない / 黙って変わる**。Rust 側が固定値を渡せるようにしておく。
+MODEL_REVISION_SYNTH = "main"
+MODEL_REVISION_VOICE_DESIGN = "main"
+MODEL_REVISION_CODEC = "main"
+
+
+def _apply_model_args(args) -> None:
+    """Rust から渡されたモデルの正本を反映する (v0.5.5 項目 3)。
+
+    渡されなかったものは既定値のまま（古い Rust と組み合わせても動く）。
+    """
+    global MODEL_REPO_SYNTH, MODEL_REPO_VOICE_DESIGN, MODEL_REPO_CODEC
+    global MODEL_REVISION_SYNTH, MODEL_REVISION_VOICE_DESIGN, MODEL_REVISION_CODEC
+    MODEL_REPO_SYNTH = args.model_synth or MODEL_REPO_SYNTH
+    MODEL_REVISION_SYNTH = args.model_synth_revision or MODEL_REVISION_SYNTH
+    MODEL_REPO_VOICE_DESIGN = args.model_voice_design or MODEL_REPO_VOICE_DESIGN
+    MODEL_REVISION_VOICE_DESIGN = (
+        args.model_voice_design_revision or MODEL_REVISION_VOICE_DESIGN
+    )
+    MODEL_REPO_CODEC = args.model_codec or MODEL_REPO_CODEC
+    MODEL_REVISION_CODEC = args.model_codec_revision or MODEL_REVISION_CODEC
+
+
+def model_dir_name(repo: str, revision: str) -> str:
+    """モデルの置き場所。**revision を含める。**
+
+    含めないと revision を上げたとき**同じパスへ上書き**になり、失敗しても戻れない
+    （v0.5.3 項目 2 / v0.5.4 項目 3 の「旧版を消さない」と同じ規律）。
+    """
+    safe = repo.replace("/", "__")
+    return f"{safe}@{revision}" if revision and revision != "main" else safe
+
 
 
 # --- リクエスト型 ----------------------------------------------------------
@@ -143,18 +182,23 @@ def download_models(asset_dir: Path) -> None:
 
     # 合成 / VoiceDesign 本体は upstream infer.py と同じく `model.safetensors` 1 ファイルでよい
     # (config 情報は safetensors のメタデータに埋め込まれている)。
-    weight_repos = [MODEL_REPO_SYNTH, MODEL_REPO_VOICE_DESIGN]
-    for repo in weight_repos:
-        local_dir = target_root / repo.replace("/", "__")
-        weight_file = local_dir / "model.safetensors"
-        if weight_file.is_file() and weight_file.stat().st_size > 0:
-            sys.stderr.write(f"[hf-download] {repo} は既に取得済み (skip)\n")
-            continue
-        sys.stderr.write(f"[hf-download] {repo}/model.safetensors をダウンロード中…\n")
+    weight_repos = [
+        (MODEL_REPO_SYNTH, MODEL_REVISION_SYNTH),
+        (MODEL_REPO_VOICE_DESIGN, MODEL_REVISION_VOICE_DESIGN),
+    ]
+    for repo, revision in weight_repos:
+        local_dir = target_root / model_dir_name(repo, revision)
+        # **自前の「存在してサイズ > 0」判定をやめた** (v0.5.5 項目 3)。
+        # 途中で切れた DL はサイズ > 0 のまま残るので、それでは完了と区別できない
+        # （v0.5.2 の 0 バイト残骸と同型）。`hf_hub_download` は etag を照合して
+        # **一致していれば落とさない**ので、整合性の判断はそちらに委ねる。
+        # 既に正しく入っている環境では通信はほぼ発生せず、再取得も起きない。
+        sys.stderr.write(f"[hf-download] {repo}@{revision}/model.safetensors を確認中…\n")
         local_dir.mkdir(parents=True, exist_ok=True)
         hf_hub_download(
             repo_id=repo,
             filename="model.safetensors",
+            revision=revision,
             local_dir=str(local_dir),
             local_dir_use_symlinks=False,
         )
@@ -162,17 +206,16 @@ def download_models(asset_dir: Path) -> None:
 
     # コーデック (DACVAE) は InferenceRuntime が repo_id 文字列でロードするので
     # HF cache に snapshot しておけば codec_repo 経由で読まれる。
-    codec_dir = target_root / MODEL_REPO_CODEC.replace("/", "__")
-    if codec_dir.is_dir() and any(codec_dir.iterdir()):
-        sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} は既に取得済み (skip)\n")
-    else:
-        sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} をダウンロード中…\n")
-        snapshot_download(
-            repo_id=MODEL_REPO_CODEC,
-            local_dir=str(codec_dir),
-            local_dir_use_symlinks=False,
-        )
-        sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} ダウンロード完了\n")
+    codec_dir = target_root / model_dir_name(MODEL_REPO_CODEC, MODEL_REVISION_CODEC)
+    # コーデックも同じ理由で `snapshot_download` に判断を委ねる。
+    sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} を確認中…\n")
+    snapshot_download(
+        repo_id=MODEL_REPO_CODEC,
+        revision=MODEL_REVISION_CODEC,
+        local_dir=str(codec_dir),
+        local_dir_use_symlinks=False,
+    )
+    sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} ダウンロード完了\n")
 
 
 class RealModelBackend:
@@ -206,8 +249,8 @@ class RealModelBackend:
         except Exception:
             return "cpu"
 
-    def _checkpoint_path(self, repo: str) -> Path:
-        return self.asset_dir / "model" / repo.replace("/", "__") / "model.safetensors"
+    def _checkpoint_path(self, repo: str, revision: str = "main") -> Path:
+        return self.asset_dir / "model" / model_dir_name(repo, revision) / "model.safetensors"
 
     def _build_runtime(self, repo: str):
         """upstream infer.py の InferenceRuntime.from_key(RuntimeKey(...)) と同じ構成。"""
@@ -500,9 +543,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="HF モデルを DL したら即終了 (download_irodori_assets ステップ 6 用)。"
         " uvicorn は立てない。",
     )
+    # **モデルの正本は Rust 側** (v0.5.5 項目 3)。渡されなければ上の既定値を使う。
+    # ここをハードコードのままにすると、`sidecar.py` は毎起動で上書きされるのに
+    # 重みは初回 DL でしか取らないため、ID を変えた瞬間に重みだけ無い状態になる。
+    parser.add_argument("--model-synth", default=None)
+    parser.add_argument("--model-synth-revision", default=None)
+    parser.add_argument("--model-voice-design", default=None)
+    parser.add_argument("--model-voice-design-revision", default=None)
+    parser.add_argument("--model-codec", default=None)
+    parser.add_argument("--model-codec-revision", default=None)
     parser.add_argument("--log-level", default="warning")
     args = parser.parse_args(argv)
 
+    _apply_model_args(args)
     logging.basicConfig(level=args.log_level.upper())
     asset_dir: Path = args.asset_dir
     asset_dir.mkdir(parents=True, exist_ok=True)
