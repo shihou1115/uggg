@@ -140,6 +140,16 @@ pub struct InstalledStamp {
     pub pins: std::collections::BTreeMap<String, String>,
     /// 実際に入ったバージョン（配布名 → 版。取得できなければ欠落）。
     pub resolved: std::collections::BTreeMap<String, String>,
+    /// このビルドが要求した**名前付き pip 要件**（配布名 → 要件文字列）。
+    ///
+    /// **`pins`（固定 URL）だけでは足りない** (v0.5.5 項目 3)。`transformers<5` を
+    /// `>=5` に変えても `outdated` は空のままで、**更新ボタンすら出なかった**。
+    /// v0.5.4 は「モデルが対象外」と書いたが、**対象外なのはモデルだけではなかった。**
+    ///
+    /// 判定は**要件文字列そのものの比較**で行う（`<5` を満たすかの版比較はしない）。
+    /// 見たいのは「このビルドが要求するものが変わったか」なので、これで足りる。
+    #[serde(default)]
+    pub requirements: std::collections::BTreeMap<String, String>,
 }
 
 /// いまのビルドが要求している固定 URL 一式。
@@ -156,6 +166,19 @@ pub fn current_pins() -> std::collections::BTreeMap<String, String> {
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect()
+}
+
+/// いまのビルドが要求している**名前付き pip 要件**一式（配布名 → 要件文字列）。
+///
+/// `pip install <spec>` で名前指定して入れるものすべて。固定 URL（`current_pins`）とは
+/// 入れ方が違うので分けて持つ。
+pub fn current_requirements() -> std::collections::BTreeMap<String, String> {
+    COMMON_REQUIREMENTS
+        .iter()
+        .chain(TORCH_PACKAGES.iter())
+        .chain(IRODORI_EXTRA_REQUIREMENTS.iter())
+        .map(|spec| (requirement_name(spec).to_string(), spec.to_string()))
+        .collect()
 }
 
 fn stamp_path(asset_root: &Path) -> PathBuf {
@@ -179,12 +202,14 @@ pub fn write_stamp_pins(
     asset_root: &Path,
     pins: std::collections::BTreeMap<String, String>,
     resolved: std::collections::BTreeMap<String, String>,
+    requirements: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     let stamp = InstalledStamp {
         schema: STAMP_SCHEMA,
         installed_at: chrono::Utc::now().timestamp(),
         pins,
         resolved,
+        requirements,
     };
     let json = serde_json::to_string_pretty(&stamp).context("導入記録の JSON 化")?;
     std::fs::write(stamp_path(asset_root), json)
@@ -295,6 +320,7 @@ where
     let py_exe = asset_root.join("python").join("python.exe");
     let stamp = read_stamp(asset_root);
     let recorded = stamp.as_ref().map(|s| s.pins.clone()).unwrap_or_default();
+    let stamp_reqs = stamp.as_ref().map(|s| s.requirements.clone());
     let mut resolved = stamp.map(|s| s.resolved).unwrap_or_default();
     // 記録の要点は「指定した版」ではなく「実際に入った版」。毎回取り直す。
     resolved.extend(query_resolved_versions(&py_exe, |l| on_line(l)));
@@ -303,11 +329,30 @@ where
     if let Some(v) = py_version {
         resolved.insert("python".to_string(), v);
     }
+    let recorded_reqs = stamp_reqs.unwrap_or_default();
     write_stamp_pins(
         asset_root,
         merged_pins(&recorded, installed, python_matches),
         resolved,
+        merged_requirements(&recorded_reqs, installed),
     )
+}
+
+/// 入れ直せた分だけを現在値へ反映した記録用の `requirements` を作る。
+///
+/// `merged_pins` と同じ規律 — **入れ直していないものまで現在値にすると記録が嘘になる**。
+fn merged_requirements(
+    recorded: &std::collections::BTreeMap<String, String>,
+    installed: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let current = current_requirements();
+    let mut reqs = recorded.clone();
+    for name in installed {
+        if let Some(spec) = current.get(name) {
+            reqs.insert(name.clone(), spec.clone());
+        }
+    }
+    reqs
 }
 
 /// 導入状態 (v0.5.4 項目 2)。
@@ -381,9 +426,15 @@ fn should_ask_python(recorded: &std::collections::BTreeMap<String, String>) -> b
 fn outdated_list(
     asset_root: &Path,
     recorded: &std::collections::BTreeMap<String, String>,
+    recorded_reqs: &std::collections::BTreeMap<String, String>,
 ) -> Vec<String> {
     let current = current_pins();
     let mut out = outdated_pins(recorded, &current);
+    // **固定 URL だけでは足りない** (v0.5.5 項目 3)。名前付き要件の版を変えても
+    // `outdated` が空のままで、更新ボタンすら出なかった。
+    out.extend(outdated_pins(recorded_reqs, &current_requirements()));
+    out.sort();
+    out.dedup();
     out.retain(|n| n != "python");
     if should_ask_python(recorded)
         && python_is_stale(
@@ -410,14 +461,14 @@ pub fn status(asset_root: &Path) -> IrodoriStatus {
             // python が混ざって、この機能が対象にしている環境がちょうど 1 つも
             // 更新できなくなっていた。
             outdated: if present {
-                outdated_list(asset_root, &Default::default())
+                outdated_list(asset_root, &Default::default(), &Default::default())
             } else {
                 Vec::new()
             },
             resolved: Default::default(),
         };
     };
-    let outdated = outdated_list(asset_root, &stamp.pins);
+    let outdated = outdated_list(asset_root, &stamp.pins, &stamp.requirements);
     IrodoriStatus {
         present,
         has_record: true,
@@ -859,6 +910,74 @@ fn merged_pins(
     pins
 }
 
+/// その配布は torch の CUDA index から入れる必要があるか (v0.5.5 項目 3)。
+///
+/// **ここを外すと PyPI の CPU 版が入り、GPU 合成が黙って壊れる。**
+/// 初回導入は `install_torch_cuda` が `--index-url` を付けているので、入れ直しでも揃える。
+fn needs_torch_index(name: &str) -> bool {
+    TORCH_PACKAGES
+        .iter()
+        .any(|spec| requirement_name(spec) == name)
+}
+
+/// 名前付き pip 要件を入れ直す (v0.5.5 項目 3)。
+///
+/// 固定 URL の 3 本と違い、**依存を解決させる必要がある**（`transformers` の major を
+/// 上げれば `huggingface_hub` も動く）。そのため `--no-deps` は付けない。
+///
+/// **守れる範囲を正直に書いておく。** 退避して戻せるのは「その名前のパッケージ」だけで、
+/// **依存の連鎖まで元に戻せるわけではない**。失敗したときは、記録してある
+/// `resolved`（実際に入っていた版）へ戻すことを試み、それも駄目なら何が起きたかを伝える。
+/// **「1 回合成できる」までの検証は v0.5.6（major 移行）で入れる** — 同じ major の中の
+/// 版変更なら import の前後比較と版の一致で足りる。
+async fn reinstall_requirement<F>(
+    py_exe: &Path,
+    name: &str,
+    spec: &str,
+    before_imports: &std::collections::BTreeMap<String, Option<String>>,
+    mut on_line: F,
+) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    on_line(&format!("{name} を入れ直しています… ({spec})"));
+    let mut args: Vec<&str> = vec![
+        "-m",
+        "pip",
+        "install",
+        "--no-warn-script-location",
+        "--upgrade",
+    ];
+    // **torch 系は CUDA 専用 index から入れる。** 名前だけで入れ直すと PyPI の
+    // **CPU 版**が入り、GPU 合成が黙って壊れる（`install_torch_cuda` と同じ index を使う）。
+    if needs_torch_index(name) {
+        args.push("--index-url");
+        args.push(TORCH_CUDA_INDEX_URL);
+        on_line("  （CUDA 12.8 の index から取得します。1〜2GB あります）");
+    }
+    args.push(spec);
+    let installed = run_python(py_exe, &args, |l| on_line(l))
+    .and_then(|()| {
+        let regressed = import_regressions(before_imports, &import_report(py_exe));
+        if regressed.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "入れ直したことで import できなくなりました: {}",
+                regressed.join(" / ")
+            ))
+        }
+    });
+
+    if let Err(err) = installed {
+        on_line(&format!("{name} の入れ直しに失敗しました: {err:#}"));
+        return Err(err).with_context(|| {
+            format!("{name} ({spec}) の入れ直しに失敗しました。依存の入れ替わりは元に戻せていません")
+        });
+    }
+    Ok(())
+}
+
 /// 古くなった分だけを入れ直す (v0.5.4 項目 3、spec §6.0)。
 ///
 /// **失敗しても、それまで動いていた環境を壊さない。** pip は「古いものを消してから
@@ -931,6 +1050,19 @@ where
     let mut updated: Vec<String> = Vec::new();
     for name in outdated {
         let Some((pkg, url)) = updatable_pin(name) else {
+            // 名前付き pip 要件は URL ではなく名前で入れ直す (v0.5.5 項目 3)。
+            if let Some(spec) = current_requirements().get(name) {
+                match reinstall_requirement(&py_exe, name, spec, &before_imports, |l| on_line(l))
+                    .await
+                {
+                    Ok(()) => updated.push(name.clone()),
+                    Err(err) => {
+                        let _ = std::fs::remove_dir_all(&backup_root);
+                        return Err(err);
+                    }
+                }
+                continue;
+            }
             on_line(&format!("{name} は入れ直しの対象外です (skip)"));
             continue;
         };
@@ -1290,7 +1422,7 @@ mod stamp_tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        write_stamp_pins(dir.path(), current_pins(), resolved).unwrap();
+        write_stamp_pins(dir.path(), current_pins(), resolved, current_requirements()).unwrap();
 
         let got = read_stamp(dir.path()).expect("読み戻せること");
         assert_eq!(got.pins, current_pins(), "要求した pin をそのまま記録する");
@@ -1310,7 +1442,7 @@ mod stamp_tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        write_stamp_pins(dir.path(), current_pins(), resolved).unwrap();
+        write_stamp_pins(dir.path(), current_pins(), resolved, current_requirements()).unwrap();
 
         let got = read_stamp(dir.path()).unwrap();
         assert!(
@@ -1482,6 +1614,93 @@ mod stamp_tests {
         );
     }
 
+    /// **入れ直せた要件だけを記録する** (v0.5.5 項目 3)。
+    ///
+    /// `merged_pins` と同じ規律。全部を現在値にすると、入れ直していない依存まで
+    /// 「最新」と記録して記録そのものが嘘になる。**`pins` 側だけ守って隣を忘れない。**
+    #[test]
+    fn only_updated_requirements_are_recorded() {
+        let updated = vec!["transformers".to_string()];
+        let reqs = merged_requirements(&Default::default(), &updated);
+        assert_eq!(reqs.len(), 1, "入れ直した 1 本だけ: {reqs:?}");
+        assert_eq!(reqs.get("transformers"), current_requirements().get("transformers"));
+        assert!(
+            !reqs.contains_key("huggingface_hub"),
+            "入れ直していないものを書かない: {reqs:?}"
+        );
+
+        // 古い記録は入れ直すまで古いまま残る
+        let mut recorded = std::collections::BTreeMap::new();
+        recorded.insert("numpy".to_string(), "numpy<1".to_string());
+        let reqs = merged_requirements(&recorded, &updated);
+        assert_eq!(
+            reqs.get("numpy").map(String::as_str),
+            Some("numpy<1"),
+            "触っていない記録を書き換えない: {reqs:?}"
+        );
+    }
+
+    /// **torch は CUDA index から入れ直す** (v0.5.5 項目 3)。
+    ///
+    /// 名前だけで `pip install` すると PyPI の **CPU 版**が入り、GPU 合成が黙って壊れる。
+    /// 初回導入（`install_torch_cuda`）は `--index-url` を付けているので、入れ直しでも揃える。
+    #[test]
+    fn torch_is_reinstalled_from_the_cuda_index() {
+        assert!(needs_torch_index("torch"), "torch は CUDA index が要る");
+        assert!(needs_torch_index("torchaudio"), "torchaudio も同じ index");
+        for other in ["transformers", "huggingface_hub", "numpy", "torchcodec"] {
+            assert!(
+                !needs_torch_index(other),
+                "{other} に CUDA index を付けると取得先を誤る"
+            );
+        }
+    }
+
+    /// **名前付き pip 要件の版を変えたら更新対象になる** (v0.5.5 項目 3)。
+    ///
+    /// v0.5.4 の判定は `current_pins()`（固定 URL 4 本）としか突き合わせておらず、
+    /// `transformers<5` を `>=5` に変えても `outdated` は空のまま＝**更新ボタンすら
+    /// 出なかった**。transformers 4→5 を届ける手段が 1 本も無い状態だった。
+    #[test]
+    fn changing_a_named_requirement_makes_it_outdated() {
+        let dir = tempfile::tempdir().unwrap();
+        let pins = current_pins();
+        let mut reqs = current_requirements();
+        assert!(
+            outdated_list(dir.path(), &pins, &reqs).is_empty(),
+            "全部一致なら空"
+        );
+
+        // 記録されているのは**古い要件**。いまのビルドは違うものを要求している
+        // ＝ 既存環境へ届けなければならない。
+        assert_eq!(
+            current_requirements().get("transformers").map(String::as_str),
+            Some("transformers<5"),
+            "前提が変わったらこのテストも直す"
+        );
+        reqs.insert("transformers".to_string(), "transformers<4".to_string());
+        let got = outdated_list(dir.path(), &pins, &reqs);
+        assert!(
+            got.iter().any(|n| n == "transformers"),
+            "要件の変更が対象に入らないと、永久に届かない: {got:?}"
+        );
+    }
+
+    /// 記録が無い環境では、要件も**全部**対象になる（何が入っているか分からないため）。
+    #[test]
+    fn a_missing_record_lists_every_requirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = outdated_list(dir.path(), &Default::default(), &Default::default());
+        for name in ["transformers", "huggingface_hub", "torch"] {
+            assert!(got.iter().any(|n| n == name), "{name} が漏れている: {got:?}");
+        }
+        assert_eq!(
+            got.len(),
+            got.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            "重複がある: {got:?}"
+        );
+    }
+
     /// 一致している記録は信じ、**実物に聞かない**。ここが常に真になると、設定パネルを
     /// 開くたびに python.exe を起動することになる。
     #[test]
@@ -1498,9 +1717,15 @@ mod stamp_tests {
     fn outdated_list_names_only_what_changed() {
         let dir = tempfile::tempdir().unwrap();
         let mut recorded = current_pins();
-        assert!(outdated_list(dir.path(), &recorded).is_empty(), "全部一致なら空");
+        assert!(
+            outdated_list(dir.path(), &recorded, &current_requirements()).is_empty(),
+            "全部一致なら空"
+        );
         recorded.insert("irodori_tts".to_string(), "OLD".to_string());
-        assert_eq!(outdated_list(dir.path(), &recorded), ["irodori_tts"]);
+        assert_eq!(
+            outdated_list(dir.path(), &recorded, &current_requirements()),
+            ["irodori_tts"]
+        );
     }
 
     /// **pin を増やしたら `current_pins` にも足す。** 足し忘れると、その依存だけ
