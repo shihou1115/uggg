@@ -96,6 +96,8 @@ where
     let _ = std::fs::remove_file(&ready_file);
 
     let mut cmd = Command::new(&python);
+    // サイドカーが生きている間ずっとコンソール窓が残らないようにする。
+    cmd.creation_flags(crate::tts::irodori_download::CREATE_NO_WINDOW);
     cmd.arg(sidecar_py)
         .arg("--asset-dir")
         .arg(asset_root)

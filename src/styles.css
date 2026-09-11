@@ -502,6 +502,12 @@ body {
      ステージ (透過ウインドウ) には影響させないよう **パネル配下だけ**に閉じる。 */
   color-scheme: light;
   background: rgba(255, 255, 255, 0.98);
+  /* **文字色も明示する。** `color-scheme` は UA ウィジェットの色と `color` の *初期値* に
+     しか効かず、`:root` の `color-scheme: light dark` がダーク側に解決した文字色は
+     そのまま継承されてくる。個別指定の無い素の要素（確認ダイアログの見出しと本文など）が
+     **白背景に白文字**になり、v0.5.4 の実機確認では「更新しますか?」の本文が読めないまま
+     OK を押す形になっていた。ボタンで同じ型を踏んだ記録が下の .panel-footer button にある。 */
+  color: #1c1c1c;
   border: 1.5px solid #555;
   border-radius: 12px;
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);

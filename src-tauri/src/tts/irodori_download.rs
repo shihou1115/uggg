@@ -22,6 +22,7 @@
 //!   spawn_blocking + thread + channel に拡張する (現状は各 step 開始時に on_line でステージを emit)
 
 use std::io::Write;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -1117,6 +1118,15 @@ async fn download_to(url: &str, dest: &Path) -> Result<()> {
 /// 単引用符の中では `'` を `''` と二重にするのが唯一のエスケープ。素通しすると
 /// **`O'Neil` のようにアポストロフィを含むユーザー名のパスで引用が壊れ、導入が失敗する**
 /// (Codex レビュー 2026-09-06)。パスはアプリ側が決めるため実害は限定的だが、
+/// 子プロセスにコンソール窓を出させない。
+///
+/// **これが無いと、pip や Expand-Archive を呼ぶたびに黒いコンソール窓が前面に出る。**
+/// v0.5.4 で「更新する」を押したときに実機で確認した。リリース版は
+/// `windows_subsystem = "windows"` でコンソールを持たないため、子プロセスが
+/// 自前で窓を割り当ててしまう。stdout/stderr のパイプはこのフラグでは変わらない。
+/// （`notepad.exe` で取説を開く経路は、窓が出るのが目的なので対象外）
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// 文字列へ埋め込む以上は正しく引用する。
 fn ps_single_quoted(p: &Path) -> String {
     p.display().to_string().replace("'", "''")
@@ -1130,6 +1140,7 @@ fn expand_zip_windows(zip: &Path, dest: &Path) -> Result<()> {
     );
     let status = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1151,6 +1162,7 @@ where
 {
     let mut child = Command::new(python_exe)
         .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

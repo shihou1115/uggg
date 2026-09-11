@@ -11,6 +11,7 @@
 //! - stderr を行単位で `voicevox-download` イベントに emit。
 
 use std::io::{Read, Write};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -62,6 +63,7 @@ pub fn run_downloader(
     stash_locked_dlls(asset_dir);
 
     let mut cmd = Command::new(downloader);
+    cmd.creation_flags(crate::tts::irodori_download::CREATE_NO_WINDOW);
     cmd.arg("-o")
         .arg(asset_dir)
         .args(["--c-api-version", CAPI_VERSION])
