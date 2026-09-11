@@ -654,6 +654,29 @@ fn updatable_pin(name: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// site-packages にいま何があるかを 1 行で述べる（実機検証の観測点）。
+///
+/// pip が `Successfully installed` と言っているのに**ファイルが変わっていない**
+/// ことがあったため、入れ直しの前後で実際の姿を証跡に残す。
+/// `direct_url.json` の `url` は「どの版か」を示す唯一の手がかりになる。
+fn describe_package(site: &Path, pkg: &str) -> String {
+    let mut infos: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(site) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&format!("{pkg}-")) && name.ends_with(".dist-info") {
+                let url = std::fs::read_to_string(e.path().join("direct_url.json"))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| "(url なし)".to_string());
+                infos.push(format!("{name} <- {url}"));
+            }
+        }
+    }
+    format!("dir={} info=[{}]", site.join(pkg).is_dir(), infos.join(", "))
+}
+
 /// `site-packages/<pkg>` と `<pkg>-*.dist-info` を退避先へ移す。
 fn move_package_aside(site: &Path, pkg: &str, backup: &Path) -> Result<()> {
     std::fs::create_dir_all(backup).with_context(|| format!("mkdir {}", backup.display()))?;
@@ -799,8 +822,11 @@ where
             continue;
         };
         on_line(&format!("{pkg} を入れ直しています…"));
+        on_line(&format!("  site={}", site.display()));
+        on_line(&format!("  退避前: {}", describe_package(&site, pkg)));
         let backup = backup_root.join(pkg);
         move_package_aside(&site, pkg, &backup)?;
+        on_line(&format!("  退避後: {}", describe_package(&site, pkg)));
 
         let installed = run_python(
             &py_exe,
@@ -817,6 +843,7 @@ where
             |l| on_line(l),
         )
         .and_then(|()| {
+            on_line(&format!("  入れ直し後: {}", describe_package(&site, pkg)));
             let regressed = import_regressions(&before_imports, &import_report(&py_exe));
             if regressed.is_empty() {
                 Ok(())
