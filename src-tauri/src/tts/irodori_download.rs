@@ -670,6 +670,15 @@ where
 /// 項目 3 の約束（失敗しても動いていた環境を壊さない）はこの排他が前提。
 static IRODORI_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// いま導入または更新が走っているか (v0.5.5 項目 4)。
+///
+/// **合成の側もこれを見る。** 見ていなかったため、更新の最中に発話が来ると
+/// **半分入れ替わった `site-packages` で新しいサイドカーが起動しうる**。
+/// 数十秒だった v0.5.4 では踏みにくいが、数 GB・十数分になるモデル更新では現実的に踏む。
+pub fn is_busy() -> bool {
+    IRODORI_BUSY.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// 取れたら作業してよい。drop で自動的に手放す（途中で return しても取り残さない）。
 pub struct IrodoriBusyGuard(());
 

@@ -223,6 +223,16 @@ impl IrodoriClient {
                 "直近の失敗により一時停止中です (cooldown)。voicevox 経路で発話します".to_string(),
             ));
         }
+        // **導入・更新の最中は新しく起動しない** (v0.5.5 項目 4、spec §6.0)。
+        // 入れ替え中の `site-packages` で起動すると、半分だけ新しい状態で読み込む。
+        // すでに動いているものは止めない（上で `current_port()` を返している）— 走っている
+        // 発話を切らないため。ここで弾くと `decide_fallback` が voicevox へ流す。
+        if crate::tts::irodori_download::is_busy() {
+            return Err(TtsError::SidecarStart(
+                "Irodori ランタイムの導入または更新が進行中です。voicevox 経路で発話します"
+                    .to_string(),
+            ));
+        }
         let script = asset_root.join("sidecar.py");
         // [hf-download] 接頭辞の行のみ irodori-download イベントへ転送する。
         // 他の uvicorn / sidecar.py 標準ログは捨てる (ノイズ抑制 + 機密漏洩防止)。
@@ -433,6 +443,39 @@ pub enum TtsError {
 
 #[cfg(test)]
 mod tests {
+    /// **更新の最中に新しいサイドカーを立てない** (v0.5.5 項目 4)。
+    ///
+    /// 入れ替え中の `site-packages` で起動すると、半分だけ新しい状態で読み込む。
+    /// `IrodoriBusyGuard` を見ているのはコマンド 2 本だけで、合成の側は見ていなかった。
+    ///
+    /// 存在しない資産ルートを渡しているので、**弾かれなければ「sidecar.py が無い」**で
+    /// 落ちる。エラーの中身で「busy で止めた」と「起動を試みた」を区別できる。
+    #[tokio::test]
+    async fn a_running_update_blocks_a_new_sidecar() {
+        let client = super::IrodoriClient::new();
+        let nowhere = std::path::Path::new("Z:/ugg-does-not-exist");
+
+        let guard = crate::tts::irodori_download::IrodoriBusyGuard::acquire().unwrap();
+        let err = client
+            .ensure_sidecar_running(nowhere, true, None)
+            .await
+            .expect_err("更新中は起動しないこと");
+        assert!(
+            format!("{err}").contains("進行中"),
+            "起動を試みる前に弾くこと: {err}"
+        );
+
+        drop(guard);
+        let err = client
+            .ensure_sidecar_running(nowhere, true, None)
+            .await
+            .expect_err("資産が無いので別の理由で落ちる");
+        assert!(
+            !format!("{err}").contains("進行中"),
+            "更新が終わったら塞がないこと: {err}"
+        );
+    }
+
     /// **発話テキストを診断ログへ残さない** (v0.5.5 項目 1、spec §3.3 / v0.5.3 項目 7)。
     ///
     /// サイドカーは合成時の例外を `f"Irodori 合成失敗: {exc}"` に包んで 500 で返す。
