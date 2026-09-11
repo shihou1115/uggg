@@ -696,17 +696,50 @@ fn restore_package(site: &Path, backup: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 入れ直したあと、実際に import できるかを確かめる。
+/// 入れ直しで壊れていないかを見るモジュール（import 名）。
+const RUNTIME_MODULES: &[&str] = &["irodori_tts", "dacvae", "silentcipher"];
+
+/// いま import できるか。できなければ**理由**（例外の最終行）を添える。
 ///
-/// pip が成功を返しても、依存の食い違いで import が落ちることはある。
-/// **「入った」ではなく「使える」まで確認してから退避を捨てる。**
-fn verify_runtime_imports(py_exe: &Path) -> Result<()> {
-    run_python(
-        py_exe,
-        &["-c", "import irodori_tts, dacvae, silentcipher"],
-        |_| {},
-    )
-    .context("入れ直したランタイムが import できません")
+/// 理由を捨ててはいけない。最初の実装は出力を握り潰しており、実機で落ちたときに
+/// 分かったのは「python 異常終了 (code Some(1))」だけだった。原因
+/// （`No module named 'pydub'`）に辿り着くのに余計な一往復を要した。
+fn import_report(py_exe: &Path) -> std::collections::BTreeMap<String, Option<String>> {
+    RUNTIME_MODULES
+        .iter()
+        .map(|m| {
+            let code = format!("import {m}");
+            let mut last = String::new();
+            let failed = run_python(py_exe, &["-c", code.as_str()], |l| last = l.to_string()).err();
+            (m.to_string(), failed.map(|_| last))
+        })
+        .collect()
+}
+
+/// **入れ直す前より悪くなったものだけ**を返す。
+///
+/// **「全部 import できること」を条件にしてはいけない。** 実機の `silentcipher` は
+/// `pydub` が入っていないため**一度も import できたことが無い**（ugg は `pydub` を
+/// 入れず、upstream の `watermark.py` も `ImportError` を握って「透かし無しで続行」する
+/// 設計）。それでも合成は成立している。ここで「全部使えること」を絶対条件にすると、
+/// **既存環境では必ずロールバックし、更新が誰にも一度も成功しない**
+/// （2026-09-11 の実機検証で実際にそうなった）。
+///
+/// 項目 3 が約束しているのは「失敗しても、それまで動いていた環境を壊さない」であって
+/// 「壊れていた環境を直す」ではない。したがって判定は**絶対値ではなく差分**で行う。
+fn import_regressions(
+    before: &std::collections::BTreeMap<String, Option<String>>,
+    after: &std::collections::BTreeMap<String, Option<String>>,
+) -> Vec<String> {
+    before
+        .iter()
+        .filter(|(_, err)| err.is_none())
+        .filter_map(|(m, _)| match after.get(m) {
+            Some(None) => None,
+            Some(Some(why)) => Some(format!("{m}: {why}")),
+            None => Some(m.clone()),
+        })
+        .collect()
 }
 
 /// 古くなった分だけを入れ直す (v0.5.4 項目 3、spec §6.0)。
@@ -750,6 +783,15 @@ where
     // 前回が異常終了して残っていた分を掃除する（更新は 1 件ずつ順に処理する）。
     let _ = std::fs::remove_dir_all(&backup_root);
 
+    // 入れ直す前に「いま何が使えるか」を控える。ここを控えずに絶対値で判定すると、
+    // 元から import できないものを理由に、正常な入れ直しまで巻き戻してしまう。
+    let before_imports = import_report(&py_exe);
+    for (m, err) in &before_imports {
+        if let Some(why) = err {
+            on_line(&format!("注意: {m} は入れ直す前から import できません ({why})"));
+        }
+    }
+
     let mut updated: Vec<String> = Vec::new();
     for name in outdated {
         let Some((pkg, url)) = updatable_pin(name) else {
@@ -774,7 +816,17 @@ where
             ],
             |l| on_line(l),
         )
-        .and_then(|()| verify_runtime_imports(&py_exe));
+        .and_then(|()| {
+            let regressed = import_regressions(&before_imports, &import_report(&py_exe));
+            if regressed.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "入れ直したことで import できなくなりました: {}",
+                    regressed.join(" / ")
+                ))
+            }
+        });
 
         if let Err(err) = installed {
             on_line(&format!("{pkg} の入れ直しに失敗しました。元に戻します: {err:#}"));
@@ -1282,6 +1334,8 @@ mod update_tests {
             root.display()
         );
 
+        let before_imports = import_report(&root.join("python").join("python.exe"));
+        println!("[before] imports={before_imports:?}");
         let before = status(&root);
         println!(
             "[before] present={} has_record={} up_to_date={}",
@@ -1307,8 +1361,12 @@ mod update_tests {
             "成功したら退避を残さない: {}",
             root.join(UPDATE_BACKUP_DIR).display()
         );
-        verify_runtime_imports(&root.join("python").join("python.exe"))
-            .expect("入れ直した後も import できること");
+        let after = import_report(&root.join("python").join("python.exe"));
+        println!("[after] imports={after:?}");
+        assert!(
+            import_regressions(&before_imports, &after).is_empty(),
+            "入れ直す前に使えていたものが使えなくなっている"
+        );
     }
 
     #[test]
@@ -1327,6 +1385,65 @@ mod update_tests {
 
     /// 退避 → 復元で、**中身も dist-info も元どおりになる**。
     /// pip は「消してから入れる」ので、ここが戻らないと失敗時に環境が壊れる。
+    fn report(pairs: &[(&str, Option<&str>)]) -> std::collections::BTreeMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(m, e)| (m.to_string(), e.map(|x| x.to_string())))
+            .collect()
+    }
+
+    /// **元から壊れていたものを理由に巻き戻さない** (v0.5.4、実機検証で発覚)。
+    ///
+    /// 実機の `silentcipher` は `pydub` が無く一度も import できていない（upstream が
+    /// 意図的に任意依存にしており、合成は透かし無しで成立する）。最初の実装は
+    /// 「3 つとも import できること」を絶対条件にしていたため、**既存環境では必ず
+    /// ロールバックし、更新が誰にも一度も成功しない**状態だった。
+    #[test]
+    fn only_a_regression_blocks_the_update() {
+        let before = report(&[
+            ("irodori_tts", None),
+            ("dacvae", None),
+            ("silentcipher", Some("ModuleNotFoundError: No module named 'pydub'")),
+        ]);
+
+        // 元から壊れていたものが壊れたままでも、それは入れ直しの失敗ではない
+        assert!(
+            import_regressions(&before, &before).is_empty(),
+            "前から import できないものを理由に巻き戻してはいけない"
+        );
+
+        // 直っていたらなおよい（改善を失敗として数えない）
+        let fixed = report(&[("irodori_tts", None), ("dacvae", None), ("silentcipher", None)]);
+        assert!(import_regressions(&before, &fixed).is_empty());
+
+        // 使えていたものが使えなくなったら、それは失敗。理由も添える
+        let broken = report(&[
+            ("irodori_tts", Some("ImportError: bad")),
+            ("dacvae", None),
+            ("silentcipher", Some("ModuleNotFoundError: No module named 'pydub'")),
+        ]);
+        let got = import_regressions(&before, &broken);
+        assert_eq!(got.len(), 1, "壊れたのは 1 つ: {got:?}");
+        assert!(got[0].starts_with("irodori_tts: "), "どれが壊れたか: {got:?}");
+        assert!(got[0].contains("ImportError: bad"), "理由を落とさない: {got:?}");
+
+        // 調べられなくなった（消えた）場合も悪化として扱う
+        let gone = report(&[("dacvae", None), ("silentcipher", None)]);
+        assert_eq!(import_regressions(&before, &gone), ["irodori_tts"]);
+    }
+
+    /// 見張る対象に、入れ直しうる 3 本が揃っていること。
+    #[test]
+    fn runtime_modules_cover_every_updatable_pin() {
+        for name in current_pins().keys() {
+            let Some((pkg, _)) = updatable_pin(name) else { continue };
+            assert!(
+                RUNTIME_MODULES.contains(&pkg),
+                "{pkg} を入れ直すのに import の見張りが無い"
+            );
+        }
+    }
+
     #[test]
     fn move_aside_then_restore_round_trips() {
         let dir = tempfile::tempdir().unwrap();
