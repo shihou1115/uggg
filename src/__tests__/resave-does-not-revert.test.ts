@@ -26,11 +26,14 @@ let currentSettings: Settings;
 /// `set_settings` の応答を作る。既定は「渡されたものをそのまま保存」。
 let saveResponder: (next: Settings) => Settings;
 
+// `restoreMocks: true` なので `vi.fn().mockResolvedValue(...)` は 1 本目のテストで
+// 実装ごと消える（2 本目以降 undefined が返り、`unlisten()` が落ちる）。
+// **実装を渡した `vi.fn(impl)` にすること**（reset は impl に戻す）。
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockResolvedValue(() => undefined),
+  listen: vi.fn(async () => () => undefined),
 }));
 vi.mock("../tts/speaker", () => ({ previewWavBase64: vi.fn() }));
-vi.mock("../confirm", () => ({ uggConfirm: vi.fn().mockResolvedValue(true) }));
+vi.mock("../confirm", () => ({ uggConfirm: vi.fn(async () => true) }));
 vi.mock("./chatlog", () => ({ openChatLog: vi.fn() }));
 vi.mock("../weather/credit", () => ({ isWeatherReady: () => false }));
 

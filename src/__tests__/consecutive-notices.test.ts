@@ -15,7 +15,10 @@ import type { TypewriterToken } from "../dialogue/typewriter";
 /// **応答が割り込む**という順番があって初めて壊れる。
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => undefined) }));
+// `restoreMocks: true` なので `vi.fn().mockResolvedValue(...)` は 1 本目のテストで
+// 実装ごと消える（2 本目以降 undefined が返り、`unlisten()` が落ちる）。
+// **実装を渡した `vi.fn(impl)` にすること**（reset は impl に戻す）。
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => undefined) }));
 vi.mock("../stage/character", () => ({ setPose: vi.fn() }));
 
 /// **最後まで表示された**本文を順に記録する。
