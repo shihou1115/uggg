@@ -508,8 +508,17 @@ fn outdated_list(
     let mut out = outdated_pins(recorded, &current);
     // **固定 URL だけでは足りない** (v0.5.5 項目 3)。名前付き要件の版を変えても
     // `outdated` が空のままで、更新ボタンすら出なかった。
-    out.extend(outdated_pins(recorded_reqs, &current_requirements()));
-    out.extend(outdated_pins(recorded_models, &current_models()));
+    // **記録に無いものを「古い」と扱わない** (v0.5.5)。
+    //
+    // 固定 URL の 3 本は「記録が無い＝ pin 前の `refs/heads/main` が入っている」と
+    // 実機で確認できていたので全部対象にしてよかった。**要件とモデルは違う。**
+    // 記録が無いのは「v0.5.4 以前が書いた記録に、その欄がまだ無い」だけで、
+    // 中身が古い証拠にはならない。ここを対象にすると、v0.5.4 から上げただけの
+    // ユーザーに **torch を含む数 GB の再取得**を強いる。
+    // v0.5.4 の python 判定と同じ原則 — **代償が非対称なら、証拠が無い側へ倒す**。
+    // 基準値は `status()` が書き込む（下の `backfill_baseline`）。
+    out.extend(outdated_recorded_only(recorded_reqs, &current_requirements()));
+    out.extend(outdated_recorded_only(recorded_models, &current_models()));
     out.sort();
     out.dedup();
     out.retain(|n| n != "python");
@@ -545,6 +554,8 @@ pub fn status(asset_root: &Path) -> IrodoriStatus {
             resolved: Default::default(),
         };
     };
+    // v0.5.4 以前が書いた記録には要件・モデルの欄が無い。基準値を書き足してから判定する。
+    let stamp = backfill_baseline(asset_root, &stamp);
     let outdated = outdated_list(asset_root, &stamp.pins, &stamp.requirements, &stamp.models);
     IrodoriStatus {
         present,
@@ -560,6 +571,60 @@ pub fn status(asset_root: &Path) -> IrodoriStatus {
 /// 返すのは**入れ直しが要る名前**。`current` にあって `recorded` と違うもの、および
 /// `current` にあって `recorded` に無いもの（pin を増やした場合）。
 /// 逆に `recorded` にしか無いものは無視する（pin を減らした場合、入れ直しは要らない）。
+/// **記録にある名前だけ**を突き合わせる（記録に無いものは対象にしない）。
+///
+/// `outdated_pins` との違いは「記録に無い」の扱い。あちらは対象にする（固定 URL は
+/// 記録が無い＝古いと実機で確認できている）。こちらは対象にしない（要件・モデルは
+/// 記録の欄が無いだけで、古い証拠にならない）。
+fn outdated_recorded_only(
+    recorded: &std::collections::BTreeMap<String, String>,
+    current: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    current
+        .iter()
+        .filter(|(name, value)| {
+            recorded
+                .get(*name)
+                .is_some_and(|recorded_value| recorded_value != *value)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// 記録に欄が無い要件・モデルへ、**いまの値を基準値として書き込む** (v0.5.5)。
+///
+/// これが無いと、v0.5.4 が書いた記録は要件の欄が空のままで、**次に要件を変えても
+/// 差が出ず永久に届かない**（v0.5.5 がまさに直した穴の再発）。
+/// 書いてよい根拠は、**v0.5.5 が要件もモデルも変えていない**こと — v0.5.4 の記録が
+/// 指す環境は、定義上いまの要求と一致している。
+fn backfill_baseline(asset_root: &Path, stamp: &InstalledStamp) -> InstalledStamp {
+    let mut out = stamp.clone();
+    let mut changed = false;
+    for (name, value) in current_requirements() {
+        if !out.requirements.contains_key(&name) {
+            out.requirements.insert(name, value);
+            changed = true;
+        }
+    }
+    for (name, value) in current_models() {
+        if !out.models.contains_key(&name) {
+            out.models.insert(name, value);
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = write_stamp_pins(
+            asset_root,
+            out.pins.clone(),
+            out.resolved.clone(),
+            out.requirements.clone(),
+            out.models.clone(),
+        );
+        crate::ulog!("[irodori] 導入記録に要件・モデルの基準値を書き足しました");
+    }
+    out
+}
+
 fn outdated_pins(
     recorded: &std::collections::BTreeMap<String, String>,
     current: &std::collections::BTreeMap<String, String>,
@@ -1796,19 +1861,98 @@ mod stamp_tests {
         );
     }
 
-    /// 記録が無い環境では、要件も**全部**対象になる（何が入っているか分からないため）。
+    /// **記録に欄が無いものを「古い」と扱わない** (v0.5.5)。
+    ///
+    /// 固定 URL の 3 本は「記録が無い＝ pin 前の `refs/heads/main` が入っている」と
+    /// 実機で確認できているので全部対象にしてよい。**要件とモデルは違う** — 記録に
+    /// 欄が無いのは v0.5.4 以前が書いた記録だからで、中身が古い証拠にはならない。
+    /// ここを対象にすると、v0.5.4 から上げただけのユーザーに **torch を含む数 GB の
+    /// 再取得**を強いる。**代償が非対称なら、証拠が無い側へ倒す**（v0.5.4 の python 判定と同じ）。
     #[test]
-    fn a_missing_record_lists_every_requirement() {
+    fn a_missing_record_does_not_accuse_requirements_or_models() {
         let dir = tempfile::tempdir().unwrap();
-        let got = outdated_list(dir.path(), &Default::default(), &Default::default(), &Default::default());
-        for name in ["transformers", "huggingface_hub", "torch"] {
-            assert!(got.iter().any(|n| n == name), "{name} が漏れている: {got:?}");
-        }
-        assert_eq!(
-            got.len(),
-            got.iter().collect::<std::collections::BTreeSet<_>>().len(),
-            "重複がある: {got:?}"
+        let got = outdated_list(
+            dir.path(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
         );
+        for name in ["transformers", "huggingface_hub", "torch"] {
+            assert!(
+                !got.iter().any(|n| n == name),
+                "{name} を数 GB かけて入れ直す理由が無い: {got:?}"
+            );
+        }
+        for name in ["model_synth", "model_codec"] {
+            assert!(!got.iter().any(|n| n == name), "{name} も同じ: {got:?}");
+        }
+        // 固定 URL の 3 本は従来どおり対象（記録が無い＝ pin 前が入っていると分かっている）
+        for pkg in ["dacvae", "irodori_tts", "silentcipher"] {
+            assert!(got.iter().any(|n| n == pkg), "{pkg} は対象のまま: {got:?}");
+        }
+    }
+
+    /// **`status()` を通しても基準値が入ること**（関数だけ作って呼び忘れない）。
+    ///
+    /// `backfill_baseline` 単体のテストでは、`status()` から呼ばれているかまでは
+    /// 固定できない。呼ばれていなければ、v0.5.4 の記録は欄が空のまま残り、
+    /// **次に要件を変えても永久に届かない**。
+    #[test]
+    fn status_writes_the_baseline_into_an_old_record() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stamp_pins(
+            dir.path(),
+            current_pins(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+
+        let st = status(dir.path());
+        assert!(st.has_record, "前提: 記録はある");
+
+        let persisted = read_stamp(dir.path()).expect("記録が読めること");
+        assert_eq!(
+            persisted.requirements,
+            current_requirements(),
+            "status() から基準値が書かれていない（呼び忘れ）"
+        );
+        assert_eq!(persisted.models, current_models(), "モデルの基準値も同じ");
+    }
+
+    /// **基準値を書き足す** (v0.5.5)。
+    ///
+    /// これが無いと、v0.5.4 が書いた記録は要件の欄が空のままで、**次に要件を変えても
+    /// 差が出ず永久に届かない**（v0.5.5 がまさに直した穴の再発）。
+    #[test]
+    fn an_old_record_gets_a_baseline_written_in() {
+        let dir = tempfile::tempdir().unwrap();
+        // v0.5.4 が書いた記録 = pins と resolved はあるが requirements / models が無い
+        write_stamp_pins(
+            dir.path(),
+            current_pins(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let before = read_stamp(dir.path()).unwrap();
+        assert!(before.requirements.is_empty() && before.models.is_empty(), "前提");
+
+        let after = backfill_baseline(dir.path(), &before);
+        assert_eq!(after.requirements, current_requirements(), "要件の基準値が入る");
+        assert_eq!(after.models, current_models(), "モデルの基準値が入る");
+
+        // **書き込まれて残ること**（次回の判定で使えなければ意味が無い）
+        let persisted = read_stamp(dir.path()).unwrap();
+        assert_eq!(persisted.requirements, current_requirements(), "保存されていない");
+
+        // 基準値が入ったあとは、変更したものだけが対象になる
+        let mut reqs = persisted.requirements.clone();
+        reqs.insert("transformers".to_string(), "transformers<4".to_string());
+        let got = outdated_list(dir.path(), &persisted.pins, &reqs, &persisted.models);
+        assert_eq!(got, ["transformers"], "変えた 1 本だけ: {got:?}");
     }
 
     /// 一致している記録は信じ、**実物に聞かない**。ここが常に真になると、設定パネルを
