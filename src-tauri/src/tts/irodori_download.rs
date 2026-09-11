@@ -654,6 +654,11 @@ fn updatable_pin(name: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// 資産ルートから site-packages の位置を出す。
+fn site_of(asset_root: &Path) -> PathBuf {
+    asset_root.join("python").join("Lib").join("site-packages")
+}
+
 /// site-packages にいま何があるかを 1 行で述べる（実機検証の観測点）。
 ///
 /// pip が `Successfully installed` と言っているのに**ファイルが変わっていない**
@@ -765,6 +770,32 @@ fn import_regressions(
         .collect()
 }
 
+/// 入れ直せた分だけを現在値へ反映した記録用の `pins` を作る。
+///
+/// **全部を現在値にしてはいけない。** 入れ直していない依存まで「最新」と記録すると、
+/// 記録そのものが嘘になる。`python` は入れ直さないが、**実物が pin と一致していることを
+/// 確認できたときだけ**記録する（確認せずに書けば嘘になり、確認したのに書かなければ
+/// 設定パネルを開くたびに `python.exe` に聞き直すことになる）。
+fn merged_pins(
+    recorded: &std::collections::BTreeMap<String, String>,
+    updated: &[String],
+    python_matches: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let current = current_pins();
+    let mut pins = recorded.clone();
+    for name in updated {
+        if let Some(url) = current.get(name) {
+            pins.insert(name.clone(), url.clone());
+        }
+    }
+    if python_matches {
+        if let Some(url) = current.get("python") {
+            pins.insert("python".to_string(), url.clone());
+        }
+    }
+    pins
+}
+
 /// 古くなった分だけを入れ直す (v0.5.4 項目 3、spec §6.0)。
 ///
 /// **失敗しても、それまで動いていた環境を壊さない。** pip は「古いものを消してから
@@ -789,10 +820,7 @@ where
             py_exe.display()
         ));
     }
-    let site = asset_root
-        .join("python")
-        .join("Lib")
-        .join("site-packages");
+    let site = site_of(asset_root);
 
     if outdated.iter().any(|n| n == "python") {
         // ここだけは安全に入れ直せない。黙って部分更新して「最新」と記録するより、
@@ -875,6 +903,24 @@ where
 
     // ここまで来たら全部成功している。退避を捨てる。
     let _ = std::fs::remove_dir_all(&backup_root);
+
+    // **記録は更新の一部。** これをコマンド層に置いていたためテストから到達できず、
+    // 「入れ直したのに `up_to_date` が false のまま」を自動で検出できなかった。
+    let stamp = read_stamp(asset_root);
+    let recorded_pins = stamp.as_ref().map(|s| s.pins.clone()).unwrap_or_default();
+    let mut resolved = stamp.map(|s| s.resolved).unwrap_or_default();
+    let py_version = installed_python_version(asset_root);
+    let python_matches = py_version.as_deref() == pinned_python_version();
+    if let Some(v) = py_version {
+        resolved.insert("python".to_string(), v);
+    }
+    write_stamp_pins(
+        asset_root,
+        merged_pins(&recorded_pins, &updated, python_matches),
+        resolved,
+    )
+    .context("入れ直しは成功しましたが、導入記録を書けませんでした")?;
+
     Ok(updated)
 }
 
@@ -1281,6 +1327,33 @@ mod stamp_tests {
         assert!(!python_is_stale(Some("3.11.9"), None), "pin を読めないなら古いと言わない");
     }
 
+    /// **入れ直せた分だけ**を現在値へ反映する。全部を現在値にすると、入れ直していない
+    /// 依存まで「最新」と記録して記録そのものが嘘になる。
+    #[test]
+    fn only_updated_pins_are_recorded() {
+        let updated = vec!["dacvae".to_string()];
+        let pins = merged_pins(&Default::default(), &updated, false);
+        assert_eq!(pins.len(), 1, "入れ直した 1 本だけ: {pins:?}");
+        assert_eq!(pins.get("dacvae"), current_pins().get("dacvae"));
+        assert!(!pins.contains_key("python"), "確認していない python を書かない");
+        assert!(!pins.contains_key("irodori_tts"), "入れ直していないものを書かない");
+
+        // 実物が pin と一致していると確認できたときだけ python も記録する
+        let pins = merged_pins(&Default::default(), &updated, true);
+        assert_eq!(pins.get("python"), current_pins().get("python"));
+
+        // 3 本入れ直し + python 確認済み = 最新になる
+        let all: Vec<String> = ["dacvae", "irodori_tts", "silentcipher"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pins = merged_pins(&Default::default(), &all, true);
+        assert!(
+            outdated_pins(&pins, &current_pins()).is_empty(),
+            "全部入れ直したら最新になること: {pins:?}"
+        );
+    }
+
     /// 一致している記録は信じ、**実物に聞かない**。ここが常に真になると、設定パネルを
     /// 開くたびに python.exe を起動することになる。
     #[test]
@@ -1425,7 +1498,22 @@ mod update_tests {
         );
         let after = import_report(&root.join("python").join("python.exe"));
         say(format!("[after] imports={after:?}"));
-        say(format!("[after] status={:?}", status(&root)));
+        let after_status = status(&root);
+        say(format!("[after] status={after_status:?}"));
+        say(format!(
+            "[after] installed.json={}",
+            std::fs::read_to_string(root.join(STAMP_FILE))
+                .unwrap_or_else(|e| format!("(読めません: {e})"))
+        ));
+        for pkg in ["dacvae", "irodori_tts", "silentcipher"] {
+            say(format!("[after] {pkg}: {}", describe_package(&site_of(&root), pkg)));
+        }
+        assert!(after_status.has_record, "記録が書かれていること");
+        assert!(
+            after_status.up_to_date,
+            "入れ直しきったら最新になること: outdated={:?}",
+            after_status.outdated
+        );
         assert!(
             import_regressions(&before_imports, &after).is_empty(),
             "入れ直す前に使えていたものが使えなくなっている"

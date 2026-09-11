@@ -379,34 +379,12 @@ pub async fn update_irodori_runtime(app: AppHandle) -> Result<Vec<String>, Strin
     // `current_pins()` を丸ごと対象にしたところ、入れ直せない `python` が混ざって
     // Err で止まり、この機能が対象にしている環境がちょうど 1 つも更新できなかった。
     let targets = status.outdated;
+    // 記録の更新は `update_irodori_runtime` の中で行う。**ここに置いていたため
+    // テストから到達できず**、「入れ直したのに `up_to_date` が false のまま」を
+    // 自動で検出できなかった。
     let updated = irodori_download::update_irodori_runtime(&root, &targets, &emit)
         .await
         .map_err(|e| format!("{e:#}"))?;
-
-    // 記録の更新: 入れ直せた分だけ現在値へ。
-    let mut pins = irodori_download::read_stamp(&root)
-        .map(|s| s.pins)
-        .unwrap_or_default();
-    let current = irodori_download::current_pins();
-    for name in &updated {
-        if let Some(url) = current.get(name) {
-            pins.insert(name.clone(), url.clone());
-        }
-    }
-    let mut resolved = irodori_download::read_stamp(&root)
-        .map(|s| s.resolved)
-        .unwrap_or_default();
-    // 実物が pin と一致していることを**確認できたときだけ** python も記録する。
-    // 確認せずに書けば記録が嘘になり、確認したのに書かなければ毎回 python.exe に聞き直すことになる。
-    if let Some(v) = irodori_download::installed_python_version(&root) {
-        if Some(v.as_str()) == irodori_download::pinned_python_version() {
-            if let Some(url) = current.get("python") {
-                pins.insert("python".to_string(), url.clone());
-            }
-        }
-        resolved.insert("python".to_string(), v);
-    }
-    irodori_download::write_stamp_pins(&root, pins, resolved).map_err(|e| format!("{e:#}"))?;
     let _ = app.emit("irodori-download", "__done__");
     Ok(updated)
 }
