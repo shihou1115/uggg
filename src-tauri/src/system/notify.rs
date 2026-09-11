@@ -122,6 +122,12 @@ impl NoticeKind {
 }
 
 pub async fn notify(app: &AppHandle, state: &Arc<AppState>, kind: NoticeKind) {
+    // **理由をログに残す** (v0.5.5 項目 1、spec §6.0)。
+    // ユーザーに見せるのはキャラの台詞（辞書の行）でよいが、**辞書キーが存在すると
+    // `fallback_text()` が使われず、`reason` がどこにも残らなかった**。
+    // 「Irodori-TTS が利用できません」とだけ出て、原因は永久に分からない状態だった。
+    // 載せる文字列は生成元で伏字・切り詰め済み（`sanitize_sidecar_error`）。
+    crate::ulog!("[notify] {}", kind.fallback_text());
     let key = kind.dict_key();
     let line = {
         let guard = state.ghost.lock().expect("ghost poisoned");

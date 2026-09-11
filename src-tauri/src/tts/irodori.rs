@@ -37,6 +37,26 @@ pub(crate) fn is_hf_progress_line(line: &str) -> bool {
     line.starts_with("[hf-download]")
 }
 
+/// サイドカーの 500 body を**ログと告知に載せてよい形**にする (v0.5.5 項目 1、spec §6.0)。
+///
+/// サイドカーは合成時の例外を `HTTPException(500, f"Irodori 合成失敗: {exc}")` に包んで返す
+/// （`sidecar.py`）。`{exc}` は tokenizer 由来などで**発話テキストを含みうる**ので、
+/// 送った本文とキャプションを伏せてから 300 文字で頭打ちにする
+/// （spec §3.3 の送信物 / v0.5.3 項目 7「診断ログに会話本文を残さない」を破らないため）。
+///
+/// **リクエスト時の例外は stderr には出ない**（`HTTPException` は応答として返るだけ）。
+/// stderr が運ぶのは起動時の import 失敗とモデル DL の進捗・失敗なので、そちらは伏せる対象が無い。
+pub(crate) fn sanitize_sidecar_error(body: &str, secrets: &[&str]) -> String {
+    let mut out = body.to_string();
+    for secret in secrets {
+        // 短すぎる文字列で置換すると、無関係な語まで潰れて診断にならない。
+        if secret.chars().count() >= 4 {
+            out = out.replace(secret, "«伏字»");
+        }
+    }
+    crate::dialogue::llm::truncate_for_log(&out)
+}
+
 /// `shutdown_if_idle` の核ロジック (pure)。port 有 + last_used != 0 + 経過 >= idle_secs で true。
 pub(crate) fn should_shutdown_for_idle(
     has_port: bool,
@@ -208,11 +228,21 @@ impl IrodoriClient {
         // 他の uvicorn / sidecar.py 標準ログは捨てる (ノイズ抑制 + 機密漏洩防止)。
         // 接頭辞判定は is_hf_progress_line (pure 関数) に切り出してテストでカバー。
         let on_stderr = move |line: &str| {
-            if let Some(app) = &app {
-                if is_hf_progress_line(line) {
+            if is_hf_progress_line(line) {
+                if let Some(app) = &app {
                     let _ = app.emit("irodori-download", line);
                 }
+                return;
             }
+            // **進捗以外を捨てない** (v0.5.5 項目 1)。捨てていたため、サイドカーが
+            // 異常終了してもユーザーに出るのは「HTTP 通信に失敗しました」だけで、
+            // 原因に辿り着く手段がアプリ側に 1 つも無かった。
+            // 平時は静か（`--log-level warning` で起動しており、リクエスト時の例外は
+            // `HTTPException` として応答に載るので stderr には来ない）。
+            crate::ulog!(
+                "[irodori:py] {}",
+                crate::dialogue::llm::truncate_for_log(line)
+            );
         };
         let handle = sidecar::start_sidecar(asset_root, &script, mock, on_stderr)
             .await
@@ -296,8 +326,12 @@ impl IrodoriClient {
             .map_err(|e| TtsError::Http(format!("{e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(TtsError::Http(format!("{status}: {text}")));
+            let body_text = resp.text().await.unwrap_or_default();
+            let caption_ref = body.caption.as_deref().unwrap_or("");
+            return Err(TtsError::Http(format!(
+                "{status}: {}",
+                sanitize_sidecar_error(&body_text, &[text, caption_ref])
+            )));
         }
         let bytes = resp
             .bytes()
@@ -331,8 +365,11 @@ impl IrodoriClient {
             .map_err(|e| TtsError::Http(format!("{e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(TtsError::Http(format!("{status}: {text}")));
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(TtsError::Http(format!(
+                "{status}: {}",
+                sanitize_sidecar_error(&body_text, &[caption])
+            )));
         }
         let r: VoiceRefResponse = resp
             .json()
@@ -390,6 +427,42 @@ pub enum TtsError {
 
 #[cfg(test)]
 mod tests {
+    /// **発話テキストを診断ログへ残さない** (v0.5.5 項目 1、spec §3.3 / v0.5.3 項目 7)。
+    ///
+    /// サイドカーは合成時の例外を `f"Irodori 合成失敗: {exc}"` に包んで 500 で返す。
+    /// `{exc}` は発話テキストを含みうるので、送った本文とキャプションを伏せてから載せる。
+    #[test]
+    fn the_spoken_text_never_reaches_the_log() {
+        let spoken = "きょうもおつかれさま、ゆっくりやすんでね";
+        let caption = "明るく元気な少女の声";
+        let body = format!("Irodori 合成失敗: TokenizerError at '{spoken}' (caption={caption})");
+
+        let got = super::sanitize_sidecar_error(&body, &[spoken, caption]);
+
+        assert!(!got.contains(spoken), "発話テキストが残っている: {got}");
+        assert!(!got.contains(caption), "キャプションが残っている: {got}");
+        assert!(
+            got.contains("TokenizerError"),
+            "診断に要る部分まで消してはいけない: {got}"
+        );
+    }
+
+    /// 短すぎる文字列で置換すると無関係な語まで潰れて診断にならない。
+    #[test]
+    fn short_secrets_are_not_redacted() {
+        let got = super::sanitize_sidecar_error("CUDA out of memory", &["a", "of", ""]);
+        assert_eq!(got, "CUDA out of memory", "3 文字以下は伏せない");
+    }
+
+    /// 長いボディはログへ丸ごと載せない（`llm.rs` と同じ規律）。
+    #[test]
+    fn a_long_body_is_truncated() {
+        let body = "x".repeat(500);
+        let got = super::sanitize_sidecar_error(&body, &[]);
+        assert!(got.chars().count() < 400, "切り詰めていない: {}", got.chars().count());
+        assert!(got.ends_with("…(以下省略)"));
+    }
+
     use super::*;
 
     #[test]
