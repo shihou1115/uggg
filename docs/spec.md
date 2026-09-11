@@ -1,4 +1,4 @@
-# ugg 要件仕様書（spec.md v1.9.0）
+# ugg 要件仕様書（spec.md v1.9.1）
 
 **フェーズ**: 本開発 Phase 1 確定版
 **作成日**: 2026-06-18
@@ -730,9 +730,16 @@ pin をいくら上げても、すでに導入したユーザーには永久に�
 **2. v4.1-Small は `transformers` 5 を要求する。**
 v4.1-Small のチェックポイントは `text_encoder_type: "pretrained"`
 （`text_tokenizer_repo: sbintuitions/modernbert-ja-310m`）で、pin 済みコードの
-`PretrainedTextBackbone` を通る。その `__init__` は
-`from transformers.initialization import no_init_weights` を**無条件に**行うが、
-このモジュールは **transformers 5 で入ったもの**で、実機の 4.57.6 には無い。
+`PretrainedTextBackbone`（`irodori_tts/model.py:822`）を通る。その `__init__` は
+`from transformers.initialization import no_init_weights` を行うが、このモジュールは
+**transformers 5 で入ったもの**で、実機の 4.57.6 には無い。
+
+**この import は「モジュール読み込み時」ではなく「`__init__` の中、しかも try/except の中」
+にある**（2026-09-11 に upstream の固定 SHA で確認。当初 v1.8.1 で「無条件 import」と
+書いたのは誤りだった）。したがって **v0.5.4 が作った import ゲートでは原理的に検出できない** —
+`import irodori_tts` は通り、**破綻は初回合成時に起きて無言で VOICEVOX へ落ちる**
+（`decide_fallback` は `VoiceRefMissing` 以外を全部フォールバックさせる）。
+依存の版を上げる回では、**「import できる」ではなく「1 回合成できる」を成否の条件にする**必要がある。
 
 v3 / v2-VoiceDesign は `text_encoder_type` を持たない（既定値）ためこの経路を通らない。
 **だから今 v3 は動いているし、新規インストールでも動く。**
@@ -1044,3 +1051,4 @@ SmartScreen 警告はいずれも実害がある。
 | 2026-09-11 | v1.8.8 | **v0.5.4 インストール版の実機確認で見つけた 1 件を v0.5.5 の引き継ぎへ計上**（スコープ外・既存の不具合）。**強制終了するとサイドカーが孤児化し、GPU を掴んだまま残る。** 終了フックが走らないため `irodori.shutdown()` が呼ばれず、残ったサイドカーはアイドル監視も効かない（監視側が死んでいる）。1 つで数 GB の VRAM を占めるので落とすたびに積み上がり、**音声が途切れ途切れになる**形で現れる。`ready.json` に `pid` を記録しているのに起動時の掃除経路が無い。直し方は pid を撃つのではなく、記録されたポートへ shutdown を投げてから `ready.json` を消す。 |
 | 2026-09-11 | v1.8.9 | **v0.5.4 タグ後の docs 整理（tidy-docs）**。削除ゼロ・参照切れゼロ（docs は 12 ファイルすべて不可侵リスト。`codex-review-2026-09.md` と `_legacy-v003/spec.md` は改訂履歴が「削除済み」と記録している行、`parameters.md` は upstream Irodori-TTS 側のファイル）。**失効 1 件を是正**: §6.0 が「これから作る」書き方のままで出荷済みの印が無く、次のスコープ決定時に未着手と読めた。出荷済みであることと、**「入れないもの」は出荷後も有効**（v0.5.1 の前例）であることを冒頭に明記した。 |
 | 2026-09-11 | v1.9.0 | **孤児サイドカーの扱いを v0.5.5 の優先項目へ格上げ**。実測で、advanced モードのローカル LLM（LM Studio の `llama-server`）が**常駐で 7.7 GB** を占めており、16 GB のうち Irodori が使えるのは**約 8 GB**しかないと判明した。サイドカー 1 つで数 GB なので、**孤児が 1 つ残っただけで次の合成が入らない**。2026-09-11 に実際そうなり「音声が途切れ途切れ」として現れた。**advanced（LLM）と Irodori 実モデルが同じ VRAM を取り合う**前提を v0.5.5 の設計時に明示的に置くこと。掃除だけでなく、**足りないときに何が起きているかを伝える**経路も要る（現状は「HTTP 通信に失敗しました」だけ ＝ stderr 破棄と同じ穴）。 |
+| 2026-09-11 | v1.9.1 | **§6.0 の事実誤認を訂正**（v0.5.5 スコープの反証レビューで発覚）。v1.8.1 で「`PretrainedTextBackbone` が `transformers.initialization` を**無条件 import** する」と書いたが、upstream の固定 SHA（`irodori_tts/model.py:822`）で確認したところ **`__init__` の中、しかも try/except の中**だった。結論（v4.1-Small は transformers 5 を要求する）は変わらないが、**「import ゲートで捕まる」という誤解を招く**記述だった。実際には `import irodori_tts` は通り、破綻は初回合成時に起きて無言で VOICEVOX へ落ちる。依存の版を上げる回では**「import できる」ではなく「1 回合成できる」を成否の条件にする**旨を明記した。 |
