@@ -1334,15 +1334,33 @@ mod update_tests {
             root.display()
         );
 
+        // **実行の証跡をファイルへ残す。** 実機検証の出力は端末の履歴と見分けがつかず、
+        // 2026-09-11 に古い出力を新しい実行と取り違えて 2 往復を空費した。
+        let log_path = std::env::temp_dir().join("ugg-e7-verify.log");
+        let _ = std::fs::write(&log_path, "");
+        let log = log_path.clone();
+        let say = move |line: String| {
+            use std::io::Write;
+            println!("{line}");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+                let _ = writeln!(f, "{line}");
+            }
+        };
+        say(format!(
+            "[harness] E-7 rev2 差分ゲート / {} / log={}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            log_path.display()
+        ));
+
         let before_imports = import_report(&root.join("python").join("python.exe"));
-        println!("[before] imports={before_imports:?}");
+        say(format!("[before] imports={before_imports:?}"));
         let before = status(&root);
-        println!(
+        say(format!(
             "[before] present={} has_record={} up_to_date={}",
             before.present, before.has_record, before.up_to_date
-        );
-        println!("[before] outdated={:?}", before.outdated);
-        println!("[before] python={:?}", installed_python_version(&root));
+        ));
+        say(format!("[before] outdated={:?}", before.outdated));
+        say(format!("[before] python={:?}", installed_python_version(&root)));
         assert!(before.present, "前提: 使える状態であること");
         assert!(!before.up_to_date, "前提: 更新対象があること（既に最新なら検証にならない）");
         assert!(
@@ -1351,10 +1369,27 @@ mod update_tests {
             before.outdated
         );
 
-        let updated = update_irodori_runtime(&root, &before.outdated, |l| println!("  | {l}"))
-            .await
-            .expect("入れ直しに失敗");
-        println!("[updated] {updated:?}");
+        let outcome = update_irodori_runtime(&root, &before.outdated, |l| say(format!("  | {l}"))).await;
+        let updated = match outcome {
+            Ok(v) => {
+                say(format!("[updated] {v:?}"));
+                v
+            }
+            Err(e) => {
+                // 失敗そのものは想定内。**失敗したときに何が残ったか**まで証跡に出す。
+                say(format!("[failed] {e:#}"));
+                say(format!(
+                    "[failed] backup_left={} stamp_written={}",
+                    root.join(UPDATE_BACKUP_DIR).exists(),
+                    root.join(STAMP_FILE).exists()
+                ));
+                say(format!(
+                    "[failed] imports={:?}",
+                    import_report(&root.join("python").join("python.exe"))
+                ));
+                panic!("入れ直しに失敗: {e:#}");
+            }
+        };
         assert_eq!(updated, before.outdated, "対象が全部入れ直されること");
         assert!(
             !root.join(UPDATE_BACKUP_DIR).exists(),
@@ -1362,7 +1397,8 @@ mod update_tests {
             root.join(UPDATE_BACKUP_DIR).display()
         );
         let after = import_report(&root.join("python").join("python.exe"));
-        println!("[after] imports={after:?}");
+        say(format!("[after] imports={after:?}"));
+        say(format!("[after] status={:?}", status(&root)));
         assert!(
             import_regressions(&before_imports, &after).is_empty(),
             "入れ直す前に使えていたものが使えなくなっている"
