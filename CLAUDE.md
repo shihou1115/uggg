@@ -103,9 +103,9 @@ v0.0.3 で得た主な負債:
 | docs/test-plan.md | テスト戦略・手動チェックリスト | v1.19 ✅（§5 に A〜G 全節。モニタ選択 A-12〜14、advanced 独り言 D-4b〜e / 時事ネタ D-6b〜c、**配達の可視性 G-2b / 保留の集約 G-2c（v0.5）**、**v0.5.1: 無音発話 E-0 / recall B-5b / DB 破損検知 E-5b / `default_shell` E-6b、および A-4 口パク・B-4 問いかけ・E-5 エクスポートの具体化**、§5.9 実機検証記録。**v0.5.3: §3.2b 操作列テスト 4 本と、§2.2 のフロント test 基盤（Vitest + happy-dom）を実際に導入**） |
 | docs/daily-support-design.md | **日常支援 Tier S の Phase 2 設計書**（§4.6 実装契約・DB・M7〜M10） | 設計 v2.1 ✅（**M7〜M10 実装済み**、Tier S 完了） |
 | docs/regular-talk-design.md | **定例会話と天気（v0.3）の Phase 2 設計書**（§4.7 実装契約・天気 API 選定・M11〜M12） | 設計 v1.2 ✅（**M11・M12 実装済み** 2026-07-24） |
-| docs/manual.md | **取扱説明書（ユーザー向け）**。`tauri.conf.json` の `bundle.resources` で**インストーラに同梱**されるため、移動・改名は配布物を壊す | v0.5.3 時点 ✅ |
+| docs/manual.md | **取扱説明書（ユーザー向け）**。`tauri.conf.json` の `bundle.resources` で**インストーラに同梱**されるため、移動・改名は配布物を壊す | v0.5.4 時点 ✅ |
 | docs/ai_model_routing.md | **モデル役割分担の正本**（4 モデル体制・例外系・障害時の運用）。本ファイルの Model Routing 節はこの要約 | ✅ |
 | docs/text-reader-spec.md | **テキスト読み上げツールの変更仕様書**（spec §4.5.8 の実装契約） | v0.1.1 で出荷済み ✅ |
 | docs/script-reader-spec.md | **テキスト読み上げ 台本形式対応の変更仕様書**（サンプルは `docs/samples/script-sample.md`。manual から参照） | v0.1.2 で出荷済み ✅ |
-| docs/release-notes/ | 各リリースの記録（v0.1.0〜v0.5.3）。**歴史記録のため削除も編集もしない** | — |
+| docs/release-notes/ | 各リリースの記録（v0.1.0〜v0.5.4）。**歴史記録のため削除も編集もしない** | — |
 | [docs/_legacy-v003/baseline-v0.0.3.md](docs/_legacy-v003/baseline-v0.0.3.md) | **v0.0.3 機能・契約・残課題の網羅スナップショット**（v0.0.3 の生 docs は 2026-07-24 の docs 整理で削除。原本はプロトタイプ `C:\claude\ugga` と git 履歴に現存） | 参照用 |
