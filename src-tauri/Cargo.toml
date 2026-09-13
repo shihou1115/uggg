@@ -1,6 +1,6 @@
 [package]
 name = "ugg"
-version = "0.5.4"
+version = "0.5.5"
 description = "ugg — desktop companion"
 authors = ["ugg Project"]
 license = "MIT"
