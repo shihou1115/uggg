@@ -144,12 +144,18 @@ pub async fn sweep_orphans(asset_root: &Path, client: &reqwest::Client) -> usize
     sweep_orphans_with(asset_root, client, PROBE_TIMEOUT).await
 }
 
-/// 掃除で相手を確かめる時間。
+/// 掃除で、つながった相手の HTTP 応答を待つ時間。
+///
+/// 合成中・モデル読み込み中のサイドカーは `/health` に答えない。待ちきれなかった記録は
+/// 「応答しない」として残す（次の起動でまた確かめる）。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 掃除で、TCP の接続だけを確かめる時間。
 ///
 /// **Windows は閉じたポートへの接続が拒否されるまで約 2 秒かかる**（SYN を再送する。
-/// 2026-09-14 実測 2.02〜2.04 秒）。これより短いと、死んだ記録を「つながったのに応答が無い」と
-/// 取り違えて永久に残す（以前の 800ms では、死んだ記録はすべてタイムアウトで判定されていた）。
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 2026-09-14 実測 2.02〜2.04 秒）。これより短いと、死んだ記録の拒否を待ちきれず
+/// 「応答しない」と取り違えて永久に残す。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn sweep_orphans_with(
     asset_root: &Path,
@@ -161,6 +167,14 @@ async fn sweep_orphans_with(
         if !candidates.iter().any(|e| e.port == port) {
             candidates.push(ReadyFile { port, pid: 0 });
         }
+    }
+    if !candidates.is_empty() {
+        // 開始と 1 件ごとの所要時間をログに残す（2026-09-14、実環境で起動から判定まで 22 秒
+        // かかっていた原因を、ログから切り分けられなかったため）。
+        crate::ulog!(
+            "[irodori] 前回の実行の記録を確かめます ({} 件)",
+            candidates.len()
+        );
     }
     // **記録は、確かめ終えたものから 1 件ずつ消す**（2026-09-13 実機で発覚）。
     // 以前は先に台帳を空にしてから確かめていた。実機では起動直後に dev が落ち、
@@ -174,21 +188,26 @@ async fn sweep_orphans_with(
         if taken_by_a_new_child(&read_ledger(asset_root), entry) {
             continue;
         }
-        match identify_sidecar(client, entry.port, probe_timeout).await {
+        let started = Instant::now();
+        let probe = identify_sidecar(client, entry.port, probe_timeout).await;
+        let took = started.elapsed().as_millis();
+        match probe {
             Probe::Ours => {
                 if !request_shutdown(entry.port, client).await {
                     // 自分のものなのに止める要求が届かなかった。記録を残して次の起動で再試行する。
                     crate::ulog!(
-                        "[irodori] 前回の実行が残したサイドカーを止められませんでした (port={} pid={}、次の起動で再試行します)",
+                        "[irodori] 前回の実行が残したサイドカーを止められませんでした (port={} pid={}、{}ms、次の起動で再試行します)",
                         entry.port,
-                        entry.pid
+                        entry.pid,
+                        took
                     );
                     continue;
                 }
                 crate::ulog!(
-                    "[irodori] 前回の実行が残したサイドカーを止めました (port={} pid={})",
+                    "[irodori] 前回の実行が残したサイドカーを止めました (port={} pid={}、{}ms)",
                     entry.port,
-                    entry.pid
+                    entry.pid,
+                    took
                 );
                 stopped += 1;
             }
@@ -197,16 +216,18 @@ async fn sweep_orphans_with(
                 // （`/speech` は同期の合成を async の中で呼ぶので、その間 `/health` に答えない）。
                 // **捨てると、合成中に強制終了された孤児に二度と届かない**（2026-09-14 監査で発覚）。
                 crate::ulog!(
-                    "[irodori] 記録のサイドカーが応答しません (port={}、使用中の可能性があるので記録を残します)",
-                    entry.port
+                    "[irodori] 記録のサイドカーが応答しません (port={}、{}ms、使用中の可能性があるので記録を残します)",
+                    entry.port,
+                    took
                 );
                 continue;
             }
             Probe::NotOurs => {
                 // 接続を拒否された = 死んでいる / 答えたが形が違う = 別のサービス。触らない。
                 crate::ulog!(
-                    "[irodori] 記録のサイドカーは見つかりません (port={}、記録だけ捨てます)",
-                    entry.port
+                    "[irodori] 記録のサイドカーは見つかりません (port={}、{}ms、記録だけ捨てます)",
+                    entry.port,
+                    took
                 );
             }
         }
@@ -227,7 +248,19 @@ enum Probe {
 }
 
 /// そのポートの相手が何者か確かめる。
+///
+/// **まず TCP の接続だけを、非同期ランタイムの外（待機スレッド）で確かめる**（2026-09-14 実環境で発覚）。
+/// HTTP のタイムアウトだけで判定すると、起動直後の混雑で「接続拒否の知らせ」と「タイマー」が
+/// 同時に処理待ちになったとき、reqwest は**タイムアウトを先に見る**（`PendingRequest::poll`）ため、
+/// 拒否された死んだ記録を「応答しない」と取り違えて残し続けた。v0.5.5 インストール版は、何も
+/// 待ち受けていないポートを起動のたびに「応答しません」と判定していた。待機スレッドでの接続の
+/// 結果はタイマーと先着を争わない。
 async fn identify_sidecar(client: &reqwest::Client, port: u16, timeout: Duration) -> Probe {
+    match tcp_reach(port, CONNECT_TIMEOUT).await {
+        Reach::Refused => return Probe::NotOurs,
+        Reach::NoAnswer => return Probe::Unanswered,
+        Reach::Connected => {}
+    }
     let url = format!("http://127.0.0.1:{port}/health");
     let resp = match client.get(&url).timeout(timeout).send().await {
         Ok(resp) => resp,
@@ -240,6 +273,31 @@ async fn identify_sidecar(client: &reqwest::Client, port: u16, timeout: Duration
         Ok(_) => Probe::NotOurs,
         Err(err) if err.is_timeout() => Probe::Unanswered,
         Err(_) => Probe::NotOurs,
+    }
+}
+
+/// TCP で見たそのポートの様子。
+#[derive(Debug, PartialEq, Eq)]
+enum Reach {
+    /// 接続できた（待ち受けている相手がいる）。
+    Connected,
+    /// 接続を拒否された、またはつなげなかった（誰もいない）。
+    Refused,
+    /// 時間内に結果が出なかった（決めつけない）。
+    NoAnswer,
+}
+
+/// 待機スレッドで TCP の接続だけを確かめる。
+async fn tcp_reach(port: u16, timeout: Duration) -> Reach {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let joined =
+        tokio::task::spawn_blocking(move || std::net::TcpStream::connect_timeout(&addr, timeout))
+            .await;
+    match joined {
+        Ok(Ok(_stream)) => Reach::Connected,
+        Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => Reach::NoAnswer,
+        Ok(Err(_)) => Reach::Refused,
+        Err(_) => Reach::NoAnswer,
     }
 }
 
@@ -731,21 +789,42 @@ mod tests {
         drop(busy);
     }
 
-    /// **確かめる時間は、閉じたポートの拒否より長い**（2026-09-14 実測で発覚）。
+    /// **TCP の接続を確かめる時間は、閉じたポートの拒否より長い**（2026-09-14 実測で発覚）。
     ///
     /// Windows は閉じたポートへの接続が拒否されるまで約 2 秒かかる。確かめる時間がそれより
-    /// 短いと、死んだ記録を「応答しない」と取り違えて**永久に残す**（以前の 800ms がそうだった）。
+    /// 短いと、死んだ記録を「応答しない」と取り違えて**永久に残す**。
     #[test]
-    fn the_probe_outlasts_a_refused_connection() {
+    fn the_connect_check_outlasts_a_refused_connection() {
         let port = free_port();
         let started = Instant::now();
         let refused = std::net::TcpStream::connect(("127.0.0.1", port));
         let took = started.elapsed();
         assert!(refused.is_err(), "前提: 誰も待ち受けていない");
         assert!(
-            PROBE_TIMEOUT > took * 2,
-            "拒否に {took:?} かかる環境で、確かめる時間 {PROBE_TIMEOUT:?} は短すぎる"
+            CONNECT_TIMEOUT > took * 2,
+            "拒否に {took:?} かかる環境で、確かめる時間 {CONNECT_TIMEOUT:?} は短すぎる"
         );
+    }
+
+    /// **HTTP の待ちが拒否より先に切れても、死んだ記録を「応答しない」と取り違えない**（2026-09-14 実環境で発覚）。
+    ///
+    /// v0.5.5 インストール版は、何も待ち受けていないポートを起動のたびに「応答しません」と判定し、
+    /// 記録を残し続けた。起動直後の混雑で拒否の知らせとタイマーが同時に処理待ちになると、reqwest は
+    /// タイムアウトを先に見る。ここでは **HTTP の待ちを拒否（Windows で約 2 秒）より短くして**同じ状況を作る。
+    #[tokio::test]
+    async fn a_dead_port_is_not_mistaken_for_a_busy_one() {
+        let probe = identify_sidecar(&test_client(), free_port(), Duration::from_millis(50)).await;
+        assert_eq!(probe, Probe::NotOurs, "拒否されたら死んでいる");
+    }
+
+    /// つながったのに答えない相手は、TCP の確認を足しても「応答しない」のまま（使用中の孤児の役）。
+    #[tokio::test]
+    async fn a_silent_listener_is_still_unanswered() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let probe = identify_sidecar(&test_client(), port, Duration::from_millis(300)).await;
+        assert_eq!(probe, Probe::Unanswered, "つながったが答えない = 使用中でありうる");
+        drop(silent);
     }
 
     /// 自分の孤児は止めて記録を消し、**止める要求が届かなければ記録を残す**（次の起動で再試行）。
