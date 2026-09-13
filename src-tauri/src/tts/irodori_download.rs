@@ -216,6 +216,64 @@ pub fn current_models() -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+/// **欄が空の記録が指す環境の中身** — v0.5.4 と v0.5.5 が入れていた要件（固定値）。
+///
+/// v0.5.4 が書いた記録には要件・モデルの欄が無い。記録そのものが無い環境（v0.5.4 より前の
+/// 導入）も同じ。そうした環境に入っているのは**当時のビルドが入れた版**であって、
+/// **いまのビルドが求める版ではない**。
+///
+/// **`current_requirements()` / `current_models()` で代用してはいけない**（2026-09-14 監査で発覚）。
+/// 代用すると、要件を変えたビルドが「いまの値」を基準値として書き、差が出ずに**更新が
+/// 永久に届かない**（v0.5.5 がまさに直した穴の再発）。v0.5.5 のうちは両者が一致するので鳴らない。
+/// **要件やモデルを変えても、この定数は変えない。**
+const V054_BASELINE_REQUIREMENTS: &[&str] = &[
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.32.1",
+    "huggingface_hub==0.27.0",
+    "numpy<2",
+    "soundfile==0.12.1",
+    "torch>=2.10.0,<2.11.0",
+    "torchaudio>=2.10.0,<2.11.0",
+    "torchcodec>=0.10.0,<0.11.0",
+    "transformers<5",
+    "accelerate>=1.0.0",
+    "peft>=0.18.0",
+    "safetensors>=0.7.0",
+    "datasets>=3.0.0",
+    "librosa",
+    "numba>=0.57.0",
+    "llvmlite>=0.40.0",
+    "sentencepiece>=0.1.99,<0.2",
+    "pyyaml>=6.0",
+    "tqdm>=4.67.3",
+    "einops",
+    "descript-audiotools>=0.7.2",
+];
+
+/// [`V054_BASELINE_REQUIREMENTS`] と同じ理由で固定するモデル（名前 → `repo@revision`）。
+const V054_BASELINE_MODELS: &[(&str, &str)] = &[
+    ("model_synth", "Aratako/Irodori-TTS-500M-v3@main"),
+    (
+        "model_voice_design",
+        "Aratako/Irodori-TTS-500M-v2-VoiceDesign@main",
+    ),
+    ("model_codec", "Aratako/Semantic-DACVAE-Japanese-32dim@main"),
+];
+
+fn v054_baseline_requirements() -> std::collections::BTreeMap<String, String> {
+    V054_BASELINE_REQUIREMENTS
+        .iter()
+        .map(|spec| (requirement_name(spec).to_string(), spec.to_string()))
+        .collect()
+}
+
+fn v054_baseline_models() -> std::collections::BTreeMap<String, String> {
+    V054_BASELINE_MODELS
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
 /// サイドカーへ渡すモデル指定（起動経路と `--download-only` の両方で使う）。
 ///
 /// **2 経路あるので 1 か所にまとめる。** 片方だけに渡すと、取得した先と読む先が食い違う。
@@ -351,13 +409,18 @@ pub fn record_installed<F>(asset_root: &Path, mut on_line: F) -> Result<()>
 where
     F: FnMut(&str),
 {
-    // 初回導入は「入れ直せる 3 本」を入れたことになる。**`python` をここに含めない** —
-    // `ensure_python_embeddable` は `python.exe` があれば skip するので、
-    // 「入れた」と「入っている」は一致しない。実物に聞いて一致したときだけ記録する。
+    // 初回導入は「入れ直せる 3 本」と、**名前付き要件とモデルの全部**を入れたことになる。
+    // **`python` をここに含めない** — `ensure_python_embeddable` は `python.exe` があれば
+    // skip するので、「入れた」と「入っている」は一致しない。実物に聞いて一致したときだけ記録する。
+    //
+    // **要件とモデルも記録する**（2026-09-14 監査で発覚）。以前は固定 URL の 3 本しか渡さず、
+    // 要件・モデルの欄が空のまま書かれて、あとで基準値を書き足す処理に頼っていた。
     let installed: Vec<String> = current_pins()
         .keys()
         .filter(|k| updatable_pin(k).is_some())
         .cloned()
+        .chain(current_requirements().into_keys())
+        .chain(current_models().into_keys())
         .collect();
     record_after_install(asset_root, &installed, |l| on_line(l))?;
     on_line("導入内容を記録しました");
@@ -508,17 +571,17 @@ fn outdated_list(
     let mut out = outdated_pins(recorded, &current);
     // **固定 URL だけでは足りない** (v0.5.5 項目 3)。名前付き要件の版を変えても
     // `outdated` が空のままで、更新ボタンすら出なかった。
-    // **記録に無いものを「古い」と扱わない** (v0.5.5)。
-    //
-    // 固定 URL の 3 本は「記録が無い＝ pin 前の `refs/heads/main` が入っている」と
-    // 実機で確認できていたので全部対象にしてよかった。**要件とモデルは違う。**
-    // 記録が無いのは「v0.5.4 以前が書いた記録に、その欄がまだ無い」だけで、
-    // 中身が古い証拠にはならない。ここを対象にすると、v0.5.4 から上げただけの
-    // ユーザーに **torch を含む数 GB の再取得**を強いる。
-    // v0.5.4 の python 判定と同じ原則 — **代償が非対称なら、証拠が無い側へ倒す**。
-    // 基準値は `status()` が書き込む（下の `backfill_baseline`）。
-    out.extend(outdated_recorded_only(recorded_reqs, &current_requirements()));
-    out.extend(outdated_recorded_only(recorded_models, &current_models()));
+    // 欄が空の記録の読み方は `outdated_section` を参照。
+    out.extend(outdated_section(
+        recorded_reqs,
+        &v054_baseline_requirements(),
+        &current_requirements(),
+    ));
+    out.extend(outdated_section(
+        recorded_models,
+        &v054_baseline_models(),
+        &current_models(),
+    ));
     out.sort();
     out.dedup();
     out.retain(|n| n != "python");
@@ -566,52 +629,39 @@ pub fn status(asset_root: &Path) -> IrodoriStatus {
     }
 }
 
-/// 記録された pin と、いまのビルドが要求する pin を突き合わせる。
+/// 要件・モデルの記録といまの要求を突き合わせる (v0.5.5 項目 3)。
 ///
-/// 返すのは**入れ直しが要る名前**。`current` にあって `recorded` と違うもの、および
-/// `current` にあって `recorded` に無いもの（pin を増やした場合）。
-/// 逆に `recorded` にしか無いものは無視する（pin を減らした場合、入れ直しは要らない）。
-/// **記録にある名前だけ**を突き合わせる（記録に無いものは対象にしない）。
+/// **欄が空なら、その環境には v0.5.4 の基準値が入っているとみなす。** 欄が空なのは
+/// v0.5.4 が書いた記録か、記録そのものが無い環境で、どちらも当時のビルドが入れた版が入っている。
 ///
-/// `outdated_pins` との違いは「記録に無い」の扱い。あちらは対象にする（固定 URL は
-/// 記録が無い＝古いと実機で確認できている）。こちらは対象にしない（要件・モデルは
-/// 記録の欄が無いだけで、古い証拠にならない）。
-fn outdated_recorded_only(
+/// - 固定 URL の 3 本と違い「欄が無い＝古い」とは言えない（言うと torch を含む数 GB の
+///   再取得を強いる）
+/// - **「欄が無い＝いまの要求どおり」とも言えない**（言うと要件を変えても届かない。
+///   2026-09-14 監査で発覚）
+///
+/// どちらの証拠も無いので、**当時の固定値で読む**。欄があって名前が無いものは、あとから
+/// 増えた要件なので対象にする（`outdated_pins` と同じ規則）。
+fn outdated_section(
     recorded: &std::collections::BTreeMap<String, String>,
+    baseline: &std::collections::BTreeMap<String, String>,
     current: &std::collections::BTreeMap<String, String>,
 ) -> Vec<String> {
-    current
-        .iter()
-        .filter(|(name, value)| {
-            recorded
-                .get(*name)
-                .is_some_and(|recorded_value| recorded_value != *value)
-        })
-        .map(|(name, _)| name.clone())
-        .collect()
+    let effective = if recorded.is_empty() { baseline } else { recorded };
+    outdated_pins(effective, current)
 }
 
-/// 記録に欄が無い要件・モデルへ、**いまの値を基準値として書き込む** (v0.5.5)。
+/// 欄が空の記録へ、**v0.5.4 の基準値**を書き込む (v0.5.5)。
 ///
-/// これが無いと、v0.5.4 が書いた記録は要件の欄が空のままで、**次に要件を変えても
-/// 差が出ず永久に届かない**（v0.5.5 がまさに直した穴の再発）。
-/// 書いてよい根拠は、**v0.5.5 が要件もモデルも変えていない**こと — v0.5.4 の記録が
-/// 指す環境は、定義上いまの要求と一致している。
+/// 判定は書き込まなくても `outdated_section` が基準値で読むので正しい。書き込むのは、
+/// 記録を「その環境に何が入っているか」の正本として完結させるため。
+///
+/// **いまの値ではなく固定の基準値を書く**（2026-09-14 監査で発覚）。以前は
+/// `current_requirements()` を書いており、根拠は「v0.5.5 は要件を変えていない」という
+/// コメントだけだった。要件を変えたビルドがここを通ると、新しい値を基準値として書いて
+/// 差が出ず、**更新が永久に届かない**。
 fn backfill_baseline(asset_root: &Path, stamp: &InstalledStamp) -> InstalledStamp {
-    let mut out = stamp.clone();
-    let mut changed = false;
-    for (name, value) in current_requirements() {
-        if !out.requirements.contains_key(&name) {
-            out.requirements.insert(name, value);
-            changed = true;
-        }
-    }
-    for (name, value) in current_models() {
-        if !out.models.contains_key(&name) {
-            out.models.insert(name, value);
-            changed = true;
-        }
-    }
+    let out = baseline_filled(stamp, &v054_baseline_requirements(), &v054_baseline_models());
+    let changed = out.requirements != stamp.requirements || out.models != stamp.models;
     if changed {
         let _ = write_stamp_pins(
             asset_root,
@@ -621,6 +671,25 @@ fn backfill_baseline(asset_root: &Path, stamp: &InstalledStamp) -> InstalledStam
             out.models.clone(),
         );
         crate::ulog!("[irodori] 導入記録に要件・モデルの基準値を書き足しました");
+    }
+    out
+}
+
+/// `backfill_baseline` の核（純粋関数）。**欄が空のときだけ**基準値で埋める。
+///
+/// 欄が 1 件でも埋まっている記録には触らない — それはその時のビルドが全部を記録したもので、
+/// 名前が無いのは後から増えた要件だから（`outdated_section` が対象にする）。
+fn baseline_filled(
+    stamp: &InstalledStamp,
+    baseline_requirements: &std::collections::BTreeMap<String, String>,
+    baseline_models: &std::collections::BTreeMap<String, String>,
+) -> InstalledStamp {
+    let mut out = stamp.clone();
+    if out.requirements.is_empty() {
+        out.requirements = baseline_requirements.clone();
+    }
+    if out.models.is_empty() {
+        out.models = baseline_models.clone();
     }
     out
 }
@@ -892,6 +961,16 @@ impl Drop for IrodoriBusyGuard {
     }
 }
 
+/// `IRODORI_BUSY` を取る・見るテストどうしを直列にする（2026-09-14 監査で発覚）。
+///
+/// `IRODORI_BUSY` はプロセス全体で 1 つで、cargo test はテストを並列に走らせる。奪い合うと
+/// `acquire().unwrap()` の panic や、busy のはずが空いている（その逆）の assert 失敗がたまに起きる。
+#[cfg(test)]
+pub(crate) fn lock_busy_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 const UPDATE_BACKUP_DIR: &str = ".update-backup";
 
 /// pin ごとの「入れ直し方」。
@@ -1067,9 +1146,11 @@ fn needs_torch_index(name: &str) -> bool {
 /// 固定 URL の 3 本と違い、**依存を解決させる必要がある**（`transformers` の major を
 /// 上げれば `huggingface_hub` も動く）。そのため `--no-deps` は付けない。
 ///
-/// **守れる範囲を正直に書いておく。** 退避して戻せるのは「その名前のパッケージ」だけで、
-/// **依存の連鎖まで元に戻せるわけではない**。失敗したときは、記録してある
-/// `resolved`（実際に入っていた版）へ戻すことを試み、それも駄目なら何が起きたかを伝える。
+/// **守れる範囲を正直に書いておく。** この経路には**退避も復元も無い**（固定 URL の 3 本と違う）。
+/// pip が依存を連鎖して入れ替えるので、名前 1 つを退避しても元の状態には戻せない。
+/// 失敗したときは、依存の入れ替わりを戻せていないことを伝えて止まる。
+/// 以前ここに「記録してある `resolved` へ戻すことを試み」と書いていたが、そのコードは無かった
+/// （2026-09-14 監査で発覚。取説と確認ダイアログも同じ約束をしていたので改めた）。
 /// **「1 回合成できる」までの検証は v0.5.6（major 移行）で入れる** — 同じ major の中の
 /// 版変更なら import の前後比較と版の一致で足りる。
 async fn reinstall_requirement<F>(
@@ -1762,6 +1843,24 @@ mod stamp_tests {
         );
     }
 
+    /// **初回導入は、要件とモデルも全部記録する**（2026-09-14 監査で発覚）。
+    ///
+    /// 以前は固定 URL の 3 本しか記録せず、要件・モデルの欄は空のまま書かれて、あとで基準値を
+    /// 書き足す処理に頼っていた。書き足す値が「いまのビルドの値」だったため、要件を変えた
+    /// ビルドで差が出ず更新が届かない穴の入口になっていた。
+    #[test]
+    fn the_install_path_records_every_requirement_and_model() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("python")).unwrap();
+        std::fs::write(dir.path().join("python").join("python.exe"), b"x").unwrap();
+
+        record_installed(dir.path(), |_| {}).expect("記録は書けること");
+
+        let stamp = read_stamp(dir.path()).expect("記録があること");
+        assert_eq!(stamp.requirements, current_requirements(), "要件を全部記録する");
+        assert_eq!(stamp.models, current_models(), "モデルを全部記録する");
+    }
+
     /// **入れ直せた分だけ**を現在値へ反映する。全部を現在値にすると、入れ直していない
     /// 依存まで「最新」と記録して記録そのものが嘘になる。
     #[test]
@@ -1861,13 +1960,13 @@ mod stamp_tests {
         );
     }
 
-    /// **記録に欄が無いものを「古い」と扱わない** (v0.5.5)。
+    /// **欄が空の記録は、v0.5.4 の基準値が入っているとみなす** (v0.5.5、2026-09-14 監査で改めた)。
     ///
     /// 固定 URL の 3 本は「記録が無い＝ pin 前の `refs/heads/main` が入っている」と
     /// 実機で確認できているので全部対象にしてよい。**要件とモデルは違う** — 記録に
     /// 欄が無いのは v0.5.4 以前が書いた記録だからで、中身が古い証拠にはならない。
     /// ここを対象にすると、v0.5.4 から上げただけのユーザーに **torch を含む数 GB の
-    /// 再取得**を強いる。**代償が非対称なら、証拠が無い側へ倒す**（v0.5.4 の python 判定と同じ）。
+    /// 再取得**を強いる。v0.5.5 は要件を変えていないので、基準値で読んでも対象は出ない。
     #[test]
     fn a_missing_record_does_not_accuse_requirements_or_models() {
         let dir = tempfile::tempdir().unwrap();
@@ -1915,10 +2014,10 @@ mod stamp_tests {
         let persisted = read_stamp(dir.path()).expect("記録が読めること");
         assert_eq!(
             persisted.requirements,
-            current_requirements(),
+            v054_baseline_requirements(),
             "status() から基準値が書かれていない（呼び忘れ）"
         );
-        assert_eq!(persisted.models, current_models(), "モデルの基準値も同じ");
+        assert_eq!(persisted.models, v054_baseline_models(), "モデルの基準値も同じ");
     }
 
     /// **基準値を書き足す** (v0.5.5)。
@@ -1941,18 +2040,98 @@ mod stamp_tests {
         assert!(before.requirements.is_empty() && before.models.is_empty(), "前提");
 
         let after = backfill_baseline(dir.path(), &before);
-        assert_eq!(after.requirements, current_requirements(), "要件の基準値が入る");
-        assert_eq!(after.models, current_models(), "モデルの基準値が入る");
+        assert_eq!(after.requirements, v054_baseline_requirements(), "要件の基準値が入る");
+        assert_eq!(after.models, v054_baseline_models(), "モデルの基準値が入る");
 
         // **書き込まれて残ること**（次回の判定で使えなければ意味が無い）
         let persisted = read_stamp(dir.path()).unwrap();
-        assert_eq!(persisted.requirements, current_requirements(), "保存されていない");
+        assert_eq!(persisted.requirements, v054_baseline_requirements(), "保存されていない");
 
         // 基準値が入ったあとは、変更したものだけが対象になる
         let mut reqs = persisted.requirements.clone();
         reqs.insert("transformers".to_string(), "transformers<4".to_string());
         let got = outdated_list(dir.path(), &persisted.pins, &reqs, &persisted.models);
         assert_eq!(got, ["transformers"], "変えた 1 本だけ: {got:?}");
+    }
+
+    /// **欄が空の記録を「いまの要求どおり」と読まない**（2026-09-14 監査で発覚）。
+    ///
+    /// 読んでしまうと、要件を変えたビルドで差が出ず、**v0.5.4 から上げただけの環境に
+    /// 更新が永久に届かない**。v0.5.5 のうちは基準値といまの値が一致して鳴らないので、
+    /// 食い違う状況を作って確かめる。
+    #[test]
+    fn an_empty_section_is_read_as_the_frozen_baseline() {
+        let baseline = pins_of(&[("transformers", "transformers<5")]);
+        let current = pins_of(&[("transformers", "transformers>=5")]);
+        assert_eq!(
+            outdated_section(&Default::default(), &baseline, &current),
+            ["transformers"],
+            "欄が空でも、当時の版といまの要求が違えば届ける"
+        );
+        assert!(
+            outdated_section(&Default::default(), &current, &current).is_empty(),
+            "当時の版のままでよければ何もしない（数 GB の再取得を強いない）"
+        );
+    }
+
+    /// **あとから増えた要件も届ける**（2026-09-14 監査の掃討で発覚）。
+    ///
+    /// 以前は「記録に名前が無いものは古いと扱わない」だったので、要件を新しく足しても
+    /// 既存環境には入らなかった。欄が埋まった記録で名前が無いのは、後から増えたものだけ。
+    #[test]
+    fn a_requirement_added_later_is_delivered() {
+        let recorded = pins_of(&[("transformers", "transformers<5")]);
+        let current = pins_of(&[("transformers", "transformers<5"), ("newdep", "newdep>=1")]);
+        assert_eq!(outdated_section(&recorded, &recorded, &current), ["newdep"]);
+    }
+
+    /// **基準値で埋めるのは欄が空のときだけ、埋めるのは固定の基準値**（2026-09-14 監査で改めた）。
+    ///
+    /// いまのビルドの値で埋めると、要件を変えたビルドで差が出ず更新が届かない。
+    /// 欄が埋まっている記録（その時のビルドが全部を記録したもの）には触らない。
+    #[test]
+    fn the_baseline_fills_only_an_empty_section_with_the_frozen_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline_reqs = pins_of(&[("transformers", "transformers<5")]);
+        let baseline_models = pins_of(&[("model_synth", "old@main")]);
+
+        write_stamp_pins(
+            dir.path(),
+            current_pins(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let empty = read_stamp(dir.path()).unwrap();
+        let filled = baseline_filled(&empty, &baseline_reqs, &baseline_models);
+        assert_eq!(filled.requirements, baseline_reqs, "渡された基準値で埋める");
+        assert_eq!(filled.models, baseline_models);
+
+        let recorded = pins_of(&[("transformers", "transformers>=5")]);
+        write_stamp_pins(
+            dir.path(),
+            current_pins(),
+            Default::default(),
+            recorded.clone(),
+            current_models(),
+        )
+        .unwrap();
+        let full = read_stamp(dir.path()).unwrap();
+        let untouched = baseline_filled(&full, &baseline_reqs, &baseline_models);
+        assert_eq!(untouched.requirements, recorded, "埋まっている欄は書き換えない");
+        assert_eq!(untouched.models, current_models());
+    }
+
+    /// 固定の基準値の写しが正しいこと（**v0.5.5 のうちは、いまの要求と一致する**）。
+    ///
+    /// v0.5.4 と v0.5.5 は要件もモデルも変えていないので、写し間違いならここで分かる。
+    /// **v0.5.6 で要件やモデルを変えたら、この等式は崩れるのが正しい。** そのときは
+    /// このテストを消す（`V054_BASELINE_*` の定数は変えない）。
+    #[test]
+    fn the_frozen_baseline_was_copied_correctly() {
+        assert_eq!(v054_baseline_requirements(), current_requirements());
+        assert_eq!(v054_baseline_models(), current_models());
     }
 
     /// 一致している記録は信じ、**実物に聞かない**。ここが常に真になると、設定パネルを
@@ -2389,6 +2568,7 @@ mod update_tests {
     /// 同じ `site-packages` を 2 経路が触ると、退避 → 入れ直し → 復元のどの段も守れない。
     #[test]
     fn install_and_update_do_not_overlap() {
+        let _serial = lock_busy_for_test();
         let first = IrodoriBusyGuard::acquire().expect("1 本目は取れる");
         assert!(
             IrodoriBusyGuard::acquire().is_err(),

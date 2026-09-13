@@ -52,6 +52,15 @@ pub(crate) fn sanitize_sidecar_error(body: &str, secrets: &[&str]) -> String {
         // 短すぎる文字列で置換すると、無関係な語まで潰れて診断にならない。
         if secret.chars().count() >= 4 {
             out = out.replace(secret, "«伏字»");
+            // **500 の本文は JSON**（`{"detail": "..."}`）なので、`"` `\` 改行を含む発話は
+            // エスケープされた形で載り、そのままの文字列とは一致しない（2026-09-14 監査で発覚）。
+            // starlette は `ensure_ascii=False` で日本語はそのまま、serde_json も同じ規則で書く。
+            if let Ok(json) = serde_json::to_string(secret) {
+                let escaped = &json[1..json.len() - 1];
+                if escaped != *secret {
+                    out = out.replace(escaped, "«伏字»");
+                }
+            }
         }
     }
     crate::dialogue::llm::truncate_for_log(&out)
@@ -257,25 +266,49 @@ impl IrodoriClient {
         let handle = sidecar::start_sidecar(asset_root, &script, mock, on_stderr)
             .await
             .map_err(|e| TtsError::SidecarStart(format!("{e:#}")))?;
-        let port = handle.port;
+        self.adopt_sidecar(handle).await
+    }
 
-        // 競合チェック: 別スレッドが先に起動済みなら自分の handle を捨てる。
-        let conflict: Option<(u16, SidecarHandle)> = {
+    /// 起動し終えたサイドカーを採用する。
+    ///
+    /// **起動前の busy 判定だけでは足りない**（2026-09-14 監査で発覚）。起動には数秒かかり、
+    /// その間に更新が始まると、更新側の `shutdown()` は**まだ保存されていないハンドル**を見て
+    /// 何もしない。そのまま保存すると、入れ替え中の `site-packages` で起動したサイドカーが居座る。
+    /// **保存と同じ錠の中で busy を見直す。** 更新側は busy を立ててから `shutdown()`（同じ錠）を
+    /// 呼ぶので、どちらが先に錠を取っても取りこぼさない。
+    async fn adopt_sidecar(&self, handle: SidecarHandle) -> Result<u16, TtsError> {
+        enum Adopt {
+            Stored(u16),
+            // 別スレッドが先に起動済み。自分の handle を捨てて相手を使う。
+            Redundant(u16, SidecarHandle),
+            // 起動の最中に導入・更新が始まった。
+            Busy(SidecarHandle),
+        }
+        let decision = {
             let mut guard = self.sidecar.lock().expect("irodori sidecar poisoned");
             if let Some(existing) = guard.as_ref() {
-                Some((existing.port, handle))
+                Adopt::Redundant(existing.port, handle)
+            } else if crate::tts::irodori_download::is_busy() {
+                Adopt::Busy(handle)
             } else {
+                let port = handle.port;
                 *guard = Some(handle);
-                None
+                Adopt::Stored(port)
             }
         };
-
-        match conflict {
-            Some((existing_port, redundant)) => {
+        match decision {
+            Adopt::Stored(port) => Ok(port),
+            Adopt::Redundant(existing_port, redundant) => {
                 let _ = sidecar::shutdown_sidecar(redundant, &self.client).await;
                 Ok(existing_port)
             }
-            None => Ok(port),
+            Adopt::Busy(started) => {
+                let _ = sidecar::shutdown_sidecar(started, &self.client).await;
+                Err(TtsError::SidecarStart(
+                    "起動の途中で Irodori ランタイムの導入または更新が始まったため、起動したサイドカーを止めました。voicevox 経路で発話します"
+                        .to_string(),
+                ))
+            }
         }
     }
 
@@ -452,6 +485,7 @@ mod tests {
     /// 落ちる。エラーの中身で「busy で止めた」と「起動を試みた」を区別できる。
     #[tokio::test]
     async fn a_running_update_blocks_a_new_sidecar() {
+        let _serial = crate::tts::irodori_download::lock_busy_for_test();
         let client = super::IrodoriClient::new();
         let nowhere = std::path::Path::new("Z:/ugg-does-not-exist");
 
@@ -474,6 +508,71 @@ mod tests {
             !format!("{err}").contains("進行中"),
             "更新が終わったら塞がないこと: {err}"
         );
+    }
+
+    /// **起動の途中で更新が始まったら、起動したサイドカーを採用しない**（2026-09-14 監査で発覚）。
+    ///
+    /// 起動前の busy 判定の後、起動（数秒）の間に更新が始まると、更新側の `shutdown()` は
+    /// まだ保存されていないハンドルを見て何もしない。採用の時点で見直さないと、入れ替え中の
+    /// `site-packages` で起動したサイドカーが居座る。子プロセスには長く走る `ping` を使う。
+    #[tokio::test]
+    async fn an_update_that_begins_mid_launch_is_not_ignored() {
+        let _serial = crate::tts::irodori_download::lock_busy_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let launched = || {
+            let child = tokio::process::Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .kill_on_drop(false)
+                .spawn()
+                .expect("ping を起動できること");
+            let pid = child.id().unwrap();
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            (super::SidecarHandle::for_test(dir.path(), port, pid, child), pid)
+        };
+        let client = super::IrodoriClient::new();
+
+        // 起動の最中に更新が始まった
+        let (started, _) = launched();
+        let guard = crate::tts::irodori_download::IrodoriBusyGuard::acquire().unwrap();
+        let err = client
+            .adopt_sidecar(started)
+            .await
+            .expect_err("更新中に起動し終えたものは採用しない");
+        assert!(format!("{err}").contains("導入または更新"), "{err}");
+        assert!(client.current_port().is_none(), "居座らせない");
+        drop(guard);
+
+        // 更新が無ければ採用する
+        let (started, pid) = launched();
+        let port = started.port;
+        assert_eq!(client.adopt_sidecar(started).await.unwrap(), port);
+        assert_eq!(client.current_port(), Some(port), "採用したものを使う");
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+    }
+
+    /// **JSON でエスケープされた発話も伏せる**（2026-09-14 監査で発覚）。
+    ///
+    /// 500 の本文は `{"detail": "..."}` の JSON なので、`"` や改行を含む発話はエスケープされた
+    /// 形で載り、そのままの文字列とは一致しない。読み上げのチャンクや LLM の出力には普通に含まれる。
+    #[test]
+    fn a_json_escaped_utterance_is_still_hidden() {
+        let spoken = "彼は「\"大丈夫\"」と言った\nそして帰った";
+        let body = serde_json::json!({ "detail": format!("Irodori 合成失敗: bad input {spoken}") })
+            .to_string();
+        assert!(!body.contains(spoken), "前提: 本文ではエスケープされている");
+        let got = super::sanitize_sidecar_error(&body, &[spoken, ""]);
+        assert!(
+            !got.contains("大丈夫") && !got.contains("帰った"),
+            "発話が残っている: {got}"
+        );
+        assert!(got.contains("«伏字»"), "{got}");
     }
 
     /// **発話テキストを診断ログへ残さない** (v0.5.5 項目 1、spec §3.3 / v0.5.3 項目 7)。

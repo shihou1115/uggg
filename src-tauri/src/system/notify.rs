@@ -126,7 +126,9 @@ pub async fn notify(app: &AppHandle, state: &Arc<AppState>, kind: NoticeKind) {
     // ユーザーに見せるのはキャラの台詞（辞書の行）でよいが、**辞書キーが存在すると
     // `fallback_text()` が使われず、`reason` がどこにも残らなかった**。
     // 「Irodori-TTS が利用できません」とだけ出て、原因は永久に分からない状態だった。
-    // 載せる文字列は生成元で伏字・切り詰め済み（`sanitize_sidecar_error`）。
+    // 載せる理由に会話の本文は入らない。合成失敗（`IrodoriUnavailable`）は生成元で伏字・
+    // 切り詰め済み（`sanitize_sidecar_error`）。資産 DL の失敗（`VoicevoxDlFailed` /
+    // `IrodoriDlFailed`）は通信・ファイル操作のエラーで、そもそも会話を含まない（切り詰めもしない）。
     crate::ulog!("[notify] {}", kind.fallback_text());
     let key = kind.dict_key();
     let line = {

@@ -249,17 +249,42 @@ class RealModelBackend:
         except Exception:
             return "cpu"
 
-    def _checkpoint_path(self, repo: str, revision: str = "main") -> Path:
+    def _checkpoint_path(self, repo: str, revision: str) -> Path:
+        # revision に既定値を持たせない（2026-09-14 監査の掃討で外した）。既定値があると、
+        # 呼び出し側が渡し忘れても黙って `main` の置き場所を読み、直した穴と同じ形に戻る。
         return self.asset_dir / "model" / model_dir_name(repo, revision) / "model.safetensors"
 
-    def _build_runtime(self, repo: str):
-        """upstream infer.py の InferenceRuntime.from_key(RuntimeKey(...)) と同じ構成。"""
+    def _codec_location(self) -> str:
+        """コーデックの読み先。**`main` 以外の revision は、取得したその置き場所から読む。**
+
+        `main` のときは従来どおり repo ID を渡す（ランタイムが HF キャッシュから読む。
+        既存環境の挙動を変えない）。固定 revision を repo ID のまま渡すと、ランタイムは
+        revision を知らずに `main` を読む。置き場所に無ければ読み込みで失敗させる
+        （黙って別の版を読むより、理由がログに残るほうがよい）。
+        """
+        if MODEL_REVISION_CODEC == "main":
+            return MODEL_REPO_CODEC
+        return str(
+            self.asset_dir
+            / "model"
+            / model_dir_name(MODEL_REPO_CODEC, MODEL_REVISION_CODEC)
+            / "weights.pth"
+        )
+
+    def _build_runtime(self, repo: str, revision: str):
+        """upstream infer.py の InferenceRuntime.from_key(RuntimeKey(...)) と同じ構成。
+
+        **取得した revision の置き場所から読む**（2026-09-14 監査で発覚）。以前は
+        `_checkpoint_path(repo)` で常に `main` の置き場所を読んでいた。Rust 側で revision を
+        固定値へ上げると、既存環境は「更新済み」と記録したまま古い重みを読み続け、新規環境は
+        FileNotFoundError で無言のフォールバックになる（取得側だけ直して読み込み側を残した形）。
+        """
         from irodori_tts.inference_runtime import (  # type: ignore
             InferenceRuntime,
             RuntimeKey,
         )
 
-        ckpt = self._checkpoint_path(repo)
+        ckpt = self._checkpoint_path(repo, revision)
         if not ckpt.is_file():
             raise FileNotFoundError(
                 f"model.safetensors が見つかりません: {ckpt}. download_models を先に実行してください"
@@ -269,7 +294,7 @@ class RealModelBackend:
             RuntimeKey(
                 checkpoint=str(ckpt),
                 model_device=device,
-                codec_repo=MODEL_REPO_CODEC,
+                codec_repo=self._codec_location(),
                 model_precision="fp32",
                 codec_device=device,
                 codec_precision="fp32",
@@ -282,12 +307,14 @@ class RealModelBackend:
 
     def _load_synth(self):
         if self._synth_runtime is None:
-            self._synth_runtime = self._build_runtime(MODEL_REPO_SYNTH)
+            self._synth_runtime = self._build_runtime(MODEL_REPO_SYNTH, MODEL_REVISION_SYNTH)
         return self._synth_runtime
 
     def _load_voice_design(self):
         if self._voice_design_runtime is None:
-            self._voice_design_runtime = self._build_runtime(MODEL_REPO_VOICE_DESIGN)
+            self._voice_design_runtime = self._build_runtime(
+                MODEL_REPO_VOICE_DESIGN, MODEL_REVISION_VOICE_DESIGN
+            )
         return self._voice_design_runtime
 
     @staticmethod

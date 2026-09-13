@@ -33,6 +33,19 @@ pub struct SidecarHandle {
     pub child: Child,
 }
 
+#[cfg(test)]
+impl SidecarHandle {
+    /// テスト用。本物の起動を経ずに、採用の判定（`IrodoriClient::adopt_sidecar`）を確かめる。
+    pub(crate) fn for_test(asset_root: &Path, port: u16, pid: u32, child: Child) -> Self {
+        Self {
+            asset_root: asset_root.to_path_buf(),
+            port,
+            pid,
+            child,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReadyFile {
     port: u16,
@@ -128,6 +141,21 @@ pub(crate) fn looks_like_our_sidecar(body: &serde_json::Value) -> bool {
 /// 台帳に加えて**旧 `ready.json` も 1 度だけ見る** — v0.5.5 より前に導入した環境には
 /// 台帳が無く、孤児の手がかりがそこにしか無いため。
 pub async fn sweep_orphans(asset_root: &Path, client: &reqwest::Client) -> usize {
+    sweep_orphans_with(asset_root, client, PROBE_TIMEOUT).await
+}
+
+/// 掃除で相手を確かめる時間。
+///
+/// **Windows は閉じたポートへの接続が拒否されるまで約 2 秒かかる**（SYN を再送する。
+/// 2026-09-14 実測 2.02〜2.04 秒）。これより短いと、死んだ記録を「つながったのに応答が無い」と
+/// 取り違えて永久に残す（以前の 800ms では、死んだ記録はすべてタイムアウトで判定されていた）。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn sweep_orphans_with(
+    asset_root: &Path,
+    client: &reqwest::Client,
+    probe_timeout: Duration,
+) -> usize {
     let mut candidates = read_ledger(asset_root);
     if let Ok(Some(port)) = try_read_port(&ready_path_for(asset_root)) {
         if !candidates.iter().any(|e| e.port == port) {
@@ -146,8 +174,8 @@ pub async fn sweep_orphans(asset_root: &Path, client: &reqwest::Client) -> usize
         if taken_by_a_new_child(&read_ledger(asset_root), entry) {
             continue;
         }
-        match identify_sidecar(client, entry.port).await {
-            true => {
+        match identify_sidecar(client, entry.port, probe_timeout).await {
+            Probe::Ours => {
                 if !request_shutdown(entry.port, client).await {
                     // 自分のものなのに止める要求が届かなかった。記録を残して次の起動で再試行する。
                     crate::ulog!(
@@ -164,8 +192,18 @@ pub async fn sweep_orphans(asset_root: &Path, client: &reqwest::Client) -> usize
                 );
                 stopped += 1;
             }
-            false => {
-                // 応答が無い / 形が違う = すでに死んでいるか、別のサービスのポート。触らない。
+            Probe::Unanswered => {
+                // つながったのに応答が無い = 合成中・モデル読み込み中の自分の孤児でありうる
+                // （`/speech` は同期の合成を async の中で呼ぶので、その間 `/health` に答えない）。
+                // **捨てると、合成中に強制終了された孤児に二度と届かない**（2026-09-14 監査で発覚）。
+                crate::ulog!(
+                    "[irodori] 記録のサイドカーが応答しません (port={}、使用中の可能性があるので記録を残します)",
+                    entry.port
+                );
+                continue;
+            }
+            Probe::NotOurs => {
+                // 接続を拒否された = 死んでいる / 答えたが形が違う = 別のサービス。触らない。
                 crate::ulog!(
                     "[irodori] 記録のサイドカーは見つかりません (port={}、記録だけ捨てます)",
                     entry.port
@@ -177,21 +215,31 @@ pub async fn sweep_orphans(asset_root: &Path, client: &reqwest::Client) -> usize
     stopped
 }
 
-/// そのポートの相手が自分たちのサイドカーか確かめる。
-async fn identify_sidecar(client: &reqwest::Client, port: u16) -> bool {
+/// 掃除の相手の見立て。
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// 応答の形が自分たちのサイドカー。
+    Ours,
+    /// 接続を拒否された（死んでいる）か、答えたが形が違う（別のサービス）。
+    NotOurs,
+    /// つながったが時間内に答えない。使用中の自分の孤児でありうる。
+    Unanswered,
+}
+
+/// そのポートの相手が何者か確かめる。
+async fn identify_sidecar(client: &reqwest::Client, port: u16, timeout: Duration) -> Probe {
     let url = format!("http://127.0.0.1:{port}/health");
-    let Ok(resp) = client
-        .get(&url)
-        .timeout(Duration::from_millis(800))
-        .send()
-        .await
-    else {
-        return false;
+    let resp = match client.get(&url).timeout(timeout).send().await {
+        Ok(resp) => resp,
+        Err(err) if err.is_timeout() => return Probe::Unanswered,
+        Err(_) => return Probe::NotOurs,
     };
     // **status は見ない**（GPU 不在で 503 を返す）。本文の形だけで判断する。
     match resp.json::<serde_json::Value>().await {
-        Ok(body) => looks_like_our_sidecar(&body),
-        Err(_) => false,
+        Ok(body) if looks_like_our_sidecar(&body) => Probe::Ours,
+        Ok(_) => Probe::NotOurs,
+        Err(err) if err.is_timeout() => Probe::Unanswered,
+        Err(_) => Probe::NotOurs,
     }
 }
 
@@ -606,7 +654,7 @@ mod tests {
     ///
     /// 実機では起動直後に dev が落ち、先に台帳を空にする作りだったため
     /// **記録を 1 件も確かめないまま 2 件とも消えた**。本物の孤児なら GPU を掴んだまま
-    /// 二度と止められない。応答しない相手を確かめている最中（800ms 待つ間）に中断して見る。
+    /// 二度と止められない。応答しない相手を確かめている最中（確かめる時間いっぱい待たされる間）に中断して見る。
     #[tokio::test]
     async fn an_interrupted_sweep_keeps_the_records_it_has_not_checked() {
         let dir = tempfile::tempdir().unwrap();
@@ -633,38 +681,71 @@ mod tests {
         drop(silent);
     }
 
-    /// 最後まで走ると、**確かめた記録は消え、途中で立った自分の子の記録は残る**。
+    /// 最後まで走ると、**死んでいた記録は消え、応答しない記録と、途中で立った自分の子の
+    /// 記録は残る**（2026-09-14 監査で「応答しない」を分けた）。
     ///
-    /// 掃除の最中に同じポートで新しい子が立つと、`ledger_add` がその記録を新しい子の pid で
-    /// 置き換える。**確かめに行ってはいけない**（自分の子に `/shutdown` を投げうる）し、
-    /// 消してもいけない（次に強制終了されたとき追えない）。
+    /// - 応答しない相手 = 合成中の自分の孤児でありうる（`/health` に答えない）。捨てると二度と届かない
+    /// - 接続を拒否された相手 = 死んでいる。記録だけ捨てる
+    /// - 掃除の最中に同じポートで新しい子が立つと、`ledger_add` がその記録を新しい子の pid で
+    ///   置き換える。**確かめに行ってはいけない**（自分の子に `/shutdown` を投げうる）し、消してもいけない
     #[tokio::test]
-    async fn a_finished_sweep_forgets_what_it_checked_but_not_a_new_child() {
+    async fn a_finished_sweep_drops_the_dead_but_keeps_the_busy_and_a_new_child() {
         let dir = tempfile::tempdir().unwrap();
-        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let silent_port = silent.local_addr().unwrap().port();
+        // 接続は受けるが応答しない相手（合成中の孤児の役）
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = busy.local_addr().unwrap().port();
+        let dead_port = free_port();
         // 掃除の最中に新しい子が取るポート。接続が来たかどうかをあとで見る。
         let new_child = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         new_child.set_nonblocking(true).unwrap();
         let child_port = new_child.local_addr().unwrap().port();
-        ledger_add(dir.path(), ReadyFile { port: silent_port, pid: 1 });
-        ledger_add(dir.path(), ReadyFile { port: child_port, pid: 2 });
+        ledger_add(dir.path(), ReadyFile { port: busy_port, pid: 1 });
+        ledger_add(dir.path(), ReadyFile { port: dead_port, pid: 2 });
+        ledger_add(dir.path(), ReadyFile { port: child_port, pid: 3 });
 
         let root = dir.path().to_path_buf();
-        let sweep = tokio::spawn(async move { sweep_orphans(&root, &test_client()).await });
-        // 1 件目（応答しない相手、800ms）を確かめている間に、新しい子が同じポートで立つ
+        // 確かめる時間は、閉じたポートの拒否（Windows で約 2 秒）より長くとる
+        let sweep = tokio::spawn(async move {
+            sweep_orphans_with(&root, &test_client(), Duration::from_secs(3)).await
+        });
+        // 1 件目（応答しない相手）を確かめている間に、新しい子が同じポートで立つ
         tokio::time::sleep(Duration::from_millis(200)).await;
         ledger_add(dir.path(), ReadyFile { port: child_port, pid: 999 });
         assert_eq!(sweep.await.unwrap(), 0);
 
-        let got = read_ledger(dir.path());
-        assert_eq!(got.len(), 1, "確かめた記録は消える: {got:?}");
-        assert_eq!((got[0].port, got[0].pid), (child_port, 999), "新しい子の記録は残る");
+        let mut got: Vec<(u16, u32)> = read_ledger(dir.path())
+            .iter()
+            .map(|e| (e.port, e.pid))
+            .collect();
+        got.sort();
+        let mut want = vec![(busy_port, 1), (child_port, 999)];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "死んだ記録だけが消える（応答しない記録と新しい子の記録は残る）"
+        );
         assert!(
             matches!(new_child.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
             "新しい子へ確かめに行ってはいけない（自分の子に /shutdown を投げうる）"
         );
-        drop(silent);
+        drop(busy);
+    }
+
+    /// **確かめる時間は、閉じたポートの拒否より長い**（2026-09-14 実測で発覚）。
+    ///
+    /// Windows は閉じたポートへの接続が拒否されるまで約 2 秒かかる。確かめる時間がそれより
+    /// 短いと、死んだ記録を「応答しない」と取り違えて**永久に残す**（以前の 800ms がそうだった）。
+    #[test]
+    fn the_probe_outlasts_a_refused_connection() {
+        let port = free_port();
+        let started = Instant::now();
+        let refused = std::net::TcpStream::connect(("127.0.0.1", port));
+        let took = started.elapsed();
+        assert!(refused.is_err(), "前提: 誰も待ち受けていない");
+        assert!(
+            PROBE_TIMEOUT > took * 2,
+            "拒否に {took:?} かかる環境で、確かめる時間 {PROBE_TIMEOUT:?} は短すぎる"
+        );
     }
 
     /// 自分の孤児は止めて記録を消し、**止める要求が届かなければ記録を残す**（次の起動で再試行）。
