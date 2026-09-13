@@ -426,14 +426,40 @@ where
 
 /// 子プロセス stderr を行単位で読み、each line を callback に流す。
 /// stderr EOF (サイドカー終了) で自然終了。
+///
+/// **読めない行でも止まらず、止まるなら理由を残す**（2026-09-14、インストール版の実環境で発覚）。
+/// `lines()` は UTF-8 として読めない行や読み取りの失敗で `Err` を返し、`while let Ok(Some(..))`
+/// はそこで**黙って抜けていた**。実機では起動の約 10 秒後に出る asyncio のトレースバックの途中で
+/// 読み取りが止まり、以後の stderr が 1 行も `ugg.log` に残らなかった（同じサイドカーへ送った
+/// 不正なリクエストに uvicorn は 400 を返したが、その警告が届かないことで確認）。
+/// 読めない部分は置換文字にして流し、読み取りそのものが失敗したら理由を 1 行流してから終える。
 async fn spawn_stderr_pump<R, F>(stderr: R, mut on_line: F)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     F: FnMut(&str) + Send + 'static,
 {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        on_line(&line);
+    let mut reader = BufReader::new(stderr);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {
+                // `lines()` と同じく、末尾の `\n` とその直前の `\r` を 1 つだけ落とす。
+                let mut end = buf.len();
+                if buf[end - 1] == b'\n' {
+                    end -= 1;
+                    if end > 0 && buf[end - 1] == b'\r' {
+                        end -= 1;
+                    }
+                }
+                on_line(&String::from_utf8_lossy(&buf[..end]));
+            }
+            Err(e) => {
+                on_line(&format!("(stderr の読み取りが止まりました: {e})"));
+                break;
+            }
+        }
     }
 }
 
@@ -970,5 +996,65 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), br#"{"port":12345,"pid":99}"#).unwrap();
         assert_eq!(try_read_port(tmp.path()).unwrap(), Some(12345));
+    }
+
+    /// stderr の行を集めるだけの受け手。
+    fn collected() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        impl FnMut(&str) + Send + 'static,
+    ) {
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        (lines, move |l: &str| sink.lock().unwrap().push(l.to_string()))
+    }
+
+    /// **UTF-8 として読めない行で stderr の読み取りを止めない**（2026-09-14、インストール版の実環境で発覚）。
+    ///
+    /// `lines()` は読めない行で `Err` を返し、`while let Ok(Some(..))` はそこで黙って抜けていた。
+    /// 実機では起動の約 10 秒後から、以後の stderr が 1 行も `ugg.log` に残らなかった。
+    #[tokio::test]
+    async fn a_line_that_is_not_utf8_does_not_stop_the_stderr_pump() {
+        let mut bytes = b"before\r\n".to_vec();
+        // cp932 の「既存」。UTF-8 としては読めない。
+        bytes.extend_from_slice(b"ConnectionResetError: \x8a\xf9\x91\xb6\n");
+        bytes.extend_from_slice(b"after\n");
+        let (lines, sink) = collected();
+        spawn_stderr_pump(std::io::Cursor::new(bytes), sink).await;
+        let got = lines.lock().unwrap().clone();
+        assert_eq!(got.len(), 3, "読めない行で止まっている: {got:?}");
+        assert_eq!(got[0], "before", "行末の CR を落としていない");
+        assert!(
+            got[1].starts_with("ConnectionResetError: ") && got[1].contains('\u{FFFD}'),
+            "読めない行を置換文字で流していない: {got:?}"
+        );
+        assert_eq!(got[2], "after", "読めない行の後が届いていない");
+    }
+
+    /// 読み取りそのものが失敗したら、**黙って終えずに理由を残す**（同上）。
+    #[tokio::test]
+    async fn a_failed_read_leaves_its_reason() {
+        struct FailsAfterOneLine {
+            sent: bool,
+        }
+        impl tokio::io::AsyncRead for FailsAfterOneLine {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.sent {
+                    return std::task::Poll::Ready(Err(std::io::Error::other("pipe broke")));
+                }
+                self.sent = true;
+                buf.put_slice(b"one\n");
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let (lines, sink) = collected();
+        spawn_stderr_pump(FailsAfterOneLine { sent: false }, sink).await;
+        let got = lines.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], "one");
+        assert!(got[1].contains("pipe broke"), "止まった理由が残っていない: {got:?}");
     }
 }
