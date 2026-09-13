@@ -27,8 +27,7 @@ pub struct SidecarHandle {
     /// 台帳（`sidecars.json`）の位置を知るために持つ。止めたときに記録を消す。
     asset_root: PathBuf,
     pub port: u16,
-    /// Phase E のヘルスチェック失敗時に PID を出してデバッグログに使う想定。
-    #[allow(dead_code)]
+    /// 台帳の記録を**ポートと pid の組**で消すために持つ（同じポートを後から別の子が取りうる）。
     pub pid: u32,
     /// `wait()` を呼ばずに保持し続けるとゾンビ化するため、`shutdown_sidecar` で wait する。
     pub child: Child,
@@ -64,19 +63,46 @@ fn write_ledger(asset_root: &Path, entries: &[ReadyFile]) {
     }
 }
 
+/// 台帳の「読む → 書き戻す」を直列にする（2026-09-13）。
+///
+/// **排他が無いと、後から書いた側が先の変更を消す。** 孤児掃除は起動直後に非同期で走り、
+/// 同じ時期に起動時の挨拶がサイドカーを立てて `ledger_add` しうる。両者が同じ内容を読んで
+/// それぞれ書き戻すと、**新しく立てた子の記録が消え、次に強制終了されたとき孤児を追えない**。
+static LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_ledger() -> std::sync::MutexGuard<'static, ()> {
+    // 中身を持たない錠なので、毒されていても続行してよい。
+    LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 台帳へ 1 件足す（起動直後に呼ぶ）。
 fn ledger_add(asset_root: &Path, entry: ReadyFile) {
+    let _guard = lock_ledger();
     let mut entries = read_ledger(asset_root);
     entries.retain(|e| e.port != entry.port);
     entries.push(entry);
     write_ledger(asset_root, &entries);
 }
 
-/// 台帳から 1 件消す（正常に止められたときに呼ぶ）。
-fn ledger_remove(asset_root: &Path, port: u16) {
+/// 台帳からその記録を 1 件消す（止まったのを見届けたとき・掃除で確かめ終えたときに呼ぶ）。
+///
+/// **ポートだけでなく pid も一致したものだけを消す。** 同じポートを後から新しい子が取ると、
+/// `ledger_add` はその記録を新しい子の pid で置き換える。ポートだけで消すと、
+/// **いま生きている自分の子の記録**を消してしまう。
+fn ledger_remove(asset_root: &Path, record: &ReadyFile) {
+    let _guard = lock_ledger();
     let mut entries = read_ledger(asset_root);
-    entries.retain(|e| e.port != port);
+    entries.retain(|e| !(e.port == record.port && e.pid == record.pid));
     write_ledger(asset_root, &entries);
+}
+
+/// 台帳のそのポートを、候補とは**別の子**（pid が違う）がいま持っているか。
+///
+/// 掃除の最中に同じポートで新しい子が立ったなら、それは自分で立てたもの。触らない。
+fn taken_by_a_new_child(ledger: &[ReadyFile], candidate: &ReadyFile) -> bool {
+    ledger
+        .iter()
+        .any(|e| e.port == candidate.port && e.pid != candidate.pid)
 }
 
 /// `/health` の応答が**自分たちのサイドカーのもの**かを判定する (v0.5.5 項目 2)。
@@ -108,19 +134,29 @@ pub async fn sweep_orphans(asset_root: &Path, client: &reqwest::Client) -> usize
             candidates.push(ReadyFile { port, pid: 0 });
         }
     }
-    // **先に台帳を空にする。** そのうえで、掃除の最中に新しく立ったサイドカーの
-    // ポートは対象から外す（掃除対象のポートを新しい子が取っていたら、自分で立てたものを
-    // 止めてしまう）。台帳は起動直後に書かれるので、ここを見れば「いま生きている自分の子」が分かる。
-    write_ledger(asset_root, &[]);
-
+    // **記録は、確かめ終えたものから 1 件ずつ消す**（2026-09-13 実機で発覚）。
+    // 以前は先に台帳を空にしてから確かめていた。実機では起動直後に dev が落ち、
+    // **記録を 1 件も確かめないまま 2 件とも消えた**。本物の孤児でも同じで、掃除の途中で
+    // アプリが落ちると（起動直後に落ちる不具合と重なれば毎回）**GPU を掴んだ孤児の手がかりが
+    // 永久に失われる**。まだ確かめていない記録は、次の起動のために残す。
     let mut stopped = 0usize;
     for entry in &candidates {
-        if read_ledger(asset_root).iter().any(|e| e.port == entry.port) {
+        // 掃除の最中に同じポートで新しい子が立ったなら自分で立てたもの。止めない。
+        // 台帳は起動直後に書かれるので、ここを見れば「いま生きている自分の子」が分かる。
+        if taken_by_a_new_child(&read_ledger(asset_root), entry) {
             continue;
         }
         match identify_sidecar(client, entry.port).await {
             true => {
-                let _ = request_shutdown(entry.port, client).await;
+                if !request_shutdown(entry.port, client).await {
+                    // 自分のものなのに止める要求が届かなかった。記録を残して次の起動で再試行する。
+                    crate::ulog!(
+                        "[irodori] 前回の実行が残したサイドカーを止められませんでした (port={} pid={}、次の起動で再試行します)",
+                        entry.port,
+                        entry.pid
+                    );
+                    continue;
+                }
                 crate::ulog!(
                     "[irodori] 前回の実行が残したサイドカーを止めました (port={} pid={})",
                     entry.port,
@@ -136,6 +172,7 @@ pub async fn sweep_orphans(asset_root: &Path, client: &reqwest::Client) -> usize
                 );
             }
         }
+        ledger_remove(asset_root, entry);
     }
     stopped
 }
@@ -308,8 +345,10 @@ async fn request_shutdown(port: u16, http: &reqwest::Client) -> bool {
 }
 
 pub async fn shutdown_sidecar(mut handle: SidecarHandle, http: &reqwest::Client) -> Result<()> {
-    // 正常に止めるので台帳から消す（残すと次回の掃除が無駄に叩く）。
-    ledger_remove(&handle.asset_root, handle.port);
+    let record = ReadyFile {
+        port: handle.port,
+        pid: handle.pid,
+    };
     let url = format!("http://127.0.0.1:{}/shutdown", handle.port);
     // shutdown 要求はベストエフォート: 失敗しても kill にフォールバック
     let _ = http
@@ -319,18 +358,27 @@ pub async fn shutdown_sidecar(mut handle: SidecarHandle, http: &reqwest::Client)
         .await;
 
     // 1 秒待って終了していなければ kill
-    match tokio::time::timeout(Duration::from_secs(1), handle.child.wait()).await {
+    let stopped = match tokio::time::timeout(Duration::from_secs(1), handle.child.wait()).await {
         Ok(Ok(_status)) => Ok(()),
         Ok(Err(err)) => Err(anyhow!("サイドカーの wait に失敗: {err}")),
         Err(_elapsed) => {
             // タイムアウト → kill
-            if let Err(err) = handle.child.kill().await {
-                return Err(anyhow!("サイドカーの kill に失敗: {err}"));
+            match handle.child.kill().await {
+                Ok(()) => {
+                    let _ = handle.child.wait().await;
+                    Ok(())
+                }
+                Err(err) => Err(anyhow!("サイドカーの kill に失敗: {err}")),
             }
-            let _ = handle.child.wait().await;
-            Ok(())
         }
+    };
+    // **止まったのを見届けてから記録を消す**（2026-09-13、孤児掃除と同じ形）。
+    // 以前は冒頭で消していた。止めている数秒の間にアプリが落ちたときや kill に失敗したとき、
+    // **生きているサイドカーの記録だけが消え**、次の起動の掃除が届かない。
+    if stopped.is_ok() {
+        ledger_remove(&handle.asset_root, &record);
     }
+    stopped
 }
 
 // === ready.json polling ===
@@ -436,10 +484,18 @@ mod tests {
         assert_eq!(got.len(), 2, "2 つ目で 1 つ目を消してはいけない: {got:?}");
 
         // 正常に止めた分だけ消える
-        super::ledger_remove(dir.path(), 50073);
+        super::ledger_remove(dir.path(), &super::ReadyFile { port: 50073, pid: 1 });
         let got = super::read_ledger(dir.path());
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].port, 59533);
+
+        // ポートが同じでも pid が違えば**別の子**（後から同じポートを取った新しい子）。消さない
+        super::ledger_remove(dir.path(), &super::ReadyFile { port: 59533, pid: 7 });
+        assert_eq!(
+            super::read_ledger(dir.path()).len(),
+            1,
+            "同じポートを持つ別の子の記録を消してはいけない"
+        );
     }
 
     /// 同じポートを 2 度足しても重複しない（再起動で同じポートを引くことはある）。
@@ -453,7 +509,245 @@ mod tests {
         assert_eq!(got[0].pid, 9, "新しい方で置き換わること");
     }
 
+    /// 台帳の「読む → 書き戻す」は直列（2026-09-13）。並行に足しても**1 件も取りこぼさない**。
+    ///
+    /// 孤児掃除は起動直後に非同期で走り、同じ時期に起動時の挨拶がサイドカーを立てうる。
+    /// 排他が無いと、後から書いた側が先の記録を消す。
+    #[test]
+    fn concurrent_ledger_writes_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let threads: Vec<_> = (0..4u16)
+            .map(|t| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50u16 {
+                        super::ledger_add(
+                            &root,
+                            super::ReadyFile {
+                                port: 10_000 + t * 100 + i,
+                                pid: 1,
+                            },
+                        );
+                    }
+                })
+            })
+            .collect();
+        for th in threads {
+            th.join().unwrap();
+        }
+        assert_eq!(
+            super::read_ledger(&root).len(),
+            200,
+            "並行に足した記録を取りこぼしてはいけない"
+        );
+    }
+
     use super::*;
+
+    /// テスト用の HTTP クライアント（環境の proxy 設定に左右されないように）。
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    /// いま誰も待ち受けていないポート（死んだ記録の役）。
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// `/health` に**自分たちの形**で答える偽のサイドカー。`/shutdown` に答えるかを選べる。
+    /// 受けたリクエスト行を記録する。
+    fn fake_sidecar(answers_shutdown: bool) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                log.lock().unwrap().push(line.clone());
+                let body = if line.starts_with("GET /health") {
+                    r#"{"status":"ok","gpu":null,"mock":true}"#
+                } else if line.starts_with("POST /shutdown") && answers_shutdown {
+                    r#"{"status":"bye"}"#
+                } else {
+                    continue; // 答えずに切る
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        (port, seen)
+    }
+
+    /// **掃除が途中で止まっても、確かめていない記録は残る**（2026-09-13 実機で発覚）。
+    ///
+    /// 実機では起動直後に dev が落ち、先に台帳を空にする作りだったため
+    /// **記録を 1 件も確かめないまま 2 件とも消えた**。本物の孤児なら GPU を掴んだまま
+    /// 二度と止められない。応答しない相手を確かめている最中（800ms 待つ間）に中断して見る。
+    #[tokio::test]
+    async fn an_interrupted_sweep_keeps_the_records_it_has_not_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        // 接続は受けるが応答しない相手（確かめる間ずっと待たされる）
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        let dead_port = free_port();
+        ledger_add(dir.path(), ReadyFile { port: silent_port, pid: 1 });
+        ledger_add(dir.path(), ReadyFile { port: dead_port, pid: 2 });
+
+        let client = test_client();
+        let interrupted = tokio::time::timeout(
+            Duration::from_millis(300),
+            sweep_orphans(dir.path(), &client),
+        )
+        .await;
+        assert!(interrupted.is_err(), "前提: 確かめている最中に中断できていること");
+
+        let ports: Vec<u16> = read_ledger(dir.path()).iter().map(|e| e.port).collect();
+        assert!(
+            ports.contains(&silent_port) && ports.contains(&dead_port),
+            "確かめ終えていない記録を消してはいけない: {ports:?}"
+        );
+        drop(silent);
+    }
+
+    /// 最後まで走ると、**確かめた記録は消え、途中で立った自分の子の記録は残る**。
+    ///
+    /// 掃除の最中に同じポートで新しい子が立つと、`ledger_add` がその記録を新しい子の pid で
+    /// 置き換える。**確かめに行ってはいけない**（自分の子に `/shutdown` を投げうる）し、
+    /// 消してもいけない（次に強制終了されたとき追えない）。
+    #[tokio::test]
+    async fn a_finished_sweep_forgets_what_it_checked_but_not_a_new_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        // 掃除の最中に新しい子が取るポート。接続が来たかどうかをあとで見る。
+        let new_child = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        new_child.set_nonblocking(true).unwrap();
+        let child_port = new_child.local_addr().unwrap().port();
+        ledger_add(dir.path(), ReadyFile { port: silent_port, pid: 1 });
+        ledger_add(dir.path(), ReadyFile { port: child_port, pid: 2 });
+
+        let root = dir.path().to_path_buf();
+        let sweep = tokio::spawn(async move { sweep_orphans(&root, &test_client()).await });
+        // 1 件目（応答しない相手、800ms）を確かめている間に、新しい子が同じポートで立つ
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ledger_add(dir.path(), ReadyFile { port: child_port, pid: 999 });
+        assert_eq!(sweep.await.unwrap(), 0);
+
+        let got = read_ledger(dir.path());
+        assert_eq!(got.len(), 1, "確かめた記録は消える: {got:?}");
+        assert_eq!((got[0].port, got[0].pid), (child_port, 999), "新しい子の記録は残る");
+        assert!(
+            matches!(new_child.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "新しい子へ確かめに行ってはいけない（自分の子に /shutdown を投げうる）"
+        );
+        drop(silent);
+    }
+
+    /// 自分の孤児は止めて記録を消し、**止める要求が届かなければ記録を残す**（次の起動で再試行）。
+    #[tokio::test]
+    async fn a_sweep_keeps_the_record_of_an_orphan_it_could_not_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stoppable, stoppable_seen) = fake_sidecar(true);
+        let (stubborn, _) = fake_sidecar(false);
+        ledger_add(dir.path(), ReadyFile { port: stoppable, pid: 1 });
+        ledger_add(dir.path(), ReadyFile { port: stubborn, pid: 2 });
+
+        let stopped = sweep_orphans(dir.path(), &test_client()).await;
+
+        assert_eq!(stopped, 1, "止められたのは 1 件だけ");
+        assert!(
+            stoppable_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("POST /shutdown")),
+            "自分の孤児には /shutdown を投げる"
+        );
+        let got = read_ledger(dir.path());
+        assert_eq!(got.len(), 1, "止められなかった記録だけ残る: {got:?}");
+        assert_eq!(got[0].port, stubborn);
+    }
+
+    /// 長く走る子プロセス（サイドカーの代役）。ポートは誰も待ち受けていないもの。
+    fn long_running_handle(asset_root: &Path) -> SidecarHandle {
+        let child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .kill_on_drop(false)
+            .spawn()
+            .expect("ping を起動できること");
+        let pid = child.id().unwrap();
+        SidecarHandle {
+            asset_root: asset_root.to_path_buf(),
+            port: free_port(),
+            pid,
+            child,
+        }
+    }
+
+    /// **止まったのを見届けてから記録を消す**（2026-09-13、孤児掃除と同じ形）。
+    ///
+    /// 冒頭で消していたため、止めている数秒の間にアプリが落ちると**生きているサイドカーの
+    /// 記録だけが消えた**。
+    #[tokio::test]
+    async fn a_shutdown_forgets_the_record_only_after_the_child_is_gone() {
+        let client = test_client();
+
+        // 止めている最中に中断すると、記録は残る
+        let dir = tempfile::tempdir().unwrap();
+        let handle = long_running_handle(dir.path());
+        let (port, pid) = (handle.port, handle.pid);
+        ledger_add(dir.path(), ReadyFile { port, pid });
+        let interrupted =
+            tokio::time::timeout(Duration::from_millis(100), shutdown_sidecar(handle, &client))
+                .await;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+        assert!(interrupted.is_err(), "前提: 止めている最中に中断できていること");
+        assert_eq!(
+            read_ledger(dir.path()).len(),
+            1,
+            "止まるのを見届ける前に記録を消してはいけない"
+        );
+
+        // 最後まで走れば消える
+        let dir = tempfile::tempdir().unwrap();
+        let handle = long_running_handle(dir.path());
+        ledger_add(
+            dir.path(),
+            ReadyFile {
+                port: handle.port,
+                pid: handle.pid,
+            },
+        );
+        shutdown_sidecar(handle, &client).await.unwrap();
+        assert!(read_ledger(dir.path()).is_empty(), "止まったら記録は消える");
+    }
 
     /// **古い `ready.json` を信じない**（2026-09-13 実機で発覚）。
     ///

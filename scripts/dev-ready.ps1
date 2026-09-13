@@ -1,4 +1,4 @@
-# dev 実機検証の「起動待ち / 再起動待ち / 孤児掃除」を決定的に行うヘルパー。
+﻿# dev 実機検証の「起動待ち / 再起動待ち / 孤児掃除」を決定的に行うヘルパー。
 #
 # 背景 (2026-07-10 再発防止):
 #   dev ログの grep による起動判定が繰り返し誤動作した。
@@ -18,7 +18,11 @@
 #       → 孤児の dev ugg.exe と、ポート 5273 を握る本リポジトリの vite(node) を停止
 #         ("Port 5273 is already in use" で dev が落ちるときは先にこれを実行)
 #
-# exit code: 0 = READY / CLEANED, 1 = タイムアウト, 2 = 引数エラー
+# exit code: 0 = READY / CLEANED, 1 = タイムアウト / 止められなかった孤児がある (FAILED), 2 = 引数エラー
+#
+# **このファイルは UTF-8 (BOM 付き) で保存すること。** Windows PowerShell 5.1 は BOM 無しの
+# ファイルを ANSI (CP932) として読むため、日本語のメッセージ (TIMEOUT / FAILED) が化けて読めない
+# (2026-09-13 に実際に化けていた)。
 
 param(
     [int]$TimeoutSec = 120,
@@ -37,11 +41,18 @@ function Get-DevProcess {
 
 if ($CleanOrphans) {
     $killed = @()
+    # 【2026-09-13 再発防止】ポート 5273 を握ったままの孤児 vite を取りこぼして
+    # 「CLEAN: no orphans」と報告し、直後の dev 起動が "Port 5273 is already in use" で落ちた。
+    # 停止の失敗を `catch {}` で握りつぶしていたのか、一致しなかったのかは特定できていない。
+    # どちらでも気づけるよう、停止の失敗を出したうえで、最後に「5273 が本当に空いたか」を確かめる。
+    $failed = @()
     foreach ($p in Get-DevProcess) {
         try {
             Stop-Process -Id $p.Id -Force -Confirm:$false -ErrorAction Stop
             $killed += "ugg.exe(dev) pid=$($p.Id)"
-        } catch {}
+        } catch {
+            $failed += "ugg.exe(dev) pid=$($p.Id): $($_.Exception.Message)"
+        }
     }
     # 本リポジトリの dev 用 node を漏れなく止める。
     # 【2026-07-18 再発防止】以前は「ポート 5273 の vite」だけ殺していたが、
@@ -57,7 +68,20 @@ if ($CleanOrphans) {
         try {
             Stop-Process -Id $proc.ProcessId -Force -Confirm:$false -ErrorAction Stop
             $killed += "node(dev) pid=$($proc.ProcessId)"
-        } catch {}
+        } catch {
+            $failed += "node(dev) pid=$($proc.ProcessId): $($_.Exception.Message)"
+        }
+    }
+    # 目的そのもの（5273 が空いたか）を最後に確かめる。一致漏れで取りこぼしてもここで分かる。
+    if ($killed.Count -gt 0) { Start-Sleep -Milliseconds 500 }
+    foreach ($conn in @(Get-NetTCPConnection -State Listen -LocalPort 5273 -ErrorAction SilentlyContinue)) {
+        $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $($conn.OwningProcess)" -ErrorAction SilentlyContinue
+        $failed += "port 5273 がまだ使用中: pid=$($conn.OwningProcess) $($owner.Name) $($owner.CommandLine)"
+    }
+    if ($failed.Count -gt 0) {
+        "FAILED: " + ($failed -join ", ")
+        if ($killed.Count -gt 0) { "CLEANED: " + ($killed -join ", ") }
+        exit 1
     }
     if ($killed.Count -gt 0) {
         "CLEANED: " + ($killed -join ", ")
