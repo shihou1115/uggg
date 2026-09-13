@@ -99,6 +99,16 @@ pub async fn synthesize_voice(
                     FallbackAction::ReturnError => return Err(format!("{err}")),
                     FallbackAction::FallbackToVoicevox => {
                         let reason = format!("{err}");
+                        // **理由は毎回ログへ残す** (v0.5.5 項目 1、2026-09-13 実機で発覚)。
+                        // 通知は 5 分に 1 回へ絞っている（キャラが同じことを言い続けないため）。
+                        // 理由のログをその後ろ（`notify()` の中）にだけ置くと、**2 回目以降の
+                        // 失敗の理由がどこにも残らない** — 実機では起動時の失敗が 1 回通知した後、
+                        // 更新中の「進行中です」がログから完全に消えていた。
+                        // `reason` は生成元で伏字・切り詰め済み（`sanitize_sidecar_error`）。
+                        crate::ulog!(
+                            "[irodori] 合成に失敗しました（VOICEVOX へ切り替え）: {}",
+                            crate::dialogue::llm::truncate_for_log(&reason)
+                        );
                         // voicevox を先に試して、成功/失敗で notify の文面を出し分ける。
                         // (順序を逆にすると、voicevox 未 DL のとき『VOICEVOX 経路で発話します』を
                         //  音/吹き出しで案内したのに実際は両方無音、という嘘 UX に陥る)

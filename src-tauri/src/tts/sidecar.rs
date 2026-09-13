@@ -256,7 +256,7 @@ where
         tokio::spawn(spawn_stderr_pump(stderr, on_stderr_line));
     }
 
-    let port = match wait_for_ready_file(&ready_file, Duration::from_secs(30)).await {
+    let port = match wait_for_ready_file(&ready_file, Duration::from_secs(30), pid).await {
         Ok(p) => p,
         Err(err) => {
             // ready.json が来ない = 起動失敗 or 長時間 HF DL 中。
@@ -335,11 +335,21 @@ pub async fn shutdown_sidecar(mut handle: SidecarHandle, http: &reqwest::Client)
 
 // === ready.json polling ===
 
-async fn wait_for_ready_file(path: &Path, deadline: Duration) -> Result<u16> {
+/// `ready.json` を読み、**起動した子の pid と一致するときだけ**そのポートを返す。
+///
+/// **pid を見ないと、古い `ready.json` を信じて死んだポートへ投げる**（2026-09-13 実機で発覚）。
+/// 起動前に `remove_file` しているが、その削除が効かない状況（ファイルロック・ウイルス対策・
+/// 仮想化されたプロファイル）では、新しい子が書くより先に**前回の子の記録**を読んでしまう。
+/// 実機では前回セッションで止めた孤児のポート 60005 へ合成を投げ、起動時の挨拶が失敗した。
+/// `sidecar.py` は `os.getpid()` を書くので、一致しないものは古い記録と判断できる。
+async fn wait_for_ready_file(path: &Path, deadline: Duration, expected_pid: u32) -> Result<u16> {
     let start = Instant::now();
     loop {
-        if let Some(port) = try_read_port(path)? {
-            return Ok(port);
+        if let Some(ready) = try_read_ready(path)? {
+            if ready_belongs_to(&ready, expected_pid) {
+                return Ok(ready.port);
+            }
+            // 前回の子の記録。新しい子が上書きするまで待つ。
         }
         if start.elapsed() > deadline {
             return Err(anyhow!("timeout"));
@@ -349,6 +359,26 @@ async fn wait_for_ready_file(path: &Path, deadline: Duration) -> Result<u16> {
 }
 
 /// ready.json を 1 回だけ試し読みする。書き込み途中で JSON が壊れていれば None を返してリトライさせる。
+/// `ready.json` をそのまま読む（port と pid の両方）。
+fn try_read_ready(path: &Path) -> Result<Option<ReadyFile>> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(None);
+    };
+    match serde_json::from_slice::<ReadyFile>(&bytes) {
+        Ok(r) => Ok(Some(r)),
+        Err(_) => Ok(None), // 書き込み中の可能性 → 次のティックで再試行
+    }
+}
+
+/// その記録が、いま起動した子のものか。
+///
+/// pid を取れなかった（子がすでに終了している）場合は 0 が来る。**0 とは一致させない** —
+/// 記録側の pid が偶然 0 でも受け入れず、待ちをタイムアウトさせて起動失敗として扱う。
+fn ready_belongs_to(ready: &ReadyFile, expected_pid: u32) -> bool {
+    expected_pid != 0 && ready.pid == expected_pid
+}
+
+/// ポートだけを読む。**孤児掃除が古い記録を拾うため**に残す（こちらは pid で絞らない）。
 fn try_read_port(path: &Path) -> Result<Option<u16>> {
     let Ok(bytes) = std::fs::read(path) else {
         return Ok(None);
@@ -424,6 +454,40 @@ mod tests {
     }
 
     use super::*;
+
+    /// **古い `ready.json` を信じない**（2026-09-13 実機で発覚）。
+    ///
+    /// 数値は実機のもの。前回セッションで止めた孤児（port 60005 / pid 43140）の記録が残り、
+    /// 新しい子（port 62776 / pid 15316）が書く前にそれを読んで、死んだポートへ合成を投げた。
+    #[test]
+    fn only_the_spawned_childs_ready_file_is_trusted() {
+        let stale = ReadyFile { port: 60005, pid: 43140 };
+        let fresh = ReadyFile { port: 62776, pid: 15316 };
+        assert!(!ready_belongs_to(&stale, 15316), "前回の子の記録を信じてはいけない");
+        assert!(ready_belongs_to(&fresh, 15316), "いま起動した子の記録は受け入れる");
+        assert!(
+            !ready_belongs_to(&ReadyFile { port: 1, pid: 0 }, 0),
+            "pid を取れなかった（子が終了済み）なら、偶然 0 の記録にも一致させない"
+        );
+    }
+
+    /// **待ちの配線まで固定する**（関数だけ正しくて呼ばれていない、を素通りさせない）。
+    ///
+    /// `ready_belongs_to` 単体のテストでは、`wait_for_ready_file` がそれを使っているかまでは
+    /// 分からない（`backfill_baseline` で同じ取りこぼしを実際にやった）。古い記録しか無ければ
+    /// **ポートを返さずに待ちがタイムアウトする**こと、一致すれば返すことを見る。
+    #[tokio::test]
+    async fn waiting_ignores_a_stale_ready_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), br#"{"port":60005,"pid":43140}"#).unwrap();
+
+        let got = wait_for_ready_file(tmp.path(), Duration::from_millis(500), 15316).await;
+        assert!(got.is_err(), "古い記録のポートを返してはいけない: {got:?}");
+
+        std::fs::write(tmp.path(), br#"{"port":62776,"pid":15316}"#).unwrap();
+        let got = wait_for_ready_file(tmp.path(), Duration::from_millis(500), 15316).await;
+        assert_eq!(got.unwrap(), 62776, "いま起動した子の記録なら返す");
+    }
 
     #[test]
     fn ready_file_parse_extracts_port_and_pid() {

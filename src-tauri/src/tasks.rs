@@ -1142,16 +1142,19 @@ pub fn spawn_irodori_health_watcher(app: AppHandle, state: Arc<AppState>) {
             // GPU 永続不在環境での 90 秒 churn を止める。voicevox 経路は引き続き動く。
             let _ = state.tts.irodori.shutdown().await;
             state.tts.irodori.disable_for(DISABLE_SECS);
+            let reason = format!(
+                "ヘルスチェックが {FAIL_THRESHOLD} 回連続失敗。{} 分は再起動を抑制します",
+                DISABLE_SECS / 60
+            );
+            // **理由は通知のレート制限より前にログへ残す** (v0.5.5 項目 1、開発方針 7 の掃討で発見)。
+            // `commands::tts` の合成フォールバックと同じ形で、通知（5 分に 1 回）の中にしか
+            // 理由を置いていなかった。20 分の抑制が始まった事実が、2 回目以降は残らない。
+            crate::ulog!("[irodori] {reason}");
             if state.tts.irodori.should_notify_unavailable() {
                 crate::system::notify::notify(
                     &app,
                     &state,
-                    crate::system::notify::NoticeKind::IrodoriUnavailable {
-                        reason: format!(
-                            "ヘルスチェックが {FAIL_THRESHOLD} 回連続失敗。{} 分は再起動を抑制します",
-                            DISABLE_SECS / 60
-                        ),
-                    },
+                    crate::system::notify::NoticeKind::IrodoriUnavailable { reason },
                 )
                 .await;
             }
