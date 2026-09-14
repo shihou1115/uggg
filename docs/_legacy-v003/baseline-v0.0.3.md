@@ -5,6 +5,7 @@
 > 本書は実装済みの現状を網羅するスナップショットであり、設計の正本は [spec.md](../spec.md) /
 > モジュール契約の正本は [architecture.md](../architecture.md) に置く。本書はそれらへの索引と
 > v0.0.3 で確定した内容・残課題のサマリを兼ねる。
+> 本文中の `src/` `src-tauri/src/` へのリンクと architecture.md の見出しアンカーは**プロトタイプ（`C:\claude\ugga`）の構成**を指しており、本リポジトリでは解決しない（スナップショットのため書き換えない）。
 
 ---
 
@@ -40,7 +41,7 @@
 - **2モード**: `low`（辞書のみ、無料・オフライン）/ `advanced`（LLM 経由）。当月コスト上限超過で自動降格、API エラー連続でも一時降格。
 - **プロバイダ**: OpenAI / Anthropic / Grok / LM Studio / Ollama（OpenAI 互換 API 経由）。
 - **掛け合いパターン 1–4**: メイン/サブの順番・3ターン目の有無。advanced のみ可変、辞書系は常に pattern 1。
-- **辞書 schema v2**（[low_mode.rs](../src-tauri/src/dialogue/low_mode.rs) / [ghosts/default/dic/main.yaml](../ghosts/default/dic/main.yaml)）:
+- **辞書 schema v2**（[low_mode.rs](../src-tauri/src/dialogue/low_mode.rs) / [ghosts/default/dic/main.yaml](../../ghosts/default/dic/main.yaml)）:
   - `rules`（keyword マッチ + priority）、`fallback`、`random_talk`、`error_talk`、`recall_talk`、`update_talk`、`events`。
   - `events` キー: `first_boot` / `boot` / `quit` / `poke_*` / `poke_rapid` / `nade_*` / `idle` /
     `focus_start` / `focus_end` / `break_end` / `pomodoro_done`。
@@ -192,7 +193,7 @@ v0.0.3 で追加・変更されたもの:
 
 ### 4.4 辞書 schema v2
 構造は [architecture.md §events](../architecture.md#つつきの部位判定-フロントが押した位置キャラ要素矩形に対する相対-xy-で縦-vheadchestbody横-hleftcenterright) と
-[ghosts/default/dic/main.yaml](../ghosts/default/dic/main.yaml) を実例として参照。
+[ghosts/default/dic/main.yaml](../../ghosts/default/dic/main.yaml) を実例として参照。
 
 ### 4.5 ファイル配置（実行時）
 | 場所 | 用途 |

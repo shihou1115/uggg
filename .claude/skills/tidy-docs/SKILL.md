@@ -15,7 +15,7 @@ v0.3.0 リリース直後の初回整理（2026-07-24）で docs/*.md は **28 �
 
 ## 実行タイミング
 
-- **リリースのタグ打ち・push 完了後**（releasing-ugg Step 8 の後）に 1 回実行する。
+- **リリースのタグ打ち後・push 前**（releasing-ugg Step 9。順序は「タグ → tidy-docs → push」、2026-09-11 に push 後から変更）に 1 回実行する。整理のコミットは同じ push で出す。
   - タグ後に行う理由: 削除しても「原本はタグ vX.Y.Z 以前の履歴にある」と復元先を一言で言える。
     リリース作業自体を hygiene で遅らせない（**リリースの完了条件には含めない**）。
   - 次バージョンのスコープ選定前に済ませる（新しい設計書を書き始める前に土台を軽くする）。
@@ -35,12 +35,12 @@ find docs -name "*.md" | while read f; do printf "%6d 行  %s\n" $(wc -l < "$f")
 
 ```bash
 grep -rln "<ファイル名の stem>" --include="*.md" --include="*.rs" --include="*.ts" \
-  --include="*.json" --include="*.js" --include="*.yaml" --include="*.ps1" \
-  CLAUDE.md README.md docs src src-tauri/src src-tauri/tauri.conf.json .claude scripts
+  --include="*.json" --include="*.js" --include="*.yaml" --include="*.ps1" --include="*.py" \
+  CLAUDE.md README.md docs src src-tauri/src src-tauri/python src-tauri/tauri.conf.json .claude scripts crates
 ```
 
 判定ルール:
-- **コード（.rs / .ts）のコメントから参照される文書は削除・改名しない**（v0.3 時点で設計書 4 本に計 40+ 箇所の参照がある。doc 整理のためにコードを触るのは本末転倒）
+- **コード（.rs / .ts / .py）のコメントから参照される文書は削除・改名しない**（v0.3 時点で設計書 4 本に計 40+ 箇所の参照がある。doc 整理のためにコードを触るのは本末転倒）
 - **`tauri.conf.json` の `bundle.resources` にある文書（`docs/manual.md`）は絶対に動かさない**（配布物が壊れる）
 - **`docs/release-notes/` からの参照は dangling 扱いしない**（当時の状態の記録。歴史は書き換えない）
 - 被参照が「索引類（CLAUDE.md 索引・spec §7 等）のみ」なら、参照行ごと整理できるので削除可能
