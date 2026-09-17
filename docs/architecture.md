@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.32）
+# ugg アーキテクチャ設計書（architecture.md v2.33）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -27,12 +27,12 @@
 │  │   src/                                          │   │
 │  │    main.ts                                      │   │
 │  │    types.ts                                     │   │
-│  │    stage/ (character/pose/alphamask/scale)      │   │
-│  │    dialogue/ (balloon/input/typewriter/chatlog) │   │
+│  │    stage/ (character/charpos/alphamask/scale)   │   │
+│  │    dialogue/ (balloon/input/typewriter)         │   │
 │  │    tts/ (speaker/mouth/credit)                  │   │
-│  │    panels/ (settings/onboarding)                │   │
+│  │    panels/ (settings/chatlog/daily/onboarding)  │   │
 │  │    menu/ (context-menu)                         │   │
-│  │    interaction/ (click/poke/nade/drag)          │   │
+│  │    interaction/ (click/poke/nade)               │   │
 │  │    system/ (toast/ghost-speech)                 │   │
 │  └────────────────── ↕ Tauri IPC ──────────────────┘   │
 │  ┌──── Backend (Rust) ─────────────────────────────┐   │
@@ -41,9 +41,9 @@
 │  │    state.rs (AppState コンテナ)                 │   │
 │  │    db.rs                                        │   │
 │  │    commands/ (1コマンド1ファイル目安)          │   │
-│  │    dialogue/ (low/advanced/llm/monologue/banter)│   │
-│  │    ghost/ (manifest/dict/asset_dnd)             │   │
-│  │    tts/ (engine/voicevox/irodori/preprocess)    │   │
+│  │    dialogue/ (low/advanced/llm/banter)          │   │
+│  │    ghost/ (manifest/dict/dnd)                   │   │
+│  │    tts/ (voicevox/irodori/sidecar/preprocess)   │   │
 │  │    presence/ (idle/quiet/window_pos)            │   │
 │  │    window/ (mask/tray)                          │   │
 │  │    system/ (secrets/cost/update/topics/notify)  │   │
@@ -110,7 +110,7 @@ src-tauri/src/
 │   └── dnd.rs               -- ★ DnD 展開（zip/フォルダ、zip slip 対策・サイズ/深さ上限）
 │
 ├── tts/                     -- TTS
-│   ├── mod.rs               -- trait TtsEngine, 振り分け
+│   ├── mod.rs               -- サブモジュールの宣言のみ（エンジンの振り分けは commands/tts.rs の synthesize_voice）
 │   ├── voicevox.rs          -- voicevox_core 埋め込み（libloading + プリビルド C API）
 │   ├── irodori.rs           -- Irodori サイドカー HTTP クライアント
 │   ├── irodori_download.rs  -- Irodori 資産 DL（Python ランタイム・依存・HF モデル）
@@ -130,11 +130,13 @@ src-tauri/src/
 │   └── window_pos.rs        -- ステージのドック（作業領域下端全幅に固定・1秒監視で再ドック・モニタ記憶）
 │
 ├── window/                  -- ウインドウ管理
-│   ├── mod.rs               -- create_main_window
+│   ├── mod.rs               -- configure_main_window / start_cursor_watcher
 │   ├── mask.rs              -- クリック透過ポーリング（50ms, set_ignore_cursor_events）
 │   └── tray.rs              -- タスクトレイ・メニュー
 │
 ├── system/                  -- 共通基盤
+│   ├── mod.rs
+│   ├── log.rs               -- ★v0.5 ファイルログ（`%APPDATA%\ugg\ugg.log`、2MB で 1 世代退避。spec §5）
 │   ├── secrets.rs           -- keyring ラッパ
 │   ├── cost.rs              -- LLM コスト追跡・上限警告・自動降格
 │   ├── update.rs            -- 更新通知
@@ -162,43 +164,46 @@ src-tauri/src/
 src/
 ├── main.ts                  -- boot 配線のみ
 ├── types.ts                 -- Rust と一致する共有型
+├── confirm.ts               -- 確認ダイアログ（window.confirm の代替。静的配置の独自モーダル）
+├── dnd.ts                   -- ゴースト/シェルの DnD インストール（dnd_install を呼ぶ）
 │
 ├── stage/                   -- ステージ・ウインドウ
-│   ├── character.ts         -- キャラ DOM 管理
-│   ├── pose.ts              -- pose 切替（visible クラス）
+│   ├── character.ts         -- キャラ DOM 管理・pose 画像の保持と切替
+│   ├── charpos.ts           -- キャラごとの X 位置管理（spec §4.1.6 / §4.3.4）
 │   ├── alphamask.ts         -- 8px グリッド合成 → update_alpha_mask
 │   └── scale.ts             -- 表示スケール（レイヤー分離方式 §10）
 │
 ├── dialogue/                -- 対話 UI
 │   ├── balloon.ts           -- 吹き出し（最大3つ、§10）
 │   ├── input.ts             -- チャット入力
-│   ├── typewriter.ts        -- タイプライター描画（速度可変）
-│   └── chatlog.ts           -- ログパネル
+│   └── typewriter.ts        -- タイプライター描画（速度可変）
 │
 ├── tts/                     -- TTS フロント
 │   ├── speaker.ts           -- TtsSpeaker / NoopSpeaker / EngineSpeaker（全 slot 直列の発声キュー + 先読み 1）
 │   ├── mouth.ts             -- 口パク（振幅駆動のみ、§A-4）
+│   ├── types.ts             -- 音声選択肢の型（VoiceOption）
 │   └── credit.ts            -- VOICEVOX クレジット表示
 │
+├── weather/
+│   └── credit.ts            -- Open-Meteo 天気クレジット表示（CC BY 4.0、spec §4.7.2）
+│
 ├── panels/                  -- UI パネル
-│   ├── settings/
-│   │   ├── index.ts         -- 全体管理（タブ管理）
-│   │   ├── general.ts       -- モード・自動起動・スケール等
-│   │   ├── llm.ts           -- プロバイダ・モデル・APIキー
-│   │   ├── voice.ts         -- TTS 設定（voicevox / irodori）
-│   │   ├── interests.ts     -- 時事ネタ・興味分野
-│   │   └── about.ts         -- バージョン・ライセンス
+│   ├── settings.ts          -- 設定パネル（1 ファイル）
+│   ├── chatlog.ts           -- ログパネル
+│   ├── reader.ts            -- テキスト読み上げパネル
+│   ├── pomodoro.ts          -- ポモドーロパネル
 │   ├── daily.ts             -- ★M7/M8 予定・ToDo パネル（リマインダー節 + ToDo 節: 3 バケットタブ・チェック完了・優先度/日課トグル）
 │   └── onboarding.ts        -- 初回オンボーディング
 │
 ├── menu/
-│   └── context-menu.ts      -- ★ 右クリック→バルーン内メニュー（C-5、spec §4.3.5）。M7 で「予定・リマインダー」項目追加
+│   └── context-menu.ts      -- ★ 右クリック→バルーン内メニュー（C-5、spec §4.3.5）。M7 で「予定・ToDo」項目追加
 │
 ├── interaction/             -- 操作
-│   ├── click.ts             -- クリック種別判別
+│   ├── click.ts             -- クリック種別判別（ドラッグ判定を含む）
 │   ├── poke.ts              -- つつき
-│   ├── nade.ts              -- 撫で
-│   └── drag.ts              -- ドラッグ
+│   └── nade.ts              -- 撫で
+│
+├── __tests__/               -- 操作列テスト（Vitest + happy-dom、test-plan §3.2b）
 │
 └── system/
     ├── toast.ts             -- トースト表示（フォールバック用）
@@ -212,12 +217,12 @@ src/
 | ★ main.rs を「配線のみ」に薄く | v0.0.3 は 1300 行超で肥大化、ロジックを各モジュールへ |
 | ★ commands/ ディレクトリ化 | コマンド追加時の影響範囲を限定 |
 | ★ dialogue/ tts/ presence/ window/ system/ tools/ をディレクトリ化 | 関連ファイルを近接、横移動削減 |
-| ★ 設定パネル UI を分割（general/llm/voice/interests/about） | v0.0.3 の settings.ts は 1500 行超 |
+| ★ 設定パネル UI を分割（general/llm/voice/interests/about）※計画のみ。実装は `panels/settings.ts` の 1 ファイル | v0.0.3 の settings.ts は 1500 行超 |
 | ★ system/notify.rs 新設 | 横断方針「ゴーストに喋らせる」を 1 箇所集約 |
-| ★ ghost/asset_dnd.rs 新設 | DnD 展開（新機能） |
+| ★ ghost/dnd.rs 新設 | DnD 展開（新機能） |
 | ★ tts/voice_ref.rs 新設 | Irodori 参照音声管理（新機能） |
 | ★ tts/preprocess.rs 新設 | 漢字→ひらがな変換 |
-| ★ tts_engine.rs 廃止 → tts/mod.rs に統合 | 3エンジン抽象（v0.0.3）から 2 エンジン trait へ |
+| ★ tts_engine.rs 廃止 → tts/mod.rs に統合 | 3エンジン抽象（v0.0.3）から 2 エンジン trait へ ※trait は実装していない（振り分けは `commands/tts.rs` の `synthesize_voice` の `match`） |
 | ★ openai_tts.rs 廃止 | openai_compat エンジンを spec で削除 |
 | ★ stt.rs 廃止 | STT を spec で削除 |
 | ★ secrets.rs / cost.rs / update.rs / topics.rs を system/ 配下に集約 | 共通基盤として明示 |
@@ -301,7 +306,7 @@ CREATE TABLE voice_refs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slot TEXT NOT NULL,          -- "main" | "sub"
     caption TEXT NOT NULL,       -- 生成に使ったキャプション
-    file_path TEXT NOT NULL,     -- %APPDATA%\ugg\irodori\refs\<id>.wav
+    file_path TEXT NOT NULL,     -- %APPDATA%\ugg\irodori\refs\<slot>_<id>.wav
     created_ts INTEGER NOT NULL,
     UNIQUE(slot)                 -- MVP は slot ごと最新1件のみ
 );
@@ -425,8 +430,8 @@ CREATE INDEX idx_monologue_cache_ghost ON monologue_cache(ghost_id);
 | `%APPDATA%\ugg\irodori\` | Irodori-TTS 資産（python / model / refs） |
 | `%APPDATA%\ugg\irodori\installed.json` | **★v0.5.4 導入記録**。`pins`（このビルドが**要求した**固定 URL）と `resolved`（**実際に入った**版）を持つ。2 つ持つのは役割が違うため — `pins` は入れ直しの要否判定に使い、`resolved` は「指定どおりに入るとは限らない」事実（`huggingface_hub==0.27.0` 指定に対し実機 0.36.2）を残す。**導入が全段成功した後にだけ書く**。**★v0.5.5**: `requirements`（配布名 → 要件文字列）と `models`（名前 → `repo@revision`）を追加。初回導入は全部を記録し、更新は入れ直せた分だけ反映する。**欄が空の記録（v0.5.4 が書いたもの・記録そのものが無い環境）は v0.5.4 の固定の基準値が入っているとみなす**（いまのビルドの値で埋めると、要件を変えたビルドで差が出ず更新が届かない） |
 | `%APPDATA%\ugg\irodori\sidecars.json` | **★v0.5.5 起動したサイドカーの台帳**（`[{port, pid}]`）。起動直後に追記し、**止まったのを見届けてから**ポートと pid の組で消す。次の起動で孤児掃除（`sweep_orphans`）が読み、`/health` の**応答の形**で自分のものと確かめてから止める。**確かめ終えた記録から 1 件ずつ消す**（途中で落ちても未確認の記録を失わない）。接続を拒否された記録は捨て、**つながったのに応答が無い記録は残す**（合成中はイベントループが塞がり `/health` に答えない） |
-| `%APPDATA%\ugg\irodori\refs\<id>.wav` | 参照音声本体（voice_refs.file_path から参照） |
-| `%LOCALAPPDATA%\ugg\logs\` | アプリログ（tauri-plugin-log） |
+| `%APPDATA%\ugg\irodori\refs\<slot>_<id>.wav` | 参照音声本体（voice_refs.file_path から参照） |
+| `%APPDATA%\ugg\ugg.log` | アプリログ（`system/log.rs`。追記、2MB で `ugg.log.1` へ 1 世代退避。spec §5） |
 | keyring `ugg` | API キー（provider 名で索引） |
 | `<app>/ghosts/<id>/` | 同梱 + DnD 追加ゴースト |
 | `<app>/shells/<id>/` | 同梱 + DnD 追加シェル |
@@ -441,13 +446,14 @@ CREATE INDEX idx_monologue_cache_ghost ON monologue_cache(ghost_id);
 pub struct AppState {
     pub db: Db,                                    // 共通
     pub settings: Mutex<Settings>,                  // 中央保持
-    pub ghost: Mutex<GhostBundle>,                  // ghost/shell/dict
+    pub ghost: Mutex<Result<GhostBundle, String>>,  // ghost/shell/dict（ロード結果を Result のまま保持）
     pub dialogue: DialogueState,                    // 対話進行
     pub presence: PresenceState,                    // 存在感
     pub tts: TtsState,                              // エンジン保持
     pub pomodoro: PomodoroState,                    // ポモドーロ
     pub window: WindowState,                        // ウインドウ
     pub governance: GovernanceState,                // ★M7 発話ガバナンス（インメモリ）
+    pub context: ContextState,                      // ★M9 状況検知（インメモリ）
 }
 ```
 
@@ -480,49 +486,40 @@ pub struct DialogueState {
     pub last_interaction: AtomicI64,
     pub degraded_until: AtomicI64,                  // 一時降格期限（unix 秒）
     pub error_streak: AtomicI64,                    // API エラー連続回数
-    pub cost_limited_emitted: AtomicBool,           // 上限超過通知済みフラグ
     pub greeted: AtomicBool,                        // 起動挨拶済み
     pub monologue_refill_ts: AtomicI64,             // ★M14 独り言キャッシュを最後に補充しようとした unix 秒
+    pub cost_unknown_notified: AtomicBool,          // ★v0.5.3 「当月コストを集計できない」告知をこのプロセスで出したか（DB 異常時も効くよう意図的にプロセス内）
+    // コスト上限の告知済みは AtomicBool ではなく app_settings の月次タグ（§2.2 cost_warned_80_month / cost_limit_notified_month）
 }
 
 pub struct PresenceState {
     pub idle_fired: AtomicBool,                     // 現放置期間で発火済か
-    pub win_x: AtomicI64,
-    pub win_y: AtomicI64,
-    pub pos_known: AtomicBool,
-    pub pos_dirty: AtomicBool,                      // 3秒デバウンス保存用
+    pub reading: AtomicBool,                        // テキスト読み上げ中（自発発話を抑制、text-reader-spec K6）
 }
 
 pub struct TtsState {
     pub voicevox: Mutex<Option<VoicevoxEngine>>,    // 遅延 init
-    pub irodori: Mutex<Option<IrodoriClient>>,      // 遅延 init（サイドカー起動含む）
-    pub openjtalk_for_preprocess: Mutex<Option<OpenJtalkRc>>,  // 漢字→かな専用
+    pub irodori: IrodoriClient,                     // サイドカーの handle・last_used 等はクライアント内部で保持（§8.4）
 }
 
 pub struct PomodoroState {
     pub focus: AtomicBool,                          // 静音判定で参照
     pub gen: AtomicU64,                             // タスクキャンセル用世代
-    pub phase: AtomicU32,                           // 0=focus, 1=break, 2=idle
+    pub phase: AtomicU32,                           // 0=idle, 1=focus, 2=break
     pub remaining: AtomicU32,
     pub round: AtomicU32,
     pub rounds: AtomicU32,
+    pub paused: AtomicBool,                         // 一時停止中（spec §4.4.5）
 }
 
 pub struct WindowState {
     pub alpha_mask: Mutex<DecodedMask>,             // クリック透過判定
-    pub scale_milli: AtomicI64,                     // display_scale × 1000
-    pub tray: std::sync::Mutex<Option<TrayHandles>>,// トレイメニュー同期
-}
-
-pub struct WorkerHandles {                          // ★ v0.0.3 では AppState 直下平坦
-    pub bg_tx: mpsc::UnboundedSender<BgTask>,
-    pub interval_tx: watch::Sender<u64>,            // ランダムトーク間隔通知
-    pub topics_tx: watch::Sender<u64>,              // 時事ネタ取得間隔通知
 }
 
 pub struct GhostBundle {
-    pub manifest: GhostManifest,
+    pub ghost: GhostManifest,
     pub shell: ShellManifest,
+    pub shell_dir: PathBuf,
     pub dictionary: Dictionary,
 }
 ```
@@ -530,31 +527,29 @@ pub struct GhostBundle {
 ### 3.3 ライフサイクル
 
 ```
-[boot]
-  ├─ DB open, settings 読み込み（"settings" キー）
-  ├─ ghost/shell/dict ロード（initial 値で GhostBundle 構築）
-  ├─ AppState::new() で全サブ状態を初期化
-  ├─ Tauri builder.manage(Arc::new(state))
+[boot]（詳細は §14.1）
+  ├─ install_panic_dialog_hook（起動時 panic を MessageBox で見せる）
+  ├─ tauri::Builder に tauri_plugin_autostart を登録
   └─ setup フックで:
-       ├─ ウインドウ生成
-       ├─ クリック透過ポーリング起動（window/mask）
-       ├─ presence::spawn_idle_watcher
-       ├─ presence::spawn_dock_keeper
-       ├─ tasks::spawn_random_talk (interval_rx)
-       ├─ tasks::spawn_topics_fetcher (topics_rx)
-       ├─ update::spawn_update_check
-       └─ tts::spawn_voicevox_preinit（事前 init）
+       ├─ AppState::initialize（log 初期化 → DB open・migrate → settings 読み込み（"settings" キー）→ ghost/shell/dict ロード）
+       ├─ app.manage(state.clone())
+       ├─ system::governance::load_backoff
+       ├─ ウインドウ設定 + クリック透過ポーリング起動（window::configure_main_window / start_cursor_watcher）
+       ├─ presence::window_pos::dock / spawn_dock_keeper
+       ├─ tasks::spawn_*（ランダムトーク・放置・Irodori のアイドル/ヘルス・更新・時事ネタ・リマインダー・日課・状況・カレンダー）
+       ├─ window::tray::install
+       ├─ commands::tts::spawn_preinit（tts_enabled のとき。voicevox の事前 init）
+       └─ tts::sidecar::install_sidecar_script / sweep_orphans（孤児サイドカーの掃除）
 
 [通常運用]
   ├─ Tauri コマンド → commands/* → 各サブ状態 / DB
-  ├─ バックグラウンドタスクは bg_tx 経由で busy ゲートを参照
+  ├─ バックグラウンドタスクの発話は system::deliver の単一ゲート（静音・busy 直列化）を通る
   └─ notify(kind, args) でゴースト発話 or トースト
 
-[終了]
-  ├─ trayから「終了」→ events.quit 発話を待ってから exit
-  ├─ presence::persist_window_pos（即時保存）
-  ├─ irodori サイドカーの正常終了（HTTP DELETE /shutdown）
-  └─ DB クローズ
+[終了]（詳細は §14.3）
+  ├─ トレイ「終了」→ quit / todo_quit を発話して待つ → 位置の即時保存 → サイドカー停止（POST /shutdown）→ exit
+  ├─ コンテキストメニュー「終了」→ サイドカー停止 → exit（挨拶なし）
+  └─ 終了シグナルを受ける処理は無い（強制終了で残ったサイドカーは次の起動の sweep_orphans が止める）
 ```
 
 ---
@@ -627,7 +622,7 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `synthesize_voice` | `text: String, slot: "main"\|"sub", caption: String\|null（省略可）` | `String` | WAV を base64 で返す（slot 基準、エンジン振り分けはバックエンド）。★ `caption` は Irodori 実モデルのみ使用（他経路は無視、空文字は None 正規化。script-reader-spec.md §3.3） |
+| `synthesize_voice` | `text: String, slot: "main"\|"sub", caption: String\|null（省略可）` | `String` | WAV を base64 で返す（slot 基準、エンジン振り分けはバックエンド）。★ `caption` は Irodori 実モデルのみ使用（他経路は無視、空文字は None 正規化。script-reader-spec.md §3.3）。**v3 本体では効いていない**（§7.1。v0.5.6 の差し替えで閉じる予定で、効くことは差し替え時に検証する） |
 | `list_voices` | なし | `VoiceOption[]` | 現在エンジンの声一覧 |
 | `voicevox_assets_ready` | なし | `bool` | 資産有無 |
 | `download_voicevox_assets` | `agreed: bool, gh_token: String\|null` | `()` | 規約同意必須、進捗は `voicevox-download` イベント |
@@ -707,7 +702,7 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `feedback_speech` | `speech_id: String, category: String` | `()` | 🔕「いまのは邪魔」。**最新のタグ付き発話と一致したときだけ**適用（誤適用は黙って無視）。backoff +1 を `governance_backoff:<category>` に永続化し gate 段 5 の間隔を線形延長、3 回でカテゴリトグルを OFF（settings 永続化 + settings-changed）。Situation* 以外は no-op |
+| `feedback_speech` | `speech_id: String, category: String` | `()` | 🔕「いまのは邪魔」。**最新のタグ付き発話と一致したときだけ**適用（誤適用は黙って無視）。backoff +1 を `governance_backoff:<category>` に永続化し gate 段 5 の間隔を線形延長、3 回でカテゴリトグルを OFF（settings 永続化 + settings-changed）。対象は `feedback_target()`（Situation* 5 種〔`SituationRain` 含む〕+ ★M11 `RegularMorning` / `RegularEvening`）で、それ以外は no-op。Regular* は段 5 の間隔延長が掛からず（段 5 は Situation* のみ）、回数と 3 回での枠 OFF だけが効く |
 
 ★M10 カレンダー（spec §4.6.4、読み取り専用）。変更系は `calendar-changed` を emit。
 
@@ -1014,6 +1009,10 @@ when:                                        # ⑥ 確率
 
 ### 7.1 全体フロー
 
+> §7.1〜§7.4 の図とコードは **Phase 2 時点の素案**。実装に `TtsEngine` trait・`IrodoriEngine`・`needs_kana_preprocess` は無い。
+> `commands/tts.rs` の `synthesize_voice` が `settings.tts_engine` の値で振り分け、voicevox 経路は `TtsState.voicevox` の
+> `VoicevoxEngine`、Irodori 経路は `preprocess_for_irodori` で漢字をかなに変えてから `IrodoriClient::synthesize`（`tts/irodori.rs`）を呼ぶ。
+
 ```
    synthesize_voice(text, slot, caption?)   ★ caption は Irodori 実モデルのみ使用
                                             ★v0.5.4 訂正: **v3 では効いていない**
@@ -1094,6 +1093,10 @@ impl TtsEngine for IrodoriEngine {
 
 ### 7.5 漢字→ひらがな前処理（K1: voicevox_core の Open JTalk 流用）
 
+> 下のコードは **Phase 2 時点の素案**。実装に `KanaPreprocessor` 型は無く、`tts/preprocess.rs` の関数
+> （`to_hiragana_preserving_emoji` など）が、`TtsState.voicevox` の VoicevoxEngine が持つ OpenJtalk を借りて変換する
+> （Irodori 経路の合成が送信前に `commands/tts.rs` の `preprocess_for_irodori` を呼ぶ。下の「初期化コスト」と §8.8）。
+
 ```rust
 // tts/preprocess.rs
 pub struct KanaPreprocessor {
@@ -1120,7 +1123,7 @@ impl KanaPreprocessor {
 ```
 
 - AccentPhrase JSON 構造は voicevox_core の公開仕様に準拠
-- 初期化コスト: OpenJtalkRc を専用に1つ持つ（VoicevoxEngine の synthesizer とは別、軽量）
+- 初期化コスト: 専用の OpenJtalkRc は持たず、`TtsState.voicevox` の VoicevoxEngine が持つ OpenJtalk を流用する（未初期化なら先に初期化する。失敗したら元のテキストのまま合成する）
 
 #### 絵文字アノテーションの保護（Irodori-TTS V3 の感情制御対応）
 
@@ -1151,17 +1154,19 @@ raw テキストフォールバックに委ねる。
 
 ```
 %APPDATA%\ugg\irodori\
-├── python\              -- M1: 公式 Embeddable Python（Windows x64, 約 10MB）
+├── python\              -- M1: 公式 Embeddable Python 3.11.9（Windows x64, 約 10MB）
 │   ├── python.exe
-│   ├── python313.dll
+│   ├── python311.dll
+│   ├── Lib\site-packages\  -- pip install で配置（torch, fastapi 等、~2GB）
 │   └── ... (標準ライブラリ)
-├── packages\            -- pip install で配置（torch, fastapi 等、~2GB）
-├── model\               -- Irodori-TTS モデル（HF から DL、数GB）
+├── model\               -- Irodori-TTS モデル（HF から DL、数GB。リポジトリと revision ごとに別フォルダで、旧版を上書きしない）
 ├── refs\                -- 参照音声 wav 格納
 │   ├── main_<id>.wav
 │   └── sub_<id>.wav
 ├── sidecar.py           -- FastAPI エントリポイント
-└── version.json         -- インストール済みバージョン情報
+├── installed.json       -- ★v0.5.4 導入記録（§2.4）
+├── sidecars.json        -- ★v0.5.5 起動したサイドカーの台帳（§2.4）
+└── ready.json           -- サイドカーが待ち受けポートと pid を書き出す（起動のたびに作り直す）
 ```
 
 ### 8.2 Python ランタイム（M1）
@@ -1177,17 +1182,24 @@ raw テキストフォールバックに委ねる。
 ### 8.3 モデル配布（HF DL）
 
 - HuggingFace `Aratako/Irodori-TTS-*` モデルを初回 DL
-- 規約同意は設定 UI でチェック必須（VOICEVOX 同様の同意ゲート）
+- 規約同意のチェックや同意文言は無い（spec §4.5.1 が規約同意を求めるのは voicevox_core のみ）。「ランタイムをダウンロード」押下時に、取得物（Python ランタイム・PyTorch (CUDA 12.8)・実モデル実行時ランタイム）と通信量（約 2〜3 GB）・所要時間（10〜20 分）を示す確認ダイアログを出し、OK なら `download_irodori_assets` を `agreed: true` で呼ぶ
 - DL 進捗は `irodori-download` イベント
 
 ### 8.4 プロセス管理（O2）
 
+> 下のコードのうち `SidecarHandle` の定義は実装どおり（v0.5.5）。続く `ensure_sidecar_running` / `idle_watcher` は
+> **Phase 2 時点の疑似コード**で、実装とは次が違う: ハンドルを守るのは `std::sync::Mutex`、`last_used` は
+> `IrodoriClient` 側の `AtomicI64`、起動の完了は `/health` の ping ではなく `ready.json`（起動した子の pid と一致するもの）で知り、
+> 停止は `POST /shutdown` のあと必要なら `kill`（`tts/sidecar.rs` / `tts/irodori.rs`）。
+
 ```rust
 pub struct SidecarHandle {
-    child: Child,                  // tokio::process::Child
-    port: u16,                     // 動的割当（起動時に空きポートを取得）
-    last_used: Instant,            // アイドル判定
+    asset_root: PathBuf,           // 台帳 sidecars.json の位置（止めたら記録を消す）
+    pub port: u16,                 // 動的割当（sidecar.py が ready.json に書き出す）
+    pub pid: u32,                  // 台帳の記録をポートと pid の組で消すため
+    pub child: Child,              // tokio::process::Child
 }
+// last_used はハンドルではなく IrodoriClient 側の AtomicI64（unix 秒、0 = 起動なし）
 
 // 起動: 初回 synthesize の手前
 async fn ensure_sidecar_running(&self) {
@@ -1248,28 +1260,31 @@ async fn idle_watcher() {
 
 ```rust
 pub async fn irodori_check_gpu() -> GpuInfo {
-    // 1) Windows DXGI / nvml で CUDA 対応 GPU 検出
+    // 1) Windows DXGI で物理アダプタを列挙し、NVIDIA（VendorId 0x10DE）を探す（nvml は使わない。CUDA の可否はサイドカー側で確かめる）
     // 2) なければ GpuInfo { available: false, ... } を返す
     // 3) 設定 UI で「Irodori-TTS は GPU 環境でのみ利用可能」と表示し DL ボタン無効化
 }
 
-// サイドカー起動時の保険:
-// /health が gpu: null を返したら起動失敗扱い → notify(IrodoriUnavailable)
-//   → 自動的に voicevox_core にフォールバック
+// サイドカー稼働中の監視（tasks::spawn_irodori_health_watcher）:
+// /health は実モデルモードで GPU が無いと 503 {status: "no_gpu"} を返す（起動の待ち合わせは ready.json で、/health は見ない）
+// 30 秒ごとに /health を ping（3 秒タイムアウト・2xx 以外も失敗・未起動なら何もしない）し、3 回連続失敗で
+//   shutdown → 20 分は ensure_sidecar_running が即 SidecarStart を返す → 理由を ugg.log へ（通知のゲートより前）
+//   → notify(IrodoriUnavailable)（synthesize_voice と共有の 5 分クールダウン）
+// 合成の失敗（VoiceRefMissing 以外）は synthesize_voice が理由を ugg.log へ残して voicevox_core で再合成し、
+//   成功したときだけ notify(IrodoriUnavailable)（commands::tts::decide_fallback）
 ```
 
 ### 8.7 参照音声管理（R1+R3 ハイブリッド）
 
 ```
-[シェル選択時]
-   ├─ shell.json に voice_caption_default があれば → 自動生成
-   │   └─ voice_refs テーブルに保存
-   └─ なければ → 設定パネルで手動入力を促す
+[参照音声の用意]
+   └─ 自動生成はしない（shell.json に既定キャプションを持つ項目は無い）。設定パネルの音声ページでキャプションを入力して生成する
+       （未生成のまま Irodori で合成すると VoiceRefMissing を返し、voicevox へはフォールバックしない）
 
 [設定パネル: 音声タブ]
    ├─ メイン/サブ それぞれに参照音声状態を表示
    ├─ 「参照音声を生成 / 再生成」ボタン
-   │   └─ クリック → キャプション入力モーダル → /v1/voice_ref/generate
+   │   └─ クリック → 同じ欄のキャプション入力欄（空なら案内して中止）の値で voice_ref_generate → /v1/voice_ref/generate
    ├─ 「プレビュー再生」ボタン
    │   └─ クリック → /v1/audio/speech で短文合成
    └─ 「参照音声を削除」ボタン
@@ -1280,8 +1295,8 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 
 ### 8.8 漢字→ひらがな前処理の呼び出し
 
-- IrodoriEngine::synthesize 内部で TtsState の `openjtalk_for_preprocess` を使い変換
-- VoicevoxEngine 内部の Synthesizer とは**別の OpenJtalkRc インスタンス**を持つ（合成中の競合を避ける）
+- Irodori 経路の合成（`commands/tts.rs`）が送信前に `preprocess_for_irodori` を呼び、`TtsState.voicevox` の VoicevoxEngine が持つ OpenJtalk で変換する（`tts/preprocess.rs` の `to_hiragana_preserving_emoji`）
+- 専用の OpenJtalkRc インスタンスは持たない。変換中は `TtsState.voicevox` の Mutex を保持する
 
 ---
 
@@ -1587,10 +1602,10 @@ fn detect_asset_kind(path: &Path) -> Result<AssetKind, DndError> {
 
 ### 12.3 セキュリティ対策
 
-- **zip slip 対策**: 展開先パスが目的ディレクトリ配下にあることを正規化後に検証（`Path::canonicalize` → starts_with）
-- **ファイル名検証**: 制御文字・予約名（CON, PRN 等）を除外
-- **サイズ上限**: 展開後合計 1 GB 上限（設定で調整可、超過時エラー）
-- **ファイル種別**: shell 用は画像 (.png, .jpg) + .json のみ、ghost 用は .yaml + .json のみを許容、その他は警告（許容するか拒否するかは options）
+- **zip slip 対策**: zip エントリ名の絶対パス・ドライブ指定・`..` を拒否（`sanitize_zip_path`）したうえで、展開先パスが目的ディレクトリ配下にあることを文字列レベルの正規化（`normalize_path`）後に starts_with で検証する。`Path::canonicalize` は Windows で `\\?\` が付き未作成のパスと比較できないため使わない。manifest の `id` も単一のフォルダ名に限定する（`validate_asset_id`。区切り文字・ドライブ指定・`.`/`..`・制御文字・前後空白・Windows 予約名・末尾ドット・UTF-8 で 65 バイト以上（日本語だけなら 22 文字以上）を拒否、★v0.4.1）
+- **ファイル名検証**: 制御文字・予約名（CON, PRN 等）の除外は manifest の `id`（＝導入先フォルダ名）にだけ掛けている。zip エントリ名・フォルダ内のファイル名には掛けていない（エントリ名は上の zip slip 検査と下の拡張子検査のみ）
+- **サイズ上限**: 展開後合計 1 GB 上限（定数 `MAX_UNCOMPRESSED_BYTES`。設定からは変えられない。超過時エラー）。フォルダ導入は再帰深さ 10 まで（`MAX_DIR_DEPTH`）
+- **ファイル種別**: shell 用は .png / .jpg / .jpeg + .json、ghost 用は .yaml / .yml / .json / .md のみを許容する。それ以外の拡張子が 1 つでも含まれていれば導入全体を拒否する（`ForbiddenFile`。警告だけで通す経路や options は無い）
 
 ### 12.4 上書き処理
 
@@ -1616,12 +1631,13 @@ async fn install_asset(
 ```
 
 - **上書き確認**: フロント側で確認ダイアログ → 確定で `dnd_install(..., overwrite: true)` を再呼び出し
+- **導入は非破壊（★v0.5.3、spec §4.5.6）**: 上の擬似コードは Phase 2 時点のもの。実装（`commands/assets.rs` の `install_one` / `swap_in`）はまず `<assets>/.staging/` に展開し、展開結果の manifest `id` が確認時と一致するかを照合してから差し替える。失敗したら作業ディレクトリだけを消し、旧版には触れない。差し替えでは旧版を `<assets>/.previous-<subdir>-<id>` へ待避してから入れ替え、成功したら待避を消す。入れ替えに失敗したら旧版を戻し、戻せなければ待避先を残して場所を ugg.log に記録する。作業ディレクトリと待避先は `ghosts/` `shells/` の外に置く。v0.5.2 までの「既存を削除してから展開」はしない
 - インストール後は **再起動を促す**（reload_assets は提供せず、再起動の動線を notify でゴーストが案内）
 
 ### 12.5 UI
 
-- WebView の `dragover` / `drop` を捕捉、`Tauri` の `getDataTransferFiles` でパスを取得
-- 設定パネル → 拡張タブにも「ファイル選択」UI を用意（DnD と同等の処理）
+- `getCurrentWebviewWindow().onDragDropEvent` の `drop` を受け、`payload.paths` から OS パスを取得（`src/dnd.ts`）
+- 設定パネルにファイル選択 UI は置いていない（`dnd_install` の呼び出し元は `dnd.ts` の DnD 経路のみ）
 
 ---
 
@@ -1633,7 +1649,7 @@ async fn install_asset(
 - **同梱**: アプリ本体 + ghosts/default + shells/default
 - **同梱しない**:
   - voicevox_core 資産（初回 DL）
-  - Irodori-TTS（初回 DL、規約同意必須・GPU 必須）
+  - Irodori-TTS（初回 DL、確認ダイアログ・GPU 必須）
 
 ### 13.2 初回 DL フロー
 
@@ -1647,7 +1663,7 @@ async fn install_asset(
 [TTS 設定（任意）]
   ├─ voicevox_core 資産 DL（規約同意 → ダウンローダ起動）
   └─ Irodori-TTS（任意・GPU 検出済の場合のみ）
-       ├─ 規約同意
+       ├─ 確認ダイアログ（通信量・所要時間）
        ├─ Embeddable Python DL
        ├─ pip パッケージ DL（torch 等）
        └─ Irodori モデル DL（HF）
@@ -1669,27 +1685,41 @@ async fn install_asset(
 
 ```
 [main]
-  ├─ tauri_plugin_log 初期化
-  ├─ tauri_plugin_autostart 初期化
-  ├─ tauri_plugin_single_instance（既起動チェック）
-  ├─ Db::open_default()
-  ├─ Settings 読み込み（app_settings の "settings" キー）
-  ├─ Ghost/Shell/Dictionary 初期ロード
-  ├─ tokio Runtime 構築
-  ├─ AppState::new() で全サブ状態初期化
+  ├─ install_panic_dialog_hook（起動時 panic を MessageBox で表示。log 初期化後は ugg.log にも残す）
   └─ tauri::Builder
-       ├─ .manage(Arc::new(state))
-       ├─ .invoke_handler(...)
-       └─ .setup(|app| {
-            ├─ create_main_window(app, settings.display_scale)
-            ├─ window::mask::spawn_cursor_polling(app, state.clone())
-            ├─ presence::idle::spawn_watcher(app, state.clone())
-            ├─ presence::window_pos::spawn_dock_keeper(state.clone())
-            ├─ workers::spawn_random_talk(app, state.clone(), interval_rx)
-            ├─ workers::spawn_topics_fetcher(app, state.clone(), topics_rx)
-            ├─ system::update::spawn_check(app, state.clone())
-            └─ tts::voicevox::spawn_preinit(state.clone())
-          })
+       ├─ .plugin(tauri_plugin_autostart::init(...))
+       ├─ .setup(|app| {
+       │    ├─ AppState::initialize(app.handle())
+       │    │    ├─ system::log::init（%APPDATA%\ugg\ugg.log）
+       │    │    ├─ Db::open(companion.db) → db.migrate()（破損を検知しているときだけ失敗しても続行）
+       │    │    ├─ Settings 読み込み（app_settings の "settings" キー）
+       │    │    └─ ghost::load_bundle（Ghost/Shell/Dictionary 初期ロード。失敗はエラー文字列で保持）
+       │    ├─ app.manage(state.clone())
+       │    ├─ system::governance::load_backoff(&state)
+       │    ├─ window::configure_main_window(app.handle())
+       │    ├─ window::start_cursor_watcher(app, state.clone())
+       │    ├─ system::manual::open_on_first_run(app, &state)
+       │    ├─ presence::window_pos::dock(app, &state)
+       │    ├─ presence::window_pos::spawn_dock_keeper(app, state.clone())
+       │    ├─ tasks::spawn_random_talk(app, state.clone())
+       │    ├─ tasks::spawn_idle_watcher(app, state.clone())
+       │    ├─ tasks::spawn_irodori_idle_watcher(state.clone())
+       │    ├─ tasks::spawn_irodori_health_watcher(app, state.clone())
+       │    ├─ tasks::spawn_update_watcher(app, state.clone())
+       │    ├─ tasks::spawn_topics_watcher(state.clone())
+       │    ├─ tasks::spawn_reminder_watcher(app, state.clone())
+       │    ├─ tasks::spawn_daily_watcher(app, state.clone())
+       │    ├─ tasks::spawn_context_watcher(app, state.clone())
+       │    ├─ tasks::spawn_calendar_watcher(app, state.clone())
+       │    ├─ window::tray::install(app, state.clone())（失敗はログのみ）
+       │    ├─ commands::tts::spawn_preinit(state.clone())（tts_enabled のとき）
+       │    └─ tts::voice_ref::irodori_root() が取れれば
+       │         ├─ tts::sidecar::install_sidecar_script(resource_dir, asset_root)
+       │         └─ tts::sidecar::sweep_orphans（非同期。★v0.5.5）
+       │  })
+       └─ .invoke_handler(...)
+
+二重起動ガード（single-instance）は無い（spec §6.0 で v0.5.6 へ引き継ぎ）
 ```
 
 ### 14.2 通常運用
@@ -1702,11 +1732,18 @@ async fn install_asset(
 ### 14.3 終了
 
 ```
-[トレイ「終了」 or プロセス終了シグナル]
-  ├─ events.quit 発話キュー投入 → 発話完了待ち（最長 5s）
-  ├─ presence::window_pos::persist 即時保存
-  ├─ tts::irodori::shutdown_sidecar
-  └─ Db ドロップ
+[トレイ「終了」]（window::tray::quit_with_farewell）
+  ├─ daily_support_enabled で未完了の today ToDo があれば events.todo_quit、無ければ events.quit を発話
+  ├─ 発話があれば (1600 + 60ms × 文字数).min(8000) + 500ms 待つ（最長 8.5s。発話が無ければ待たない）
+  ├─ presence::window_pos::persist_now（位置の即時保存）
+  ├─ state.tts.irodori.shutdown()（POST /shutdown → 1s で止まらなければ kill。未起動なら即 return）
+  └─ app.exit(0)
+
+[コンテキストメニュー「終了」]（commands::lifecycle::quit_app）
+  ├─ state.tts.irodori.shutdown()
+  └─ app.exit(0)（挨拶なし・位置の即時保存なし）
+
+終了シグナルを受ける処理（RunEvent::ExitRequested 等）は無い。強制終了で残ったサイドカーは次の起動の sweep_orphans が止める
 ```
 
 ---
@@ -1720,8 +1757,8 @@ async fn install_asset(
 | GPU が利用可能 → 利用不能（運転中変化） | サイドカー異常終了 | notify(IrodoriUnavailable) + voicevox_core に自動切り替え |
 | 辞書 v3 のパース失敗 | アプリ起動失敗 | バリデータで起動時に警告、デフォルト辞書にフォールバック |
 | user_profile の肥大化 | system prompt 肥大化 | モード別容量管理（要約サイクル or 件数上限） |
-| zip slip 等の DnD 経由のパス脱出 | 任意ファイル書き込み | `canonicalize` 後の starts_with 検証 |
-| Python サイドカー起動時の文字エンコーディング | 出力文字化け | UTF-8 強制（PYTHONIOENCODING） |
+| zip slip 等の DnD 経由のパス脱出 | 任意ファイル書き込み | zip エントリ名の検査（`sanitize_zip_path`）+ `normalize_path` 後の starts_with 検証 + manifest `id` の検証（`validate_asset_id`）（§12.3） |
+| Python サイドカー起動時の文字エンコーディング | stderr の文字化け・読み取りの停止 | **UTF-8 の強制は実装していない**（`PYTHONIOENCODING` などの環境変数は設定していない。同梱の Python は `._pth` による isolated なので、環境変数ではそもそも効かない）。読めない行は置換文字にして流し、読み取りが止まるときは理由を `ugg.log` に残す（★v0.5.5）。実環境のサイドカーだけ cp932 で出力する理由はまだわかっておらず、v0.5.6 へ引き継いでいる（spec §6.0） |
 | サイドカーの孤児プロセス化 | リソースリーク（1 つで数 GB の VRAM） | アプリ終了時に `/shutdown` → kill。**強制終了で残ったものは次の起動で掃除する**（台帳 `sidecars.json` ＋ 応答の形で識別、★v0.5.5）。**Job Object による親子連動は未実装** — 当初ここに書いていたが実装されていなかった（2026-09-14 リリース前監査で発覚し、記述を実態へ改めた。検討は v0.5.6 へ） |
 
 ---
@@ -1773,3 +1810,4 @@ async fn install_asset(
 | 2026-09-14 | v2.30 | **v0.5.5 リリース前監査（release-audit）の指摘を反映**。① **欄が空の記録の基準値を固定値にした** — `backfill_baseline` がいまのビルドの値を書いており、要件を変えたビルドで差が出ず更新が届かなかった（v0.5.5 単体では両者が一致して鳴らない）。欄が空の記録は v0.5.4 の基準値（`V054_BASELINE_*`）で読み（`outdated_section`）、欄があって名前が無いものは後から増えた要件として対象にする。初回導入は要件とモデルも全部記録する。② **モデルを、取得した revision の置き場所から読む** — 取得側だけ revision を見ており、読み込み側は常に `main` を読んでいた（`_build_runtime` / `_codec_location`。`main` のときの挙動は変えない）。③ **孤児掃除が「応答が遅い」を「死んでいる」と同じに扱っていた** — 合成中はサイドカーのイベントループが塞がり `/health` に答えない。接続を拒否されたら捨て、つながったのに答えないなら残す（`Probe`）。確かめる時間は 5 秒（Windows は閉じたポートの拒否に約 2 秒かかり、以前の 800ms では死んだ記録もタイムアウトで判定されていた）。④ **起動の途中で更新が始まると、起動したサイドカーが居座る** — 保存と同じ錠の中で busy を見直す（`adopt_sidecar`）。⑤ 伏字が JSON でエスケープされた発話に効かなかった。⑥ busy を奪い合うテスト 2 本を直列化。⑦ 記述の追随（`installed.json` の欄、`sidecars.json` の行、`get_irodori_status`、リスク表の Job Object）。**契約・設定フィールド・DB スキーマの変更なし。** |
 | 2026-09-14 | v2.31 | **v0.5.5 インストール版の実環境で、孤児掃除が死んだ記録を「応答しない」と取り違えていた**（v2.30 ③の修正が実環境で成立していなかった）。何も待ち受けていないポート（旧 `ready.json` の記録）を、起動のたびに「応答しません（記録を残します）」と判定していた（dev では 2 秒の拒否で正しく捨てていた）。原因: reqwest の `PendingRequest::poll` は**全体のタイムアウトを先に見てから**通信の結果を見る。起動直後の混雑で「接続拒否の知らせ」と「5 秒のタイマー」が同時に処理待ちになると、拒否されていてもタイムアウトと判定される。**対処: HTTP の前に、TCP の接続だけを待機スレッド（`spawn_blocking` ＋ `connect_timeout`、10 秒）で確かめる**（`tcp_reach`）。拒否なら死んでいる、つながったら従来どおり HTTP で応答の形を見る、時間内に結果が出なければ決めつけずに残す。待機スレッドでの接続の結果はタイマーと先着を争わない。あわせて、掃除の開始と 1 件ごとの所要時間をログに出す（今回の起動から判定まで 22 秒の原因を、ログから切り分けられなかったため）。**契約・設定フィールド・DB スキーマの変更なし。** |
 | 2026-09-14 | v2.32 | **v0.5.5 タグ後の docs 整理（tidy-docs）**。§7.1 全体フローの `caption` の注記が「v0.5.5 の v4.1-Small 差し替えで初めて効く」のままだった（v0.5.4 のスコープ確定時の記述で、v0.5.5 のスコープ確定で差し替えを v0.5.6 へ再分割したときに追随していなかった）。v0.5.6 へ訂正。あわせて改訂履歴の v2.29 の行を版の順へ並べ直した（中身は変えていない）。**契約・設計の変更なし。** |
+| 2026-09-17 | v2.33 | **v0.5.6 前の docs 整理（外部レビューの検証）**。実装と突き合わせて、Phase 2 の設計のまま残っていた記述を是正した。① 構造体のコードブロックを実装へ（`DialogueState` の旧 `cost_limited_emitted` を外して `cost_unknown_notified` を追加、`AppState` / `PresenceState` / `TtsState` / `PomodoroState` / `WindowState` / `GhostBundle` / `SidecarHandle`。実装に無い `WorkerHandles` を削除）② 構成図（§1.1〜§1.4）を実ファイルへ（実在しない `pose.ts` / `drag.ts` / `panels/settings/` の分割 / `asset_dnd.rs` / `dialogue/monologue.rs` / `tts/ (engine)` / `trait TtsEngine` / `create_main_window` を訂正し、抜けていたファイルを追加）③ ファイル資産表と §8.1 の図（ログは `%APPDATA%\ugg\ugg.log`、参照音声は `refs\<slot>_<id>.wav`、Python は 3.11.9、`installed.json` / `sidecars.json` / `ready.json`、site-packages の位置）④ §4.11 `feedback_speech` の対象に定例会話、`caption` が v3 本体で効かない注記、メニュー項目名「予定・ToDo」 ⑤ §8.3 / §8.6 / §8.7 / §13（GPU 不在は稼働中のヘルス監視が扱う、`voice_caption_default` とキャプション入力モーダルは無い、Irodori に規約同意は無く確認ダイアログだけ）⑥ §12 DnD 導入（`canonicalize` を使わない zip slip 検査、定数の上限、許可外拡張子の拒否、ファイル名検証の範囲、v0.5.3 の非破壊導入、ファイル選択 UI は無い）⑦ §3.3 / §14 の起動と終了の流れ（存在しないプラグイン・関数名を実名へ、終了経路が 2 本あること）⑧ §15 の「UTF-8 強制」は未実装 ⑨ §7.1〜§7.5 と §8.4 の疑似コードに、Phase 2 の素案で実装と違う点を注記。**契約・設計判断の変更はなし。** |

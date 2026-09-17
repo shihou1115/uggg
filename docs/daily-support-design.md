@@ -2,7 +2,7 @@
 
 **対象**: spec.md §4.6 日常支援（v0.2 スコープ）＝ Tier S 4 機能
 **位置付け**: spec §4.6（要件の正本）を実装可能な契約・構造へ具体化する Phase 2 成果物。個別機能の詳細 spec（`text-reader-spec.md` 等）と同列の設計文書。
-**状態**: 設計 v2.2。**M7〜M10 すべて実装済み**（M7 統合リマインダー / M8 ToDo・日課 / M9 状況発話+ガバナンス / M10 カレンダー参照。2026-07-18、architecture.md v1.4 に契約反映済み。実装時の確定判断は §11.1 と architecture §2/§11.4 の注記参照）。**Tier S 4 機能そろい、v0.2.0 として出荷**（2026-07-18、タグ `v0.2.0`）。
+**状態**: 設計 v2.3。**M7〜M10 すべて実装済み**（M7 統合リマインダー / M8 ToDo・日課 / M9 状況発話+ガバナンス / M10 カレンダー参照。2026-07-18、architecture.md v1.4 に契約反映済み。実装時の確定判断は §11.1 と architecture §2/§11.4 の注記参照）。**Tier S 4 機能そろい、v0.2.0 として出荷**（2026-07-18、タグ `v0.2.0`）。
 **作成日**: 2026-07-12（v2 同日改訂、§13 改訂履歴）
 
 ---
@@ -377,7 +377,7 @@ events `situation_break / situation_late_night / situation_battery / situation_t
   ```rust
   enum CalendarSource { File { path: PathBuf }, Url { url: String } }
   ```
-  File は設定パネルのファイル選択（tauri dialog）で追加。更新は `fetched_ts` より新しい mtime を検知して再読込。Url は HTTP GET。取得失敗時は既存キャッシュを表示（オフライン動作 §4.6.4）。
+  File は設定パネルでパスを手入力して追加（tauri のファイル選択ダイアログは見送り、§11.1 項目 12）。更新は `fetched_ts` より新しい mtime を検知して再読込。Url は HTTP GET。取得失敗時は既存キャッシュを表示（オフライン動作 §4.6.4）。
 - **取得**: `system/calendar.rs` 新設。`VEVENT` の `SUMMARY/DTSTART/DTEND/UID/RRULE/EXDATE/RECURRENCE-ID/STATUS` をパース（軽量自前 or crate）。時刻は §2.5 の TZ 契約で UTC 化。
 - **RRULE 展開（near-term のみ）**: 表示窓（今日〜7 日、既定）＋通知窓ぶんだけ発生インスタンスに展開して `calendar_cache` へ UPSERT（複合キー §2.3）。`EXDATE`/`RECURRENCE-ID`/`CANCELLED` を反映（除外回は行を作らない or status='cancelled'）。**対応できない RRULE は黙って落とさず**、その予定を「繰り返し（未対応）」として当日分のみ表示し UI に印を付ける。完全な RRULE 対応は将来（§11）。
 - **キャッシュ/更新**: §2.3 の `notify_key` 差分規則で `notified` を保持/リセット。取得は `spawn_calendar_watcher`（既定 30〜60 分）＋手動 `refresh_calendar`。
@@ -416,7 +416,7 @@ reminders 拡張 5 列 + `reminder_log`（v6）/ `todos`（v7）/ `calendar_cach
 `reminder_fired, reminder_snoozed, todo_morning, todo_follow, todo_done, todo_stale, situation_break, situation_late_night, situation_battery, situation_todo_follow, calendar_upcoming`。すべてサブ主体推奨。
 
 ### 8.6 新規モジュール
-`system/deliver.rs`（通知配達・DeliveryOutcome）/ `system/governance.rs`（can_deliver + record_delivered）/ `presence/context.rs`（OS 状況検知）/ `system/calendar.rs`（ICS 取得・パース・RRULE near-term 展開）/ `commands/daily.rs`（or tools.rs 拡張）/ フロント `panels/daily.ts`。windows crate に `Win32_System_Power`（バッテリー）・`Win32_UI_Input_KeyboardAndMouse`（GetLastInputInfo、既存 feature に含まれる可能性あり要確認）・音量用 `Win32_Media_Audio`（任意 §11）を追加。ICS ファイル選択に tauri dialog。
+`system/deliver.rs`（通知配達・DeliveryOutcome）/ `system/governance.rs`（can_deliver + record_delivered）/ `presence/context.rs`（OS 状況検知）/ `system/calendar.rs`（ICS 取得・パース・RRULE near-term 展開）/ `commands/daily.rs`（or tools.rs 拡張）/ フロント `panels/daily.ts`。windows crate に `Win32_System_Power`（バッテリー）・`Win32_UI_Input_KeyboardAndMouse`（GetLastInputInfo、既存 feature に含まれる可能性あり要確認）・音量用 `Win32_Media_Audio`（任意 §11）を追加。ICS ファイルはパス手入力（tauri dialog は見送り、§11.1 項目 12）。
 
 ---
 
@@ -467,7 +467,7 @@ M7 で「通知配達 + ガバナンス」という 2 つの横断基盤を先�
 11. **M9 での追加確定**:
     - **辞書キーの統合**: §7.3/§8.5 の `situation_todo_follow` キーは新設せず、M8 整備済みの `todo_follow`（未完了の思い出し）と `todo_stale`（滞留の再整理提案）に統合した（重複回避）。カテゴリはどちらも `SituationTodoFollow`（トグルは todo_follow_enabled）。
     - **終了前確認の実装形**: トレイの「終了」で未完了の today ToDo があれば `events.todo_quit`（{count}）を通常の `quit` の代わりに再生する（ユーザー起点なのでゲート非対象・ブロッキング確認ダイアログは置かない）。コンテキストメニューの「終了」は M3 判断（即 exit・挨拶なし）のまま変更しない。
-    - **🔕 の適用範囲**: `feedback_allowed=true` は Situation* カテゴリのみ（§4.3 のバックオフ機構＝段 4/5 の適用対象と一致させる。Notice や独り言には「頻度を下げる」レバーが無いため）。speech_id は deliver の連番で、**最新のタグ付き発話と一致したときだけ**適用（バック側でも照合）。
+    - **🔕 の適用範囲**: `feedback_allowed=true` は Situation* カテゴリのみ（§4.3 のバックオフ機構＝段 4/5 の適用対象と一致させる。Notice や独り言には「頻度を下げる」レバーが無いため）。**★M11 で拡張**: 定例会話 `RegularMorning` / `RegularEvening` も 🔕 対象（間隔延長なし・3 回で枠 OFF。`feedback_target()`、regular-talk-design §4.2）。speech_id は deliver の連番で、**最新のタグ付き発話と一致したときだけ**適用（バック側でも照合）。
     - **深夜利用と夜間静音の相互作用**: 深夜の声かけ（Ambient）は夜間静音帯では gate 段 2 にブロックされる。両方を同じ帯で有効にした場合は静音が優先（ガバナンスとして一貫。声かけが欲しい帯は夜間静音から外すこと）。
 12. **M10 での追加確定**:
     - **ICS パーサは自前実装**（依存を増やさない）。行 unfolding → VEVENT ブロック → SUMMARY/DTSTART/DTEND/UID/RRULE/EXDATE/RECURRENCE-ID/STATUS。パース・展開・notify_key の網羅は `system/calendar.rs` のテストを正とする。
@@ -509,3 +509,4 @@ M7 で「通知配達 + ガバナンス」という 2 つの横断基盤を先�
 | v2 | 2026-07-12 | 外部レビュー（重大 4 / 高 4 / 中 2）を反映。**発火 ≠ 完了**（reminders＋reminder_log 分離、§2.1）／**到達保証**（DeliveryOutcome＋フォールバック＋起動時回収、§3.1/§3.2/§7.1）／**gate を can_deliver＋record_delivered に分離**し直列化（§4.2）／**カレンダー複合キー・notify_key 差分・RRULE near-term 展開・ファイル/URL 両対応**（§2.3/§7.4、二重ゲート解消）／**時刻・TZ 契約を §2.5 に新設**／**🔕 のフロント payload 契約**（speech_id 等、§4.3）／**夜間静音を独立フラグ化**（§5）。過剰設計（フロント ack・予約トークン・完全 RRULE）は非採用として明記。 |
 | v2.1 | 2026-09-05 | **docs 整理（tidy-docs、v0.5.2 タグ後）**: §3.1 の到達保証に**v0.5 の可視性判定**を追記。`app.emit` は hide / 最小化でも `Ok` を返すため `Toast` を到達扱いにすると単発リマインダーが無言で完了扱いになる問題があり、`deliver::window_is_visible` を到達判定側に置いて不可視なら `Deferred` を返す形に変わった。契約（`DeliveryOutcome` の値・消化規約）そのものは不変。 |
 | v2.2 | 2026-09-14 | **docs 整理（tidy-docs、v0.5.5 タグ後）**: 冒頭の状態行が「v0.2 リリース候補」のままだったので、v0.2.0 で出荷済みと明記。設計内容の変更はなし。 |
+| v2.3 | 2026-09-17 | **v0.5.6 前の docs 整理（外部レビューの検証）**: §7.4 と §8.6 の ICS ファイルの追加方法を、実装どおり「パスを手入力（tauri のファイル選択ダイアログは見送り、§11.1 項目 12）」へ直した。§11.1 項目 11 に、M11 で 🔕 の対象が定例会話 `RegularMorning` / `RegularEvening` へ広がったことを注記。設計内容の変更はなし。 |

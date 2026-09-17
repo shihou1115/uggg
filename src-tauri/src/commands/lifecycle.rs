@@ -15,10 +15,9 @@ pub async fn quit_app(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result
     // M4c Phase E: Irodori サイドカーを best-effort で shutdown してからアプリを終了する。
     // shutdown は最大 1〜2 秒待つが、サイドカーが起動していなければ即 return。
     let _ = state.tts.irodori.shutdown().await;
-    // トレイ経由の終了挨拶を再利用するよう、tray::quit_with_farewell と同じ流れに揃えたいが
-    // public 化していないので暫定でこちらは即 exit。コンテキストメニュー「終了」は
-    // トレイの quit を呼ばないので、ここで挨拶を出さないと UX に齟齬が出る。M3 では
-    // tray と挙動を合わせるため、シンプルに即 exit に統一する判断。
+    // コンテキストメニュー「終了」は挨拶をせず即 exit する。トレイの「終了」は
+    // tray::quit_with_farewell で quit / todo_quit を再生してから終了するので、経路で挙動が違う。
+    // この違いは取扱説明書に明記している。揃えるかは spec §6.0 の v0.5.6 への引き継ぎで判断する。
     app.exit(0);
     Ok(())
 }

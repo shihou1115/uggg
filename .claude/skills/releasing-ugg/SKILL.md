@@ -63,6 +63,7 @@ v0.1.0 リリースでは、G1〜G6 の実機検証を全部 PASS させたあ�
 cd src-tauri && cargo test        # 全テストパス
 cd src-tauri && cargo check       # 警告 0 が理想
 npx tsc --noEmit                  # フロント型検査 (リポジトリルートで)
+npm test                          # フロントの操作列テスト (Vitest。release-audit には含まれない)
 ```
 
 ### Step 2: バージョン三点セット + lockfile の同期

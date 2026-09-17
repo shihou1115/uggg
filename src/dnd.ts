@@ -4,9 +4,8 @@
 //! バックの `dnd_install` を呼ぶ。conflict があれば confirm() で上書き確認、
 //! 再度 `dnd_install({overwrite: true})` を打つ。
 //!
-//! 設定パネル「キャラクター」セクションには `<input type="file">` の
-//! フォールバックを置き、WebView で path が取れない環境では File 自体は
-//! 扱えないので「DnD でファイルを window にドロップしてください」と案内する。
+//! 設定パネルにファイル選択 UI は置いていない（`dnd_install` の呼び出し元は
+//! この DnD 経路のみ）。
 
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
