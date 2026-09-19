@@ -1577,7 +1577,9 @@ where
                 if raw.is_empty() {
                     continue;
                 }
-                let s = String::from_utf8_lossy(raw);
+                // pip などは同梱の Python の既定（cp932）で書く。UTF-8 で読めなければ
+                // Shift_JIS で読む（v0.5.6 項目 2。「アクセスが拒否されました」が読めるように）。
+                let s = crate::tts::reader::decode_output_line(raw);
                 let t = s.trim();
                 if !t.is_empty() {
                     on_line(t);

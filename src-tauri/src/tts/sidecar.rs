@@ -453,7 +453,8 @@ where
                         end -= 1;
                     }
                 }
-                on_line(&String::from_utf8_lossy(&buf[..end]));
+                // UTF-8 で読めなければ Shift_JIS（cp932）で読む（v0.5.6 項目 2）。
+                on_line(&crate::tts::reader::decode_output_line(&buf[..end]));
             }
             Err(e) => {
                 on_line(&format!("(stderr の読み取りが止まりました: {e})"));
@@ -1012,22 +1013,30 @@ mod tests {
     ///
     /// `lines()` は読めない行で `Err` を返し、`while let Ok(Some(..))` はそこで黙って抜けていた。
     /// 実機では起動の約 10 秒後から、以後の stderr が 1 行も `ugg.log` に残らなかった。
+    /// **cp932 の行は日本語として読む**（v0.5.6 項目 2。サイドカーの stderr は実際に cp932 だった）。
+    /// どちらの文字コードでも読めない行は置換文字で流し、その後も読み続ける。
     #[tokio::test]
     async fn a_line_that_is_not_utf8_does_not_stop_the_stderr_pump() {
         let mut bytes = b"before\r\n".to_vec();
         // cp932 の「既存」。UTF-8 としては読めない。
         bytes.extend_from_slice(b"ConnectionResetError: \x8a\xf9\x91\xb6\n");
+        // UTF-8 でも Shift_JIS でも読めない。
+        bytes.extend_from_slice(b"broken: \xff\xfe\n");
         bytes.extend_from_slice(b"after\n");
         let (lines, sink) = collected();
         spawn_stderr_pump(std::io::Cursor::new(bytes), sink).await;
         let got = lines.lock().unwrap().clone();
-        assert_eq!(got.len(), 3, "読めない行で止まっている: {got:?}");
+        assert_eq!(got.len(), 4, "読めない行で止まっている: {got:?}");
         assert_eq!(got[0], "before", "行末の CR を落としていない");
-        assert!(
-            got[1].starts_with("ConnectionResetError: ") && got[1].contains('\u{FFFD}'),
-            "読めない行を置換文字で流していない: {got:?}"
+        assert_eq!(
+            got[1], "ConnectionResetError: 既存",
+            "cp932 の行を日本語として読んでいない: {got:?}"
         );
-        assert_eq!(got[2], "after", "読めない行の後が届いていない");
+        assert!(
+            got[2].starts_with("broken: ") && got[2].contains('\u{FFFD}'),
+            "どちらでも読めない行を置換文字で流していない: {got:?}"
+        );
+        assert_eq!(got[3], "after", "読めない行の後が届いていない");
     }
 
     /// 読み取りそのものが失敗したら、**黙って終えずに理由を残す**（同上）。

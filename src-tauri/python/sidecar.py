@@ -42,9 +42,34 @@ import os
 import socket
 import struct
 import sys
+import time
 import wave
 from pathlib import Path
 from typing import Optional
+
+# 切り替える前の stderr の文字コード（`log_stdio_encoding` が起動時に 1 行残す）。
+ORIGINAL_STDERR_ENCODING = getattr(sys.stderr, "encoding", None)
+
+
+def use_utf8_stdio() -> None:
+    """stdout / stderr を UTF-8 にする (spec §6.0 v0.5.6 項目 2)。
+
+    パイプへ書くとき、CPython は UTF-8 モードでなければ ANSI コードページ (日本語 Windows では
+    cp932) で書く。同梱の Python は `._pth` で isolated なので、環境変数 (PYTHONIOENCODING /
+    PYTHONUTF8) では変えられない。2026-09-19 に ugg が起動したサイドカーの中で
+    `stderr.encoding=cp932` を観測し、Windows のエラー文が ugg.log で化けていた原因と確定した
+    (Rust 側は UTF-8 で読む)。`-X utf8` は `open()` の既定の文字コードまで変えてモデル側のコードに
+    影響しうるので使わず、stdio だけを切り替える。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass  # 切り替えられなくても、Rust 側が Shift_JIS で読み直す
+
+
+# 依存の import より前に切り替える（依存が無いときのエラー文も日本語なので）。
+use_utf8_stdio()
 
 try:
     from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -78,6 +103,26 @@ MODEL_REVISION_SYNTH = "main"
 MODEL_REVISION_VOICE_DESIGN = "main"
 MODEL_REVISION_CODEC = "main"
 
+# 推論の精度。v0.5.6 では変えない（bf16 は v0.5.7 の乗り換えと一緒に入れる。spec §6.0）。
+MODEL_PRECISION = "fp32"
+CODEC_PRECISION = "fp32"
+
+# 合成のサンプラー (spec §6.0 v0.5.6 項目 1)。
+# 通常合成は linear 40 → sway 8。参照音声の事前変換と合わせて約 3.6〜4.1 倍速（2026-09-14 の実測。
+# 音はユーザーが自分の参照音声で聴いて許容と裁定）。`sway_coeff` は計測と同じ -1.0 のまま。
+SYNTH_NUM_STEPS = 8
+SYNTH_T_SCHEDULE = "sway"
+# 参照音声の生成（VoiceDesign・no_ref）は据え置く。sway 8 を測ったのは参照音声つきの合成だけで、
+# 生成は一度きりなので速さより品質が効く。用途 2 つの値を分けるだけで、設定の仕組みは作らない。
+VOICE_DESIGN_NUM_STEPS = 40
+VOICE_DESIGN_T_SCHEDULE = "linear"
+
+# 参照音声の前処理。事前変換の結果の値を決めるので、変換結果のファイル名にも入れる。
+REF_NORMALIZE_DB = -16.0
+REF_ENSURE_MAX = True
+MAX_REF_SECONDS = 30.0
+REF_LATENT_SUFFIX = ".latent.pt"
+
 
 def _apply_model_args(args) -> None:
     """Rust から渡されたモデルの正本を反映する (v0.5.5 項目 3)。
@@ -104,6 +149,23 @@ def model_dir_name(repo: str, revision: str) -> str:
     """
     safe = repo.replace("/", "__")
     return f"{safe}@{revision}" if revision and revision != "main" else safe
+
+
+def ref_latent_path(ref_wav: Path, model_key: str, precision: str) -> Path:
+    """参照音声の事前変換の結果の置き場所 (spec §6.0 v0.5.6 項目 1)。**参照 wav の隣**に置く。
+
+    変換結果の値は、変換を行うコーデック・形を整える合成モデル・それぞれの精度・参照の前処理で
+    変わるので、全部をファイル名に入れる（`model_key` と `precision` は呼び出し側が両モデル分を
+    つないで渡す。どれかが変われば別のファイルになり、古い結果を読まない）。ただし revision が
+    `main` の間は、上流が中身を差し替えても名前は変わらない（固定の revision へ上げるまでの限界）。
+    参照音声を消す・作り直すときは、Rust 側の `voice_ref::delete_file` が参照 wav と同じ
+    ディレクトリの `<参照 wav の stem>.*.latent.pt`（書きかけの `.tmp` を含む）を一緒に消す —
+    **置き場所・名前の形・`.tmp` の付け方を変えるなら向こうも直す**（契約テストが見張る）。
+    """
+    prep = f"n{REF_NORMALIZE_DB:g}_e{int(REF_ENSURE_MAX)}_s{MAX_REF_SECONDS:g}"
+    return ref_wav.with_name(
+        f"{ref_wav.stem}.{model_key}.{precision}.{prep}{REF_LATENT_SUFFIX}"
+    )
 
 
 
@@ -239,6 +301,9 @@ class RealModelBackend:
         self.asset_dir = asset_dir
         self._synth_runtime = None
         self._voice_design_runtime = None
+        # 参照音声の事前変換に一度失敗したら、このプロセスの間は参照 wav のまま合成する
+        # （毎回失敗して遅くなるのを避ける。サイドカーは使わなければ 5 分で止まるので、次の起動でまた試す）。
+        self._latent_disabled = False
 
     @staticmethod
     def _resolve_device() -> str:
@@ -295,9 +360,9 @@ class RealModelBackend:
                 checkpoint=str(ckpt),
                 model_device=device,
                 codec_repo=self._codec_location(),
-                model_precision="fp32",
+                model_precision=MODEL_PRECISION,
                 codec_device=device,
-                codec_precision="fp32",
+                codec_precision=CODEC_PRECISION,
                 codec_deterministic_encode=True,
                 codec_deterministic_decode=True,
                 compile_model=False,
@@ -323,29 +388,36 @@ class RealModelBackend:
         text: str,
         caption: Optional[str],
         ref_wav: Optional[str],
+        ref_latent: Optional[str],
         no_ref: bool,
         duration_scale: float,
+        num_steps: int,
+        t_schedule_mode: str,
     ):
-        """upstream infer.py のデフォルト引数群を写し取った SamplingRequest を組み立てる。"""
+        """upstream infer.py のデフォルト引数群を写し取った SamplingRequest を組み立てる。
+
+        ステップ数とサンプラーは用途（通常合成 / 参照音声の生成）ごとに呼び出し側が渡す
+        （spec §6.0 v0.5.6 項目 1）。`ref_wav` と `ref_latent` は上流が同時指定を拒むので片方だけ。
+        """
         from irodori_tts.inference_runtime import SamplingRequest  # type: ignore
 
         return SamplingRequest(
             text=text,
             caption=caption,
             ref_wav=ref_wav,
-            ref_latent=None,
+            ref_latent=ref_latent,
             ref_embed=None,
             no_ref=no_ref,
-            ref_normalize_db=None if no_ref else -16.0,
-            ref_ensure_max=True,
+            ref_normalize_db=None if no_ref else REF_NORMALIZE_DB,
+            ref_ensure_max=REF_ENSURE_MAX,
             num_candidates=1,
             decode_mode="sequential",
             seconds=None,
             duration_scale=duration_scale,
-            max_ref_seconds=30.0,
+            max_ref_seconds=MAX_REF_SECONDS,
             max_text_len=None,
             max_caption_len=None,
-            num_steps=40,
+            num_steps=num_steps,
             cfg_scale_text=3.0,
             cfg_scale_caption=3.0,
             cfg_scale_speaker=5.0,
@@ -362,7 +434,7 @@ class RealModelBackend:
             speaker_kv_max_layers=None,
             speaker_uncond_mode="mask",
             seed=None,
-            t_schedule_mode="linear",
+            t_schedule_mode=t_schedule_mode,
             sway_coeff=-1.0,
             trim_tail=True,
             tail_window_size=20,
@@ -370,6 +442,79 @@ class RealModelBackend:
             tail_mean_threshold=0.1,
             lora_adapter=None,
         )
+
+    def _synth_request(
+        self,
+        text: str,
+        caption: Optional[str],
+        ref_wav: Optional[str],
+        ref_latent: Optional[str],
+    ):
+        """通常合成（参照音声つき）のリクエスト。"""
+        return self._make_request(
+            text=text,
+            caption=caption,
+            ref_wav=ref_wav,
+            ref_latent=ref_latent,
+            no_ref=False,
+            duration_scale=1.0,
+            num_steps=SYNTH_NUM_STEPS,
+            t_schedule_mode=SYNTH_T_SCHEDULE,
+        )
+
+    def _reference_latent(self, runtime, voice_ref_path: Path) -> tuple[Optional[str], bool]:
+        """参照音声の事前変換の結果（ファイルのパス）と、今回作ったかどうかを返す
+        (spec §6.0 v0.5.6 項目 1)。
+
+        作れなければ None を返し、呼び出し側は今までどおり参照 wav を渡す（遅くなるだけで喋れる）。
+        変換結果を作る公開 API は上流に無いので、ランタイム自身が合成のたびに使っている
+        非公開のメソッド `_load_reference_latent` を 1 回だけ呼ぶ。2026-09-14 の計測と同じ方法で、
+        値はランタイムの内部と同じになる（音はビット同一）。渡す側は公開 API（`ref_latent` は
+        ファイルのパス）なので、結果はファイルに置く。
+        """
+        if self._latent_disabled:
+            return None, False
+        if not voice_ref_path.is_file():
+            # 参照 wav そのものが無いのは事前変換の問題ではない。止めずに、今までどおり合成側の
+            # エラーにする（ここで止めると、参照を作り直した後もこのプロセスの間は遅いままになる）。
+            return None, False
+        # 値を作るのはコーデック、形を整えるのは合成モデル。両方をキーに入れる。
+        path = ref_latent_path(
+            voice_ref_path,
+            model_dir_name(MODEL_REPO_SYNTH, MODEL_REVISION_SYNTH)
+            + "+"
+            + model_dir_name(MODEL_REPO_CODEC, MODEL_REVISION_CODEC),
+            f"{MODEL_PRECISION}-{CODEC_PRECISION}",
+        )
+        try:
+            # 参照 wav のほうが新しければ作り直す（同じ名前のまま中身が変わった場合の保険）。
+            if path.is_file() and path.stat().st_mtime >= voice_ref_path.stat().st_mtime:
+                return str(path), False
+            import torch  # type: ignore
+
+            # テキストは変換に使われない。発話の本文を渡さない（失敗の理由がログに残るため）。
+            request = self._synth_request(
+                self.VOICE_REF_READING_TEXT, None, str(voice_ref_path), None
+            )
+            with torch.inference_mode():
+                latent, _mask = runtime._load_reference_latent(
+                    req=request, batch_size=1, messages=[]
+                )
+            tmp = path.with_name(path.name + ".tmp")
+            torch.save(latent[0].detach().cpu().clone(), tmp)
+            os.replace(tmp, path)
+            return str(path), True
+        except Exception as exc:
+            if _is_out_of_memory(exc):
+                # 事前変換のせいではない。止めずに、次の合成でまた作る
+                _diag("[irodori] GPU のメモリが足りず参照音声を事前変換できないので、参照 wav で合成します")
+                return None, False
+            self._latent_disabled = True
+            _diag(
+                "[irodori] 参照音声の事前変換ができないので、このサイドカーが止まるまで参照 wav のまま"
+                f"合成します: {type(exc).__name__}: {exc}"
+            )
+            return None, False
 
     def synthesize(
         self,
@@ -384,14 +529,43 @@ class RealModelBackend:
         # フロントの playbackRate で補正) との挙動対称性を保つ。
         _ = speed
         runtime = self._load_synth()
-        request = self._make_request(
-            text=text,
-            caption=caption,
-            ref_wav=str(voice_ref_path),
-            no_ref=False,
-            duration_scale=1.0,
+        started = time.perf_counter()
+        latent, created = self._reference_latent(runtime, voice_ref_path)
+        if latent is None:
+            result = runtime.synthesize(
+                self._synth_request(text, caption, str(voice_ref_path), None), log_fn=None
+            )
+        else:
+            try:
+                result = runtime.synthesize(
+                    self._synth_request(text, caption, None, latent), log_fn=None
+                )
+            except Exception as exc:
+                if _is_out_of_memory(exc):
+                    raise  # 変換結果のせいではない。参照 wav でやり直しても同じく足りない
+                _diag(
+                    "[irodori] 参照音声の変換結果を使った合成に失敗したので、参照 wav でやり直します: "
+                    f"{type(exc).__name__}"
+                )
+                # 参照 wav でも失敗したら、例外はそのまま上へ返る（本文などの問題で、変換結果は消さない）。
+                result = runtime.synthesize(
+                    self._synth_request(text, caption, str(voice_ref_path), None), log_fn=None
+                )
+                # 参照 wav なら合成できた＝変換結果の側が合わない（壊れている等）。消して、このサイドカーが
+                # 止まるまで使わない（作り直しても同じなら、毎回「失敗してやり直し」になって遅くなる）。
+                try:
+                    Path(latent).unlink()
+                except OSError:
+                    pass
+                self._latent_disabled = True
+                latent, created = None, False
+        # 所要時間を 1 行残す（spec §6.0 v0.5.6 項目 1 の確かめ方）。本文と caption は残さない。
+        # 変換結果を作った回はその時間も入るので、そうと分かるように書く。
+        reference = "wav" if latent is None else ("latent（今回作成）" if created else "latent")
+        _diag(
+            f"[irodori] 合成 {(time.perf_counter() - started) * 1000:.0f} ms"
+            f"（{SYNTH_NUM_STEPS} ステップ・{SYNTH_T_SCHEDULE}・参照 {reference}）"
         )
-        result = runtime.synthesize(request, log_fn=None)
         return _audio_to_wav_bytes(result.audio, int(result.sample_rate))
 
     def generate_voice_ref(self, caption: str, out_path: Path) -> None:
@@ -400,8 +574,11 @@ class RealModelBackend:
             text=self.VOICE_REF_READING_TEXT,
             caption=caption,
             ref_wav=None,
+            ref_latent=None,
             no_ref=True,
             duration_scale=1.0,
+            num_steps=VOICE_DESIGN_NUM_STEPS,
+            t_schedule_mode=VOICE_DESIGN_T_SCHEDULE,
         )
         result = runtime.synthesize(request, log_fn=None)
 
@@ -411,6 +588,26 @@ class RealModelBackend:
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         save_wav(str(out_path), result.audio, int(result.sample_rate))
+
+
+def _diag(line: str) -> None:
+    """診断の 1 行を stderr へ書く。書けなくても本来の処理を止めない
+    （成功した合成を、ログが書けないせいで 500 にしない）。"""
+    try:
+        sys.stderr.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _is_out_of_memory(exc: BaseException) -> bool:
+    """GPU のメモリ不足か（torch が無い・古い環境でも落ちない）。"""
+    try:
+        import torch  # type: ignore
+
+        oom = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+        return oom is not None and isinstance(exc, oom)
+    except Exception:
+        return False
 
 
 def _audio_to_wav_bytes(audio, sample_rate: int) -> bytes:
@@ -547,6 +744,42 @@ def write_ready_file(path: Path, port: int) -> None:
     tmp.replace(path)
 
 
+def log_stdio_encoding() -> None:
+    """stderr の文字コードを起動時に 1 行残す (spec §6.0 v0.5.6 項目 2)。
+
+    v0.5.5 の実環境では、サイドカーの stderr に cp932 の行が混ざっていた。2026-09-19 にこの行で
+    ugg が起動したサイドカーの中を観測し、`stderr.encoding=cp932` だったので `use_utf8_stdio` で
+    切り替えるようにした。切り替えが効いているかを確かめるため、切り替える前の文字コード
+    (`original`) と切り替えた後の文字コードを並べて残す。
+    `sample` は日本語の見本で、Rust 側の ugg.log で読めれば正しく届いている。`sample_hex` は
+    Python が書くつもりのバイト列で、ASCII なのでどの文字コードで読んでも崩れない。
+    """
+    import locale
+
+    sample = "既存の接続"
+    try:
+        enc = getattr(sys.stderr, "encoding", None)
+        try:
+            sample_hex = sample.encode(enc or "utf-8", errors="replace").hex()
+        except LookupError:
+            sample_hex = "?"
+        sys.stderr.write(
+            "[stdio] "
+            f"stderr.encoding={enc} (original={ORIGINAL_STDERR_ENCODING}) "
+            f"errors={getattr(sys.stderr, 'errors', None)} "
+            f"locale={locale.getpreferredencoding(False)} "
+            f"utf8_mode={sys.flags.utf8_mode} isolated={sys.flags.isolated} "
+            f"no_site={sys.flags.no_site} isatty={sys.stderr.isatty()} "
+            f"sample={sample} sample_hex={sample_hex}\n"
+        )
+        sys.stderr.flush()
+    except Exception as exc:  # 診断の 1 行で起動を止めない
+        try:
+            sys.stderr.write(f"[stdio] 文字コードの確認に失敗: {exc!r}\n")
+        except Exception:
+            pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="ugg Irodori-TTS sidecar")
     parser.add_argument("--asset-dir", required=True, type=Path)
@@ -600,6 +833,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     port = args.port if args.port and args.port > 0 else pick_free_port(args.host)
     LOG.info("sidecar binding to %s:%d (mock=%s)", args.host, port, args.mock)
+    # --download-only の後に置く: そちらの出力は進捗としてユーザーの画面に流れるので、診断の行を混ぜない
+    log_stdio_encoding()
 
     backend: Optional[RealModelBackend] = None
     if not args.mock:

@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.34）
+# ugg アーキテクチャ設計書（architecture.md v2.35）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -117,7 +117,7 @@ src-tauri/src/
 │   ├── sidecar.rs           -- サイドカープロセスの起動・停止・監視
 │   ├── gpu.rs               -- GPU 検出（Irodori 可否判定）
 │   ├── preprocess.rs        -- 漢字→ひらがな変換（voicevox_core の OpenJtalk を流用）
-│   ├── reader.rs            -- テキスト読み上げ: .txt 読込 + チャンク分割 + .md 台本対応（text-reader-spec.md / script-reader-spec.md）
+│   ├── reader.rs            -- テキスト読み上げ: .txt 読込 + チャンク分割 + .md 台本対応（text-reader-spec.md / script-reader-spec.md）。★v0.5.6: 子プロセスの出力 1 行の読み方（`decode_output_line`。UTF-8 → Shift_JIS）もここに置き、sidecar / irodori_download / download が共有する
 │   ├── script.rs            -- ★ .md 台本形式パース + 検証（フェンス抽出・ScriptError。script-reader-spec.md）
 │   ├── download.rs          -- 公式ダウンローダ起動（既定 voicevox_core 資産）
 │   └── voice_ref.rs         -- ★ Irodori 参照音声管理（生成・保存・削除）
@@ -431,6 +431,7 @@ CREATE INDEX idx_monologue_cache_ghost ON monologue_cache(ghost_id);
 | `%APPDATA%\ugg\irodori\installed.json` | **★v0.5.4 導入記録**。`pins`（このビルドが**要求した**固定 URL）と `resolved`（**実際に入った**版）を持つ。2 つ持つのは役割が違うため — `pins` は入れ直しの要否判定に使い、`resolved` は「指定どおりに入るとは限らない」事実（`huggingface_hub==0.27.0` 指定に対し実機 0.36.2）を残す。**導入が全段成功した後にだけ書く**。**★v0.5.5**: `requirements`（配布名 → 要件文字列）と `models`（名前 → `repo@revision`）を追加。初回導入は全部を記録し、更新は入れ直せた分だけ反映する。**欄が空の記録（v0.5.4 が書いたもの・記録そのものが無い環境）は v0.5.4 の固定の基準値が入っているとみなす**（いまのビルドの値で埋めると、要件を変えたビルドで差が出ず更新が届かない） |
 | `%APPDATA%\ugg\irodori\sidecars.json` | **★v0.5.5 起動したサイドカーの台帳**（`[{port, pid}]`）。起動直後に追記し、**止まったのを見届けてから**ポートと pid の組で消す。次の起動で孤児掃除（`sweep_orphans`）が読み、`/health` の**応答の形**で自分のものと確かめてから止める。**確かめ終えた記録から 1 件ずつ消す**（途中で落ちても未確認の記録を失わない）。接続を拒否された記録は捨て、**つながったのに応答が無い記録は残す**（合成中はイベントループが塞がり `/health` に答えない） |
 | `%APPDATA%\ugg\irodori\refs\<slot>_<id>.wav` | 参照音声本体（voice_refs.file_path から参照） |
+| `%APPDATA%\ugg\irodori\refs\<slot>_<id>.<合成モデル>+<コーデック>.<精度>.<前処理>.latent.pt` | **★v0.5.6 参照音声の事前変換の結果**（spec §6.0 項目 1）。サイドカーが参照 wav の隣に作り（書きかけは `.latent.pt.tmp`）、以後の合成に使い回す。参照 wav より古ければ作り直す。値を決めるものは全部名前に入れる（合成モデルとコーデックの repo@revision・両者の精度・参照の前処理）。**消すのは `voice_ref::delete_file`**（参照音声の削除と作り直しの両経路）で、`<stem>.` で始まり `.latent.pt` / `.latent.pt.tmp` で終わるものを消す。**名前の形・置き場所・`.tmp` の付け方は `sidecar.py` の `ref_latent_path` と揃える約束**（契約テスト `the_latent_name_matches_the_sidecar`） |
 | `%APPDATA%\ugg\ugg.log` | アプリログ（`system/log.rs`。追記、2MB で `ugg.log.1` へ 1 世代退避。spec §5） |
 | keyring `ugg` | API キー（provider 名で索引） |
 | `<app>/ghosts/<id>/` | 同梱 + DnD 追加ゴースト |
@@ -1163,6 +1164,7 @@ raw テキストフォールバックに委ねる。
 ├── model\               -- Irodori-TTS モデル（HF から DL、数GB。リポジトリと revision ごとに別フォルダで、旧版を上書きしない）
 ├── refs\                -- 参照音声 wav 格納
 │   ├── main_<id>.wav
+│   ├── main_<id>.<合成モデル>+<コーデック>.<精度>.<前処理>.latent.pt  -- ★v0.5.6 事前変換の結果（§2.4）
 │   └── sub_<id>.wav
 ├── sidecar.py           -- FastAPI エントリポイント
 ├── installed.json       -- ★v0.5.4 導入記録（§2.4）
@@ -1289,7 +1291,8 @@ pub async fn irodori_check_gpu() -> GpuInfo {
    ├─ 「プレビュー再生」ボタン
    │   └─ クリック → /v1/audio/speech で短文合成
    └─ 「参照音声を削除」ボタン
-       └─ voice_refs テーブル削除 + ファイル削除
+       └─ voice_refs テーブル削除 + ファイル削除（★v0.5.6: 事前変換の結果 `.latent.pt` も一緒に消す。
+          作り直しで古い参照 wav を消すときも同じ `voice_ref::delete_file` を通る）
 ```
 
 `voice_refs` テーブルは MVP では `UNIQUE(slot)` で各 slot 最新1件のみ（複数履歴は将来課題）。
@@ -1761,7 +1764,7 @@ async fn install_asset(
 | 辞書 v3 のパース失敗 | アプリ起動失敗 | バリデータで起動時に警告、デフォルト辞書にフォールバック |
 | user_profile の肥大化 | system prompt 肥大化 | モード別容量管理（要約サイクル or 件数上限） |
 | zip slip 等の DnD 経由のパス脱出 | 任意ファイル書き込み | zip エントリ名の検査（`sanitize_zip_path`）+ `normalize_path` 後の starts_with 検証 + manifest `id` の検証（`validate_asset_id`）（§12.3） |
-| Python サイドカー起動時の文字エンコーディング | stderr の文字化け・読み取りの停止 | **UTF-8 の強制は実装していない**（`PYTHONIOENCODING` などの環境変数は設定していない。同梱の Python は `._pth` による isolated なので、環境変数ではそもそも効かない）。読めない行は置換文字にして流し、読み取りが止まるときは理由を `ugg.log` に残す（★v0.5.5）。実環境のサイドカーだけ cp932 で出力する理由はまだわかっておらず、v0.5.6 へ引き継いでいる（spec §6.0） |
+| Python サイドカー起動時の文字エンコーディング | stderr の文字化け・読み取りの停止 | **★v0.5.6 原因を確かめて直した**（spec §6.0 項目 2）。ugg が起動したサイドカーの中で観測すると `stderr.encoding=cp932`・`isolated=1`・`utf8_mode=0` だった — CPython はパイプへ書くとき、UTF-8 モードでなければ ANSI コードページで書く。同梱の Python は `._pth` で isolated なので、環境変数（`PYTHONIOENCODING` / `PYTHONUTF8`）では変えられない。**送り側**: `sidecar.py` が依存の import より前に stdout / stderr を `reconfigure(encoding="utf-8")` で切り替える（`-X utf8` は `open()` の既定まで変えてモデル側のコードに影響しうるので使わない）。起動ごとに切り替え前と後の文字コードを `[stdio]` の 1 行で残す。**受け側**: 子プロセスの出力を読む 3 か所（サイドカーの stderr / `run_python` ＝ pip とモデル取得 / VOICEVOX のダウンローダ）は `reader::decode_output_line` で UTF-8 → Shift_JIS の順に読み、どちらでも読めない行は置換文字で流す（pip の出力は中身に手を入れられないので受け側で読む。行頭の BOM では判定しない）。読み取りが止まるときは理由を `ugg.log` に残す（★v0.5.5）。インストール版での効き目は実機検証で確かめる |
 | サイドカーの孤児プロセス化 | リソースリーク（1 つで数 GB の VRAM） | アプリ終了時に `/shutdown` → kill。**強制終了で残ったものは次の起動で掃除する**（台帳 `sidecars.json` ＋ 応答の形で識別、★v0.5.5）。**Job Object による親子連動は未実装** — 当初ここに書いていたが実装されていなかった（2026-09-14 リリース前監査で発覚し、記述を実態へ改めた。v0.5.6 で入れる — spec §6.0 項目 4） |
 
 ---
@@ -1815,3 +1818,4 @@ async fn install_asset(
 | 2026-09-14 | v2.32 | **v0.5.5 タグ後の docs 整理（tidy-docs）**。§7.1 全体フローの `caption` の注記が「v0.5.5 の v4.1-Small 差し替えで初めて効く」のままだった（v0.5.4 のスコープ確定時の記述で、v0.5.5 のスコープ確定で差し替えを v0.5.6 へ再分割したときに追随していなかった）。v0.5.6 へ訂正。あわせて改訂履歴の v2.29 の行を版の順へ並べ直した（中身は変えていない）。**契約・設計の変更なし。** |
 | 2026-09-17 | v2.33 | **v0.5.6 前の docs 整理（外部レビューの検証）**。実装と突き合わせて、Phase 2 の設計のまま残っていた記述を是正した。① 構造体のコードブロックを実装へ（`DialogueState` の旧 `cost_limited_emitted` を外して `cost_unknown_notified` を追加、`AppState` / `PresenceState` / `TtsState` / `PomodoroState` / `WindowState` / `GhostBundle` / `SidecarHandle`。実装に無い `WorkerHandles` を削除）② 構成図（§1.1〜§1.4）を実ファイルへ（実在しない `pose.ts` / `drag.ts` / `panels/settings/` の分割 / `asset_dnd.rs` / `dialogue/monologue.rs` / `tts/ (engine)` / `trait TtsEngine` / `create_main_window` を訂正し、抜けていたファイルを追加）③ ファイル資産表と §8.1 の図（ログは `%APPDATA%\ugg\ugg.log`、参照音声は `refs\<slot>_<id>.wav`、Python は 3.11.9、`installed.json` / `sidecars.json` / `ready.json`、site-packages の位置）④ §4.11 `feedback_speech` の対象に定例会話、`caption` が v3 本体で効かない注記、メニュー項目名「予定・ToDo」 ⑤ §8.3 / §8.6 / §8.7 / §13（GPU 不在は稼働中のヘルス監視が扱う、`voice_caption_default` とキャプション入力モーダルは無い、Irodori に規約同意は無く確認ダイアログだけ）⑥ §12 DnD 導入（`canonicalize` を使わない zip slip 検査、定数の上限、許可外拡張子の拒否、ファイル名検証の範囲、v0.5.3 の非破壊導入、ファイル選択 UI は無い）⑦ §3.3 / §14 の起動と終了の流れ（存在しないプラグイン・関数名を実名へ、終了経路が 2 本あること）⑧ §15 の「UTF-8 強制」は未実装 ⑨ §7.1〜§7.5 と §8.4 の疑似コードに、Phase 2 の素案で実装と違う点を注記。**契約・設計判断の変更はなし。** |
 | 2026-09-19 | v2.34 | **v0.5.6 スコープ確定（spec v1.11）に伴う参照先の訂正と注記**。モデルの差し替えが v0.5.7 へ分割されたので、caption の時期の記述 2 か所（契約表の `synthesize_voice`・§7.1 全体フロー）を v0.5.7 へ直した（§7.1 は、MF の `use_caption_condition` が未確認なので「効くかを確かめる」にとどめた）。§14 の二重起動ガードと §15 のリスク表の Job Object を、裁定の結果（完全な single-instance は入れず、台帳の所有者とプロセスをまたぐ錠だけ入れる／Job Object は v0.5.6 で入れる）へ直した。**スコープの検証で分かった事実を 2 か所に注記した**: 契約表の `update_irodori_runtime` の「失敗したら戻す」は途中の失敗では成り立っていない（それより前に成功した分の退避も消す。名前付き要件は戻せない）／§11 の severity 二段トーストは取り下げ。**契約・設計の変更なし**（設計の変更は各項目の実装時に行う）。 |
+| 2026-09-19 | v2.35 | **v0.5.6 項目 1（速くする）と項目 2 の文字コードの実装に伴う改訂**。§2.4 の資産表と §8.1 の構成図に、参照音声の事前変換の結果（`refs\<slot>_<id>.<合成モデル>+<コーデック>.<精度>.<前処理>.latent.pt`）を足し、作る側（サイドカー）・消す側（`voice_ref::delete_file`）と、名前の形を 2 つの言語で揃える約束を書いた。§8.7 の参照音声の削除に、変換結果も一緒に消えることを足した。§15 のリスク表の文字コードの行を、2026-09-19 の観測で確定した原因（パイプへは ANSI コードページで書く・isolated のため環境変数は効かない）と、送り側（`reconfigure`）・受け側（UTF-8 → Shift_JIS）の対策へ書き換えた（「UTF-8 の強制は実装していない」「理由はまだわかっていない」は事実でなくなった）。§1 のモジュール表の reader.rs に、子プロセスの出力の読み方を共有するようになったことを足した。**契約（コマンド・イベント・設定・DB）の変更なし。** |

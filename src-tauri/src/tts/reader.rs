@@ -98,6 +98,31 @@ fn decode_bytes(bytes: &[u8]) -> Result<String> {
     bail!("文字コードを判定できません (UTF-8 / Shift_JIS のみ対応)")
 }
 
+/// 子プロセスの出力 1 行を文字列にする (pure、テスト対象。spec §6.0 v0.5.6 項目 2)。
+///
+/// UTF-8 → Shift_JIS の順に試し、どちらでも読めなければ UTF-8 として置換文字で流す
+/// （読めない行で止めない — v0.5.5 で stderr の読み取りが黙って止まった）。
+/// 同梱の Python はパイプへ ANSI コードページ（日本語 Windows では cp932）で書く
+/// （2026-09-19 に ugg が起動したサイドカーの中で `stderr.encoding=cp932` を観測）。
+/// `sidecar.py` は自分の stdio を UTF-8 に切り替えるが、pip やダウンローダの出力は
+/// 中身に手を入れられないので、受け側で読む。
+///
+/// **行頭の BOM で文字コードを決めない。** ファイル用の `decode_bytes` が使う `Encoding::decode` は
+/// 行頭が `FF FE` / `FE FF` だと UTF-16 として読み、壊れた行を置換文字ではなく意味の無い文字列にする。
+/// 出力の 1 行に BOM が付く理由は無いので、ここでは BOM を見ない読み方にする（ファイルの読み上げは
+/// UTF-16 の台本を読むために BOM を見る必要があるので、`decode_bytes` は変えない）。
+pub(crate) fn decode_output_line(bytes: &[u8]) -> String {
+    let (s, had_errors) = encoding_rs::UTF_8.decode_without_bom_handling(bytes);
+    if !had_errors {
+        return s.into_owned();
+    }
+    let (s, had_errors) = encoding_rs::SHIFT_JIS.decode_without_bom_handling(bytes);
+    if !had_errors {
+        return s.into_owned();
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 /// チャンク分割の最小単位。通常文字は 1 トークン、Irodori 絵文字はコードポイント数に
 /// かかわらず 1 トークン (不可分)。
 #[derive(Debug, Clone, PartialEq)]
@@ -426,6 +451,54 @@ mod tests {
         // "こんにちは" の Shift_JIS バイト列
         let sjis: &[u8] = &[0x82, 0xB1, 0x82, 0xF1, 0x82, 0xC9, 0x82, 0xBF, 0x82, 0xCD];
         assert_eq!(decode_bytes(sjis).unwrap(), "こんにちは");
+    }
+
+    // === decode_output_line ===
+
+    /// 実機で化けていた行そのもの（cp932 の Windows のエラー文）を読めること。
+    #[test]
+    fn an_output_line_in_cp932_is_read_as_japanese() {
+        let mut line = b"ConnectionResetError: [WinError 10054] ".to_vec();
+        // cp932 の「既存の接続」（2026-09-19 の観測の sample_hex と同じバイト列）
+        line.extend_from_slice(&[0x8a, 0xf9, 0x91, 0xb6, 0x82, 0xcc, 0x90, 0xda, 0x91, 0xb1]);
+        assert_eq!(
+            decode_output_line(&line),
+            "ConnectionResetError: [WinError 10054] 既存の接続"
+        );
+    }
+
+    /// UTF-8 の行は UTF-8 のまま読む（Shift_JIS を先に試すと、UTF-8 の日本語が化ける）。
+    ///
+    /// **順序を守らせるには、Shift_JIS としても誤りなく読める UTF-8 が要る。**「既存の接続」の
+    /// UTF-8 は Shift_JIS としては読めないので、Shift_JIS を先に試しても UTF-8 に戻って通ってしまう
+    /// （変異テストで素通りした）。「アクセスが拒否されました」の UTF-8 は Shift_JIS としても
+    /// 誤りなく読め、「繧｢繧ｯ…」に化ける。pip のエラーで読みたいのがまさにこの文。
+    #[test]
+    fn an_output_line_in_utf8_stays_utf8() {
+        assert_eq!(
+            decode_output_line("アクセスが拒否されました".as_bytes()),
+            "アクセスが拒否されました"
+        );
+        assert_eq!(decode_output_line("既存の接続".as_bytes()), "既存の接続");
+        assert_eq!(decode_output_line(b"plain ascii"), "plain ascii");
+    }
+
+    /// どちらでも読めない行は、止めずに置換文字で流す。
+    #[test]
+    fn an_output_line_in_neither_encoding_is_passed_with_replacement_chars() {
+        let got = decode_output_line(b"x \xff\xfe y");
+        assert!(got.starts_with("x ") && got.ends_with(" y"), "{got:?}");
+        assert!(got.contains('\u{FFFD}'), "{got:?}");
+    }
+
+    /// **行頭が UTF-16 の BOM に見えても UTF-16 として読まない。** BOM を見る読み方だと、
+    /// `FF FE` で始まる偶数長の行は UTF-16LE として誤りなく読めてしまい、置換文字ではなく
+    /// 意味の無い文字列がログに残る。
+    #[test]
+    fn an_output_line_starting_like_a_utf16_bom_is_not_read_as_utf16() {
+        let got = decode_output_line(b"\xff\xfeab");
+        assert!(got.contains('\u{FFFD}'), "{got:?}");
+        assert!(got.ends_with("ab"), "{got:?}");
     }
 
     #[test]

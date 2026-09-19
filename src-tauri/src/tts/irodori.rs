@@ -44,8 +44,11 @@ pub(crate) fn is_hf_progress_line(line: &str) -> bool {
 /// 送った本文とキャプションを伏せてから 300 文字で頭打ちにする
 /// （spec §3.3 の送信物 / v0.5.3 項目 7「診断ログに会話本文を残さない」を破らないため）。
 ///
-/// **リクエスト時の例外は stderr には出ない**（`HTTPException` は応答として返るだけ）。
-/// stderr が運ぶのは起動時の import 失敗とモデル DL の進捗・失敗なので、そちらは伏せる対象が無い。
+/// **合成の例外そのものは stderr には出ない**（`HTTPException` は応答として返るだけ）。
+/// stderr が運ぶのは起動時の import 失敗・モデル DL の進捗と失敗・起動時の文字コードの 1 行と、
+/// 要求の途中の診断の行（合成の所要時間、参照音声の事前変換の失敗とやり直し。v0.5.6 項目 1）。
+/// 事前変換には固定文を渡し、診断の行は型名と数値だけなので、発話本文は入らない（伏せる対象が無い）。
+/// ただしランタイム自身が stderr に何を書くかは未確認なので、stderr への伏字は v0.5.6 項目 2 で入れる。
 pub(crate) fn sanitize_sidecar_error(body: &str, secrets: &[&str]) -> String {
     let mut out = body.to_string();
     for secret in secrets {
@@ -243,8 +246,7 @@ impl IrodoriClient {
             ));
         }
         let script = asset_root.join("sidecar.py");
-        // [hf-download] 接頭辞の行のみ irodori-download イベントへ転送する。
-        // 他の uvicorn / sidecar.py 標準ログは捨てる (ノイズ抑制 + 機密漏洩防止)。
+        // [hf-download] 接頭辞の行は irodori-download イベントへ転送し、それ以外は ugg.log へ残す。
         // 接頭辞判定は is_hf_progress_line (pure 関数) に切り出してテストでカバー。
         let on_stderr = move |line: &str| {
             if is_hf_progress_line(line) {
@@ -256,8 +258,10 @@ impl IrodoriClient {
             // **進捗以外を捨てない** (v0.5.5 項目 1)。捨てていたため、サイドカーが
             // 異常終了してもユーザーに出るのは「HTTP 通信に失敗しました」だけで、
             // 原因に辿り着く手段がアプリ側に 1 つも無かった。
-            // 平時は静か（`--log-level warning` で起動しており、リクエスト時の例外は
-            // `HTTPException` として応答に載るので stderr には来ない）。
+            // 平時に来るのは、起動ごとに文字コードの 1 行（`[stdio]`、v0.5.6 項目 2）と、
+            // 合成 1 回ごとに所要時間の 1 行（v0.5.6 項目 1）。uvicorn は `--log-level warning` で
+            // 起動しており、合成の例外は `HTTPException` として応答に載るので、それ以外はほぼ来ない。
+            // 所要時間の行は 100 バイト程度で、ugg.log（2MB で 1 世代）に約 2 万行入る。
             crate::ulog!(
                 "[irodori:py] {}",
                 crate::dialogue::llm::truncate_for_log(line)

@@ -100,7 +100,8 @@ pub fn run_downloader(
             if raw.is_empty() {
                 continue;
             }
-            let s = String::from_utf8_lossy(raw);
+            // Windows のエラー文は cp932 で来うる。UTF-8 で読めなければ Shift_JIS で読む（v0.5.6 項目 2）。
+            let s = crate::tts::reader::decode_output_line(raw);
             let clean = strip_ansi(&s);
             let t = clean.trim();
             if t.is_empty() {
