@@ -141,7 +141,7 @@ clamp を行うのは実効再生レートの最終合成 (§2.4) のみで、�
 - `caption` は Irodori 実モデル (500M-v3) の caption 条件付けに渡す
   (`cfg_scale_caption` は sidecar 内の既存値 3.0 のまま)。
   **★2026-09 注記: 500M-v3 本体の checkpoint は `use_caption_condition: false` のため、渡しても
-  条件付けに入らず音声に反映されない（spec.md §6.0 の v0.5.6 引き継ぎ）。下記の「有効判定」は
+  条件付けに入らず音声に反映されない（spec.md §6.0 の v0.5.7 引き継ぎ）。下記の「有効判定」は
   「caption を渡す経路が生きている」ことの判定であり、反映されることは意味しない。**
 - **有効判定は再生開始前にフロントで行う**。専用コマンドは追加せず、**既存 Tauri コマンド
   `irodori_assets_ready` (資産の存在確認、architecture.md §4.7) と設定 `tts_engine` の組合せ**
@@ -368,13 +368,15 @@ slot / playbackRate / pause の 3 パラメタ適用、再生開始前の slot �
 
 **前提**: S4・S9 は Irodori 実モデル導入済み環境で行う。未導入環境では代替として
 sidecar ログで `SamplingRequest.caption` に値が透過されることを確認する (S4')。
+（★2026-09-19 注記: sidecar にそのようなログを出す箇所は無く、caption は伏字の対象でもあるので、この代替は実行できない。
+v0.5.7 の差し替え時に書き換える。spec.md §6.0）
 
 | # | 手順 | 期待 |
 |---|---|---|
 | S1 | 台本 .md を DnD (voicevox) | host 行=main の声、guest 行=sub の声で交互に読む |
 | S2 | speed 指定行 (±0.15) | 該当行だけ速度が変わる。実効レートは [0.5, 2.0] に収まる |
 | S3 | pause_after 0.6 の行 | 行の後の間が明確に長い |
-| S4 | **Irodori 実モデル + caption 行** (「驚いて大声で」等) | 演技が音声に乗る。sidecar ログの SamplingRequest.caption に値が入る（★2026-09 注記: v3 本体では、この確認が裏付けるのは値が sidecar まで届くことだけ。§2.5 参照） |
+| S4 | **Irodori 実モデル + caption 行** (「驚いて大声で」等) | 演技が音声に乗る。sidecar ログの SamplingRequest.caption に値が入る（★2026-09 注記: v3 本体は caption を条件付けに使わないため、演技は音声に乗らない。期待値のログは sidecar に出す箇所が無く caption は伏字の対象なので、この確認が何を裏付けたかは記録から確かめられない。v0.5.7 の差し替え時に書き換える。§2.5・spec.md §6.0 参照） |
 | S5 | voicevox で caption 入り台本 | エラーにならず読む + パネルに注記が**再生終了まで**表示。caption なし台本、および Irodori 実モデル可判定の環境では注記が出ない |
 | S6 | 不正台本 (未定義話者 / ref_wav / JSON 破損 / speed 範囲外 / 通常の Markdown 文書) | 再生開始せず、種別ごとの文言 (§2.3/§2.8) で原因が分かる |
 | S7 | プレーン .txt (回帰) | v0.1.1 と同一挙動 (順序・速度・間・停止) |

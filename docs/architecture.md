@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.33）
+# ugg アーキテクチャ設計書（architecture.md v2.34）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -622,7 +622,7 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `synthesize_voice` | `text: String, slot: "main"\|"sub", caption: String\|null（省略可）` | `String` | WAV を base64 で返す（slot 基準、エンジン振り分けはバックエンド）。★ `caption` は Irodori 実モデルのみ使用（他経路は無視、空文字は None 正規化。script-reader-spec.md §3.3）。**v3 本体では効いていない**（§7.1。v0.5.6 の差し替えで閉じる予定で、効くことは差し替え時に検証する） |
+| `synthesize_voice` | `text: String, slot: "main"\|"sub", caption: String\|null（省略可）` | `String` | WAV を base64 で返す（slot 基準、エンジン振り分けはバックエンド）。★ `caption` は Irodori 実モデルのみ使用（他経路は無視、空文字は None 正規化。script-reader-spec.md §3.3）。**v3 本体では効いていない**（§7.1。v0.5.7 の差し替えで閉じる予定で、効くことは差し替え時に検証する） |
 | `list_voices` | なし | `VoiceOption[]` | 現在エンジンの声一覧 |
 | `voicevox_assets_ready` | なし | `bool` | 資産有無 |
 | `download_voicevox_assets` | `agreed: bool, gh_token: String\|null` | `()` | 規約同意必須、進捗は `voicevox-download` イベント |
@@ -631,7 +631,7 @@ pub struct GhostBundle {
 | `delete_github_token` | なし | `()` | |
 | `irodori_check_gpu` | なし | `GpuInfo` | ★ 起動時 GPU 検出（Q3 対応） |
 | `irodori_assets_ready` | なし | `bool` | ★ **「使えるか」だけを返す**（★v0.5.4 で意味を明確化）。最新かどうかは混ぜない — 混ぜるとフロントの `canUseReal = gpuOk && assetsOk` が倒れ、古いが動いている環境で `tts_irodori_use_real_model` が黙って false に書き換わって永続化される |
-| `update_irodori_runtime` | なし | `String[]`（入れ直せた pin 名） | **★v0.5.4**（spec §6.0 項目 3）。初回導入と**別経路**だが、**同時には走らない**（`IrodoriBusyGuard`。同じ site-packages を 2 経路が触ると退避も復元も守れない）。**実行前に稼働中のサイドカーを停止する**（止めないと合成は旧コードのまま続き、遅延 import するモジュールを差し替えると動いているプロセスが壊れる）。古くなった pin だけを「**退避 → 入れ直し → import の前後比較 → 悪化が無ければ退避を捨てる**」で入れ替える（失敗したら戻す。戻せなければ退避を残してログに場所を出す）。**`python` は対象外** — `ensure_python_embeddable` は `python.exe` があれば skip し、稼働中のインタプリタを安全に差し替える方法が無いため、その旨を返して止まる。**ただし `outdated` に `python` を入れるのは実物の版が違うときだけ** — 記録の欠落で混ぜると更新経路が丸ごと止まる。成功後は**入れ直せた分だけ**記録（`installed.json`）を書き換える（実物の版が pin と一致していることを確認できたときは `python` も記録する）。**記録の書き込みは更新処理の一部**で、コマンド層では行わない |
+| `update_irodori_runtime` | なし | `String[]`（入れ直せた pin 名） | **★v0.5.4**（spec §6.0 項目 3）。初回導入と**別経路**だが、**同時には走らない**（`IrodoriBusyGuard`。同じ site-packages を 2 経路が触ると退避も復元も守れない）。**実行前に稼働中のサイドカーを停止する**（止めないと合成は旧コードのまま続き、遅延 import するモジュールを差し替えると動いているプロセスが壊れる）。古くなった pin だけを「**退避 → 入れ直し → import の前後比較 → 悪化が無ければ退避を捨てる**」で入れ替える（失敗したら戻す。戻せなければ退避を残してログに場所を出す）。**`python` は対象外** — `ensure_python_embeddable` は `python.exe` があれば skip し、稼働中のインタプリタを安全に差し替える方法が無いため、その旨を返して止まる。**ただし `outdated` に `python` を入れるのは実物の版が違うときだけ** — 記録の欠落で混ぜると更新経路が丸ごと止まる。成功後は**入れ直せた分だけ**記録（`installed.json`）を書き換える（実物の版が pin と一致していることを確認できたときは `python` も記録する）。**記録の書き込みは更新処理の一部**で、コマンド層では行わない。**★2026-09-19: 「失敗したら戻す」は途中の失敗では成り立っていない** — どの段で失敗しても退避ディレクトリを丸ごと消す（固定 URL の段では、失敗したものを戻せた場合に限る）ので、それより前に入れ直しに成功した分の退避（＝唯一の旧版）も消える。名前付き要件には退避も復元も無い（spec §6.0 v0.5.6 の「分かったこと 2」。項目 3d で直す） |
 | `get_irodori_status` | なし | `IrodoriStatus { present, has_record, up_to_date, outdated[], resolved{} }` | **★v0.5.4**（spec §6.0 項目 2）。導入記録（`installed.json`）と、いまのビルドが要求する pin を突き合わせる（**★v0.5.5 で名前付き要件とモデルも**。欄が空の記録は v0.5.4 の固定の基準値で読む）。`present` は `irodori_assets_ready` と同じ意味、`up_to_date` は**別の信号**。**記録が無い環境（v0.5.4 より前の導入）は `up_to_date: false`** — 分からないものを「最新」とは言わない。**`outdated` は記録が無くても名指しする**（入れ直せば済むものは分かる）。**`python` だけは記録ではなく実物（`python.exe --version`）で判定**し、聞けなければ「古い」とは言わない。呼び出し側は `outdated` をそのまま対象にする |
 | `download_irodori_assets` | `agreed: bool` | `()` | ★ 進捗 `irodori-download` |
 | `voice_ref_generate` | `slot: String, caption: String` | `VoiceRef[]` | ★ Irodori 参照音声生成（同期完了、進捗イベントなし）。完了後の一覧を返す |
@@ -1017,7 +1017,8 @@ when:                                        # ⑥ 確率
    synthesize_voice(text, slot, caption?)   ★ caption は Irodori 実モデルのみ使用
                                             ★v0.5.4 訂正: **v3 では効いていない**
                                             (本体 checkpoint が use_caption_condition:false)。
-                                            v0.5.6 の v4.1-Small 差し替えで初めて効く
+                                            v0.5.7 の差し替え（MF）で効くかを確かめる
+                                            （MF の use_caption_condition は未確認。spec §6.0 の spike）
             │
             ▼
    ┌────────────────────┐
@@ -1479,7 +1480,7 @@ pub async fn notify(
 | VoicevoxDlFailed | Important |
 | IrodoriUnavailable | Important |
 
-※ 実装の notify() は severity 二段トーストを持たない（発話 or トースト fallback の二択）。
+※ 実装の notify() は severity 二段トーストを持たない（発話 or トースト fallback の二択）。**二段トーストは spec §6.0 v0.5.6 項目 6（2026-09-19 ユーザー裁定）で取り下げた。** §11.1 / §11.2 の素案（告知の種類の一覧・既定の表も実装から外れている）は項目 6 の実装時に書き直す。
 ★M7: `ReminderFired` variant は削除（§11.4 の deliver_event 経路へ一本化）。
 
 ### 11.3 呼び出し点
@@ -1719,7 +1720,9 @@ async fn install_asset(
        │  })
        └─ .invoke_handler(...)
 
-二重起動ガード（single-instance）は無い（spec §6.0 で v0.5.6 へ引き継ぎ）
+二重起動ガード（single-instance）は無い（v0.5.6 でも入れない — 2026-09-19 ユーザー裁定。他のインスタンスの
+生きたサイドカーを孤児と取り違えない対策（spec §6.0 項目 4）と、プロセスをまたぐ導入・更新と台帳の錠
+（項目 3f・4）だけを入れる）
 ```
 
 ### 14.2 通常運用
@@ -1759,7 +1762,7 @@ async fn install_asset(
 | user_profile の肥大化 | system prompt 肥大化 | モード別容量管理（要約サイクル or 件数上限） |
 | zip slip 等の DnD 経由のパス脱出 | 任意ファイル書き込み | zip エントリ名の検査（`sanitize_zip_path`）+ `normalize_path` 後の starts_with 検証 + manifest `id` の検証（`validate_asset_id`）（§12.3） |
 | Python サイドカー起動時の文字エンコーディング | stderr の文字化け・読み取りの停止 | **UTF-8 の強制は実装していない**（`PYTHONIOENCODING` などの環境変数は設定していない。同梱の Python は `._pth` による isolated なので、環境変数ではそもそも効かない）。読めない行は置換文字にして流し、読み取りが止まるときは理由を `ugg.log` に残す（★v0.5.5）。実環境のサイドカーだけ cp932 で出力する理由はまだわかっておらず、v0.5.6 へ引き継いでいる（spec §6.0） |
-| サイドカーの孤児プロセス化 | リソースリーク（1 つで数 GB の VRAM） | アプリ終了時に `/shutdown` → kill。**強制終了で残ったものは次の起動で掃除する**（台帳 `sidecars.json` ＋ 応答の形で識別、★v0.5.5）。**Job Object による親子連動は未実装** — 当初ここに書いていたが実装されていなかった（2026-09-14 リリース前監査で発覚し、記述を実態へ改めた。検討は v0.5.6 へ） |
+| サイドカーの孤児プロセス化 | リソースリーク（1 つで数 GB の VRAM） | アプリ終了時に `/shutdown` → kill。**強制終了で残ったものは次の起動で掃除する**（台帳 `sidecars.json` ＋ 応答の形で識別、★v0.5.5）。**Job Object による親子連動は未実装** — 当初ここに書いていたが実装されていなかった（2026-09-14 リリース前監査で発覚し、記述を実態へ改めた。v0.5.6 で入れる — spec §6.0 項目 4） |
 
 ---
 
@@ -1811,3 +1814,4 @@ async fn install_asset(
 | 2026-09-14 | v2.31 | **v0.5.5 インストール版の実環境で、孤児掃除が死んだ記録を「応答しない」と取り違えていた**（v2.30 ③の修正が実環境で成立していなかった）。何も待ち受けていないポート（旧 `ready.json` の記録）を、起動のたびに「応答しません（記録を残します）」と判定していた（dev では 2 秒の拒否で正しく捨てていた）。原因: reqwest の `PendingRequest::poll` は**全体のタイムアウトを先に見てから**通信の結果を見る。起動直後の混雑で「接続拒否の知らせ」と「5 秒のタイマー」が同時に処理待ちになると、拒否されていてもタイムアウトと判定される。**対処: HTTP の前に、TCP の接続だけを待機スレッド（`spawn_blocking` ＋ `connect_timeout`、10 秒）で確かめる**（`tcp_reach`）。拒否なら死んでいる、つながったら従来どおり HTTP で応答の形を見る、時間内に結果が出なければ決めつけずに残す。待機スレッドでの接続の結果はタイマーと先着を争わない。あわせて、掃除の開始と 1 件ごとの所要時間をログに出す（今回の起動から判定まで 22 秒の原因を、ログから切り分けられなかったため）。**契約・設定フィールド・DB スキーマの変更なし。** |
 | 2026-09-14 | v2.32 | **v0.5.5 タグ後の docs 整理（tidy-docs）**。§7.1 全体フローの `caption` の注記が「v0.5.5 の v4.1-Small 差し替えで初めて効く」のままだった（v0.5.4 のスコープ確定時の記述で、v0.5.5 のスコープ確定で差し替えを v0.5.6 へ再分割したときに追随していなかった）。v0.5.6 へ訂正。あわせて改訂履歴の v2.29 の行を版の順へ並べ直した（中身は変えていない）。**契約・設計の変更なし。** |
 | 2026-09-17 | v2.33 | **v0.5.6 前の docs 整理（外部レビューの検証）**。実装と突き合わせて、Phase 2 の設計のまま残っていた記述を是正した。① 構造体のコードブロックを実装へ（`DialogueState` の旧 `cost_limited_emitted` を外して `cost_unknown_notified` を追加、`AppState` / `PresenceState` / `TtsState` / `PomodoroState` / `WindowState` / `GhostBundle` / `SidecarHandle`。実装に無い `WorkerHandles` を削除）② 構成図（§1.1〜§1.4）を実ファイルへ（実在しない `pose.ts` / `drag.ts` / `panels/settings/` の分割 / `asset_dnd.rs` / `dialogue/monologue.rs` / `tts/ (engine)` / `trait TtsEngine` / `create_main_window` を訂正し、抜けていたファイルを追加）③ ファイル資産表と §8.1 の図（ログは `%APPDATA%\ugg\ugg.log`、参照音声は `refs\<slot>_<id>.wav`、Python は 3.11.9、`installed.json` / `sidecars.json` / `ready.json`、site-packages の位置）④ §4.11 `feedback_speech` の対象に定例会話、`caption` が v3 本体で効かない注記、メニュー項目名「予定・ToDo」 ⑤ §8.3 / §8.6 / §8.7 / §13（GPU 不在は稼働中のヘルス監視が扱う、`voice_caption_default` とキャプション入力モーダルは無い、Irodori に規約同意は無く確認ダイアログだけ）⑥ §12 DnD 導入（`canonicalize` を使わない zip slip 検査、定数の上限、許可外拡張子の拒否、ファイル名検証の範囲、v0.5.3 の非破壊導入、ファイル選択 UI は無い）⑦ §3.3 / §14 の起動と終了の流れ（存在しないプラグイン・関数名を実名へ、終了経路が 2 本あること）⑧ §15 の「UTF-8 強制」は未実装 ⑨ §7.1〜§7.5 と §8.4 の疑似コードに、Phase 2 の素案で実装と違う点を注記。**契約・設計判断の変更はなし。** |
+| 2026-09-19 | v2.34 | **v0.5.6 スコープ確定（spec v1.11）に伴う参照先の訂正と注記**。モデルの差し替えが v0.5.7 へ分割されたので、caption の時期の記述 2 か所（契約表の `synthesize_voice`・§7.1 全体フロー）を v0.5.7 へ直した（§7.1 は、MF の `use_caption_condition` が未確認なので「効くかを確かめる」にとどめた）。§14 の二重起動ガードと §15 のリスク表の Job Object を、裁定の結果（完全な single-instance は入れず、台帳の所有者とプロセスをまたぐ錠だけ入れる／Job Object は v0.5.6 で入れる）へ直した。**スコープの検証で分かった事実を 2 か所に注記した**: 契約表の `update_irodori_runtime` の「失敗したら戻す」は途中の失敗では成り立っていない（それより前に成功した分の退避も消す。名前付き要件は戻せない）／§11 の severity 二段トーストは取り下げ。**契約・設計の変更なし**（設計の変更は各項目の実装時に行う）。 |
