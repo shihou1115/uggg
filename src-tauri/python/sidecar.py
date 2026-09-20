@@ -226,6 +226,30 @@ def make_mock_voice_ref_wav() -> bytes:
 
 # --- HF モデル DL + 実モデル推論 (M4c Phase G, 実機検証で確定) -----------
 
+def _show_download_progress() -> None:
+    """取得の進捗を、端末でなくても出させる（v0.5.6 項目 2）。
+
+    huggingface_hub の進捗バー（tqdm）は、端末でないと出ない（`disable=None` の既定）。ugg は
+    パイプで読むので、数 GB の取得中も画面が止まって見えた。hub は環境変数 `TQDM_POSITION=-1`
+    のときだけ強制で出すが、それは tqdm の表示位置まで変え、カーソル移動の制御文字が混ざる。
+    そこで判定の関数だけを「自動なら出す」に差し替える（明示の無効はそのまま）。上流の変更で
+    見つからなければ、今までどおり出ないだけ（取得そのものは止めない）。
+    """
+    try:
+        import importlib
+
+        hub_tqdm = importlib.import_module("huggingface_hub.utils.tqdm")
+        decide = hub_tqdm.is_tqdm_disabled
+
+        def _shown_even_without_a_terminal(log_level):  # type: ignore[no-untyped-def]
+            disabled = decide(log_level)
+            return False if disabled is None else disabled
+
+        hub_tqdm.is_tqdm_disabled = _shown_even_without_a_terminal
+    except Exception as exc:
+        _diag(f"[hf-download] 取得の進捗は出せません（取得は続けます）: {type(exc).__name__}")
+
+
 def download_models(asset_dir: Path) -> None:
     """Aratako/Irodori-TTS 系モデルを `asset_dir/model/<repo>` に取得する。
 
@@ -239,6 +263,7 @@ def download_models(asset_dir: Path) -> None:
             "[hf-download] huggingface_hub が見つかりません。Irodori 資産 DL を実行してください\n"
         )
         raise
+    _show_download_progress()
     target_root = asset_dir / "model"
     target_root.mkdir(parents=True, exist_ok=True)
 

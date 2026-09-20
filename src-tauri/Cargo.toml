@@ -25,7 +25,9 @@ anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "now"] }
 rand = "0.8"
-tokio = { version = "1", features = ["sync", "macros", "time", "rt", "process", "io-util"] }
+# `rt-multi-thread` は `block_in_place` のため（v0.5.6 項目 2。pip などの同期待ちで非同期の
+# ワーカーを塞がない）。tauri が既に有効にしているので、増えるコードは無い。
+tokio = { version = "1", features = ["sync", "macros", "time", "rt", "rt-multi-thread", "process", "io-util"] }
 # keyring 3.x は **プラットフォームの feature を明示しないと OS の資格情報ストアを
 # 組み込まず、メモリ上のモックにフォールバックする**。その状態では set_password が
 # 成功を返すのに次の Entry から読めず、API キーが永続化されない (UI は「保存しました」
@@ -53,6 +55,10 @@ windows = { version = "0.58", features = [
     # M9 状況検知 (daily-support-design §7.3): GetSystemPowerStatus / GetTickCount
     "Win32_System_Power",
     "Win32_System_SystemInformation",
+    # v0.5.6 項目 2: 子プロセスを木ごと止める・無進捗を判定する（`tts::child_process` の Job Object）
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Security",
 ] }
 
 [dev-dependencies]

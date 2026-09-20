@@ -7,6 +7,7 @@
 //! - voicevox: voicevox_core.dll を libloading で実行時ロード、プロセス内 CPU 合成
 //! - irodori: ugg が同梱 Python サイドカーを起動・停止管理 (M4c で実装)
 
+pub(crate) mod child_process;
 pub mod download;
 pub mod gpu;
 pub mod irodori;

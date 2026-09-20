@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.35）
+# ugg アーキテクチャ設計書（architecture.md v2.36）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -117,7 +117,8 @@ src-tauri/src/
 │   ├── sidecar.rs           -- サイドカープロセスの起動・停止・監視
 │   ├── gpu.rs               -- GPU 検出（Irodori 可否判定）
 │   ├── preprocess.rs        -- 漢字→ひらがな変換（voicevox_core の OpenJtalk を流用）
-│   ├── reader.rs            -- テキスト読み上げ: .txt 読込 + チャンク分割 + .md 台本対応（text-reader-spec.md / script-reader-spec.md）。★v0.5.6: 子プロセスの出力 1 行の読み方（`decode_output_line`。UTF-8 → Shift_JIS）もここに置き、sidecar / irodori_download / download が共有する
+│   ├── reader.rs            -- テキスト読み上げ: .txt 読込 + チャンク分割 + .md 台本対応（text-reader-spec.md / script-reader-spec.md）。★v0.5.6: 子プロセスの出力 **1 行**の読み方（`decode_output_line`。UTF-8 → Shift_JIS）もここに置く（行に組み立てるのは呼ぶ側 = `sidecar.rs` の stderr ポンプと `child_process.rs`）
+│   ├── child_process.rs     -- ★v0.5.6 子プロセスの起動と出力の読み取り（行ごとに流す・`\n` と `\r`・色付けの制御文字を落とす・無進捗なら Job Object ごと止める・同期待ちでワーカーを塞がない）。`irodori_download` の `run_python` と `download.rs` のダウンローダが使う
 │   ├── script.rs            -- ★ .md 台本形式パース + 検証（フェンス抽出・ScriptError。script-reader-spec.md）
 │   ├── download.rs          -- 公式ダウンローダ起動（既定 voicevox_core 資産）
 │   └── voice_ref.rs         -- ★ Irodori 参照音声管理（生成・保存・削除）
@@ -1186,7 +1187,16 @@ raw テキストフォールバックに委ねる。
 
 - HuggingFace `Aratako/Irodori-TTS-*` モデルを初回 DL
 - 規約同意のチェックや同意文言は無い（spec §4.5.1 が規約同意を求めるのは voicevox_core のみ）。「ランタイムをダウンロード」押下時に、取得物（Python ランタイム・PyTorch (CUDA 12.8)・実モデル実行時ランタイム）と通信量（約 2〜3 GB）・所要時間（10〜20 分）を示す確認ダイアログを出し、OK なら `download_irodori_assets` を `agreed: true` で呼ぶ
-- DL 進捗は `irodori-download` イベント
+- DL 進捗は `irodori-download` イベント。**行が届いたときに流す**（★v0.5.6 項目 2。以前は子プロセスが
+  終わってからまとめて流しており、数 GB の取得中は画面が 1 行のまま固まった）
+- **パイプ越しでは pip も huggingface_hub も取得中の進捗を出さない**（★v0.5.6 で判明。pip の rich は
+  端末でないと描かず、hub の tqdm は `disable=None` の既定で端末でないと出ない）。そこで pip には
+  `--progress-bar raw`（pip 24.1 以降。入っている版を見てから付ける）を渡し、`Progress N of M` の行を
+  「取得中 N / M MB（P%）」へ直して割合が変わったときだけ流す。`sidecar.py` は `--download-only` の
+  取得の間だけ hub の判定（`is_tqdm_disabled`）を「自動なら出す」に差し替える
+- 失敗したときは**理由**（pip の `ERROR:` の行・例外の行）をエラーに添え、直前の 20 行を `ugg.log`
+  （`[irodori:python]`）に残す。進捗の上書きの行は残さない
+- **出力も読み書きも CPU も 5 分無ければ止める**（`child_process`。Job Object の集計で孫まで見る）
 
 ### 8.4 プロセス管理（O2）
 
@@ -1760,12 +1770,13 @@ async fn install_asset(
 |---|---|---|
 | voicevox_core C API のバージョン差 | 起動時クラッシュ | バージョン固定（FFI と一致する版を初回 DL） |
 | Irodori-TTS モデル DL の中断 | サイドカー起動失敗 | チェックサム検証、再 DL の動線 |
+| 子プロセス（pip・モデル取得・ダウンローダ）が固まる | 錠を握ったまま戻らず、**再起動まで Irodori が使えない** | **★v0.5.6 項目 2**: 出力・読み書き・CPU のどれも 5 分無ければ Job ごと止める（`child_process`）。出力だけで数えると、pip が torch を展開している間（黙って書き続け、CPU もほとんど使わない）に正常な処理を止めるので、Job Object の集計（孫を含む）で読み書きと CPU も見る。通信の側（Python 本体と get-pip.py の取得・ダウンローダの取得・更新の確認）には接続と読み取りの上限を付けた |
 | GPU が利用可能 → 利用不能（運転中変化） | サイドカー異常終了 | notify(IrodoriUnavailable) + voicevox_core に自動切り替え |
 | 辞書 v3 のパース失敗 | アプリ起動失敗 | バリデータで起動時に警告、デフォルト辞書にフォールバック |
 | user_profile の肥大化 | system prompt 肥大化 | モード別容量管理（要約サイクル or 件数上限） |
 | zip slip 等の DnD 経由のパス脱出 | 任意ファイル書き込み | zip エントリ名の検査（`sanitize_zip_path`）+ `normalize_path` 後の starts_with 検証 + manifest `id` の検証（`validate_asset_id`）（§12.3） |
-| Python サイドカー起動時の文字エンコーディング | stderr の文字化け・読み取りの停止 | **★v0.5.6 原因を確かめて直した**（spec §6.0 項目 2）。ugg が起動したサイドカーの中で観測すると `stderr.encoding=cp932`・`isolated=1`・`utf8_mode=0` だった — CPython はパイプへ書くとき、UTF-8 モードでなければ ANSI コードページで書く。同梱の Python は `._pth` で isolated なので、環境変数（`PYTHONIOENCODING` / `PYTHONUTF8`）では変えられない。**送り側**: `sidecar.py` が依存の import より前に stdout / stderr を `reconfigure(encoding="utf-8")` で切り替える（`-X utf8` は `open()` の既定まで変えてモデル側のコードに影響しうるので使わない）。起動ごとに切り替え前と後の文字コードを `[stdio]` の 1 行で残す。**受け側**: 子プロセスの出力を読む 3 か所（サイドカーの stderr / `run_python` ＝ pip とモデル取得 / VOICEVOX のダウンローダ）は `reader::decode_output_line` で UTF-8 → Shift_JIS の順に読み、どちらでも読めない行は置換文字で流す（pip の出力は中身に手を入れられないので受け側で読む。行頭の BOM では判定しない）。読み取りが止まるときは理由を `ugg.log` に残す（★v0.5.5）。インストール版での効き目は実機検証で確かめる |
-| サイドカーの孤児プロセス化 | リソースリーク（1 つで数 GB の VRAM） | アプリ終了時に `/shutdown` → kill。**強制終了で残ったものは次の起動で掃除する**（台帳 `sidecars.json` ＋ 応答の形で識別、★v0.5.5）。**Job Object による親子連動は未実装** — 当初ここに書いていたが実装されていなかった（2026-09-14 リリース前監査で発覚し、記述を実態へ改めた。v0.5.6 で入れる — spec §6.0 項目 4） |
+| Python サイドカー起動時の文字エンコーディング | stderr の文字化け・読み取りの停止 | **★v0.5.6 原因を確かめて直した**（spec §6.0 項目 2）。ugg が起動したサイドカーの中で観測すると `stderr.encoding=cp932`・`isolated=1`・`utf8_mode=0` だった — CPython はパイプへ書くとき、UTF-8 モードでなければ ANSI コードページで書く。同梱の Python は `._pth` で isolated なので、環境変数（`PYTHONIOENCODING` / `PYTHONUTF8`）では変えられない。**送り側**: `sidecar.py` が依存の import より前に stdout / stderr を `reconfigure(encoding="utf-8")` で切り替える（`-X utf8` は `open()` の既定まで変えてモデル側のコードに影響しうるので使わない）。起動ごとに切り替え前と後の文字コードを `[stdio]` の 1 行で残す。**受け側**: 子プロセスの出力を読む 3 か所（サイドカーの stderr / `run_python` ＝ pip とモデル取得 / VOICEVOX のダウンローダ）は `reader::decode_output_line` で UTF-8 → Shift_JIS の順に読み、どちらでも読めない行は置換文字で流す（pip の出力は中身に手を入れられないので受け側で読む。行頭の BOM では判定しない）。読み取りが止まるときは理由を `ugg.log` に残す（★v0.5.5）。**★v0.5.6 項目 2 の残りで、VOICEVOX のダウンローダの経路だけ直っていなかったのを直した** — 色付けの制御文字を落とす処理が 1 バイトずつ文字に積み直しており、正しく読めた日本語をそのあとで壊していた（`アクセスが拒否されました` が読めない）。制御文字を落とすのは `child_process` に寄せ、UTF-8 の区間はそのまま残す。インストール版での効き目は実機検証で確かめる |
+| サイドカーの孤児プロセス化 | リソースリーク（1 つで数 GB の VRAM） | アプリ終了時に `/shutdown` → kill。**強制終了で残ったものは次の起動で掃除する**（台帳 `sidecars.json` ＋ 応答の形で識別、★v0.5.5）。**Job Object による親子連動は 6 か所のうち 2 か所**（`run_python` と VOICEVOX のダウンローダ）**が v0.5.6 項目 2 で入った** — 無進捗で止めるときに孫まで止める必要があり、読み書きと CPU の集計も Job から取る。「閉じたら中身ごと終わらせる」設定なので、ugg が強制終了されても子は残らない。**残りはサイドカーと zip の展開**（spec §6.0 項目 4。当初ここに「実装済み」と書いていたが実装されておらず、2026-09-14 リリース前監査で記述を実態へ改めた経緯がある） |
 
 ---
 
@@ -1819,3 +1830,4 @@ async fn install_asset(
 | 2026-09-17 | v2.33 | **v0.5.6 前の docs 整理（外部レビューの検証）**。実装と突き合わせて、Phase 2 の設計のまま残っていた記述を是正した。① 構造体のコードブロックを実装へ（`DialogueState` の旧 `cost_limited_emitted` を外して `cost_unknown_notified` を追加、`AppState` / `PresenceState` / `TtsState` / `PomodoroState` / `WindowState` / `GhostBundle` / `SidecarHandle`。実装に無い `WorkerHandles` を削除）② 構成図（§1.1〜§1.4）を実ファイルへ（実在しない `pose.ts` / `drag.ts` / `panels/settings/` の分割 / `asset_dnd.rs` / `dialogue/monologue.rs` / `tts/ (engine)` / `trait TtsEngine` / `create_main_window` を訂正し、抜けていたファイルを追加）③ ファイル資産表と §8.1 の図（ログは `%APPDATA%\ugg\ugg.log`、参照音声は `refs\<slot>_<id>.wav`、Python は 3.11.9、`installed.json` / `sidecars.json` / `ready.json`、site-packages の位置）④ §4.11 `feedback_speech` の対象に定例会話、`caption` が v3 本体で効かない注記、メニュー項目名「予定・ToDo」 ⑤ §8.3 / §8.6 / §8.7 / §13（GPU 不在は稼働中のヘルス監視が扱う、`voice_caption_default` とキャプション入力モーダルは無い、Irodori に規約同意は無く確認ダイアログだけ）⑥ §12 DnD 導入（`canonicalize` を使わない zip slip 検査、定数の上限、許可外拡張子の拒否、ファイル名検証の範囲、v0.5.3 の非破壊導入、ファイル選択 UI は無い）⑦ §3.3 / §14 の起動と終了の流れ（存在しないプラグイン・関数名を実名へ、終了経路が 2 本あること）⑧ §15 の「UTF-8 強制」は未実装 ⑨ §7.1〜§7.5 と §8.4 の疑似コードに、Phase 2 の素案で実装と違う点を注記。**契約・設計判断の変更はなし。** |
 | 2026-09-19 | v2.34 | **v0.5.6 スコープ確定（spec v1.11）に伴う参照先の訂正と注記**。モデルの差し替えが v0.5.7 へ分割されたので、caption の時期の記述 2 か所（契約表の `synthesize_voice`・§7.1 全体フロー）を v0.5.7 へ直した（§7.1 は、MF の `use_caption_condition` が未確認なので「効くかを確かめる」にとどめた）。§14 の二重起動ガードと §15 のリスク表の Job Object を、裁定の結果（完全な single-instance は入れず、台帳の所有者とプロセスをまたぐ錠だけ入れる／Job Object は v0.5.6 で入れる）へ直した。**スコープの検証で分かった事実を 2 か所に注記した**: 契約表の `update_irodori_runtime` の「失敗したら戻す」は途中の失敗では成り立っていない（それより前に成功した分の退避も消す。名前付き要件は戻せない）／§11 の severity 二段トーストは取り下げ。**契約・設計の変更なし**（設計の変更は各項目の実装時に行う）。 |
 | 2026-09-19 | v2.35 | **v0.5.6 項目 1（速くする）と項目 2 の文字コードの実装に伴う改訂**。§2.4 の資産表と §8.1 の構成図に、参照音声の事前変換の結果（`refs\<slot>_<id>.<合成モデル>+<コーデック>.<精度>.<前処理>.latent.pt`）を足し、作る側（サイドカー）・消す側（`voice_ref::delete_file`）と、名前の形を 2 つの言語で揃える約束を書いた。§8.7 の参照音声の削除に、変換結果も一緒に消えることを足した。§15 のリスク表の文字コードの行を、2026-09-19 の観測で確定した原因（パイプへは ANSI コードページで書く・isolated のため環境変数は効かない）と、送り側（`reconfigure`）・受け側（UTF-8 → Shift_JIS）の対策へ書き換えた（「UTF-8 の強制は実装していない」「理由はまだわかっていない」は事実でなくなった）。§1 のモジュール表の reader.rs に、子プロセスの出力の読み方を共有するようになったことを足した。**契約（コマンド・イベント・設定・DB）の変更なし。** |
+| 2026-09-20 | v2.36 | **v0.5.6 項目 2 の残り（進捗を行ごとに・無進捗の中断・stderr の伏字）の実装に伴う改訂**。① §1 のモジュール表に `tts/child_process.rs` を追加（子プロセスの起動・行ごとの読み取り・無進捗の中断・Job Object）。`reader.rs` の行は「行に組み立てるのは呼ぶ側」に改めた。② §8.3 に取得の進捗の出し方を追記（**パイプ越しでは pip も huggingface_hub も進捗を出さない**ので、pip は `--progress-bar raw`、hub はモデル取得の間だけ判定を差し替える。失敗したら理由の行をエラーに添え、直前の 20 行を `ugg.log` に残す）。③ §15 のリスク表: 文字コードの行を実装に合わせ、**VOICEVOX のダウンローダの経路は v2.35 の時点では直っていなかった**（色付けの制御文字を落とす処理が 1 バイトずつ文字に積み直しており日本語が化けた）ことを明記。Job Object の行を「6 か所のうち 2 か所は v0.5.6 項目 2 で入れた（残りはサイドカーと zip の展開 ＝ 項目 4）」に改めた。子プロセスが固まる行を追加。**契約・設定フィールド・DB スキーマの変更なし。** |

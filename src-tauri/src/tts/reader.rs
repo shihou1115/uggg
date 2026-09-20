@@ -105,7 +105,9 @@ fn decode_bytes(bytes: &[u8]) -> Result<String> {
 /// 同梱の Python はパイプへ ANSI コードページ（日本語 Windows では cp932）で書く
 /// （2026-09-19 に ugg が起動したサイドカーの中で `stderr.encoding=cp932` を観測）。
 /// `sidecar.py` は自分の stdio を UTF-8 に切り替えるが、pip やダウンローダの出力は
-/// 中身に手を入れられないので、受け側で読む。
+/// 中身に手を入れられないので、受け側で読む。**行に組み立てるのは呼ぶ側**
+/// （サイドカーの stderr は `sidecar::spawn_stderr_pump`、pip とダウンローダは
+/// `child_process::LineAssembler`）。判定は行が確定してから行う。
 ///
 /// **行頭の BOM で文字コードを決めない。** ファイル用の `decode_bytes` が使う `Encoding::decode` は
 /// 行頭が `FF FE` / `FE FF` だと UTF-16 として読み、壊れた行を置換文字ではなく意味の無い文字列にする。

@@ -18,13 +18,16 @@
 //! - `--no-deps`: irodori-tts pyproject の `dacvae` / `silentcipher` git+ 依存をスキップし
 //!   別 step で明示的に install (順序: silentcipher → dacvae → irodori-tts)
 //! - zip 展開は PowerShell の `Expand-Archive` 呼び出し: 追加 crate なし
-//! - run_python は wait → 全 stdout/stderr 一括読み: シンプル優先。リアルタイム進捗が必要になれば
-//!   spawn_blocking + thread + channel に拡張する (現状は各 step 開始時に on_line でステージを emit)
+//! - run_python は出力を**行ごとに**流す（v0.5.6 項目 2。以前は終わってから一括で読んでおり、数 GB の
+//!   取得中は画面が 1 行のまま固まった）。無進捗が続けば止める。仕組みは `tts::child_process`
 
 use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use crate::tts::child_process::{self, Ended, Line, Stream};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -813,9 +816,7 @@ where
         "共通 Python 依存をインストールしています ({} パッケージ)…",
         COMMON_REQUIREMENTS.len()
     ));
-    let mut args: Vec<&str> = vec!["-m", "pip", "install", "--no-warn-script-location"];
-    args.extend(COMMON_REQUIREMENTS);
-    run_python(&py_exe, &args, |l| on_line(l))?;
+    run_pip_install(&py_exe, COMMON_REQUIREMENTS, |l| on_line(l))?;
     Ok(())
 }
 
@@ -826,17 +827,9 @@ where
 {
     let py_exe = asset_root.join("python").join("python.exe");
     on_line("PyTorch (CUDA 12.8) をインストールしています… (1〜2GB ダウンロードします)");
-    let mut args: Vec<&str> = vec![
-        "-m",
-        "pip",
-        "install",
-        "--no-warn-script-location",
-        "--upgrade",
-        "--index-url",
-        TORCH_CUDA_INDEX_URL,
-    ];
+    let mut args: Vec<&str> = vec!["--upgrade", "--index-url", TORCH_CUDA_INDEX_URL];
     args.extend(TORCH_PACKAGES);
-    run_python(&py_exe, &args, |l| on_line(l))?;
+    run_pip_install(&py_exe, &args, |l| on_line(l))?;
     Ok(())
 }
 
@@ -864,57 +857,18 @@ where
         "Irodori-TTS の追加 pip 依存をインストールしています ({} パッケージ、~数百MB)…",
         IRODORI_EXTRA_REQUIREMENTS.len()
     ));
-    let mut args: Vec<&str> = vec![
-        "-m",
-        "pip",
-        "install",
-        "--no-warn-script-location",
-        "--upgrade",
-    ];
+    let mut args: Vec<&str> = vec!["--upgrade"];
     args.extend(IRODORI_EXTRA_REQUIREMENTS);
-    run_python(&py_exe, &args, |l| on_line(l))?;
+    run_pip_install(&py_exe, &args, |l| on_line(l))?;
 
     on_line("silentcipher を GitHub アーカイブから取得しています…");
-    run_python(
-        &py_exe,
-        &[
-            "-m",
-            "pip",
-            "install",
-            "--no-warn-script-location",
-            "--no-deps",
-            SILENTCIPHER_ZIPBALL,
-        ],
-        |l| on_line(l),
-    )?;
+    run_pip_install(&py_exe, &["--no-deps", SILENTCIPHER_ZIPBALL], |l| on_line(l))?;
 
     on_line("dacvae を GitHub アーカイブから取得しています…");
-    run_python(
-        &py_exe,
-        &[
-            "-m",
-            "pip",
-            "install",
-            "--no-warn-script-location",
-            "--no-deps",
-            DACVAE_ZIPBALL,
-        ],
-        |l| on_line(l),
-    )?;
+    run_pip_install(&py_exe, &["--no-deps", DACVAE_ZIPBALL], |l| on_line(l))?;
 
     on_line("Irodori-TTS 本体を GitHub アーカイブから取得しています…");
-    run_python(
-        &py_exe,
-        &[
-            "-m",
-            "pip",
-            "install",
-            "--no-warn-script-location",
-            "--no-deps",
-            IRODORI_TTS_ZIPBALL,
-        ],
-        |l| on_line(l),
-    )?;
+    run_pip_install(&py_exe, &["--no-deps", IRODORI_TTS_ZIPBALL], |l| on_line(l))?;
 
     on_line("Irodori-TTS ランタイムのインストールが完了しました");
     Ok(())
@@ -1067,16 +1021,37 @@ const RUNTIME_MODULES: &[&str] = &["irodori_tts", "dacvae", "silentcipher"];
 /// 理由を捨ててはいけない。最初の実装は出力を握り潰しており、実機で落ちたときに
 /// 分かったのは「python 異常終了 (code Some(1))」だけだった。原因
 /// （`No module named 'pydub'`）に辿り着くのに余計な一往復を要した。
+///
+/// 理由の取り方は `failure_reason`。失敗は想定内（`silentcipher` は一度も import できていない）
+/// なので、ログには残さない。
 fn import_report(py_exe: &Path) -> std::collections::BTreeMap<String, Option<String>> {
     RUNTIME_MODULES
         .iter()
         .map(|m| {
             let code = format!("import {m}");
-            let mut last = String::new();
-            let failed = run_python(py_exe, &["-c", code.as_str()], |l| last = l.to_string()).err();
-            (m.to_string(), failed.map(|_| last))
+            (
+                m.to_string(),
+                failure_reason(py_exe, &["-c", code.as_str()]),
+            )
         })
         .collect()
+}
+
+/// 走らせて、失敗したら**理由**（stderr の最後の行）を返す。成功なら `None`。
+///
+/// **理由は stderr の最後の行から取る**（v0.5.6 項目 2）。出力を行ごとに流すようになり、
+/// stdout と stderr は届いた順に混ざる。import の途中で stdout に書いたものは終了時に
+/// まとめて吐き出されるので、**両方の最後の行を取ると、例外の行ではなくそちらを拾いうる**。
+/// 進捗の上書きの行も理由にしない。
+fn failure_reason(exe: &Path, args: &[&str]) -> Option<String> {
+    let mut last = None;
+    run_python_lines(exe, args, false, |l| {
+        if l.stream == Stream::Stderr && !l.overwritten {
+            last = Some(l.text.to_string());
+        }
+    })
+    .err()
+    .map(|err| last.unwrap_or_else(|| format!("{err:#}")))
 }
 
 /// **入れ直す前より悪くなったものだけ**を返す。
@@ -1164,13 +1139,7 @@ where
     F: FnMut(&str),
 {
     on_line(&format!("{name} を入れ直しています… ({spec})"));
-    let mut args: Vec<&str> = vec![
-        "-m",
-        "pip",
-        "install",
-        "--no-warn-script-location",
-        "--upgrade",
-    ];
+    let mut args: Vec<&str> = vec!["--upgrade"];
     // **torch 系は CUDA 専用 index から入れる。** 名前だけで入れ直すと PyPI の
     // **CPU 版**が入り、GPU 合成が黙って壊れる（`install_torch_cuda` と同じ index を使う）。
     if needs_torch_index(name) {
@@ -1179,7 +1148,7 @@ where
         on_line("  （CUDA 12.8 の index から取得します。1〜2GB あります）");
     }
     args.push(spec);
-    let installed = run_python(py_exe, &args, |l| on_line(l))
+    let installed = run_pip_install(py_exe, &args, |l| on_line(l))
     .and_then(|()| {
         let regressed = import_regressions(before_imports, &import_report(py_exe));
         if regressed.is_empty() {
@@ -1327,13 +1296,9 @@ where
         }
         on_line(&format!("  退避後: {}", describe_package(&site, pkg)));
 
-        let installed = run_python(
+        let installed = run_pip_install(
             &py_exe,
             &[
-                "-m",
-                "pip",
-                "install",
-                "--no-warn-script-location",
                 "--no-deps",
                 // 直 URL でも確実に入れ替えるため、キャッシュと既存判定を跨がせない。
                 "--force-reinstall",
@@ -1480,7 +1445,9 @@ async fn download_to(url: &str, dest: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create parent: {}", parent.display()))?;
     }
-    let resp = reqwest::Client::new()
+    // 上限を付けたクライアントを使う（v0.5.6 項目 2）。**この経路は導入の錠を握ったまま待つ**ので、
+    // 相手が生きたまま黙ると、再起動するまで導入も更新も押せない。
+    let resp = crate::tts::download::http_client()
         .get(url)
         .send()
         .await
@@ -1495,39 +1462,44 @@ async fn download_to(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Windows PowerShell の `Expand-Archive` で zip を展開。追加 crate なし。
-/// PowerShell の単引用符文字列へ埋め込める形にする (v0.5.3)。
-///
-/// 単引用符の中では `'` を `''` と二重にするのが唯一のエスケープ。素通しすると
-/// **`O'Neil` のようにアポストロフィを含むユーザー名のパスで引用が壊れ、導入が失敗する**
-/// (Codex レビュー 2026-09-06)。パスはアプリ側が決めるため実害は限定的だが、
-/// 子プロセスにコンソール窓を出させない。
+/// 子プロセスにコンソール窓を出させない起動のフラグ。
 ///
 /// **これが無いと、pip や Expand-Archive を呼ぶたびに黒いコンソール窓が前面に出る。**
 /// v0.5.4 で「更新する」を押したときに実機で確認した。リリース版は
 /// `windows_subsystem = "windows"` でコンソールを持たないため、子プロセスが
 /// 自前で窓を割り当ててしまう。stdout/stderr のパイプはこのフラグでは変わらない。
 /// （`notepad.exe` で取説を開く経路は、窓が出るのが目的なので対象外）
+///
+/// 出力を読む子プロセスには `child_process::run_streaming` が付ける。ここで直に使うのは
+/// zip の展開（出力を読まない）だけ。
 pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// 文字列へ埋め込む以上は正しく引用する。
+/// PowerShell の単引用符文字列へ埋め込める形にする (v0.5.3)。
+///
+/// 単引用符の中では `'` を `''` と二重にするのが唯一のエスケープ。素通しすると
+/// **`O'Neil` のようにアポストロフィを含むユーザー名のパスで引用が壊れ、導入が失敗する**
+/// (Codex レビュー 2026-09-06)。パスはアプリ側が決めるため実害は限定的。
 fn ps_single_quoted(p: &Path) -> String {
     p.display().to_string().replace("'", "''")
 }
 
+/// Windows PowerShell の `Expand-Archive` で zip を展開。追加 crate なし。
 fn expand_zip_windows(zip: &Path, dest: &Path) -> Result<()> {
     let cmd = format!(
         "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
         ps_single_quoted(zip),
         ps_single_quoted(dest)
     );
-    let status = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| "Expand-Archive 起動失敗")?;
+    // 呼び出し元は非同期（`ensure_python_embeddable`）。待つ間ワーカーを塞がない（v0.5.6 項目 2）。
+    let status = child_process::off_the_async_workers(|| {
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    })
+    .with_context(|| "Expand-Archive 起動失敗")?;
     if !status.success() {
         return Err(anyhow!(
             "Expand-Archive 異常終了 (code {:?})",
@@ -1537,61 +1509,440 @@ fn expand_zip_windows(zip: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Python を 1 回起動して stdout/stderr を行単位で on_line に流す。
-/// 終了コード != 0 で Err。標準出力は完了後に一括処理 (リアルタイムには出さない)。
+/// 無進捗とみなすまでの時間（v0.5.6 項目 2）。
+///
+/// 数えるのは「出力も、読み書きも、CPU も無い」時間（`child_process`）。pip が黙って torch を
+/// 展開している間や、パイプ越しで進捗を出さない取得の間は数えないので、本当に止まったときだけ効く。
+/// 通信の待ちは pip も huggingface_hub も十数秒で打ち切って再試行するので、5 分は十分に長い。
+const PYTHON_STALL_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// 失敗したときにログへ残す、直前の出力の行数。
+const FAILURE_TAIL_LINES: usize = 20;
+
+/// Python を 1 回起動して、出力を行ごとに `on_line` へ流す（stdout と stderr は届いた順に混ざる）。
+///
+/// 終了コード != 0 で Err。**理由を添える**（pip の `ERROR:` の行・例外の行。以前は
+/// 「python 異常終了 (code Some(1))」だけで、pip の「アクセスが拒否されました」は画面の最新の
+/// 1 行として一瞬出て消えていた）。直前の出力はログに残す。無進捗が続けば止めて Err。
 fn run_python<F>(python_exe: &Path, args: &[&str], mut on_line: F) -> Result<()>
 where
     F: FnMut(&str),
 {
-    let mut child = Command::new(python_exe)
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("python 起動失敗: {}", python_exe.display()))?;
+    run_python_lines(python_exe, args, true, |l| on_line(l.text))
+}
 
-    // stdout/stderr を別スレッドで一括取得 (wait をブロックしないため)。
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let h_out = stdout.map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut s, &mut buf);
-            buf
-        })
-    });
-    let h_err = stderr.map(|mut s| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut s, &mut buf);
-            buf
-        })
-    });
-
-    let status = child.wait().with_context(|| "python 待機失敗")?;
-
-    for h in [h_out, h_err].into_iter().flatten() {
-        if let Ok(buf) = h.join() {
-            for raw in buf.split(|b| *b == b'\n' || *b == b'\r') {
-                if raw.is_empty() {
-                    continue;
+/// `run_python` の本体。行がどちらの出力から来たか、上書き（`\r`）かも渡す。
+/// `log_failure` が偽なら、失敗してもログに残さない（失敗が想定内の問い合わせ用）。
+fn run_python_lines<F>(
+    python_exe: &Path,
+    args: &[&str],
+    log_failure: bool,
+    mut on_line: F,
+) -> Result<()>
+where
+    F: FnMut(Line<'_>),
+{
+    let mut cmd = Command::new(python_exe);
+    cmd.args(args);
+    let mut progress = PipProgress::default();
+    let mut tail = OutputTail::default();
+    // 呼び出し元の多くは非同期の関数。待つ間ワーカーを塞がない（v0.5.4 で見送った件）。
+    let ended = child_process::off_the_async_workers(|| {
+        child_process::run_streaming(cmd, None, Some(PYTHON_STALL_AFTER), |line| {
+            if let Some(shown) = progress.describe(line.text) {
+                if let Some(text) = shown {
+                    on_line(Line {
+                        text: &text,
+                        overwritten: true,
+                        ..line
+                    });
                 }
-                // pip などは同梱の Python の既定（cp932）で書く。UTF-8 で読めなければ
-                // Shift_JIS で読む（v0.5.6 項目 2。「アクセスが拒否されました」が読めるように）。
-                let s = crate::tts::reader::decode_output_line(raw);
-                let t = s.trim();
-                if !t.is_empty() {
-                    on_line(t);
-                }
+                return;
+            }
+            tail.push(line);
+            on_line(line);
+        })
+    })
+    .with_context(|| format!("python 起動失敗: {}", python_exe.display()))?;
+    let err = match ended {
+        Ended::Exited(status) if status.success() => return Ok(()),
+        Ended::Exited(status) => match tail.reason() {
+            Some(why) => anyhow!("python 異常終了 (code {:?}): {why}", status.code()),
+            None => anyhow!("python 異常終了 (code {:?})", status.code()),
+        },
+        Ended::Stalled => anyhow!(
+            "Python の処理が {} 分間、出力も読み書きもしないまま止まっていたので中断しました",
+            PYTHON_STALL_AFTER.as_secs() / 60
+        ),
+    };
+    if log_failure {
+        crate::ulog!("[irodori:python] {} — {err}", describe_args(args));
+        for line in &tail.lines {
+            crate::ulog!("[irodori:python]   {line}");
+        }
+    }
+    Err(err)
+}
+
+/// ログに載せる引数（`-c` のスクリプトは長く、理由の判断に要らないので省く）。
+fn describe_args(args: &[&str]) -> String {
+    let shown: Vec<&str> = args
+        .iter()
+        .map(|a| if a.contains('\n') { "<script>" } else { a })
+        .collect();
+    crate::dialogue::llm::truncate_for_log(&shown.join(" "))
+}
+
+/// 失敗の理由と、ログに残す直前の出力。
+#[derive(Default)]
+struct OutputTail {
+    lines: std::collections::VecDeque<String>,
+    /// stderr の行のうち、失敗を述べている最後のもの。
+    failure: Option<String>,
+    /// stderr の最後の行（pip の新版の告知は除く）。
+    last_stderr: Option<String>,
+}
+
+impl OutputTail {
+    fn push(&mut self, line: Line<'_>) {
+        // 進捗の上書き（tqdm）は残さない。残すと直前の出力が進捗だけで埋まる。
+        if line.overwritten {
+            return;
+        }
+        if self.lines.len() == FAILURE_TAIL_LINES {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line.text.to_string());
+        if line.stream == Stream::Stderr {
+            if is_failure_line(line.text) {
+                self.failure = Some(line.text.to_string());
+            }
+            if !line.text.starts_with("[notice]") {
+                self.last_stderr = Some(line.text.to_string());
             }
         }
     }
 
-    if !status.success() {
-        return Err(anyhow!("python 異常終了 (code {:?})", status.code()));
+    /// 失敗の理由。失敗を述べている行が無ければ、stderr の最後の行。
+    fn reason(&self) -> Option<&str> {
+        self.failure.as_deref().or(self.last_stderr.as_deref())
     }
-    Ok(())
+}
+
+/// 失敗を述べている行か。pip は `ERROR:` の行のあとに「Check the permissions.」のような
+/// 補足や新版の告知を続けるので、最後の行が理由とは限らない。
+fn is_failure_line(text: &str) -> bool {
+    if text.starts_with("ERROR:") {
+        return true;
+    }
+    if text.starts_with("[hf-download]") {
+        return text.contains("失敗");
+    }
+    // Python の例外の最終行（`ModuleNotFoundError: No module named 'x'` /
+    // `huggingface_hub.errors.RepositoryNotFoundError: ...`）
+    let head = text.split(':').next().unwrap_or("");
+    !head.is_empty()
+        && !head.contains(' ')
+        && (head.ends_with("Error") || head.ends_with("Exception"))
+}
+
+/// pip の `--progress-bar raw` の行（`Progress 1234 of 5678`）を、画面向けの文言に直す。
+///
+/// raw は 1 秒に 4 行まで出す。画面は最新の 1 行しか見せないので、割合が変わったときだけ出す。
+#[derive(Default)]
+struct PipProgress {
+    shown_percent: Option<u64>,
+    /// 大きさが分からない取得で、最後に出したときの量。
+    shown_bytes: Option<u64>,
+}
+
+impl PipProgress {
+    /// pip の進捗の行なら `Some`（中身は出す文言。今回は出さないなら `None`）。進捗でなければ `None`。
+    fn describe(&mut self, line: &str) -> Option<Option<String>> {
+        let rest = line.strip_prefix("Progress ")?;
+        let (done, total) = rest.split_once(" of ")?;
+        let done: u64 = done.trim().parse().ok()?;
+        let total: u64 = total.trim().parse().ok()?;
+        const MB: f64 = 1024.0 * 1024.0;
+        if total > 0 {
+            let percent = done.saturating_mul(100) / total;
+            if self.shown_percent == Some(percent) {
+                return Some(None);
+            }
+            self.shown_percent = Some(percent);
+            Some(Some(format!(
+                "  取得中 {:.0} / {:.0} MB（{percent}%）",
+                done as f64 / MB,
+                total as f64 / MB
+            )))
+        } else {
+            const STEP: u64 = 10 * 1024 * 1024;
+            let show = match self.shown_bytes {
+                None => true,
+                Some(prev) => done < prev || done >= prev + STEP,
+            };
+            if !show {
+                return Some(None);
+            }
+            self.shown_bytes = Some(done);
+            Some(Some(format!("  取得中 {:.0} MB", done as f64 / MB)))
+        }
+    }
+}
+
+/// `pip install` を走らせる（共通の引数はここで付ける）。
+///
+/// - `--progress-bar raw`: パイプ越しだと pip は取得中の進捗を出さない（rich は端末でないと
+///   描かない）ので、数 GB の torch の取得中は画面が止まって見えた。`raw` は進捗を行で出し、
+///   `PipProgress` が画面向けに直す。**pip 24.1 からの選択肢**なので、入っている pip の版を
+///   見てから付ける（知らない pip に渡すと、引数の誤りで導入そのものが止まる）
+/// - `--disable-pip-version-check`: pip の新版の告知を出させない（失敗の理由の行のあとに続き、
+///   ログの直前の出力を埋める）
+fn run_pip_install<F>(py_exe: &Path, args: &[&str], on_line: F) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    let site = py_exe
+        .parent()
+        .map(|d| d.join("Lib").join("site-packages"))
+        .unwrap_or_default();
+    let mut full: Vec<&str> = vec![
+        "-m",
+        "pip",
+        "install",
+        "--no-warn-script-location",
+        "--disable-pip-version-check",
+    ];
+    if pip_has_raw_progress(&site) {
+        full.extend(["--progress-bar", "raw"]);
+    }
+    full.extend_from_slice(args);
+    run_python(py_exe, &full, on_line)
+}
+
+/// 入っている pip が `--progress-bar raw` を知っているか（24.1 以降）。分からなければ偽。
+fn pip_has_raw_progress(site: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(site) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let Some(version) = name
+            .strip_prefix("pip-")
+            .and_then(|r| r.strip_suffix(".dist-info"))
+        else {
+            return false;
+        };
+        let mut parts = version.split('.').map(|p| p.parse::<u32>().ok());
+        match (parts.next().flatten(), parts.next().flatten()) {
+            (Some(major), Some(minor)) => (major, minor) >= (24, 1),
+            _ => false,
+        }
+    })
+}
+
+#[cfg(test)]
+mod run_python_tests {
+    use super::*;
+
+    fn line(stream: Stream, text: &str) -> Line<'_> {
+        Line {
+            stream,
+            text,
+            overwritten: false,
+        }
+    }
+
+    /// **pip の失敗の理由は `ERROR:` の行。** そのあとに補足と新版の告知が続くので、
+    /// 最後の行を理由にすると「Check the permissions.」や告知を返してしまう。
+    #[test]
+    fn the_reason_of_a_pip_failure_is_its_error_line() {
+        let mut tail = OutputTail::default();
+        for (s, t) in [
+            (Stream::Stdout, "Collecting torch"),
+            (
+                Stream::Stderr,
+                "ERROR: Could not install packages due to an OSError: [WinError 5] アクセスが拒否されました。: 'c10.dll'",
+            ),
+            (Stream::Stderr, "Check the permissions."),
+            (Stream::Stderr, "[notice] A new release of pip is available: 26.1.2 -> 26.2"),
+        ] {
+            tail.push(line(s, t));
+        }
+        assert_eq!(
+            tail.reason(),
+            Some("ERROR: Could not install packages due to an OSError: [WinError 5] アクセスが拒否されました。: 'c10.dll'")
+        );
+    }
+
+    /// Python の例外は最終行が理由。**stdout の行は理由にしない**（届いた順に混ざるので、
+    /// 例外のあとに stdout の書き残しが届きうる）。
+    #[test]
+    fn the_reason_of_a_traceback_is_its_exception_and_stdout_is_ignored() {
+        let mut tail = OutputTail::default();
+        for (s, t) in [
+            (Stream::Stderr, "Traceback (most recent call last):"),
+            (Stream::Stderr, "File \"<string>\", line 1, in <module>"),
+            (Stream::Stderr, "ModuleNotFoundError: No module named 'pydub'"),
+            (Stream::Stdout, "loading done"),
+        ] {
+            tail.push(line(s, t));
+        }
+        assert_eq!(tail.reason(), Some("ModuleNotFoundError: No module named 'pydub'"));
+    }
+
+    /// 失敗を述べる行が無ければ stderr の最後の行（モデル取得の失敗は `[hf-download]` の行）。
+    #[test]
+    fn without_an_error_line_the_last_stderr_line_is_the_reason() {
+        let mut tail = OutputTail::default();
+        tail.push(line(Stream::Stderr, "[hf-download] Aratako/Irodori-TTS-500M-v3@main/model.safetensors を確認中…"));
+        tail.push(line(Stream::Stderr, "something odd happened"));
+        assert_eq!(tail.reason(), Some("something odd happened"));
+        tail.push(line(Stream::Stderr, "[hf-download] モデル DL 失敗: 404 Client Error"));
+        tail.push(line(Stream::Stderr, "note: see above"));
+        assert_eq!(tail.reason(), Some("[hf-download] モデル DL 失敗: 404 Client Error"));
+    }
+
+    /// 進捗の上書き（tqdm）はログに残さない。残す行数には上限がある。
+    #[test]
+    fn the_tail_skips_overwritten_progress_and_is_bounded() {
+        let mut tail = OutputTail::default();
+        tail.push(Line {
+            stream: Stream::Stderr,
+            text: "model.safetensors:  45%|####5     | 900M/2.00G",
+            overwritten: true,
+        });
+        assert!(tail.lines.is_empty());
+        assert_eq!(tail.reason(), None, "進捗の行を理由にしない");
+        for i in 0..(FAILURE_TAIL_LINES + 5) {
+            tail.push(line(Stream::Stdout, &format!("line {i}")));
+        }
+        assert_eq!(tail.lines.len(), FAILURE_TAIL_LINES);
+        assert_eq!(tail.lines.back().map(String::as_str), Some("line 24"));
+    }
+
+    /// pip の raw の進捗は、割合が変わったときだけ画面向けの 1 行にする。進捗でない行は素通し。
+    #[test]
+    fn pip_raw_progress_is_shown_once_per_percent() {
+        let mut p = PipProgress::default();
+        let total = 100 * 1024 * 1024;
+        assert_eq!(
+            p.describe(&format!("Progress 0 of {total}")),
+            Some(Some("  取得中 0 / 100 MB（0%）".to_string()))
+        );
+        assert_eq!(p.describe(&format!("Progress 1000 of {total}")), Some(None));
+        assert_eq!(
+            p.describe(&format!("Progress {} of {total}", total / 2)),
+            Some(Some("  取得中 50 / 100 MB（50%）".to_string()))
+        );
+        // 次のファイルはまた 0% から
+        assert_eq!(
+            p.describe(&format!("Progress 0 of {total}")),
+            Some(Some("  取得中 0 / 100 MB（0%）".to_string()))
+        );
+        assert_eq!(p.describe("Collecting torch"), None);
+        assert_eq!(p.describe("Progress bar is fine"), None);
+    }
+
+    /// 大きさの分からない取得（`of 0`）は 10 MB ごとに出す。
+    #[test]
+    fn pip_raw_progress_without_a_size_is_shown_every_ten_megabytes() {
+        let mut p = PipProgress::default();
+        const MB: u64 = 1024 * 1024;
+        assert!(matches!(p.describe("Progress 0 of 0"), Some(Some(_))));
+        assert_eq!(p.describe(&format!("Progress {} of 0", 5 * MB)), Some(None));
+        assert_eq!(
+            p.describe(&format!("Progress {} of 0", 10 * MB)),
+            Some(Some("  取得中 10 MB".to_string()))
+        );
+    }
+
+    /// `--progress-bar raw` は pip 24.1 から。知らない pip に渡すと導入が止まるので、版を見る。
+    #[test]
+    fn raw_progress_is_used_only_with_a_pip_that_knows_it() {
+        let has = |names: &[&str]| {
+            let dir = tempfile::tempdir().unwrap();
+            for n in names {
+                std::fs::create_dir(dir.path().join(n)).unwrap();
+            }
+            pip_has_raw_progress(dir.path())
+        };
+        assert!(has(&["pip-26.1.2.dist-info"]));
+        assert!(has(&["pip-24.1.dist-info"]));
+        assert!(!has(&["pip-24.0.dist-info"]));
+        assert!(!has(&["pip-23.3.2.dist-info"]));
+        assert!(!has(&["pipx-25.0.dist-info", "torch-2.10.0.dist-info"]));
+        assert!(!has(&[]), "pip が見当たらなければ付けない");
+        assert!(!pip_has_raw_progress(Path::new("Z:/no/such/site-packages")));
+    }
+
+    #[test]
+    fn exception_lines_are_recognised_but_prose_is_not() {
+        assert!(is_failure_line("OSError: [WinError 5] アクセスが拒否されました。"));
+        assert!(is_failure_line("huggingface_hub.errors.RepositoryNotFoundError: 404"));
+        assert!(is_failure_line("ERROR: No matching distribution found for torch"));
+        assert!(!is_failure_line("Successfully installed torch-2.10.0"));
+        assert!(!is_failure_line("Note: this Error: is prose"));
+        assert!(!is_failure_line("[hf-download] モデル DL 完了"));
+    }
+
+    /// **理由は stderr から選ぶ**（本物の経路で確かめる。`cmd.exe` を python の代わりに走らせる）。
+    ///
+    /// stdout の行をあとから届かせている: Python は stdout をまとめて吐き出すので、終了の直前に
+    /// 届きうる。両方の最後の行を取ると、例外の行ではなくそちらを拾う。
+    #[test]
+    fn the_reason_comes_from_stderr_even_when_stdout_arrives_last() {
+        let tag = std::process::id();
+        let script = format!(
+            "echo ModuleNotFoundError: No module named 'pydub' 1>&2& waitfor /t 2 UggLate{tag} >nul 2>&1& echo stdout-late& exit 1"
+        );
+        let got = failure_reason(Path::new("cmd.exe"), &["/d", "/c", &script]);
+        assert_eq!(
+            got.as_deref(),
+            Some("ModuleNotFoundError: No module named 'pydub'")
+        );
+        // 成功したら理由は無い。
+        assert_eq!(failure_reason(Path::new("cmd.exe"), &["/d", "/c", "echo ok"]), None);
+    }
+
+    /// **pip の進捗は書き換えて流し、失敗の理由には `ERROR:` の行を選ぶ**（本物の経路で確かめる）。
+    #[test]
+    fn progress_lines_are_rewritten_and_the_error_line_becomes_the_reason() {
+        let script = "echo Progress 0 of 104857600& echo Collecting torch& echo ERROR: boom 1>&2& echo Check the permissions. 1>&2& exit 1";
+        let mut seen: Vec<(bool, String)> = Vec::new();
+        let err = run_python_lines(Path::new("cmd.exe"), &["/d", "/c", script], false, |l| {
+            seen.push((l.overwritten, l.text.to_string()))
+        })
+        .expect_err("異常終了は Err");
+        let texts: Vec<&str> = seen.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(
+            !texts.contains(&"Progress 0 of 104857600"),
+            "生の進捗の行を流している: {texts:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|(overwritten, t)| *overwritten && t.starts_with("  取得中 0 / 100 MB")),
+            "書き換えた進捗の行が流れていない: {seen:?}"
+        );
+        assert!(texts.contains(&"Collecting torch"), "{texts:?}");
+        let message = format!("{err:#}");
+        assert!(message.contains("ERROR: boom"), "理由が載っていない: {message}");
+        assert!(message.contains("code Some(1)"), "{message}");
+    }
+
+    /// 失敗のログに `-c` のスクリプトを丸ごと載せない。
+    #[test]
+    fn the_logged_arguments_omit_inline_scripts() {
+        assert_eq!(
+            describe_args(&["-c", "import json\nprint(1)"]),
+            "-c <script>"
+        );
+        assert_eq!(
+            describe_args(&["-m", "pip", "install", "torch"]),
+            "-m pip install torch"
+        );
+    }
 }
 
 #[cfg(test)]

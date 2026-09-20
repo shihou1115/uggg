@@ -8,6 +8,7 @@
 //! spec §5: 自動更新は行わない (コード署名がないため)。本機能は **手動 DL & 再インストール** を促す案内のみ。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -28,6 +29,9 @@ pub async fn check_update_once(app: &AppHandle, state: &Arc<AppState>) -> Result
     };
     let feed: UpdateFeed = reqwest::Client::new()
         .get(&url)
+        // 小さな JSON なので全体に上限を付ける（v0.5.6 項目 2 の掃討。上限が無いと、手動の
+        // 「更新を確認」が相手の沈黙で戻らなくなる）。
+        .timeout(Duration::from_secs(30))
         .send()
         .await
         .with_context(|| format!("update feed 取得: {url}"))?

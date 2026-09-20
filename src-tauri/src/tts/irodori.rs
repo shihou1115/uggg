@@ -13,9 +13,10 @@
 //! `synthesize` は現状 Phase D の sidecar.py モックモードで `mock` 起動した場合は
 //! 正弦波 wav を返す。Phase G で `--mock` を外して実 Aratako/Irodori-TTS モデルに結線する。
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,8 @@ fn now_secs() -> i64 {
 }
 
 /// サイドカー stderr の 1 行を `irodori-download` event へ転送すべきかを判定する pure 関数。
-/// `[hf-download]` で始まる行だけ通し、uvicorn の INFO ログや warning は捨てる。
+/// `[hf-download]` で始まる行だけ画面へ送る。**それ以外は捨てずに `ugg.log` へ残す**
+/// （v0.5.5 項目 1。`route_stderr_line` を参照）。
 pub(crate) fn is_hf_progress_line(line: &str) -> bool {
     line.starts_with("[hf-download]")
 }
@@ -47,8 +49,9 @@ pub(crate) fn is_hf_progress_line(line: &str) -> bool {
 /// **合成の例外そのものは stderr には出ない**（`HTTPException` は応答として返るだけ）。
 /// stderr が運ぶのは起動時の import 失敗・モデル DL の進捗と失敗・起動時の文字コードの 1 行と、
 /// 要求の途中の診断の行（合成の所要時間、参照音声の事前変換の失敗とやり直し。v0.5.6 項目 1）。
-/// 事前変換には固定文を渡し、診断の行は型名と数値だけなので、発話本文は入らない（伏せる対象が無い）。
-/// ただしランタイム自身が stderr に何を書くかは未確認なので、stderr への伏字は v0.5.6 項目 2 で入れる。
+/// 事前変換には固定文を渡し、診断の行は型名と数値だけなので、発話本文は入らない。
+/// ただしランタイム自身が stderr に何を書くかは分からないので、stderr の行も
+/// `sanitize_stderr_line` で伏せる（v0.5.6 項目 2）。
 pub(crate) fn sanitize_sidecar_error(body: &str, secrets: &[&str]) -> String {
     let mut out = body.to_string();
     for secret in secrets {
@@ -67,6 +70,70 @@ pub(crate) fn sanitize_sidecar_error(body: &str, secrets: &[&str]) -> String {
         }
     }
     crate::dialogue::llm::truncate_for_log(&out)
+}
+
+/// 伏せるために覚えておく、直近に送った本文とキャプションの数（v0.5.6 項目 2）。
+/// 1 回の合成で本文とキャプションの 2 つを覚えるので、8 回分。
+const RECENT_SECRETS: usize = 16;
+
+/// サイドカーの stderr の 1 行を、ログと画面に載せてよい形にする（v0.5.6 項目 2、spec §3.3）。
+///
+/// stderr の行は要求と対応が付かず、要求が終わったあとにも届く（asyncio の後始末など）ので、
+/// 直近に送った本文とキャプションを全部伏せる。**そのままの形では一致しないことがある**ので、
+/// 断片にも分けて伏せる（長いものから置き換える）:
+/// - **行ごと**: stderr は行ごとに届くので、複数行の本文が丸ごと 1 行に載ることは無い
+/// - **Python が書き換える文字の位置で区切った断片**: `repr` は「表示できない文字」を `‍` の
+///   ように書くので、全角空白（U+3000）や絵文字の結合（U+200D。溜息の絵文字 `😮‍💨` に入る）を
+///   含む本文は、そのままの形でも JSON の形でも一致しない
+///
+/// **限界**: 照合で伏せるので、ランタイムが正規化した形（NFKC など）や独自のエスケープで書けば
+/// 取りこぼす。白名簿にする（決まった語以外を全部伏せる）のは spec §6.0 の「見つけたが今回の裁定に
+/// 含めていないもの」に置いてある。いまのランタイムには、本文を stderr に書く経路は見つかっていない
+/// （`log_fn=None` で呼び、例外文にも本文は入らない）。これは v0.5.7 の新しいランタイム向けの守り。
+pub(crate) fn sanitize_stderr_line(line: &str, recent: &[String]) -> String {
+    sanitize_sidecar_error(line, &secret_variants(recent.iter().map(String::as_str)))
+}
+
+/// 伏せる対象を、断片も含めて長いものから並べる（500 の本文と stderr の両方で使う）。
+fn secret_variants<'a>(secrets: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    for secret in secrets {
+        out.push(secret);
+        out.extend(secret.lines().map(str::trim));
+        out.extend(secret.split(rewritten_by_python).map(str::trim));
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.chars().count()));
+    out.dedup();
+    out
+}
+
+/// Python が `repr` で書き換える文字か（`str.isprintable()` が偽になるもののうち、実際に発話へ
+/// 入りうるもの）。ここで本文を区切り、断片も伏せる対象にする。
+fn rewritten_by_python(c: char) -> bool {
+    c.is_control()
+        // 空白のうち、半角スペース以外（全角空白 U+3000 を含む）
+        || (c.is_whitespace() && c != ' ')
+        // 書式用の文字（U+200D の ZWJ、方向指定、U+FEFF など）
+        || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{feff}')
+}
+
+/// サイドカーの stderr の 1 行の行き先（pure）。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StderrRoute {
+    /// モデル取得の進捗。画面（`irodori-download` イベント）へ。
+    Progress(String),
+    /// それ以外。`ugg.log` へ。
+    Log(String),
+}
+
+/// 伏せてから行き先を決める。**伏せるのは振り分けより前** — 画面へ流す行も伏せる。
+pub(crate) fn route_stderr_line(line: &str, recent: &[String]) -> StderrRoute {
+    let line = sanitize_stderr_line(line, recent);
+    if is_hf_progress_line(&line) {
+        StderrRoute::Progress(line)
+    } else {
+        StderrRoute::Log(line)
+    }
 }
 
 /// `shutdown_if_idle` の核ロジック (pure)。port 有 + last_used != 0 + 経過 >= idle_secs で true。
@@ -107,6 +174,9 @@ pub struct IrodoriClient {
     /// → 次 synth で再起動 → 90 秒 churn を繰り返すのを防ぐため、health watcher 経路から
     /// 20 分の sticky cooldown を設定する。voicevox fallback は引き続き動く。
     disable_until: AtomicI64,
+    /// 直近に送った本文とキャプション。サイドカーの stderr を伏せるのに使う（v0.5.6 項目 2）。
+    /// stderr を読むタスクと共有するので `Arc`。
+    recent_secrets: Arc<StdMutex<VecDeque<String>>>,
 }
 
 impl IrodoriClient {
@@ -121,7 +191,68 @@ impl IrodoriClient {
             last_used: AtomicI64::new(0),
             last_notified_unavailable: AtomicI64::new(0),
             disable_until: AtomicI64::new(0),
+            recent_secrets: Arc::new(StdMutex::new(VecDeque::new())),
         }
+    }
+
+    /// 送る本文とキャプションを覚える（**送る前に**。stderr は応答より先に届きうる）。
+    ///
+    /// ロックが毒になっていても中身を使う（覚えられないと伏せられない ＝ ログに本文が残る）。
+    fn remember_secrets(&self, texts: &[&str]) {
+        let mut recent = self
+            .recent_secrets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for t in texts {
+            // 短いものは伏せない（`sanitize_sidecar_error` と同じ基準）ので覚えない。
+            if t.chars().count() >= 4 {
+                recent.push_back(t.to_string());
+            }
+        }
+        while recent.len() > RECENT_SECRETS {
+            recent.pop_front();
+        }
+    }
+
+    /// サイドカーの stderr の 1 行を受ける関数（起動のたびに作ってポンプへ渡す）。
+    /// 行き先を差し替えられるようにしてあるのは、伏字が実際に通ることをテストで確かめるため。
+    fn stderr_sink_to(
+        &self,
+        mut deliver: impl FnMut(StderrRoute) + Send + 'static,
+    ) -> impl FnMut(&str) + Send + 'static {
+        let recent = self.recent_secrets.clone();
+        move |line: &str| {
+            let snapshot: Vec<String> = recent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .cloned()
+                .collect();
+            deliver(route_stderr_line(line, &snapshot));
+        }
+    }
+
+    /// サイドカーの stderr の 1 行を、画面（進捗）と `ugg.log`（それ以外）へ流す。
+    fn stderr_sink(&self, app: Option<AppHandle>) -> impl FnMut(&str) + Send + 'static {
+        self.stderr_sink_to(move |route| {
+            // [hf-download] 接頭辞の行は irodori-download イベントへ転送し、それ以外は ugg.log へ残す。
+            match route {
+                StderrRoute::Progress(line) => {
+                    if let Some(app) = &app {
+                        let _ = app.emit("irodori-download", line);
+                    }
+                }
+                // **進捗以外を捨てない** (v0.5.5 項目 1)。捨てていたため、サイドカーが
+                // 異常終了してもユーザーに出るのは「HTTP 通信に失敗しました」だけで、
+                // 原因に辿り着く手段がアプリ側に 1 つも無かった。
+                // 平時に来るのは、起動ごとに文字コードの 1 行（`[stdio]`、v0.5.6 項目 2）と、
+                // 合成 1 回ごとに所要時間の 1 行（v0.5.6 項目 1）。uvicorn は `--log-level warning` で
+                // 起動しており、合成の例外は `HTTPException` として応答に載るので、それ以外はほぼ来ない。
+                // 所要時間の行は 100 バイト程度で、ugg.log（2MB で 1 世代）に約 2 万行入る。
+                // 伏せたうえで 300 文字で切り詰め済み（`sanitize_sidecar_error`）。
+                StderrRoute::Log(line) => crate::ulog!("[irodori:py] {line}"),
+            }
+        })
     }
 
     /// `secs` 秒間、`ensure_sidecar_running` を即エラーで弾く sticky cooldown を設定する。
@@ -246,27 +377,8 @@ impl IrodoriClient {
             ));
         }
         let script = asset_root.join("sidecar.py");
-        // [hf-download] 接頭辞の行は irodori-download イベントへ転送し、それ以外は ugg.log へ残す。
-        // 接頭辞判定は is_hf_progress_line (pure 関数) に切り出してテストでカバー。
-        let on_stderr = move |line: &str| {
-            if is_hf_progress_line(line) {
-                if let Some(app) = &app {
-                    let _ = app.emit("irodori-download", line);
-                }
-                return;
-            }
-            // **進捗以外を捨てない** (v0.5.5 項目 1)。捨てていたため、サイドカーが
-            // 異常終了してもユーザーに出るのは「HTTP 通信に失敗しました」だけで、
-            // 原因に辿り着く手段がアプリ側に 1 つも無かった。
-            // 平時に来るのは、起動ごとに文字コードの 1 行（`[stdio]`、v0.5.6 項目 2）と、
-            // 合成 1 回ごとに所要時間の 1 行（v0.5.6 項目 1）。uvicorn は `--log-level warning` で
-            // 起動しており、合成の例外は `HTTPException` として応答に載るので、それ以外はほぼ来ない。
-            // 所要時間の行は 100 バイト程度で、ugg.log（2MB で 1 世代）に約 2 万行入る。
-            crate::ulog!(
-                "[irodori:py] {}",
-                crate::dialogue::llm::truncate_for_log(line)
-            );
-        };
+        // 行き先の判定と伏字は `route_stderr_line`（pure 関数）でテストする。
+        let on_stderr = self.stderr_sink(app);
         let handle = sidecar::start_sidecar(asset_root, &script, mock, on_stderr)
             .await
             .map_err(|e| TtsError::SidecarStart(format!("{e:#}")))?;
@@ -359,6 +471,7 @@ impl IrodoriClient {
         mock: bool,
         app: Option<AppHandle>,
     ) -> Result<Vec<u8>, TtsError> {
+        self.remember_secrets(&[text, caption.as_deref().unwrap_or("")]);
         let port = self.ensure_sidecar_running(asset_root, mock, app).await?;
         self.touch_last_used();
         let url = format!("http://127.0.0.1:{port}/v1/audio/speech");
@@ -383,7 +496,7 @@ impl IrodoriClient {
             let caption_ref = body.caption.as_deref().unwrap_or("");
             return Err(TtsError::Http(format!(
                 "{status}: {}",
-                sanitize_sidecar_error(&body_text, &[text, caption_ref])
+                sanitize_sidecar_error(&body_text, &secret_variants([text, caption_ref]))
             )));
         }
         let bytes = resp
@@ -402,6 +515,7 @@ impl IrodoriClient {
         mock: bool,
         app: Option<AppHandle>,
     ) -> Result<PathBuf, TtsError> {
+        self.remember_secrets(&[caption]);
         let port = self.ensure_sidecar_running(asset_root, mock, app).await?;
         self.touch_last_used();
         let url = format!("http://127.0.0.1:{port}/v1/voice_ref/generate");
@@ -421,7 +535,7 @@ impl IrodoriClient {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(TtsError::Http(format!(
                 "{status}: {}",
-                sanitize_sidecar_error(&body_text, &[caption])
+                sanitize_sidecar_error(&body_text, &secret_variants([caption]))
             )));
         }
         let r: VoiceRefResponse = resp
@@ -597,6 +711,142 @@ mod tests {
             got.contains("TokenizerError"),
             "診断に要る部分まで消してはいけない: {got}"
         );
+    }
+
+    /// **サイドカーの stderr も伏せる**（v0.5.6 項目 2）。stderr は行ごとに届くので、
+    /// 複数行の本文は丸ごとは一致しない。各行でも伏せる。
+    #[test]
+    fn a_stderr_line_hides_every_line_of_a_recent_utterance() {
+        let recent = vec![
+            "きょうもおつかれさま\nゆっくりやすんでね".to_string(),
+            "明るく元気な少女の声".to_string(),
+        ];
+        let got = super::sanitize_stderr_line("WARNING: odd token in 'ゆっくりやすんでね'", &recent);
+        assert!(!got.contains("ゆっくり"), "{got}");
+        assert!(got.contains("WARNING: odd token"), "診断に要る部分は残す: {got}");
+        // Python の repr は改行を \n と書く
+        let got = super::sanitize_stderr_line(
+            "ValueError: 'きょうもおつかれさま\\nゆっくりやすんでね' (明るく元気な少女の声)",
+            &recent,
+        );
+        assert!(
+            !got.contains("おつかれ") && !got.contains("ゆっくり") && !got.contains("少女"),
+            "{got}"
+        );
+        // 平時の行は変えない
+        let timing = "[irodori] 合成 239 ms（8 ステップ・sway・参照 latent）";
+        assert_eq!(super::sanitize_stderr_line(timing, &recent), timing);
+    }
+
+    /// **Python が書き換える文字を含む本文も伏せる**（v0.5.6 項目 2 のレビュー指摘）。
+    /// `repr` は表示できない文字を `‍` のように書くので、そのままの形では一致しない。
+    /// 絵文字の結合（溜息 `😮‍💨`。`preprocess` が残す）と全角空白が対象。
+    #[test]
+    fn an_utterance_with_characters_python_escapes_is_still_hidden() {
+        let spoken = "ふうっ😮\u{200D}💨つかれた";
+        let with_wide_space = "きょうも\u{3000}おつかれさま";
+        let recent = vec![spoken.to_string(), with_wide_space.to_string()];
+        // Python の repr 相当（表示できない文字がエスケープされた形）
+        let logged = format!(
+            "ValueError: bad token in 'ふうっ😮\\u200d💨つかれた' / 'きょうも\\u3000おつかれさま'"
+        );
+        let got = super::sanitize_stderr_line(&logged, &recent);
+        assert!(
+            !got.contains("つかれた") && !got.contains("おつかれさま") && !got.contains("ふうっ"),
+            "発話が残っている: {got}"
+        );
+        assert!(got.contains("ValueError"), "診断に要る部分は残す: {got}");
+    }
+
+    /// 伏せるのは振り分けより前（画面へ流す進捗の行も伏せる）。進捗以外はログへ。
+    #[test]
+    fn stderr_lines_are_hidden_before_they_are_routed() {
+        let recent = vec!["ないしょのはなし".to_string()];
+        assert_eq!(
+            super::route_stderr_line("[hf-download] ないしょのはなし を確認中…", &recent),
+            super::StderrRoute::Progress("[hf-download] «伏字» を確認中…".to_string())
+        );
+        assert_eq!(
+            super::route_stderr_line("Traceback: ないしょのはなし", &recent),
+            super::StderrRoute::Log("Traceback: «伏字»".to_string())
+        );
+    }
+
+    /// **覚えた本文が、stderr の受け口を通って実際に伏せられる**（v0.5.6 項目 2）。
+    /// 純関数のテストだけだと、受け口が別の入れ物を見ていても・伏字を通さなくても緑になる。
+    #[test]
+    fn the_stderr_sink_hides_what_the_client_has_sent() {
+        let client = super::IrodoriClient::new();
+        let seen = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let collected = seen.clone();
+        let mut sink = client.stderr_sink_to(move |route| {
+            collected.lock().unwrap().push(route);
+        });
+
+        client.remember_secrets(&["ないしょの本文です", "ないしょの声色"]);
+        sink("ValueError: ないしょの本文です を読めません");
+        sink("[hf-download] ないしょの声色 を確認中…");
+        sink("[irodori] 合成 239 ms（8 ステップ・sway・参照 latent）");
+
+        let got = seen.lock().unwrap();
+        assert_eq!(
+            got[0],
+            super::StderrRoute::Log("ValueError: «伏字» を読めません".to_string())
+        );
+        assert_eq!(
+            got[1],
+            super::StderrRoute::Progress("[hf-download] «伏字» を確認中…".to_string())
+        );
+        assert_eq!(
+            got[2],
+            super::StderrRoute::Log(
+                "[irodori] 合成 239 ms（8 ステップ・sway・参照 latent）".to_string()
+            ),
+            "平時の行は変えない"
+        );
+    }
+
+    /// **送った本文を覚える**（stderr を伏せる材料）。失敗した要求でも、送る前に覚えている
+    /// （stderr は応答より先に届きうる）。覚える数には上限がある。
+    #[tokio::test]
+    async fn what_is_sent_is_remembered_for_hiding_stderr() {
+        // 応答しないポート（接続は拒否される）へ送らせる。送る前に覚えているかを見る。
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let client = super::IrodoriClient::new();
+        *client.sidecar.lock().unwrap() =
+            Some(super::SidecarHandle::for_test(dir.path(), port, pid, child));
+
+        let _ = client
+            .synthesize(dir.path(), "ないしょの本文です", std::path::Path::new("x.wav"), 1.0, Some("ないしょの声色".to_string()), false, None)
+            .await;
+        let _ = client
+            .generate_voice_ref(dir.path(), "べつの声色の説明", &dir.path().join("o.wav"), false, None)
+            .await;
+        let recent: Vec<String> = client.recent_secrets.lock().unwrap().iter().cloned().collect();
+        assert_eq!(recent, ["ないしょの本文です", "ないしょの声色", "べつの声色の説明"]);
+
+        for i in 0..20 {
+            client.remember_secrets(&[&format!("本文その{i}")]);
+        }
+        let recent = client.recent_secrets.lock().unwrap();
+        assert_eq!(recent.len(), super::RECENT_SECRETS);
+        assert_eq!(recent.back().map(String::as_str), Some("本文その19"));
+        drop(recent);
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
     }
 
     /// 短すぎる文字列で置換すると無関係な語まで潰れて診断にならない。
