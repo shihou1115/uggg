@@ -3720,6 +3720,10 @@ mod update_tests {
             "python.exe が無い: {}",
             root.display()
         );
+        // v0.5.6 から更新の最後に `sidecar.py --synth-once` で確かめるので、対象の `sidecar.py` を
+        // このリポジトリのものへ置き換える（ugg が起動のたびに行うのと同じ上書き）。
+        crate::tts::sidecar::install_sidecar_script(Path::new(env!("CARGO_MANIFEST_DIR")), &root)
+            .expect("sidecar.py を置けること");
 
         // **実行の証跡をファイルへ残す。** 実機検証の出力は端末の履歴と見分けがつかず、
         // 2026-09-11 に古い出力を新しい実行と取り違えて 2 往復を空費した。
@@ -3832,6 +3836,9 @@ mod update_tests {
     /// いまのビルドの値で合格すること（読み込みを含めた所要時間を出す — 締め切り 10 分の根拠になる実測）と、
     /// **重みの無い読み先を試すと「戻す」側に倒れる**ことを確かめる。ugg を終了してから走らせる（GPU を空ける）。
     ///
+    /// 対象の `sidecar.py` は**このリポジトリのものへ置き換える**（ugg が起動のたびに行うのと同じ上書き）。
+    /// 対象には最後に起動した ugg の `sidecar.py` があり、それが v0.5.5 以前だと `--synth-once` を知らない。
+    ///
     /// ```powershell
     /// $env:UGG_IRODORI_REAL_ROOT = "$env:APPDATA\\ugg\\irodori"
     /// cargo test -- --ignored --nocapture irodori_gate_on_a_real_runtime
@@ -3841,6 +3848,8 @@ mod update_tests {
     fn irodori_gate_on_a_real_runtime() {
         let root = real_root();
         let py = root.join("python").join("python.exe");
+        crate::tts::sidecar::install_sidecar_script(Path::new(env!("CARGO_MANIFEST_DIR")), &root)
+            .expect("sidecar.py を置けること");
         let (read, from) = model_args_for_read(&root);
         println!("[gate] 読み先（{from}から）: {}", read.join(" "));
         println!("[gate] 材料: {:?}", pick_gate_voice_ref(&root));
