@@ -3812,6 +3812,101 @@ mod update_tests {
         );
     }
 
+    /// 実環境のテストの対象（`UGG_IRODORI_REAL_ROOT` で明示させる。うっかり実行できないように）。
+    fn real_root() -> PathBuf {
+        let Ok(root) = std::env::var("UGG_IRODORI_REAL_ROOT") else {
+            panic!("UGG_IRODORI_REAL_ROOT が未設定です（対象を明示すること）");
+        };
+        let root = PathBuf::from(root);
+        assert!(
+            root.join("python").join("python.exe").is_file(),
+            "python.exe が無い: {}",
+            root.display()
+        );
+        root
+    }
+
+    /// **実機検証用**（v0.5.6 項目 3b、test-plan E-10 の 4）。実物のランタイムで 1 回合成のゲートを走らせる。
+    ///
+    /// **環境は変えない**（`.update-gate\` に参照音声の写しを置き、終わったら消す。事前変換の結果もそこに作られる）。
+    /// いまのビルドの値で合格すること（読み込みを含めた所要時間を出す — 締め切り 10 分の根拠になる実測）と、
+    /// **重みの無い読み先を試すと「戻す」側に倒れる**ことを確かめる。ugg を終了してから走らせる（GPU を空ける）。
+    ///
+    /// ```powershell
+    /// $env:UGG_IRODORI_REAL_ROOT = "$env:APPDATA\\ugg\\irodori"
+    /// cargo test -- --ignored --nocapture irodori_gate_on_a_real_runtime
+    /// ```
+    #[test]
+    #[ignore = "実物のランタイムで合成する。UGG_IRODORI_REAL_ROOT を指定して明示的に実行する"]
+    fn irodori_gate_on_a_real_runtime() {
+        let root = real_root();
+        let py = root.join("python").join("python.exe");
+        let (read, from) = model_args_for_read(&root);
+        println!("[gate] 読み先（{from}から）: {}", read.join(" "));
+        println!("[gate] 材料: {:?}", pick_gate_voice_ref(&root));
+
+        let fetch = model_args_for_fetch();
+        let passed = run_synth_gate(&root, &py, &fetch, |l| println!("  | {l}"));
+        println!("[gate] いまのビルドの値で: {passed:?} → {:?}", gate_verdict(&passed, None));
+        assert!(
+            matches!(passed, GateOutcome::Passed { .. }),
+            "合格すること（参照音声が無い・GPU が見えない環境では確かめられない）: {passed:?}"
+        );
+
+        // 重みの無い読み先（存在しない revision）を試す
+        let mut bogus = fetch.clone();
+        let at = bogus
+            .iter()
+            .position(|a| a == "--model-synth-revision")
+            .expect("revision の引数がある");
+        bogus[at + 1] = "ugg-no-such-revision".to_string();
+        let failed = run_synth_gate(&root, &py, &bogus, |l| println!("  | {l}"));
+        println!("[gate] 重みの無い読み先で: {failed:?} → {:?}", gate_verdict(&failed, None));
+        assert!(
+            matches!(gate_verdict(&failed, None), GateVerdict::RollBack(_)),
+            "重みが無ければ不合格として戻す側に倒れること: {failed:?}"
+        );
+        assert!(!root.join(GATE_DIR).exists(), "作業場所を残さない");
+    }
+
+    /// **実機検証用**（v0.5.6 項目 3d、test-plan E-10 の 4）。名前付きの配布を**控えの版へ戻せる**ことを、
+    /// 実物の pip で確かめる。**実環境を書き換え、通信が要る。** ugg を終了してから走らせる。
+    ///
+    /// 小さく、合成の経路が直接使わない `tqdm` を 1 つ別の版へ入れ替え、控えから戻す。入れ替え先は ugg の要件
+    /// （`tqdm>=4.67.3`）を満たす版にするので、万一戻せなくても要件の範囲に収まる。
+    ///
+    /// ```powershell
+    /// $env:UGG_IRODORI_REAL_ROOT = "$env:APPDATA\\ugg\\irodori"
+    /// cargo test -- --ignored --nocapture irodori_rollback_on_a_real_runtime
+    /// ```
+    #[test]
+    #[ignore = "実環境を書き換える（通信が要る）。UGG_IRODORI_REAL_ROOT を指定して明示的に実行する"]
+    fn irodori_rollback_on_a_real_runtime() {
+        let root = real_root();
+        let py = root.join("python").join("python.exe");
+        let before = query_all_versions(&py, |l| println!("  | {l}")).expect("版を控えられること");
+        let tqdm = before.get("tqdm").expect("tqdm が入っていること").clone();
+        let target = if tqdm == "4.67.3" { "4.68.0" } else { "4.67.3" };
+        println!("[before] 配布 {} 件 / tqdm={tqdm} → {target} へ入れ替える", before.len());
+
+        run_pip_install(&py, &["--no-deps", &format!("tqdm=={target}")], |l| println!("  | {l}"))
+            .expect("入れ替えられること");
+        let changed = query_all_versions(&py, |l| println!("  | {l}")).unwrap();
+        println!("[changed] tqdm={:?}", changed.get("tqdm"));
+        assert_eq!(
+            versions_to_restore(&before, &changed),
+            [("tqdm".to_string(), tqdm.clone())],
+            "前提: tqdm だけが入れ替わったこと"
+        );
+
+        let left = roll_back_versions(&py, &before, |l| println!("  | {l}")).expect("戻せたか確かめられること");
+        let after = query_all_versions(&py, |l| println!("  | {l}")).unwrap();
+        println!("[after] tqdm={:?} 戻せなかったもの={left:?}", after.get("tqdm"));
+        assert!(left.is_empty(), "戻せなかったもの: {left:?}");
+        assert_eq!(after.get("tqdm"), Some(&tqdm), "控えの版へ戻ること");
+        assert!(versions_to_restore(&before, &after).is_empty(), "ほかも控えのまま");
+    }
+
     #[test]
     fn python_is_not_updatable_in_place() {
         assert!(updatable_pin("python").is_none());
