@@ -271,6 +271,9 @@ def download_models(asset_dir: Path) -> None:
     target_root = asset_dir / "model"
     target_root.mkdir(parents=True, exist_ok=True)
 
+    # `local_dir_use_symlinks` は渡さない（v0.5.6 項目 3c）。huggingface_hub 0.23 以降は非推奨で無視され
+    # （警告の行を出すだけ）、1.x では引数ごと消えて TypeError になる。v0.5.7 には、新しい sidecar.py が
+    # 更新前の依存のまま動く期間と、その逆の期間があるので、どちらの版でも通る形にしておく。
     # 合成 / VoiceDesign 本体は upstream infer.py と同じく `model.safetensors` 1 ファイルでよい
     # (config 情報は safetensors のメタデータに埋め込まれている)。
     weight_repos = [
@@ -291,7 +294,6 @@ def download_models(asset_dir: Path) -> None:
             filename="model.safetensors",
             revision=revision,
             local_dir=str(local_dir),
-            local_dir_use_symlinks=False,
         )
         sys.stderr.write(f"[hf-download] {repo} ダウンロード完了\n")
 
@@ -304,7 +306,6 @@ def download_models(asset_dir: Path) -> None:
         repo_id=MODEL_REPO_CODEC,
         revision=MODEL_REVISION_CODEC,
         local_dir=str(codec_dir),
-        local_dir_use_symlinks=False,
     )
     sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} ダウンロード完了\n")
 

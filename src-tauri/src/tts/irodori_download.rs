@@ -1197,69 +1197,562 @@ fn needs_torch_index(name: &str) -> bool {
         .any(|spec| requirement_name(spec) == name)
 }
 
-/// 名前付き pip 要件を入れ直す (v0.5.5 項目 3)。
+/// 全配布の版を聞くときの目印（v0.5.6 項目 3d）。記録用の `VERSIONS_MARKER` とは別。
+const ALL_VERSIONS_MARKER: &str = "UGG_ALL_VERSIONS ";
+
+/// 更新の前に控える、全配布の版（v0.5.6 項目 3d）。
 ///
-/// 固定 URL の 3 本と違い、**依存を解決させる必要がある**（`transformers` の major を
-/// 上げれば `huggingface_hub` も動く）。そのため `--no-deps` は付けない。
+/// **退避のディレクトリ（`.update-backup`）の外に置く。** 中に置くと、次の更新の冒頭の「退避が残って
+/// いたら先に戻す」処理がこのファイルを退避として扱い、失敗して**以後ずっと更新できなくなる**。
+const VERSIONS_SNAPSHOT_FILE: &str = "update-versions.json";
+
+/// その他の要件を入れるときに torch を縛る制約ファイル（入れ終わったら消す）。
+const TORCH_CONSTRAINTS_FILE: &str = "update-constraints.txt";
+
+/// GitHub の zipball で入れている 3 本の配布名（正規化した名前）。
 ///
-/// **守れる範囲を正直に書いておく。** この経路には**退避も復元も無い**（固定 URL の 3 本と違う）。
-/// pip が依存を連鎖して入れ替えるので、名前 1 つを退避しても元の状態には戻せない。
-/// 失敗したときは、依存の入れ替わりを戻せていないことを伝えて止まる。
-/// 以前ここに「記録してある `resolved` へ戻すことを試み」と書いていたが、そのコードは無かった
-/// （2026-09-14 監査で発覚。取説と確認ダイアログも同じ約束をしていたので改めた）。
-/// **「1 回合成できる」までの検証は v0.5.6（major 移行）で入れる** — 同じ major の中の
-/// 版変更なら import の前後比較と版の一致で足りる。
-async fn reinstall_requirement<F>(
+/// **版を指定して入れ直さない。** PyPI には無い（同名の別物がありうる）ので、`dacvae==x` を入れると
+/// 失敗するか**別のパッケージが入る**。この 3 本は退避のディレクトリから戻す。
+const PINNED_DISTRIBUTIONS: &[&str] = &["silentcipher", "dacvae", "irodori-tts"];
+
+/// 固定 URL の 3 本を入れる順（依存の順。初回導入と同じ）。
+const PIN_ORDER: &[&str] = &["silentcipher", "dacvae", "irodori_tts"];
+
+/// 配布名を正規化する（PEP 503: 小文字にし、`-` `_` `.` の並びを `-` 1 つにする）。
+/// `importlib.metadata` が返す名前は書き方がまちまちなので、比べる前に揃える。
+fn normalize_dist_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut sep = false;
+    for c in name.chars() {
+        if matches!(c, '-' | '_' | '.') {
+            sep = true;
+            continue;
+        }
+        if sep && !out.is_empty() {
+            out.push('-');
+        }
+        sep = false;
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+/// `ALL_VERSIONS_MARKER` の行から、全配布の版（名前は正規化済み）を取り出す。
+fn parse_all_versions_line(line: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    let json = line.trim().strip_prefix(ALL_VERSIONS_MARKER)?;
+    let raw: std::collections::BTreeMap<String, String> = serde_json::from_str(json).ok()?;
+    Some(
+        raw.into_iter()
+            .map(|(name, version)| (normalize_dist_name(&name), version))
+            .collect(),
+    )
+}
+
+/// いま入っている**全部の**配布の版を聞く（v0.5.6 項目 3d の控え）。
+///
+/// **記録用の `query_resolved_versions` を使ってはいけない。** あちらは ugg が名指しで入れた約 24 件しか
+/// 見ないので、pip が依存を連鎖して入れ替える `tokenizers` などが控えに入らない。見えていない配布は
+/// 差分ゼロに見え、**戻していないのに「戻しました」と言う**ことになる。
+fn query_all_versions<F>(py_exe: &Path, mut on_line: F) -> Result<std::collections::BTreeMap<String, String>>
+where
+    F: FnMut(&str),
+{
+    let script = format!(
+        "import json,importlib.metadata as m
+out={{}}
+for d in m.distributions():
+    n=d.metadata.get('Name')
+    if n: out[n]=d.version
+print({marker:?}+json.dumps(out,sort_keys=True))",
+        marker = ALL_VERSIONS_MARKER,
+    );
+    let mut found = None;
+    run_python(py_exe, &["-c", &script], |line| match parse_all_versions_line(line) {
+        Some(map) => found = Some(map),
+        None => on_line(line),
+    })?;
+    found.ok_or_else(|| anyhow!("入っている版の一覧を読み取れませんでした"))
+}
+
+/// 控えの版と違う（または消えた）配布。**固定 URL の 3 本は含めない**（退避から戻すため）。
+/// 新しく増えた配布は含めない（残しても import されなければ使われない。`added_since` でログにだけ出す）。
+fn versions_to_restore(
+    before: &std::collections::BTreeMap<String, String>,
+    after: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    before
+        .iter()
+        .filter(|(name, _)| !PINNED_DISTRIBUTIONS.contains(&name.as_str()))
+        .filter(|(name, version)| after.get(*name) != Some(*version))
+        .map(|(name, version)| (name.clone(), version.clone()))
+        .collect()
+}
+
+/// 控えに無かった（更新で新しく入った）配布。
+fn added_since(
+    before: &std::collections::BTreeMap<String, String>,
+    after: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    after
+        .keys()
+        .filter(|name| !before.contains_key(*name))
+        .cloned()
+        .collect()
+}
+
+/// `name==version` の並びを、torch の CUDA index から入れるものとそれ以外に分ける。
+///
+/// **1 回の pip にまとめてはいけない。** `--index-url` は呼び出し全体に効くので、CUDA の index に無い
+/// パッケージが取れない。逆に torch 系を PyPI から取ると **CPU 版**が入り、GPU 合成が黙って壊れる。
+fn split_by_index(items: &[(String, String)]) -> (Vec<String>, Vec<String>) {
+    let mut torch = Vec::new();
+    let mut other = Vec::new();
+    for (name, version) in items {
+        let spec = format!("{name}=={version}");
+        if needs_torch_index(name) {
+            torch.push(spec);
+        } else {
+            other.push(spec);
+        }
+    }
+    (torch, other)
+}
+
+/// CUDA 版の torch が CPU 版へ入れ替わったか（v0.5.6 項目 3c の守り）。
+///
+/// CUDA の index の torch は版に `+cu128` のような印が付き、Windows の PyPI の torch（CPU 版）には付かない。
+/// 依存の連鎖で PyPI の torch が入ると、合成は GPU を使えなくなり、**無言で VOICEVOX へ落ちる**。
+fn cuda_torch_replaced(
+    before: &std::collections::BTreeMap<String, String>,
+    after: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let was_cuda = before.get("torch").is_some_and(|v| v.contains("+cu"));
+    match after.get("torch") {
+        _ if !was_cuda => None,
+        Some(v) if v.contains("+cu") => None,
+        Some(v) => Some(format!("torch が CUDA 版から CPU 版（{v}）へ入れ替わりました")),
+        None => Some("torch が消えました".to_string()),
+    }
+}
+
+fn versions_snapshot_path(asset_root: &Path) -> PathBuf {
+    asset_root.join(VERSIONS_SNAPSHOT_FILE)
+}
+
+/// 控えを書く（書きかけを読ませないよう、差し替えで書く）。
+fn write_versions_snapshot(
+    asset_root: &Path,
+    versions: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let path = versions_snapshot_path(asset_root);
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(versions).context("版の控えの JSON 化")?;
+    std::fs::write(&tmp, json).with_context(|| format!("版の控えの書き出し: {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("版の控えの差し替え: {}", path.display()))?;
+    Ok(())
+}
+
+fn read_versions_snapshot(asset_root: &Path) -> Option<std::collections::BTreeMap<String, String>> {
+    let text = std::fs::read_to_string(versions_snapshot_path(asset_root)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn remove_versions_snapshot(asset_root: &Path) {
+    let _ = std::fs::remove_file(versions_snapshot_path(asset_root));
+}
+
+/// 名前付きの配布を、控えの版へ入れ直す（v0.5.6 項目 3d）。**戻せなかったもの**を返す。
+///
+/// - `--no-deps` で、変わった配布を**全部まとめて**控えの版に固定して入れ直す（依存を解決させると、
+///   また別の版を連れてくる）
+/// - torch 系とそれ以外で pip を分ける（`split_by_index`）
+/// - 入れ直すには**通信が要る**。PyPI からその版が消えていれば戻せない（戻せなかったものとして返す）
+fn roll_back_versions<F>(
     py_exe: &Path,
-    name: &str,
-    spec: &str,
+    before: &std::collections::BTreeMap<String, String>,
+    mut on_line: F,
+) -> Result<Vec<String>>
+where
+    F: FnMut(&str),
+{
+    let after = query_all_versions(py_exe, |l| on_line(l))?;
+    let added = added_since(before, &after);
+    if !added.is_empty() {
+        // 消さない（import されなければ使われない。消すほうが別の依存を壊しうる）。
+        crate::ulog!("[irodori] 更新で新しく入った配布は残します: {}", added.join(", "));
+    }
+    let to_restore = versions_to_restore(before, &after);
+    if to_restore.is_empty() {
+        return Ok(Vec::new());
+    }
+    on_line(&format!(
+        "入れ替わった {} 件を元の版へ戻しています…（通信が要ります）",
+        to_restore.len()
+    ));
+    let (torch, other) = split_by_index(&to_restore);
+    if !torch.is_empty() {
+        let mut args: Vec<&str> = vec!["--no-deps", "--force-reinstall", "--index-url", TORCH_CUDA_INDEX_URL];
+        args.extend(torch.iter().map(String::as_str));
+        if let Err(err) = run_pip_install(py_exe, &args, |l| on_line(l)) {
+            on_line(&format!("PyTorch を元の版へ戻せませんでした: {err:#}"));
+        }
+    }
+    if !other.is_empty() {
+        let mut args: Vec<&str> = vec!["--no-deps", "--force-reinstall"];
+        args.extend(other.iter().map(String::as_str));
+        if let Err(err) = run_pip_install(py_exe, &args, |l| on_line(l)) {
+            on_line(&format!("元の版へ戻せない配布があります: {err:#}"));
+        }
+    }
+    let now = query_all_versions(py_exe, |l| on_line(l))?;
+    Ok(versions_to_restore(before, &now)
+        .into_iter()
+        .map(|(name, version)| match now.get(&name) {
+            Some(v) => format!("{name}=={version}（いまは {v}）"),
+            None => format!("{name}=={version}（いまは入っていない）"),
+        })
+        .collect())
+}
+
+/// 退避が**最後まで**済んだ印（`<退避先>/<pkg>.aside-complete`）。
+///
+/// 戻すとき、退避が済んでいれば「いま site-packages にあるその配布」は入れ直しで入った新しいもの
+/// なので、先に退けてから戻す（残すと dist-info が 2 つになる）。**済んでいなければ、残っているのは
+/// 動かせなかった原本**なので、消してはいけない。
+fn aside_complete_marker(backup_root: &Path, pkg: &str) -> PathBuf {
+    backup_root.join(format!("{pkg}.aside-complete"))
+}
+
+/// いま site-packages にある `<pkg>` と `<pkg>-*.dist-info` を消す（退避を戻す前の片付け）。
+fn remove_installed_package(site: &Path, pkg: &str) -> Result<()> {
+    let dir = site.join(pkg);
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir).with_context(|| format!("片付け: {}", dir.display()))?;
+    }
+    if let Ok(entries) = std::fs::read_dir(site) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&format!("{pkg}-")) && name.ends_with(".dist-info") {
+                std::fs::remove_dir_all(e.path()).with_context(|| format!("片付け: {name}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 退避を全部戻す（固定 URL の 3 本。通信は要らない）。**ディレクトリだけ**を退避として扱う
+/// （印や控えのファイルを `restore_package` に渡すと、読み取りに失敗して「戻せない」と誤判定する）。
+fn restore_all_backups(site: &Path, backup_root: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(backup_root) else {
+        return Ok(());
+    };
+    let mut failed: Vec<String> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let pkg = e.file_name().to_string_lossy().into_owned();
+        let result = (|| {
+            if aside_complete_marker(backup_root, &pkg).is_file() {
+                remove_installed_package(site, &pkg)?;
+            }
+            restore_package(site, &path)
+        })();
+        if let Err(err) = result {
+            crate::ulog!("[irodori] 退避の復元に失敗: {} ({err:#})", path.display());
+            failed.push(pkg);
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("退避を戻せません: {}", failed.join(", ")))
+    }
+}
+
+/// 前回の更新が途中で止まっていたら、先に元へ戻す（v0.5.4 項目 3 / v0.5.6 項目 3d）。
+///
+/// **残っている退避や控えを無条件に消さない。** 残っているのは「戻すのに失敗したので消さずに置いた」か
+/// 「途中でアプリが落ちた」ときだけで、そこには**唯一残った旧版の手がかり**が入っている。
+/// 戻せたら捨てる。戻せなければ場所を伝えて止まる。
+fn recover_interrupted_update<F>(asset_root: &Path, py_exe: &Path, mut on_line: F) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    let site = site_of(asset_root);
+    let backup_root = asset_root.join(UPDATE_BACKUP_DIR);
+    if backup_root.is_dir() {
+        on_line("前回の入れ直しが中断しています。退避したものを先に戻します…");
+        restore_all_backups(&site, &backup_root).with_context(|| {
+            format!(
+                "前回の入れ直しで退避したものを戻せません。手動で戻してから再実行してください。退避先: {}",
+                backup_root.display()
+            )
+        })?;
+        let _ = std::fs::remove_dir_all(&backup_root);
+        on_line("戻しました");
+    }
+    if let Some(before) = read_versions_snapshot(asset_root) {
+        on_line("前回の更新が途中で止まっています。入れ替わった依存を元の版へ戻します…");
+        let left = roll_back_versions(py_exe, &before, |l| on_line(l))
+            .context("前回の更新の後始末で、入っている版を確かめられませんでした")?;
+        if !left.is_empty() {
+            return Err(anyhow!(
+                "前回の更新で入れ替わった依存を元の版へ戻せません（通信を確かめてから、もう一度更新してください）: {}。控え: {}",
+                left.join(" / "),
+                versions_snapshot_path(asset_root).display()
+            ));
+        }
+        remove_versions_snapshot(asset_root);
+        on_line("戻しました");
+    }
+    Ok(())
+}
+
+/// 何をどの順で入れ直すか（v0.5.6 項目 3c。純関数）。
+///
+/// **`outdated` の並び（アルファベット順）に従わない。** 順は ① 名前付き要件（torch 系を先に）
+/// ② 固定 URL の 3 本（依存の順）③ モデル ④ 合成で確かめる。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UpdatePlan {
+    /// torch の CUDA index から入れる要件（`current_requirements()` の書き方のまま）。
+    torch: Vec<String>,
+    /// それ以外の名前付き要件。**1 回の pip** で入れる（依存の解決を 1 回にする）。
+    other: Vec<String>,
+    /// 固定 URL の 3 本（`PIN_ORDER` の順）。
+    pins: Vec<&'static str>,
+    /// モデルを確かめて取るか（`--download-only` が 3 本まとめて etag を照合する）。
+    models: bool,
+    /// 入れ直すもの全部（記録に使う）。
+    names: Vec<String>,
+    /// 入れ直せないので飛ばすもの。
+    skipped: Vec<String>,
+}
+
+impl UpdatePlan {
+    /// site-packages を入れ替えるか（版の控えが要るか）。
+    fn touches_packages(&self) -> bool {
+        !self.torch.is_empty() || !self.other.is_empty() || !self.pins.is_empty()
+    }
+}
+
+fn update_plan(outdated: &[String]) -> UpdatePlan {
+    let requirements = current_requirements();
+    let models = current_models();
+    let mut plan = UpdatePlan::default();
+    for name in outdated {
+        if updatable_pin(name).is_some() {
+            plan.names.push(name.clone());
+        } else if models.contains_key(name) {
+            plan.models = true;
+            plan.names.push(name.clone());
+        } else if let Some(spec) = requirements.get(name) {
+            if needs_torch_index(name) {
+                plan.torch.push(spec.clone());
+            } else {
+                plan.other.push(spec.clone());
+            }
+            plan.names.push(name.clone());
+        } else {
+            plan.skipped.push(name.clone());
+        }
+    }
+    plan.pins = PIN_ORDER
+        .iter()
+        .copied()
+        .filter(|pkg| outdated.iter().any(|n| n == pkg))
+        .collect();
+    plan
+}
+
+/// その他の要件を入れるときに、torch をいまの版に縛る制約（v0.5.6 項目 3c）。
+///
+/// 依存の解決で torch の版が動くと、PyPI から **CPU 版**を取りに行く（その pip には CUDA の index を
+/// 渡していない）。いまの版に縛っておけば、動かす必要があるときは pip が**入れる前に**失敗する。
+fn torch_constraints(versions: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    TORCH_PACKAGES
+        .iter()
+        .map(|spec| normalize_dist_name(requirement_name(spec)))
+        .filter_map(|name| versions.get(&name).map(|v| format!("{name}=={v}")))
+        .collect()
+}
+
+/// 計画どおりに入れ直す（失敗したら Err。**戻すのは呼び出し側**）。
+async fn apply_update_plan<F>(
+    asset_root: &Path,
+    py_exe: &Path,
+    plan: &UpdatePlan,
     before_imports: &std::collections::BTreeMap<String, Option<String>>,
+    before_versions: &std::collections::BTreeMap<String, String>,
     mut on_line: F,
 ) -> Result<()>
 where
     F: FnMut(&str),
 {
-    on_line(&format!("{name} を入れ直しています… ({spec})"));
-    let mut args: Vec<&str> = vec!["--upgrade"];
-    // **torch 系は CUDA 専用 index から入れる。** 名前だけで入れ直すと PyPI の
-    // **CPU 版**が入り、GPU 合成が黙って壊れる（`install_torch_cuda` と同じ index を使う）。
-    if needs_torch_index(name) {
-        args.push("--index-url");
-        args.push(TORCH_CUDA_INDEX_URL);
-        on_line("  （CUDA 12.8 の index から取得します。1〜2GB あります）");
-    }
-    args.push(spec);
-    let installed = run_pip_install(py_exe, &args, |l| on_line(l))
-    .and_then(|()| {
+    let site = site_of(asset_root);
+    let backup_root = asset_root.join(UPDATE_BACKUP_DIR);
+    let regressions = |on_line: &mut F| -> Result<()> {
         let regressed = import_regressions(before_imports, &import_report(py_exe));
         if regressed.is_empty() {
             Ok(())
         } else {
+            on_line(&format!("入れ直したことで import できなくなりました: {}", regressed.join(" / ")));
             Err(anyhow!(
                 "入れ直したことで import できなくなりました: {}",
                 regressed.join(" / ")
             ))
         }
-    });
+    };
 
-    if let Err(err) = installed {
-        on_line(&format!("{name} の入れ直しに失敗しました: {err:#}"));
-        return Err(err).with_context(|| {
-            format!("{name} ({spec}) の入れ直しに失敗しました。依存の入れ替わりは元に戻せていません")
-        });
+    // ① 名前付き要件。torch 系を先に（その他の要件が新しい torch を前提にしていても、PyPI から
+    //    取りに行かせないため）。
+    if !plan.torch.is_empty() {
+        on_line("PyTorch を入れ直しています…（CUDA 12.8 の index から。1〜2GB あります）");
+        let mut args: Vec<&str> = vec!["--upgrade", "--index-url", TORCH_CUDA_INDEX_URL];
+        args.extend(plan.torch.iter().map(String::as_str));
+        run_pip_install(py_exe, &args, |l| on_line(l)).context("PyTorch の入れ直しに失敗しました")?;
     }
+    if !plan.other.is_empty() {
+        on_line(&format!(
+            "Python の依存を入れ直しています…（{}）",
+            plan.other.join(" ")
+        ));
+        let now = query_all_versions(py_exe, |l| on_line(l))?;
+        let constraints = torch_constraints(&now);
+        let constraints_path = asset_root.join(TORCH_CONSTRAINTS_FILE);
+        let mut args: Vec<String> = vec!["--upgrade".to_string()];
+        if !constraints.is_empty() {
+            std::fs::write(&constraints_path, constraints.join("\n") + "\n")
+                .with_context(|| format!("制約ファイルの書き出し: {}", constraints_path.display()))?;
+            args.push("-c".to_string());
+            args.push(constraints_path.to_string_lossy().into_owned());
+        }
+        args.extend(plan.other.iter().cloned());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let installed = run_pip_install(py_exe, &refs, |l| on_line(l));
+        let _ = std::fs::remove_file(&constraints_path);
+        installed.context("Python の依存の入れ直しに失敗しました")?;
+    }
+    if !plan.torch.is_empty() || !plan.other.is_empty() {
+        let now = query_all_versions(py_exe, |l| on_line(l))?;
+        if let Some(why) = cuda_torch_replaced(before_versions, &now) {
+            return Err(anyhow!("{why}（GPU で合成できなくなるため、元に戻します）"));
+        }
+        regressions(&mut on_line)?;
+    }
+
+    // ② 固定 URL の 3 本（依存の順）。退避してから入れ直す（戻すのは呼び出し側）。
+    for pkg in &plan.pins {
+        let Some((pkg, url)) = updatable_pin(pkg) else {
+            continue;
+        };
+        on_line(&format!("{pkg} を入れ直しています…"));
+        on_line(&format!("  site={}", site.display()));
+        on_line(&format!("  退避前: {}", describe_package(&site, pkg)));
+        let backup = backup_root.join(pkg);
+        // 退避は「ディレクトリ」と「dist-info」の 2 段で、前者だけ動いて後者で失敗しうる
+        // （ファイルがロックされている等）。**そのまま返すと site-packages から消えたまま**
+        // になるので、ここで戻す（印を書く前なので、あとの全戻しは原本を消さない）。
+        if let Err(err) = move_package_aside(&site, pkg, &backup) {
+            if let Err(restore_err) = restore_package(&site, &backup) {
+                crate::ulog!(
+                    "[irodori] 退避中の失敗を戻せません。退避を残します: {} ({restore_err:#})",
+                    backup.display()
+                );
+            }
+            return Err(err);
+        }
+        std::fs::write(aside_complete_marker(&backup_root, pkg), b"")
+            .with_context(|| format!("退避の印: {}", backup.display()))?;
+        on_line(&format!("  退避後: {}", describe_package(&site, pkg)));
+        run_pip_install(
+            py_exe,
+            &[
+                "--no-deps",
+                // 直 URL でも確実に入れ替えるため、キャッシュと既存判定を跨がせない。
+                "--force-reinstall",
+                url,
+            ],
+            |l| on_line(l),
+        )
+        .with_context(|| format!("{pkg} の入れ直しに失敗しました"))?;
+        on_line(&format!("  入れ直し後: {}", describe_package(&site, pkg)));
+        regressions(&mut on_line)?;
+    }
+
+    // ③ モデル（`--download-only` が 3 本まとめて etag を照合し、差があるときだけ取る）。
+    if plan.models {
+        on_line("HF モデルを確認しています…（差があるときだけ取得します）");
+        let sidecar_py = asset_root.join("sidecar.py");
+        install_irodori_models(asset_root, &sidecar_py, |l| on_line(l))
+            .await
+            .context("HF モデルの取得に失敗しました")?;
+    }
+
+    // ④ 合成で確かめる — v0.5.6 項目 3b で入れる。
     Ok(())
 }
 
-/// 古くなった分だけを入れ直す (v0.5.4 項目 3、spec §6.0)。
+/// 失敗した更新を元に戻し、**何が戻って何が戻らなかったか**を添えたエラーを返す（v0.5.6 項目 3d）。
 ///
-/// **失敗しても、それまで動いていた環境を壊さない。** pip は「古いものを消してから
-/// 新しいものを入れる」ので、途中で失敗すると消えたままになる。そこで
-/// **退避 → 入れ直し → import 確認 → 成功したら退避を捨てる**の順にし、
-/// どこかで失敗したら退避から戻す（v0.5.3 項目 2 と同じ規律）。
-/// **戻すことにも失敗したら退避先を消さず、場所をログに残す。**
+/// 戻す強さは 3 種類で違う: 固定 URL の 3 本は退避から（通信は要らない）／名前付きの配布は控えの版へ
+/// 入れ直す（**通信が要り、戻せないことがある**）／モデルは戻さない（同じ repo@revision なら上書き。
+/// v0.5.6 は版を変えないので差は出ない）。戻せなかったものがあれば**退避と控えを残し**、次の更新の前に
+/// もう一度戻す。
+fn roll_back_update<F>(
+    asset_root: &Path,
+    py_exe: &Path,
+    before_versions: Option<&std::collections::BTreeMap<String, String>>,
+    err: anyhow::Error,
+    mut on_line: F,
+) -> anyhow::Error
+where
+    F: FnMut(&str),
+{
+    on_line(&format!("更新に失敗しました。入れ替えたものを元に戻します: {err:#}"));
+    let site = site_of(asset_root);
+    let backup_root = asset_root.join(UPDATE_BACKUP_DIR);
+    let mut left: Vec<String> = Vec::new();
+    if backup_root.is_dir() {
+        match restore_all_backups(&site, &backup_root) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&backup_root);
+            }
+            Err(e) => left.push(format!("{e:#}（退避先: {}）", backup_root.display())),
+        }
+    }
+    if let Some(before) = before_versions {
+        match roll_back_versions(py_exe, before, |l| on_line(l)) {
+            Ok(rest) => left.extend(rest),
+            Err(e) => left.push(format!("入っている版を確かめられません: {e:#}")),
+        }
+    }
+    if left.is_empty() {
+        remove_versions_snapshot(asset_root);
+        on_line("元の状態へ戻しました");
+        anyhow!("{err:#}（入れ替えたものは元の版へ戻しました）")
+    } else {
+        on_line(&format!("元に戻せなかったもの: {}", left.join(" / ")));
+        anyhow!(
+            "{err:#}。元に戻せなかったもの: {}（退避と控えは残してあり、次の更新の前にもう一度戻します）",
+            left.join(" / ")
+        )
+    }
+}
+
+/// 古くなった分だけを入れ直す (v0.5.4 項目 3 / v0.5.6 項目 3c・3d、spec §6.0)。
 ///
-/// 戻り値は「入れ直せた pin の名前」。呼び出し側はこれで記録を部分的に更新する。
+/// **1 つのトランザクションにする。** 途中のどこで失敗しても、入れ替えたものを**全部**戻す
+/// （以前は、後の段で失敗すると、それより前に成功した分の退避＝唯一の旧版を戻さずに消していた。
+/// 名前付き要件には退避も復元も無かった）。記録（`installed.json`）は全部成功したときにだけ書く。
+///
+/// 1. 前回の更新が途中で止まっていれば、先に元へ戻す（`recover_interrupted_update`）
+/// 2. 入っている全配布の版を控える（控えを取れなければ何も変えずに止まる）
+/// 3. 計画の順に入れ直す（`update_plan` / `apply_update_plan`）
+/// 4. 失敗したら全部戻す（`roll_back_update`）。成功したら退避と控えを捨てて記録する
+///
+/// 戻り値は「入れ直せた名前」。呼び出し側はこれで記録を部分的に更新する。
 pub async fn update_irodori_runtime<F>(
     asset_root: &Path,
     outdated: &[String],
@@ -1275,7 +1768,6 @@ where
             py_exe.display()
         ));
     }
-    let site = site_of(asset_root);
 
     if outdated.iter().any(|n| n == "python") {
         // ここだけは安全に入れ直せない。黙って部分更新して「最新」と記録するより、
@@ -1285,30 +1777,11 @@ where
         ));
     }
 
-    let backup_root = asset_root.join(UPDATE_BACKUP_DIR);
-    // **残っている退避を無条件に消さない。** 退避が残っているのは「復元に失敗したので
-    // 消さずに置いた」ときだけで、そこには**唯一残った旧版**が入っている。
-    // まず戻しを試み、戻せたら捨てる。戻せなければ場所を伝えて止まる
-    // （消してから入れ直しに失敗すると、守ろうとしたものを失う）。
-    if backup_root.is_dir() {
-        on_line("前回の入れ直しが中断しています。退避したものを先に戻します…");
-        let mut recovered = true;
-        if let Ok(entries) = std::fs::read_dir(&backup_root) {
-            for e in entries.flatten() {
-                if let Err(err) = restore_package(&site, &e.path()) {
-                    crate::ulog!("[irodori] 退避の復元に失敗: {} ({err:#})", e.path().display());
-                    recovered = false;
-                }
-            }
-        }
-        if !recovered {
-            return Err(anyhow!(
-                "前回の入れ直しで退避したものを戻せません。手動で戻してから再実行してください。退避先: {}",
-                backup_root.display()
-            ));
-        }
-        let _ = std::fs::remove_dir_all(&backup_root);
-        on_line("戻しました。入れ直しを続けます");
+    recover_interrupted_update(asset_root, &py_exe, |l| on_line(l))?;
+
+    let plan = update_plan(outdated);
+    for name in &plan.skipped {
+        on_line(&format!("{name} は入れ直しの対象外です (skip)"));
     }
 
     // 入れ直す前に「いま何が使えるか」を控える。ここを控えずに絶対値で判定すると、
@@ -1320,113 +1793,43 @@ where
         }
     }
 
-    let mut updated: Vec<String> = Vec::new();
-    let mut models_refreshed = false;
-    for name in outdated {
-        let Some((pkg, url)) = updatable_pin(name) else {
-            // 名前付き pip 要件は URL ではなく名前で入れ直す (v0.5.5 項目 3)。
-            if current_models().contains_key(name) {
-                // モデルは名前ごとではなく一括で確認する（`--download-only` が 3 本まとめて
-                // etag 照合する）。同じ回で 2 本目以降が来ても二重に走らせない。
-                if !models_refreshed {
-                    on_line("HF モデルを確認しています…（差があるときだけ取得します）");
-                    let sidecar_py = asset_root.join("sidecar.py");
-                    if let Err(err) = install_irodori_models(asset_root, &sidecar_py, |l| on_line(l)).await {
-                        let _ = std::fs::remove_dir_all(&backup_root);
-                        return Err(err).context("HF モデルの取得に失敗しました");
-                    }
-                    models_refreshed = true;
-                }
-                updated.push(name.clone());
-                continue;
-            }
-            if let Some(spec) = current_requirements().get(name) {
-                match reinstall_requirement(&py_exe, name, spec, &before_imports, |l| on_line(l))
-                    .await
-                {
-                    Ok(()) => updated.push(name.clone()),
-                    Err(err) => {
-                        let _ = std::fs::remove_dir_all(&backup_root);
-                        return Err(err);
-                    }
-                }
-                continue;
-            }
-            on_line(&format!("{name} は入れ直しの対象外です (skip)"));
-            continue;
-        };
-        on_line(&format!("{pkg} を入れ直しています…"));
-        on_line(&format!("  site={}", site.display()));
-        on_line(&format!("  退避前: {}", describe_package(&site, pkg)));
-        let backup = backup_root.join(pkg);
-        // 退避は「ディレクトリ」と「dist-info」の 2 段で、前者だけ動いて後者で失敗しうる
-        // （ファイルがロックされている等）。**そのまま返すと site-packages から消えたまま**
-        // になるので、ここでも戻す。
-        if let Err(err) = move_package_aside(&site, pkg, &backup) {
-            if let Err(restore_err) = restore_package(&site, &backup) {
-                crate::ulog!(
-                    "[irodori] 退避中の失敗を戻せません。退避を残します: {} ({restore_err:#})",
-                    backup.display()
-                );
-                return Err(err).with_context(|| {
-                    format!("復元にも失敗しました。退避先: {}", backup.display())
-                });
-            }
-            let _ = std::fs::remove_dir_all(&backup_root);
-            return Err(err);
-        }
-        on_line(&format!("  退避後: {}", describe_package(&site, pkg)));
+    // **版の控え**（v0.5.6 項目 3d）。パッケージを入れ替えるときだけ取る（モデルだけの更新・
+    // 前回の後始末だけの呼び出しでは、戻す対象が無い）。取れなければ、戻す手段が無いので何も変えずに止まる。
+    let touches_packages = plan.touches_packages();
+    let before_versions = if touches_packages {
+        let versions = query_all_versions(&py_exe, |l| on_line(l))
+            .context("更新の前に、いま入っている版を控えられませんでした（何も変えていません）")?;
+        write_versions_snapshot(asset_root, &versions)
+            .context("更新の前に、いま入っている版の控えを書けませんでした（何も変えていません）")?;
+        versions
+    } else {
+        Default::default()
+    };
 
-        let installed = run_pip_install(
-            &py_exe,
-            &[
-                "--no-deps",
-                // 直 URL でも確実に入れ替えるため、キャッシュと既存判定を跨がせない。
-                "--force-reinstall",
-                url,
-            ],
-            |l| on_line(l),
-        )
-        .and_then(|()| {
-            on_line(&format!("  入れ直し後: {}", describe_package(&site, pkg)));
-            let regressed = import_regressions(&before_imports, &import_report(&py_exe));
-            if regressed.is_empty() {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "入れ直したことで import できなくなりました: {}",
-                    regressed.join(" / ")
-                ))
-            }
-        });
-
-        if let Err(err) = installed {
-            on_line(&format!("{pkg} の入れ直しに失敗しました。元に戻します: {err:#}"));
-            if let Err(restore_err) = restore_package(&site, &backup) {
-                // **戻せなかったら退避を消さない。** 消すと、まさに守ろうとしたものを失う。
-                crate::ulog!(
-                    "[irodori] 復元に失敗しました。退避を残します: {} ({restore_err:#})",
-                    backup.display()
-                );
-                return Err(err).with_context(|| {
-                    format!("復元にも失敗しました。退避先: {}", backup.display())
-                });
-            }
-            let _ = std::fs::remove_dir_all(&backup_root);
-            return Err(err);
-        }
-        updated.push(name.clone());
+    let applied = apply_update_plan(
+        asset_root,
+        &py_exe,
+        &plan,
+        &before_imports,
+        &before_versions,
+        |l| on_line(l),
+    )
+    .await;
+    if let Err(err) = applied {
+        let versions = touches_packages.then_some(&before_versions);
+        return Err(roll_back_update(asset_root, &py_exe, versions, err, |l| on_line(l)));
     }
 
-    // ここまで来たら全部成功している。退避を捨てる。
-    let _ = std::fs::remove_dir_all(&backup_root);
+    // ここまで来たら全部成功している。退避と控えを捨てる。
+    let _ = std::fs::remove_dir_all(asset_root.join(UPDATE_BACKUP_DIR));
+    remove_versions_snapshot(asset_root);
 
     // **記録は更新の一部。** これをコマンド層に置いていたためテストから到達できず、
     // 「入れ直したのに `up_to_date` が false のまま」を自動で検出できなかった。
-    record_after_install(asset_root, &updated, |l| on_line(l))
+    record_after_install(asset_root, &plan.names, |l| on_line(l))
         .context("入れ直しは成功しましたが、導入記録を書けませんでした")?;
 
-    Ok(updated)
+    Ok(plan.names)
 }
 
 /// 6) HF モデル本体を sidecar.py の `--download-only` モードで取得する (M4c Phase G)。
@@ -3185,6 +3588,279 @@ mod update_tests {
             !dir.path().join(UPDATE_BACKUP_DIR).exists(),
             "戻せたら退避は捨てる"
         );
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// 配布名の書き方の揺れを揃える（`importlib.metadata` の名前と要件の名前を突き合わせるため）。
+    #[test]
+    fn distribution_names_are_normalized() {
+        assert_eq!(normalize_dist_name("Huggingface_Hub"), "huggingface-hub");
+        assert_eq!(normalize_dist_name("irodori_tts"), "irodori-tts");
+        assert_eq!(normalize_dist_name("ruamel.yaml"), "ruamel-yaml");
+        assert_eq!(normalize_dist_name("a.-_b"), "a-b");
+        assert_eq!(normalize_dist_name("torch"), "torch");
+    }
+
+    /// 全配布の版の行を読む（名前は正規化する）。無関係な行は拾わない。
+    #[test]
+    fn the_all_versions_line_is_parsed_with_normalized_names() {
+        let line = format!("{ALL_VERSIONS_MARKER}{{\"Huggingface_Hub\":\"0.36.2\",\"torch\":\"2.10.0+cu128\"}}");
+        let got = parse_all_versions_line(&line).expect("読めること");
+        assert_eq!(got.get("huggingface-hub").map(String::as_str), Some("0.36.2"));
+        assert_eq!(got.get("torch").map(String::as_str), Some("2.10.0+cu128"));
+        assert!(parse_all_versions_line("Collecting torch").is_none());
+        // 記録用の目印とは取り違えない
+        assert!(parse_all_versions_line(&format!("{VERSIONS_MARKER}{{}}")).is_none());
+    }
+
+    /// **戻すのは「版が変わった・消えた」配布だけ**（v0.5.6 項目 3d）。
+    /// 固定 URL の 3 本は含めない（PyPI には無いので版指定で入れ直せない。退避から戻す）。
+    /// 新しく増えた配布も含めない（`added_since` でログにだけ出す）。
+    #[test]
+    fn only_changed_or_missing_distributions_are_restored() {
+        let before = map(&[
+            ("transformers", "4.57.6"),
+            ("tokenizers", "0.22.1"),
+            ("numpy", "1.26.4"),
+            ("dacvae", "0.1.0"),
+            ("irodori-tts", "0.1.0"),
+        ]);
+        let after = map(&[
+            ("transformers", "5.0.0"),
+            // tokenizers は消えた
+            ("numpy", "1.26.4"),
+            ("dacvae", "0.2.0"),
+            ("irodori-tts", "0.2.0"),
+            ("hf-xet", "1.0.0"),
+        ]);
+        assert_eq!(
+            versions_to_restore(&before, &after),
+            [
+                ("tokenizers".to_string(), "0.22.1".to_string()),
+                ("transformers".to_string(), "4.57.6".to_string()),
+            ],
+            "固定 URL の 3 本・変わっていないもの・増えたものは含めない"
+        );
+        assert_eq!(added_since(&before, &after), ["hf-xet"]);
+    }
+
+    /// 固定 URL の 3 本の名前は、正規化した名前で持つ（控えの名前は正規化済み）。
+    #[test]
+    fn the_pinned_distributions_are_the_updatable_pins() {
+        for name in PIN_ORDER {
+            assert!(updatable_pin(name).is_some(), "{name} は固定 URL の 1 本");
+            assert!(
+                PINNED_DISTRIBUTIONS.contains(&normalize_dist_name(name).as_str()),
+                "{name} を版指定の入れ直しから外していない"
+            );
+        }
+        assert_eq!(PINNED_DISTRIBUTIONS.len(), PIN_ORDER.len());
+    }
+
+    /// **戻しの pip も torch 系とそれ以外で分ける**（1 回にまとめると `--index-url` が全体に効き、
+    /// CUDA の index に無いパッケージが戻せない）。
+    #[test]
+    fn a_rollback_splits_torch_from_the_rest() {
+        let (torch, other) = split_by_index(&[
+            ("torch".to_string(), "2.10.0+cu128".to_string()),
+            ("transformers".to_string(), "4.57.6".to_string()),
+            ("torchaudio".to_string(), "2.10.0+cu128".to_string()),
+        ]);
+        assert_eq!(torch, ["torch==2.10.0+cu128", "torchaudio==2.10.0+cu128"]);
+        assert_eq!(other, ["transformers==4.57.6"]);
+    }
+
+    /// **CUDA 版の torch が CPU 版へ入れ替わったら失敗にする**（v0.5.6 項目 3c の守り）。
+    /// 元から CPU 版の環境は咎めない（GPU の無い環境の更新を巻き戻さない）。
+    #[test]
+    fn a_cuda_torch_replaced_by_the_cpu_build_is_caught() {
+        let cuda = map(&[("torch", "2.10.0+cu128")]);
+        assert!(cuda_torch_replaced(&cuda, &map(&[("torch", "2.10.0")])).is_some(), "CPU 版へ");
+        assert!(cuda_torch_replaced(&cuda, &map(&[])).is_some(), "消えた");
+        assert!(cuda_torch_replaced(&cuda, &map(&[("torch", "2.10.1+cu128")])).is_none());
+        let cpu = map(&[("torch", "2.10.0")]);
+        assert!(cuda_torch_replaced(&cpu, &map(&[("torch", "2.10.0")])).is_none(), "元から CPU 版");
+    }
+
+    /// **段取りは固定順**（v0.5.6 項目 3c）。`outdated` のアルファベット順に従わない。
+    #[test]
+    fn the_update_plan_has_a_fixed_order() {
+        let outdated: Vec<String> = [
+            "irodori_tts",
+            "model_synth",
+            "silentcipher",
+            "torch",
+            "transformers",
+            "dacvae",
+            "model_codec",
+            "no_such_thing",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let plan = update_plan(&outdated);
+        assert_eq!(plan.pins, ["silentcipher", "dacvae", "irodori_tts"], "依存の順");
+        assert_eq!(plan.torch.len(), 1, "torch は CUDA の index 側: {plan:?}");
+        assert!(plan.torch[0].starts_with("torch"), "{plan:?}");
+        assert_eq!(plan.other.len(), 1, "transformers はその他の側: {plan:?}");
+        assert!(plan.other[0].starts_with("transformers"), "{plan:?}");
+        assert!(plan.models, "モデルは 1 回にまとめて確かめる");
+        assert_eq!(plan.skipped, ["no_such_thing"]);
+        assert_eq!(plan.names.len(), 7, "入れ直すものは全部記録に回る: {plan:?}");
+        assert!(plan.touches_packages());
+        assert!(!update_plan(&["model_synth".to_string()]).touches_packages(), "モデルだけなら版の控えは要らない");
+    }
+
+    /// その他の要件を入れるとき、torch をいまの版に縛る（PyPI の CPU 版を取りに行かせない）。
+    #[test]
+    fn other_requirements_are_installed_with_torch_pinned() {
+        let got = torch_constraints(&map(&[
+            ("torch", "2.10.0+cu128"),
+            ("torchaudio", "2.10.0+cu128"),
+            ("transformers", "4.57.6"),
+        ]));
+        assert_eq!(got, ["torch==2.10.0+cu128", "torchaudio==2.10.0+cu128"]);
+        assert!(torch_constraints(&map(&[("numpy", "1.26.4")])).is_empty());
+    }
+
+    /// **退避が済んだ配布を戻すときは、入れ直しで入った新しいものを先に退ける**（v0.5.6 項目 3d）。
+    /// 退けないと dist-info が 2 つ残り、pip も import も新旧を取り違える。
+    #[test]
+    fn restoring_a_finished_aside_removes_the_new_install_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = make_site(dir.path());
+        let backup_root = dir.path().join(UPDATE_BACKUP_DIR);
+        put_pkg(&site, "dacvae", "0.1.0", "old");
+        move_package_aside(&site, "dacvae", &backup_root.join("dacvae")).unwrap();
+        std::fs::write(aside_complete_marker(&backup_root, "dacvae"), b"").unwrap();
+        // 入れ直しで新しい版が入った
+        put_pkg(&site, "dacvae", "0.2.0", "new");
+
+        restore_all_backups(&site, &backup_root).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(site.join("dacvae").join("__init__.py")).unwrap(),
+            "old"
+        );
+        assert!(site.join("dacvae-0.1.0.dist-info").is_dir(), "旧版の dist-info が戻る");
+        assert!(!site.join("dacvae-0.2.0.dist-info").exists(), "新しい dist-info を残さない");
+    }
+
+    /// **退避が途中で止まった配布は、site に残っている原本を消さない**（v0.5.6 項目 3d）。
+    /// 退避の印が無い ＝ 入れ直しはまだ走っていない ＝ site に残っているのは動かせなかった原本。
+    #[test]
+    fn restoring_an_unfinished_aside_keeps_the_original_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = make_site(dir.path());
+        let backup_root = dir.path().join(UPDATE_BACKUP_DIR);
+        put_pkg(&site, "dacvae", "0.1.0", "old");
+        // ディレクトリだけ退避できて、dist-info は動かせなかった
+        std::fs::create_dir_all(backup_root.join("dacvae")).unwrap();
+        std::fs::rename(site.join("dacvae"), backup_root.join("dacvae").join("dacvae")).unwrap();
+
+        restore_all_backups(&site, &backup_root).unwrap();
+
+        assert!(site.join("dacvae-0.1.0.dist-info").is_dir(), "原本の dist-info を消していない");
+        assert_eq!(
+            std::fs::read_to_string(site.join("dacvae").join("__init__.py")).unwrap(),
+            "old"
+        );
+    }
+
+    /// **退避のディレクトリにファイルがあっても、更新が止まらない**（反証 #0 の形）。
+    /// 以前はファイルを退避として `restore_package` に渡し、読み取りに失敗して「戻せない」と止まっていた。
+    /// 版の控えをここに置くと、以後ずっと更新できなくなるところだった（控えは外に置いた）。
+    #[test]
+    fn files_in_the_backup_dir_are_not_mistaken_for_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let _site = make_site(dir.path());
+        let backup_root = dir.path().join(UPDATE_BACKUP_DIR);
+        std::fs::create_dir_all(&backup_root).unwrap();
+        std::fs::write(backup_root.join("dacvae.aside-complete"), b"").unwrap();
+        std::fs::write(backup_root.join("versions.json"), b"{}").unwrap();
+        let py = dir.path().join("python").join("python.exe");
+
+        recover_interrupted_update(dir.path(), &py, |_| {}).expect("ファイルは退避として扱わない");
+        assert!(!backup_root.exists(), "戻せたら退避を捨てる");
+        assert!(
+            !versions_snapshot_path(dir.path()).starts_with(&backup_root),
+            "版の控えは退避のディレクトリの外に置く"
+        );
+    }
+
+    /// **前回の更新の控えが残っていたら、黙って捨てない**（v0.5.6 項目 3d）。
+    /// 戻せたか確かめられないとき（ここでは python が動かない）は、控えを残して止まる。
+    #[tokio::test]
+    async fn a_leftover_version_snapshot_is_not_dropped_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        make_site(dir.path());
+        std::fs::write(dir.path().join("python").join("python.exe"), b"x").unwrap();
+        write_versions_snapshot(dir.path(), &map(&[("transformers", "4.57.6")])).unwrap();
+
+        let err = update_irodori_runtime(dir.path(), &[], |_| {})
+            .await
+            .expect_err("戻せたか確かめられないうちは進まない");
+        assert!(format!("{err:#}").contains("前回の更新"), "{err:#}");
+        assert!(
+            read_versions_snapshot(dir.path()).is_some(),
+            "控えを残す（次の更新でもう一度戻す）"
+        );
+    }
+
+    /// **後の段で失敗しても、前の段で入れ替えた分まで戻す**（v0.5.6 項目 3d。spec §6.0 の土台の欠落 ①）。
+    ///
+    /// 以前は、後の段（例: モデルの取得）で失敗すると退避を丸ごと消していたので、それより前に
+    /// 入れ直しが成功した固定 URL の配布は**新しい版のまま、唯一の旧版を失っていた**。
+    #[test]
+    fn a_later_failure_rolls_back_what_earlier_steps_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = make_site(dir.path());
+        let backup_root = dir.path().join(UPDATE_BACKUP_DIR);
+        for pkg in ["silentcipher", "dacvae"] {
+            put_pkg(&site, pkg, "0.1.0", "old");
+            move_package_aside(&site, pkg, &backup_root.join(pkg)).unwrap();
+            std::fs::write(aside_complete_marker(&backup_root, pkg), b"").unwrap();
+            put_pkg(&site, pkg, "0.2.0", "new");
+        }
+        let py = dir.path().join("python").join("python.exe");
+
+        let err = roll_back_update(dir.path(), &py, None, anyhow!("HF モデルの取得に失敗しました"), |_| {});
+
+        for pkg in ["silentcipher", "dacvae"] {
+            assert_eq!(
+                std::fs::read_to_string(site.join(pkg).join("__init__.py")).unwrap(),
+                "old",
+                "{pkg} を旧版へ戻す"
+            );
+            assert!(!site.join(format!("{pkg}-0.2.0.dist-info")).exists());
+        }
+        assert!(!backup_root.exists(), "戻せたら退避を捨てる");
+        let message = format!("{err:#}");
+        assert!(message.contains("HF モデルの取得に失敗しました"), "元の理由を残す: {message}");
+        assert!(message.contains("元の版へ戻しました"), "戻したことを言う: {message}");
+    }
+
+    /// 版の控えは差し替えで書き、書きかけを残さない。
+    #[test]
+    fn the_version_snapshot_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = map(&[("torch", "2.10.0+cu128"), ("numpy", "1.26.4")]);
+        write_versions_snapshot(dir.path(), &versions).unwrap();
+        assert_eq!(read_versions_snapshot(dir.path()), Some(versions));
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [VERSIONS_SNAPSHOT_FILE]);
+        remove_versions_snapshot(dir.path());
+        assert!(read_versions_snapshot(dir.path()).is_none());
     }
 
     /// 導入と更新を同時に走らせない（監査 ①）。
