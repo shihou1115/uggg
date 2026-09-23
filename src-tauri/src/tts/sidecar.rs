@@ -354,6 +354,11 @@ where
             sidecar_py.display()
         ));
     }
+    // 読む先は導入記録から決める（v0.5.6 項目 3a）。**どこから決めたかを残す** — 実機で
+    // 「記録どおりの重みを読んでいるか」を追える唯一の観測点で、実データの確認もこの行で見る。
+    let (model_args, from) = crate::tts::irodori_download::model_args_for_read(asset_root);
+    crate::ulog!("[irodori] モデルの読み先を{}から決めました: {}", from, model_args.join(" "));
+
     let ready_file = ready_path_for(asset_root);
     // 古い ready.json を消してから起動 (port 誤読を防ぐ)
     let _ = std::fs::remove_file(&ready_file);
@@ -372,8 +377,9 @@ where
         .arg("warning")
         // **モデルの正本は Rust 側** (v0.5.5 項目 3)。`sidecar.py` は毎起動で上書き
         // コピーされるので、あちらのハードコードを正本にすると「コードだけ新しくなって
-        // 重みが無い」状態を作る。取得側（`--download-only`）と同じ値をここでも渡す。
-        .args(crate::tts::irodori_download::model_args())
+        // 重みが無い」状態を作る。**読む先は導入記録から決める**（v0.5.6 項目 3a）— 取得側
+        // （`--download-only`）はいまのビルドの値を使い、**更新が成功したときだけ記録が追いつく**。
+        .args(&model_args)
         // HF モデル DL は起動 hot path から外し、download_irodori_assets ステップ 6
         // (irodori_download::install_irodori_models) で先に取得する。ここでは常に --no-download。
         // モデル不在のまま実モード起動した場合は RealModelBackend.synth が FileNotFoundError を

@@ -277,17 +277,91 @@ fn v054_baseline_models() -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-/// サイドカーへ渡すモデル指定（起動経路と `--download-only` の両方で使う）。
+/// **取得しに行く先**（いまのビルドが求めるモデル）。`--download-only` で使う。
 ///
-/// **2 経路あるので 1 か所にまとめる。** 片方だけに渡すと、取得した先と読む先が食い違う。
-pub fn model_args() -> Vec<String> {
+/// 読み先（サイドカーの起動で渡す値）とは**別**にする（v0.5.6 項目 3a）。以前は同じ値を両方へ渡していたが、
+/// それだと定数を変えた版を入れた瞬間に、**重みが無いモデルを読みに行く**（更新を終えるまで高品質モードが死に、
+/// キャラは「GPU 環境が整っていない」と事実でない説明をする）。**取得はいまのビルド、読みは記録**で、
+/// **更新が成功したときだけ記録がいまのビルドに追いつく**。
+pub fn model_args_for_fetch() -> Vec<String> {
+    model_args_from(&current_models())
+}
+
+/// **読みに行く先**（記録から決める。v0.5.6 項目 3a の決定表）。サイドカーの起動で使う。
+/// 引数の並びと、**どこから決めたか**（ログに残す）を返す。
+pub fn model_args_for_read(asset_root: &Path) -> (Vec<String>, &'static str) {
+    let stamp = read_stamp(asset_root);
+    (
+        model_args_from(&models_to_read(stamp.as_ref())),
+        where_models_come_from(stamp.as_ref()),
+    )
+}
+
+/// 読み先の決定表（純関数）。**名前ごとに引く。**
+///
+/// | その名前の状態 | 読み先 |
+/// |---|---|
+/// | 記録の `models` に値がある | その値 |
+/// | 記録が無い・その名前の欄が無い | `V054_BASELINE_MODELS`（欄が空の記録が指す環境の中身） |
+/// | 基準値にもその名前が無い（v0.5.7 でモデルを増やしたとき） | いまのビルド |
+///
+/// **記録全体ではなく名前ごとに引く**のは、`models` が名前ごとに欠けうるため（`merged_models` は入れ直した分しか
+/// 書かず、`baseline_filled` は欄が**丸ごと**空のときしか埋めない）。記録全体を単位にすると「1 本だけ欠けた記録」の
+/// 読み先が未定義になり、渡さなかった分は `sidecar.py` の既定値が使われて記録と食い違う。
+pub(crate) fn models_to_read(
+    stamp: Option<&InstalledStamp>,
+) -> std::collections::BTreeMap<String, String> {
+    let recorded = stamp.map(|s| s.models.clone()).unwrap_or_default();
+    pick_models_to_read(&recorded, &v054_baseline_models(), &current_models())
+}
+
+/// 決定表の中身（3 つの表から名前ごとに選ぶだけの純関数）。
+///
+/// **表を引数で受け取る**のは、v0.5.6 では基準値といまのビルドが**同じ値**で、本物の定数では
+/// 「名前ごとに引く」と「記録全体で引く」の違いが出ないため（初めて違いが出るのは v0.5.7）。
+/// 違う値で固定しておかないと、規則を壊してもテストが鳴らない。
+fn pick_models_to_read(
+    recorded: &std::collections::BTreeMap<String, String>,
+    baseline: &std::collections::BTreeMap<String, String>,
+    build: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    build
+        .keys()
+        .map(|name| {
+            let value = recorded
+                .get(name)
+                .or_else(|| baseline.get(name))
+                .or_else(|| build.get(name))
+                .cloned()
+                .unwrap_or_default();
+            (name.clone(), value)
+        })
+        .collect()
+}
+
+/// 読み先を**どこから決めたか**（実機で追えるようにログへ出す。v0.5.6 項目 3a）。
+pub(crate) fn where_models_come_from(stamp: Option<&InstalledStamp>) -> &'static str {
+    match stamp {
+        Some(s) if current_models().keys().all(|k| s.models.contains_key(k)) => "記録",
+        Some(s) if !s.models.is_empty() => "記録と基準値",
+        _ => "基準値",
+    }
+}
+
+/// 名前 → `repo@revision` の表を、サイドカーへ渡す引数の並びにする。
+fn model_args_from(models: &std::collections::BTreeMap<String, String>) -> Vec<String> {
     let mut out = Vec::new();
-    for (name, repo, rev) in MODEL_PINS {
-        let flag = match *name {
+    for (name, value) in models {
+        let flag = match name.as_str() {
             "model_synth" => "--model-synth",
             "model_voice_design" => "--model-voice-design",
             "model_codec" => "--model-codec",
             _ => continue,
+        };
+        // 記録は `repo@revision` の 1 つの文字列。`@` はモデル名に出てこないので最後の `@` で切る。
+        let (repo, rev) = match value.rsplit_once('@') {
+            Some((repo, rev)) if !repo.is_empty() && !rev.is_empty() => (repo, rev),
+            _ => (value.as_str(), "main"),
         };
         out.push(flag.to_string());
         out.push(repo.to_string());
@@ -330,8 +404,15 @@ pub fn write_stamp_pins(
         models,
     };
     let json = serde_json::to_string_pretty(&stamp).context("導入記録の JSON 化")?;
-    std::fs::write(stamp_path(asset_root), json)
-        .with_context(|| format!("導入記録の書き出し: {}", stamp_path(asset_root).display()))?;
+    // **途中の状態を読ませない**（v0.5.6 項目 3a）。書き込みは truncate → 書き込みなので、その間に
+    // 読むと壊れた JSON になり、`read_stamp` はそれを「記録なし」に畳む。読み先を記録から決めるように
+    // なったので、そのときの読み先は基準値へ倒れる。`sidecar.py` の変換結果の書き出しと同じ形にする。
+    let path = stamp_path(asset_root);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)
+        .with_context(|| format!("導入記録の書き出し: {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("導入記録の差し替え: {}", path.display()))?;
     Ok(())
 }
 
@@ -1378,14 +1459,15 @@ where
     on_line("Aratako/Irodori-TTS の HF モデル (約 2〜4GB) を取得しています…");
     let asset_root_str = asset_root.to_string_lossy().into_owned();
     let sidecar_py_str = sidecar_py.to_string_lossy().into_owned();
-    let models = model_args();
+    let models = model_args_for_fetch();
     let mut args: Vec<&str> = vec![
         sidecar_py_str.as_str(),
         "--asset-dir",
         asset_root_str.as_str(),
         "--download-only",
     ];
-    // **正本は Rust 側。** ここで渡さないと、取得する先と起動時に読む先が食い違う。
+    // **取得はいまのビルドの値**（読み先は記録から決める。v0.5.6 項目 3a）。渡さないと `sidecar.py` の
+    // 既定値で取りに行き、Rust が求めているものと食い違う。
     args.extend(models.iter().map(String::as_str));
     run_python(&py_exe, &args, |l| on_line(l))?;
     Ok(())
@@ -1954,6 +2036,195 @@ mod stamp_tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    fn stamp_with_models(models: &[(&str, &str)]) -> InstalledStamp {
+        InstalledStamp {
+            schema: STAMP_SCHEMA,
+            installed_at: 0,
+            pins: Default::default(),
+            resolved: Default::default(),
+            requirements: Default::default(),
+            models: pins_of(models),
+        }
+    }
+
+    /// **読み先は記録から、名前ごとに決める**（v0.5.6 項目 3a の決定表）。
+    ///
+    /// 記録に無い名前は基準値（欄が空の記録が指す環境の中身）へ倒す。**記録全体ではなく名前ごと**に
+    /// 引くのは、`models` が名前ごとに欠けうるため（入れ直した分しか書かないので、1 本だけ欠けた記録が作れる）。
+    /// 記録全体を単位にすると、その 1 本の読み先が未定義になり、渡さなかった分は `sidecar.py` の既定値が使われる。
+    #[test]
+    fn the_read_targets_come_from_the_record_name_by_name() {
+        // 記録が無い → 全部が基準値
+        assert_eq!(models_to_read(None), v054_baseline_models());
+
+        // 記録にある名前はその値、無い名前は基準値
+        let stamp = stamp_with_models(&[("model_synth", "Aratako/Irodori-TTS-500M-v9@abc123")]);
+        let got = models_to_read(Some(&stamp));
+        assert_eq!(
+            got.get("model_synth").map(String::as_str),
+            Some("Aratako/Irodori-TTS-500M-v9@abc123"),
+            "記録の値を読む"
+        );
+        assert_eq!(
+            got.get("model_codec"),
+            v054_baseline_models().get("model_codec"),
+            "記録に無い名前は基準値へ倒す"
+        );
+        assert_eq!(got.len(), current_models().len(), "ビルドが求める名前は全部そろう");
+    }
+
+    /// 決定表の規則そのもの（**名前ごとに 記録 → 基準値 → ビルド**）。
+    ///
+    /// v0.5.6 では基準値といまのビルドが同じ値なので、本物の定数では規則を壊しても差が出ない。
+    /// 3 つの表に**違う値**を入れて、どこから来たかを 1 つずつ確かめる。
+    #[test]
+    fn the_decision_table_picks_name_by_name() {
+        let recorded = pins_of(&[("a", "記録のa")]);
+        let baseline = pins_of(&[("a", "基準値のa"), ("b", "基準値のb")]);
+        let build = pins_of(&[("a", "ビルドのa"), ("b", "ビルドのb"), ("c", "ビルドのc")]);
+
+        let got = pick_models_to_read(&recorded, &baseline, &build);
+
+        assert_eq!(got.get("a").map(String::as_str), Some("記録のa"), "記録が最優先");
+        assert_eq!(
+            got.get("b").map(String::as_str),
+            Some("基準値のb"),
+            "**記録があっても、その名前が無ければ基準値**（記録全体を単位にしない）"
+        );
+        assert_eq!(
+            got.get("c").map(String::as_str),
+            Some("ビルドのc"),
+            "基準値にも無ければビルド（v0.5.7 でモデルを増やしたとき）"
+        );
+        assert_eq!(got.len(), 3, "ビルドが求める名前がそろう: {got:?}");
+
+        // 記録が無い環境は全部が基準値（ビルドではない）
+        let none = pick_models_to_read(&Default::default(), &baseline, &build);
+        assert_eq!(none.get("a").map(String::as_str), Some("基準値のa"));
+        assert_eq!(none.get("b").map(String::as_str), Some("基準値のb"));
+    }
+
+    /// **サイドカーの起動は「読み先」を渡すこと**（v0.5.6 項目 3a の配線）。
+    ///
+    /// 関数を取り違えても型は合うので、テストでは捕まらない（起動には実物の python が要る）。
+    /// `sidecar.py` の既定値を見張っているのと同じやり方で、呼び出しの側をテキストで固定する。
+    #[test]
+    fn the_sidecar_is_started_with_the_read_targets() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/sidecar.rs"),
+        )
+        .expect("sidecar.rs を読めること");
+        assert!(
+            src.contains("model_args_for_read(asset_root)"),
+            "起動が読み先を使っていない"
+        );
+        assert!(
+            !src.contains("model_args_for_fetch"),
+            "起動に取得先を渡している（重みが無いモデルを読みに行く）"
+        );
+    }
+
+    /// 読み先をどこから決めたかを言い分ける（実機で追う観測点）。
+    #[test]
+    fn the_source_of_the_read_targets_is_named() {
+        assert_eq!(where_models_come_from(None), "基準値");
+        let full: Vec<(&str, &str)> = V054_BASELINE_MODELS.to_vec();
+        assert_eq!(where_models_come_from(Some(&stamp_with_models(&full))), "記録");
+        assert_eq!(
+            where_models_come_from(Some(&stamp_with_models(&full[..1]))),
+            "記録と基準値"
+        );
+    }
+
+    /// **取得する先と読む先は別**（v0.5.6 項目 3a）。取得はいまのビルド、読みは記録。
+    /// 同じ値を両方へ渡していたため、定数を変えた版を入れた瞬間に重みの無いモデルを読みに行っていた。
+    #[test]
+    fn what_is_fetched_and_what_is_read_can_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stamp_pins(
+            dir.path(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            pins_of(&[
+                ("model_synth", "Aratako/Irodori-TTS-500M-v3@old111"),
+                (
+                    "model_voice_design",
+                    "Aratako/Irodori-TTS-500M-v2-VoiceDesign@main",
+                ),
+                ("model_codec", "Aratako/Semantic-DACVAE-Japanese-32dim@main"),
+            ]),
+        )
+        .unwrap();
+
+        let (read, from) = model_args_for_read(dir.path());
+        assert_eq!(from, "記録");
+        let read = read.join(" ");
+        assert!(read.contains("--model-synth-revision old111"), "{read}");
+        let fetch = model_args_for_fetch().join(" ");
+        assert!(fetch.contains("--model-synth-revision main"), "{fetch}");
+        assert_ne!(read, fetch, "記録が古ければ読み先と取得先は違う");
+    }
+
+    /// **書いている最中に読んでも、記録は壊れて見えない**（v0.5.6 項目 3a）。
+    ///
+    /// 上書きで書くと truncate と書き込みの間が読めてしまい、`read_stamp` はそれを「記録なし」に畳む。
+    /// 読み先を記録から決めるようになったので、そのとき読み先が基準値へ倒れる（v0.5.7 では
+    /// 更新に成功した環境が旧モデルを読みに行き、合成が無言で VOICEVOX へ落ちる）。
+    #[test]
+    fn a_record_being_written_is_never_read_half_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let write = |tag: &str| {
+            write_stamp_pins(
+                &root,
+                pins_of(&[("python", "3.11.9")]),
+                pins_of(&[("torch", tag)]),
+                Default::default(),
+                pins_of(&[("model_synth", "Aratako/Irodori-TTS-500M-v3@main")]),
+            )
+            .unwrap()
+        };
+        write("2.10.0");
+
+        let reading = root.clone();
+        let reader = std::thread::spawn(move || {
+            let mut missing = 0;
+            for _ in 0..400 {
+                if read_stamp(&reading).is_none() {
+                    missing += 1;
+                }
+            }
+            missing
+        });
+        for i in 0..200 {
+            write(if i % 2 == 0 { "2.10.0" } else { "2.10.1" });
+        }
+        let missing = reader.join().unwrap();
+        assert_eq!(missing, 0, "書いている最中の記録が {missing} 回読めなかった");
+    }
+
+    /// 記録の書き込みは差し替えで行う（書きかけを残さない）。
+    #[test]
+    fn the_record_is_replaced_not_written_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stamp_pins(
+            dir.path(),
+            pins_of(&[("python", "3.11.9")]),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        assert!(read_stamp(dir.path()).is_some(), "書いた記録が読めること");
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, [STAMP_FILE], "書きかけを残さない: {left:?}");
     }
 
     /// **記録が無い環境を「最新」と言わない** (v0.5.4 項目 2)。
@@ -2565,13 +2836,13 @@ mod stamp_tests {
         assert_eq!(got, ["model_synth"], "モデルの変更が対象に入らないと届かない");
     }
 
-    /// **サイドカーへ渡す指定は、取得側と起動側で同じであること** (v0.5.5 項目 3)。
+    /// **取得しに行く先は、ビルドが求める pin を全部渡すこと** (v0.5.5 項目 3 / v0.5.6 項目 3a)。
     ///
-    /// 2 経路あるので、片方だけに渡すと**取得した先と読む先が食い違う**。
-    /// `model_args` に一本化し、`--download-only` と通常起動の両方がこれを使う。
+    /// 渡さない分は `sidecar.py` の既定値で取りに行き、Rust が求めているものと食い違う。
+    /// **読む先は別**（記録から決める。`the_read_targets_come_from_the_record_name_by_name`）。
     #[test]
     fn model_args_cover_every_pin() {
-        let args = model_args();
+        let args = model_args_for_fetch();
         for (_, repo, rev) in MODEL_PINS {
             assert!(args.iter().any(|a| a == repo), "{repo} を渡していない: {args:?}");
             assert!(args.iter().any(|a| a == rev), "{repo} の revision を渡していない");

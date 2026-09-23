@@ -94,6 +94,10 @@ SAMPLE_RATE = 22050  # モック wav のサンプルレート
 # **毎起動で無条件に上書きコピーされる**のに重みは初回 DL でしか取らないため、
 # ID を変えた瞬間「コードだけ新しくなって重みが無い」状態になる。
 # Rust から `--model-*` で渡させ、ここの値は**渡されなかったとき用の保険**に留める。
+#
+# v0.5.6 項目 3a: Rust が渡す値は経路で違う。**取得（--download-only）はいまのビルドの値、
+# 起動（読み先）は導入記録から決めた値**で、更新が成功したときだけ記録がビルドに追いつく。
+# ここの既定値は v3（重みがある側）のままにしておく — 渡し忘れたときに重みの無い側へ倒れないように。
 MODEL_REPO_SYNTH = "Aratako/Irodori-TTS-500M-v3"
 MODEL_REPO_VOICE_DESIGN = "Aratako/Irodori-TTS-500M-v2-VoiceDesign"
 MODEL_REPO_CODEC = "Aratako/Semantic-DACVAE-Japanese-32dim"
