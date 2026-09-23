@@ -55,6 +55,8 @@ pub(crate) enum Ended {
     Exited(ExitStatus),
     /// 無進捗が続いたので、Job ごと止めた。
     Stalled,
+    /// 全体の締め切りを過ぎたので、Job ごと止めた（`run_streaming_until`）。
+    TimedOut,
 }
 
 /// 1 行の上限。改行を出さずに書き続けるプロセスで、メモリを使い切らないため。
@@ -307,11 +309,27 @@ const TICK: Duration = Duration::from_millis(250);
 /// - `stall_after` の間、出力も読み書きも CPU も無ければ、Job ごと止めて `Ended::Stalled`
 /// - 非同期の文脈から呼ぶときは `off_the_async_workers` で包む
 pub(crate) fn run_streaming(
+    cmd: Command,
+    stdin: Option<&[u8]>,
+    stall_after: Option<Duration>,
+    on_line: impl FnMut(Line<'_>),
+) -> std::io::Result<Ended> {
+    run_streaming_until(cmd, stdin, stall_after, None, on_line)
+}
+
+/// `run_streaming` に**全体の締め切り**を足したもの（v0.5.6 項目 3b の合成ゲート）。
+///
+/// 無進捗は「出力も読み書きも CPU も無い」で数えるので、**CPU を使い続けて終わらない処理**
+/// （例: 読み込みが止まらないモデル）では鳴らない。締め切りを過ぎたら Job ごと止めて `Ended::TimedOut`。
+/// Job に入れられなかったときも、締め切りは子を止めて守る（無進捗の判定と違い、止め方が 1 つで足りる）。
+pub(crate) fn run_streaming_until(
     mut cmd: Command,
     stdin: Option<&[u8]>,
     stall_after: Option<Duration>,
+    deadline: Option<Duration>,
     mut on_line: impl FnMut(Line<'_>),
 ) -> std::io::Result<Ended> {
+    let started = Instant::now();
     cmd.creation_flags(crate::tts::irodori_download::CREATE_NO_WINDOW)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -362,6 +380,8 @@ pub(crate) fn run_streaming(
     let mut last_activity = job.as_ref().and_then(Job::activity);
     let mut last_check = Instant::now();
     let mut open = true;
+    // 抜けた理由。`None` は子が自分で終わった（`exited` に終了状態が入る）。
+    let mut stopped: Option<Ended> = None;
     let exited = loop {
         if open {
             match rx.recv_timeout(TICK) {
@@ -389,8 +409,13 @@ pub(crate) fn run_streaming(
                 }
             }
             if last_progress.elapsed() >= limit {
+                stopped = Some(Ended::Stalled);
                 break None;
             }
+        }
+        if deadline.is_some_and(|limit| started.elapsed() >= limit) {
+            stopped = Some(Ended::TimedOut);
+            break None;
         }
     };
 
@@ -410,7 +435,7 @@ pub(crate) fn run_streaming(
         Some(status) => Ok(Ended::Exited(status)),
         None => {
             let _ = child.wait();
-            Ok(Ended::Stalled)
+            Ok(stopped.unwrap_or(Ended::Stalled))
         }
     }
 }
@@ -676,6 +701,37 @@ mod tests {
         assert!(
             after.io > before.io,
             "書き続けているのに読み書きが増えていない: {before:?} → {after:?}"
+        );
+    }
+
+    /// **締め切りを過ぎたら、動き続けている子も止める**（v0.5.6 項目 3b）。無進捗の判定では止まらない
+    /// （出力も読み書きも続いている）ものを止められるのは締め切りだけ。
+    #[test]
+    fn a_busy_child_is_stopped_at_the_deadline() {
+        let started = Instant::now();
+        let mut lines = 0;
+        // 0.1 秒おきに 1 行出し続ける（30 秒かかる）
+        let mut c = Command::new("powershell.exe");
+        c.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "1..300 | ForEach-Object { Write-Output \"tick $_\"; Start-Sleep -Milliseconds 100 }",
+        ]);
+        let ended = run_streaming_until(
+            c,
+            None,
+            Some(Duration::from_secs(60)),
+            Some(Duration::from_secs(3)),
+            |_| lines += 1,
+        )
+        .unwrap();
+        assert!(matches!(ended, Ended::TimedOut), "{ended:?}");
+        assert!(lines > 0, "止めるまでは行が流れていた");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "締め切りで止まっていない: {:?}",
+            started.elapsed()
         );
     }
 

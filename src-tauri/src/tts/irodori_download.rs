@@ -1690,7 +1690,7 @@ where
             .context("HF モデルの取得に失敗しました")?;
     }
 
-    // ④ 合成で確かめる — v0.5.6 項目 3b で入れる。
+    // ④ 合成で確かめる のは呼び出し側（`update_irodori_runtime`。不合格なら戻したあとにもう一度試すため）。
     Ok(())
 }
 
@@ -1741,6 +1741,266 @@ where
     }
 }
 
+// ============ 1 回合成のゲート (v0.5.6 項目 3b) ============
+
+/// 一発合成の報告の目印（`sidecar.py` の `SYNTH_ONCE_*_MARKER` と同じ文字列。契約テストが見張る）。
+const SYNTH_ONCE_START_MARKER: &str = "UGG_SYNTH_ONCE_START ";
+const SYNTH_ONCE_MARKER: &str = "UGG_SYNTH_ONCE ";
+/// 一発合成の終了コード（`sidecar.py` と揃える）。
+const SYNTH_ONCE_OOM: i32 = 2;
+const SYNTH_ONCE_NO_GPU: i32 = 3;
+
+/// ゲートの締め切り。**根拠になる実測が無い**（モデルの読み込み時間の記録が docs に 1 件も無い）ので
+/// 広めに取り、実機検証で所要時間を記録する（合格したときの行に、読み込みを含めた時間を出す）。
+/// 無進捗 5 分は「CPU を使い続けて終わらない読み込み」では鳴らないので、締め切りが別に要る。
+const GATE_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+/// 落ちたときに「VRAM 不足の疑い」とみなす、開始時の空き VRAM（MB）。
+/// v3・fp32 の VRAM のピークは実測 3.5 GB（spec §6.0 の実測表）。
+const GATE_VRAM_SUSPECT_MB: u64 = 4096;
+
+/// ゲートの作業場所（参照音声の写しと、事前変換の結果が置かれる。終わったら消す）。
+const GATE_DIR: &str = ".update-gate";
+
+/// torch が CUDA を使えるかを聞くときの目印。
+const CUDA_PROBE_MARKER: &str = "UGG_CUDA ";
+
+/// 子プロセスがどう終わったか（ゲートの判定に要る分だけ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateExit {
+    Code(Option<i32>),
+    /// 締め切り・無進捗で止めた。
+    TimedOut,
+}
+
+/// 一発合成の結果（v0.5.6 項目 3b）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateOutcome {
+    /// 合成できた（モデルの読み込みを含めた時間）。
+    Passed { ms: u64 },
+    /// 参照音声が 1 つも無い（ユーザー裁定: 確かめられなかったとして更新は成立させる）。
+    NoVoiceRef,
+    /// torch から GPU が見えない。
+    NoGpu,
+    /// GPU のメモリ不足（例外として捕まえられた）。
+    OutOfMemory,
+    /// 合成できなかった（理由つき）。
+    Failed(String),
+    /// 結果の行を出さずに終わった（例外にならずプロセスごと落ちた）。開始時の空き VRAM があれば添える。
+    Crashed { code: Option<i32>, vram_free_mb: Option<u64> },
+    /// 締め切りまでに終わらなかった。
+    TimedOut,
+}
+
+/// 子プロセスの終わり方と、目印の 2 行から結果を決める（純関数）。
+fn classify_gate(
+    exit: GateExit,
+    start: Option<&serde_json::Value>,
+    result: Option<&serde_json::Value>,
+) -> GateOutcome {
+    if exit == GateExit::TimedOut {
+        return GateOutcome::TimedOut;
+    }
+    let vram_free_mb = start
+        .and_then(|s| s.get("vram_free_mb"))
+        .and_then(serde_json::Value::as_u64);
+    let Some(result) = result else {
+        let GateExit::Code(code) = exit else {
+            return GateOutcome::TimedOut;
+        };
+        // 結果の行が無くても、終了コードが意味を持つことがある。
+        return match code {
+            Some(SYNTH_ONCE_OOM) => GateOutcome::OutOfMemory,
+            Some(SYNTH_ONCE_NO_GPU) => GateOutcome::NoGpu,
+            _ => GateOutcome::Crashed { code, vram_free_mb },
+        };
+    };
+    let ok = result.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
+    let bytes = result.get("bytes").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    if ok && bytes > 0 && exit == GateExit::Code(Some(0)) {
+        let ms = result.get("ms").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        return GateOutcome::Passed { ms };
+    }
+    match result.get("kind").and_then(serde_json::Value::as_str) {
+        Some("oom") => GateOutcome::OutOfMemory,
+        Some("no_gpu") => GateOutcome::NoGpu,
+        _ => GateOutcome::Failed(
+            result
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(crate::dialogue::llm::truncate_for_log)
+                .unwrap_or_else(|| "理由の分からない失敗".to_string()),
+        ),
+    }
+}
+
+/// ゲートの結果をどう扱うか。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateVerdict {
+    /// 合格。
+    Pass(String),
+    /// 確かめられなかったが、更新は成立させる（ユーザー裁定 2026-09-20: 参照音声が無い・元から GPU が
+    /// 見えない環境）。
+    Skip(String),
+    /// VRAM が足りない。「移行の失敗」とは別の案内で全部戻す（spec の裁定: 既定は戻して「空けてからもう一度」）。
+    RollBackForVram(String),
+    /// 更新で壊れた疑い。全部戻し、元の状態でもう一度試して切り分ける。
+    RollBack(String),
+}
+
+/// ゲートの結果の扱いを決める（純関数）。
+///
+/// **GPU は差分で見る**（反証レビュー #1）。「GPU が見えなければ飛ばす」だけだと、更新が CUDA を壊した
+/// ときも成功として記録が進み、更新ボタンが消えて戻す導線ごと失われる。**前は使えたのに使えなく
+/// なった**なら更新のせいとして戻す。元から使えない（または分からない）環境だけ飛ばす。
+fn gate_verdict(outcome: &GateOutcome, cuda_before: Option<bool>) -> GateVerdict {
+    match outcome {
+        GateOutcome::Passed { ms } => GateVerdict::Pass(format!(
+            "合成できました（モデルの読み込みを含めて {:.1} 秒）",
+            *ms as f64 / 1000.0
+        )),
+        GateOutcome::NoVoiceRef => GateVerdict::Skip(
+            "参照音声がまだ無いので、合成は確かめられませんでした（更新は済ませました）".to_string(),
+        ),
+        GateOutcome::NoGpu if cuda_before == Some(true) => GateVerdict::RollBack(
+            "更新のあと、GPU（CUDA）が使えなくなりました".to_string(),
+        ),
+        GateOutcome::NoGpu => GateVerdict::Skip(
+            "GPU が見えないので、合成は確かめられませんでした（更新は済ませました）".to_string(),
+        ),
+        GateOutcome::OutOfMemory => GateVerdict::RollBackForVram(
+            "GPU のメモリ（VRAM）が足りず、合成で確かめられませんでした".to_string(),
+        ),
+        GateOutcome::Crashed {
+            vram_free_mb: Some(free),
+            ..
+        } if *free < GATE_VRAM_SUSPECT_MB => GateVerdict::RollBackForVram(format!(
+            "合成の確認の途中で Python が終了しました。始めたときの空き VRAM が {free} MB で、足りなかったと見られます"
+        )),
+        GateOutcome::Crashed { code, .. } => GateVerdict::RollBack(format!(
+            "合成の確認の途中で Python が異常終了しました (code {code:?})"
+        )),
+        GateOutcome::Failed(why) => GateVerdict::RollBack(format!("更新したランタイムで合成できませんでした: {why}")),
+        GateOutcome::TimedOut => GateVerdict::RollBack(format!(
+            "合成の確認が {} 分で終わりませんでした",
+            GATE_DEADLINE.as_secs() / 60
+        )),
+    }
+}
+
+/// 戻したあとの確認の結果を、エラーに添える（純関数。反証レビュー #2）。
+///
+/// **絶対値で「更新のせい」と決めない。** 合成は更新と関係の無い理由（共有の HF キャッシュが掃除された・
+/// 参照音声が壊れている）でも落ちる。戻した状態で合成できれば更新が原因、できなければ元から合成できない
+/// 環境（更新のせいではない）と言い分ける。
+fn explain_after_recheck(err: anyhow::Error, recheck: &GateOutcome) -> anyhow::Error {
+    match recheck {
+        GateOutcome::Passed { .. } => anyhow!("{err:#}。元に戻した状態では合成できたので、更新が原因です"),
+        GateOutcome::OutOfMemory | GateOutcome::Crashed { .. } | GateOutcome::TimedOut => {
+            anyhow!("{err:#}。元に戻した状態でも合成を確かめられませんでした（更新のせいかは分かりません）")
+        }
+        GateOutcome::Failed(why) => anyhow!(
+            "{err:#}。元に戻した状態でも合成できませんでした — 更新の前から、この環境では合成できていません（更新のせいではありません）: {why}"
+        ),
+        GateOutcome::NoVoiceRef | GateOutcome::NoGpu => err,
+    }
+}
+
+/// ゲートの材料にする参照音声（ユーザー裁定 2026-09-20: いまある参照音声を使う）。
+///
+/// `refs\` の wav から、メイン → サブ → その他の順、同じ順位なら新しいものを選ぶ。DB は見ない
+/// （更新の経路は DB に触れない。記録の無い wav も、合成の材料としては同じく使える）。
+fn pick_gate_voice_ref(asset_root: &Path) -> Option<PathBuf> {
+    let refs = asset_root.join("refs");
+    let entries = std::fs::read_dir(&refs).ok()?;
+    let mut candidates: Vec<(u8, std::cmp::Reverse<std::time::SystemTime>, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            if !name.to_ascii_lowercase().ends_with(".wav") || !path.is_file() {
+                return None;
+            }
+            let rank = if name.starts_with("main_") {
+                0
+            } else if name.starts_with("sub_") {
+                1
+            } else {
+                2
+            };
+            let modified = e.metadata().and_then(|m| m.modified()).ok()?;
+            Some((rank, std::cmp::Reverse(modified), path))
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next().map(|(_, _, path)| path)
+}
+
+/// 1 回だけ合成して確かめる（v0.5.6 項目 3b）。`model_args` は試すモデル（取得したいまのビルドの値か、
+/// 戻したあとの読み先）。**HTTP は使わない**（更新中は錠で塞がっている）ので、子プロセスとして走らせる。
+fn run_synth_gate<F>(asset_root: &Path, py_exe: &Path, model_args: &[String], mut on_line: F) -> GateOutcome
+where
+    F: FnMut(&str),
+{
+    let Some(voice) = pick_gate_voice_ref(asset_root) else {
+        return GateOutcome::NoVoiceRef;
+    };
+    // 参照音声は**写しを渡す**。事前変換の結果は参照 wav の隣に作られるので、元の場所で走らせると
+    // ユーザーの refs に試験の変換結果が残る。他のプロセスが掴んでいるファイルで落ちることも避けられる。
+    let work = asset_root.join(GATE_DIR);
+    let _ = std::fs::remove_dir_all(&work);
+    let copy = work.join("ref.wav");
+    if let Err(err) = std::fs::create_dir_all(&work).and_then(|()| std::fs::copy(&voice, &copy).map(|_| ())) {
+        let _ = std::fs::remove_dir_all(&work);
+        return GateOutcome::Failed(format!("参照音声を作業場所へ写せません: {err}"));
+    }
+    on_line("更新したランタイムで 1 回合成して確かめています…（モデルの読み込みに時間がかかります）");
+    let mut cmd = Command::new(py_exe);
+    cmd.arg(asset_root.join("sidecar.py"))
+        .arg("--asset-dir")
+        .arg(asset_root)
+        .arg("--synth-once")
+        .arg("--voice-ref")
+        .arg(&copy)
+        .args(model_args);
+    let mut start: Option<serde_json::Value> = None;
+    let mut result: Option<serde_json::Value> = None;
+    let ended = child_process::off_the_async_workers(|| {
+        child_process::run_streaming_until(cmd, None, Some(PYTHON_STALL_AFTER), Some(GATE_DEADLINE), |l| {
+            // 目印は START を先に見る（`UGG_SYNTH_ONCE` は START の頭と同じ）。
+            if let Some(json) = l.text.strip_prefix(SYNTH_ONCE_START_MARKER.trim_end()) {
+                start = serde_json::from_str(json.trim()).ok();
+            } else if let Some(json) = l.text.strip_prefix(SYNTH_ONCE_MARKER.trim_end()) {
+                result = serde_json::from_str(json.trim()).ok();
+            } else if !l.overwritten {
+                on_line(l.text);
+            }
+        })
+    });
+    let _ = std::fs::remove_dir_all(&work);
+    let exit = match ended {
+        Ok(Ended::Exited(status)) => GateExit::Code(status.code()),
+        Ok(Ended::Stalled | Ended::TimedOut) => GateExit::TimedOut,
+        Err(err) => return GateOutcome::Failed(format!("python 起動失敗: {err}")),
+    };
+    classify_gate(exit, start.as_ref(), result.as_ref())
+}
+
+/// torch から CUDA が使えるか（更新の前に聞いておく。分からなければ `None`）。
+fn probe_cuda(py_exe: &Path) -> Option<bool> {
+    let script = format!(
+        "import json,torch\nprint({marker:?}+json.dumps(bool(torch.cuda.is_available())))",
+        marker = CUDA_PROBE_MARKER,
+    );
+    let mut found = None;
+    let _ = run_python_lines(py_exe, &["-c", &script], false, |l| {
+        if let Some(json) = l.text.strip_prefix(CUDA_PROBE_MARKER.trim_end()) {
+            found = serde_json::from_str::<bool>(json.trim()).ok();
+        }
+    });
+    found
+}
+
 /// 古くなった分だけを入れ直す (v0.5.4 項目 3 / v0.5.6 項目 3c・3d、spec §6.0)。
 ///
 /// **1 つのトランザクションにする。** 途中のどこで失敗しても、入れ替えたものを**全部**戻す
@@ -1750,7 +2010,8 @@ where
 /// 1. 前回の更新が途中で止まっていれば、先に元へ戻す（`recover_interrupted_update`）
 /// 2. 入っている全配布の版を控える（控えを取れなければ何も変えずに止まる）
 /// 3. 計画の順に入れ直す（`update_plan` / `apply_update_plan`）
-/// 4. 失敗したら全部戻す（`roll_back_update`）。成功したら退避と控えを捨てて記録する
+/// 4. **1 回合成して確かめる**（`run_synth_gate` / `gate_verdict`。v0.5.6 項目 3b）
+/// 5. 失敗・不合格なら全部戻す（`roll_back_update`）。成功したら退避と控えを捨てて記録する
 ///
 /// 戻り値は「入れ直せた名前」。呼び出し側はこれで記録を部分的に更新する。
 pub async fn update_irodori_runtime<F>(
@@ -1793,6 +2054,15 @@ where
         }
     }
 
+    // **GPU が使えるかを先に聞いておく**（v0.5.6 項目 3b。ゲートで GPU が見えなかったとき、
+    // 「元から見えない環境」と「更新で壊れた」を言い分けるため）。パッケージを入れ替えないなら
+    // CUDA は壊れようがないので聞かない（torch の読み込みに数秒かかる）。
+    let cuda_before = if plan.touches_packages() {
+        probe_cuda(&py_exe)
+    } else {
+        None
+    };
+
     // **版の控え**（v0.5.6 項目 3d）。パッケージを入れ替えるときだけ取る（モデルだけの更新・
     // 前回の後始末だけの呼び出しでは、戻す対象が無い）。取れなければ、戻す手段が無いので何も変えずに止まる。
     let touches_packages = plan.touches_packages();
@@ -1815,9 +2085,44 @@ where
         |l| on_line(l),
     )
     .await;
+    let versions = touches_packages.then_some(&before_versions);
     if let Err(err) = applied {
-        let versions = touches_packages.then_some(&before_versions);
         return Err(roll_back_update(asset_root, &py_exe, versions, err, |l| on_line(l)));
+    }
+
+    // ④ **1 回合成して確かめる**（v0.5.6 項目 3b）。試すのは**取得したいまのビルドの値**（旧い読み先で
+    // 試しても「コードだけ新しくて重みが無い」を捕まえられない）。
+    // 入れ直すものが無い呼び出し（前回の後始末だけ）では確かめない（何も変えていない）。
+    let outcome = if plan.names.is_empty() {
+        GateOutcome::Passed { ms: 0 }
+    } else {
+        run_synth_gate(asset_root, &py_exe, &model_args_for_fetch(), |l| on_line(l))
+    };
+    match gate_verdict(&outcome, cuda_before) {
+        GateVerdict::Pass(_) if plan.names.is_empty() => {}
+        GateVerdict::Pass(message) => {
+            // 読み込みを含めた所要時間の記録（締め切りの根拠になる実測が無いため、実機で集める）。
+            crate::ulog!("[irodori] 更新の確認: {message}");
+            on_line(&message);
+        }
+        GateVerdict::Skip(message) => {
+            crate::ulog!("[irodori] 更新の確認: {message}");
+            on_line(&message);
+        }
+        GateVerdict::RollBackForVram(why) => {
+            let err = anyhow!(
+                "{why}。VRAM を空けてから（GPU を使うほかのアプリを止めてから）、もう一度更新してください"
+            );
+            return Err(roll_back_update(asset_root, &py_exe, versions, err, |l| on_line(l)));
+        }
+        GateVerdict::RollBack(why) => {
+            let err = roll_back_update(asset_root, &py_exe, versions, anyhow!(why), |l| on_line(l));
+            // **絶対値で「更新のせい」と決めない**（反証レビュー #2）。戻した状態でもう一度試して切り分ける。
+            on_line("元に戻した状態でも合成できるかを確かめています…（更新のせいかを切り分けます）");
+            let (read_args, _) = model_args_for_read(asset_root);
+            let recheck = run_synth_gate(asset_root, &py_exe, &read_args, |l| on_line(l));
+            return Err(explain_after_recheck(err, &recheck));
+        }
     }
 
     // ここまで来たら全部成功している。退避と控えを捨てる。
@@ -2059,6 +2364,8 @@ where
             "Python の処理が {} 分間、出力も読み書きもしないまま止まっていたので中断しました",
             PYTHON_STALL_AFTER.as_secs() / 60
         ),
+        // 締め切りは付けていない（`run_streaming` は無進捗でだけ止める）ので来ないが、来たら同じく中断。
+        Ended::TimedOut => anyhow!("Python の処理が時間内に終わらなかったので中断しました"),
     };
     if log_failure {
         crate::ulog!("[irodori:python] {} — {err}", describe_args(args));
@@ -3861,6 +4168,187 @@ mod update_tests {
         assert_eq!(names, [VERSIONS_SNAPSHOT_FILE]);
         remove_versions_snapshot(dir.path());
         assert!(read_versions_snapshot(dir.path()).is_none());
+    }
+
+    fn json(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// 子プロセスの終わり方と目印の行から、ゲートの結果を決める（v0.5.6 項目 3b）。
+    #[test]
+    fn the_gate_outcome_is_read_from_the_markers_and_the_exit() {
+        let start = json(r#"{"cuda":true,"vram_free_mb":2500}"#);
+        let ok = json(r#"{"ok":true,"ms":41234,"bytes":90000}"#);
+        assert_eq!(
+            classify_gate(GateExit::Code(Some(0)), Some(&start), Some(&ok)),
+            GateOutcome::Passed { ms: 41234 }
+        );
+        // 「ok」と言っても空の合成・0 以外の終了は合格にしない
+        let empty = json(r#"{"ok":true,"ms":1,"bytes":0}"#);
+        assert!(matches!(
+            classify_gate(GateExit::Code(Some(0)), None, Some(&empty)),
+            GateOutcome::Failed(_)
+        ));
+        assert!(!matches!(
+            classify_gate(GateExit::Code(Some(1)), None, Some(&ok)),
+            GateOutcome::Passed { .. }
+        ));
+        assert_eq!(
+            classify_gate(GateExit::Code(Some(2)), None, Some(&json(r#"{"ok":false,"kind":"oom"}"#))),
+            GateOutcome::OutOfMemory
+        );
+        assert_eq!(
+            classify_gate(GateExit::Code(Some(3)), None, Some(&json(r#"{"ok":false,"kind":"no_gpu"}"#))),
+            GateOutcome::NoGpu
+        );
+        assert_eq!(
+            classify_gate(
+                GateExit::Code(Some(1)),
+                None,
+                Some(&json(r#"{"ok":false,"kind":"other","error":"FileNotFoundError: model.safetensors"}"#))
+            ),
+            GateOutcome::Failed("FileNotFoundError: model.safetensors".to_string())
+        );
+        // **結果の行が無い ＝ 例外にならず落ちた**。開始時の空き VRAM を手がかりに残す
+        assert_eq!(
+            classify_gate(GateExit::Code(Some(-1073741819)), Some(&start), None),
+            GateOutcome::Crashed { code: Some(-1073741819), vram_free_mb: Some(2500) }
+        );
+        // 結果の行が無くても、終了コードが意味を持つ
+        assert_eq!(classify_gate(GateExit::Code(Some(2)), None, None), GateOutcome::OutOfMemory);
+        assert_eq!(classify_gate(GateExit::TimedOut, Some(&start), Some(&ok)), GateOutcome::TimedOut);
+    }
+
+    /// **GPU は差分で見る**（反証レビュー #1）。前は使えたのに使えなくなったら更新のせいとして戻す。
+    /// 元から見えない・分からない環境だけ飛ばす（ユーザー裁定）。
+    #[test]
+    fn a_gpu_lost_by_the_update_is_rolled_back_but_a_missing_one_is_skipped() {
+        assert!(matches!(gate_verdict(&GateOutcome::NoGpu, Some(true)), GateVerdict::RollBack(_)));
+        assert!(matches!(gate_verdict(&GateOutcome::NoGpu, Some(false)), GateVerdict::Skip(_)));
+        assert!(matches!(gate_verdict(&GateOutcome::NoGpu, None), GateVerdict::Skip(_)));
+        assert!(matches!(gate_verdict(&GateOutcome::NoVoiceRef, Some(true)), GateVerdict::Skip(_)));
+        assert!(matches!(gate_verdict(&GateOutcome::Passed { ms: 1 }, Some(true)), GateVerdict::Pass(_)));
+    }
+
+    /// **VRAM 不足は「移行の失敗」と別の案内で戻す**（spec の裁定）。例外にならず落ちたときは、
+    /// 始めたときの空き VRAM が少なければ VRAM 不足とみなす。
+    #[test]
+    fn a_vram_shortage_is_told_apart_from_a_broken_update() {
+        assert!(matches!(gate_verdict(&GateOutcome::OutOfMemory, None), GateVerdict::RollBackForVram(_)));
+        assert!(matches!(
+            gate_verdict(&GateOutcome::Crashed { code: Some(1), vram_free_mb: Some(900) }, None),
+            GateVerdict::RollBackForVram(_)
+        ));
+        assert!(matches!(
+            gate_verdict(&GateOutcome::Crashed { code: Some(1), vram_free_mb: Some(12000) }, None),
+            GateVerdict::RollBack(_)
+        ));
+        assert!(matches!(
+            gate_verdict(&GateOutcome::Crashed { code: Some(1), vram_free_mb: None }, None),
+            GateVerdict::RollBack(_)
+        ));
+        assert!(matches!(gate_verdict(&GateOutcome::Failed("x".into()), None), GateVerdict::RollBack(_)));
+        assert!(matches!(gate_verdict(&GateOutcome::TimedOut, None), GateVerdict::RollBack(_)));
+    }
+
+    /// **戻した状態でもう一度試して、更新のせいかを言い分ける**（反証レビュー #2）。
+    #[test]
+    fn the_recheck_after_the_rollback_says_whose_fault_it_was() {
+        let base = || anyhow!("更新したランタイムで合成できませんでした: X");
+        let caused = format!("{:#}", explain_after_recheck(base(), &GateOutcome::Passed { ms: 1 }));
+        assert!(caused.contains("更新が原因"), "{caused}");
+        let before = format!(
+            "{:#}",
+            explain_after_recheck(base(), &GateOutcome::Failed("FileNotFoundError".into()))
+        );
+        assert!(before.contains("更新のせいではありません"), "{before}");
+        assert!(before.contains("FileNotFoundError"), "{before}");
+        let unknown = format!("{:#}", explain_after_recheck(base(), &GateOutcome::OutOfMemory));
+        assert!(unknown.contains("分かりません"), "{unknown}");
+    }
+
+    /// ゲートの材料: `refs\` の wav から、メイン → サブ → その他、同じ順位なら新しいもの（ユーザー裁定）。
+    /// 事前変換の結果（`.latent.pt`）は選ばない。
+    #[test]
+    fn the_gate_uses_the_newest_main_reference_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(pick_gate_voice_ref(dir.path()), None, "refs が無ければ材料なし");
+        let refs = dir.path().join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        let put = |name: &str, age_secs: u64| {
+            let path = refs.join(name);
+            std::fs::write(&path, b"RIFF").unwrap();
+            let when = std::time::SystemTime::now() - Duration::from_secs(age_secs);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+            path
+        };
+        put("sub_300.wav", 10);
+        put("main_100.wav", 1000);
+        let newest_main = put("main_200.wav", 100);
+        put("main_200.Aratako__x.fp32-fp32.n-16_e1_s30.latent.pt", 1);
+        assert_eq!(pick_gate_voice_ref(dir.path()), Some(newest_main));
+    }
+
+    /// 参照音声が 1 つも無ければ、合成は確かめず（python も起動せず）「材料なし」を返す。
+    #[test]
+    fn without_a_reference_voice_the_gate_is_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("python").join("python.exe");
+        let mut lines = Vec::new();
+        assert_eq!(
+            run_synth_gate(dir.path(), &py, &[], |l| lines.push(l.to_string())),
+            GateOutcome::NoVoiceRef
+        );
+        assert!(lines.is_empty(), "何も始めていない: {lines:?}");
+        assert!(!dir.path().join(GATE_DIR).exists());
+    }
+
+    /// **ゲートは取得したいまのビルドの値で試し、戻したあとの確認は読み先で試す**（v0.5.6 項目 3b の配線）。
+    /// 取り違えても型は合うのでテストでは捕まらない（実物の python が要る）。旧い読み先で試すと
+    /// 「コードだけ新しくて重みが無い」を捕まえられず、戻したあとを新しい値で試すと切り分けにならない。
+    #[test]
+    fn the_gate_tries_the_new_models_and_the_recheck_tries_the_old_ones() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"),
+        )
+        .unwrap();
+        let body = &src[src.find("pub async fn update_irodori_runtime").unwrap()..];
+        let body = &body[..body.find("
+}
+").unwrap()];
+        let gate = body
+            .find("run_synth_gate(asset_root, &py_exe, &model_args_for_fetch()")
+            .expect("ゲートが取得したいまのビルドの値で試していない");
+        let read = body
+            .find("let (read_args, _) = model_args_for_read(asset_root);")
+            .expect("戻したあとの確認が読み先を使っていない");
+        let recheck = body
+            .find("run_synth_gate(asset_root, &py_exe, &read_args")
+            .expect("戻したあとにもう一度試していない");
+        assert!(gate < read && read < recheck, "順序が崩れている");
+    }
+
+    /// **`sidecar.py` の一発合成と噛み合っていること**（目印の文字列・終了コード・分岐の位置）。
+    /// どちらか片方だけ変えると、ゲートは結果を読めず「落ちた」と誤判定する。
+    #[test]
+    fn the_gate_matches_the_sidecar_synth_once_mode() {
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("python/sidecar.py"))
+            .expect("sidecar.py を読めること");
+        assert!(src.contains(&format!("SYNTH_ONCE_START_MARKER = {SYNTH_ONCE_START_MARKER:?}")));
+        assert!(src.contains(&format!("SYNTH_ONCE_MARKER = {SYNTH_ONCE_MARKER:?}")));
+        assert!(src.contains(&format!("SYNTH_ONCE_OOM = {SYNTH_ONCE_OOM}")));
+        assert!(src.contains(&format!("SYNTH_ONCE_NO_GPU = {SYNTH_ONCE_NO_GPU}")));
+        assert!(src.contains("SYNTH_ONCE_OK = 0"));
+        // HTTP を立てないモードなので、ポート確保と --ready-file の必須チェックより前で分岐すること
+        let branch = src.find("    if args.synth_once:").expect("--synth-once の分岐があること");
+        let port = src.find("    port = args.port if").expect("ポート確保");
+        let ready = src.find("--ready-file が必要です").expect("--ready-file の必須チェック");
+        assert!(branch < port && branch < ready, "分岐がポート確保・--ready-file の検査より後にある");
     }
 
     /// 導入と更新を同時に走らせない（監査 ①）。

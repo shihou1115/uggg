@@ -11,6 +11,8 @@ CLI:
         --host 127.0.0.1            (省略可)
         --port 0                    0 で動的割当 (省略可)
         --mock                      実モデルを使わずモック wav を返す
+        --download-only             HF モデルを取得したら終了（初回導入・更新）
+        --synth-once --voice-ref W  1 回だけ合成して結果を報告し終了（更新の確認。v0.5.6）
 
 エンドポイント (architecture §8.5):
     GET  /health                       → {status, gpu, mock}
@@ -640,6 +642,69 @@ def _is_out_of_memory(exc: BaseException) -> bool:
         return False
 
 
+# --- 更新の成否を確かめる一発合成 (spec §6.0 v0.5.6 項目 3b) -----------------
+
+# 報告の目印。Rust 側（irodori_download）と同じ文字列にする（契約テストが見張る）。
+SYNTH_ONCE_START_MARKER = "UGG_SYNTH_ONCE_START "
+SYNTH_ONCE_MARKER = "UGG_SYNTH_ONCE "
+# 終了コード（Rust 側と揃える）。
+SYNTH_ONCE_OK = 0
+SYNTH_ONCE_FAILED = 1
+SYNTH_ONCE_OOM = 2
+SYNTH_ONCE_NO_GPU = 3
+# 読み上げる固定文。**発話の本文は渡さない**（失敗の理由がログに残るため）。
+SYNTH_ONCE_TEXT = "こんにちは。更新の確認です。"
+
+
+def _report(marker: str, payload: dict) -> None:
+    sys.stdout.write(marker + json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def synth_once(asset_dir: Path, voice_ref: Path) -> int:
+    """更新の成否を確かめるため、1 回だけ合成する (spec §6.0 v0.5.6 項目 3b)。
+
+    更新中は HTTP の経路が錠で塞がっているので、更新処理の子プロセスとして走らせる。結果は stdout の
+    目印付きの 1 行と終了コードで返す。**VRAM 不足では例外にならずプロセスごと落ちることがある**
+    （v0.5.4 の実機で実績）ので、モデルを読む前に空き VRAM を 1 行出しておく（落ちたときの手がかり）。
+    参照音声は Rust が一時フォルダへ写したものを渡す（事前変換の結果が参照 wav の隣に作られるため、
+    ユーザーの refs を汚さない）。
+    """
+    try:
+        import torch  # type: ignore
+    except Exception as exc:
+        _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "other", "error": f"{type(exc).__name__}: {exc}"})
+        return SYNTH_ONCE_FAILED
+    cuda = bool(torch.cuda.is_available())
+    start = {"cuda": cuda, "torch_cuda": getattr(torch.version, "cuda", None)}
+    if cuda:
+        try:
+            free, total = torch.cuda.mem_get_info()
+            start["vram_free_mb"] = int(free // (1024 * 1024))
+            start["vram_total_mb"] = int(total // (1024 * 1024))
+        except Exception:
+            pass
+    _report(SYNTH_ONCE_START_MARKER, start)
+    if not cuda:
+        _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "no_gpu"})
+        return SYNTH_ONCE_NO_GPU
+    started = time.perf_counter()
+    try:
+        wav = RealModelBackend(asset_dir).synthesize(SYNTH_ONCE_TEXT, voice_ref, 1.0, None)
+    except Exception as exc:
+        if _is_out_of_memory(exc):
+            _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "oom", "error": type(exc).__name__})
+            return SYNTH_ONCE_OOM
+        _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "other", "error": f"{type(exc).__name__}: {exc}"})
+        return SYNTH_ONCE_FAILED
+    if not wav:
+        _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "other", "error": "合成結果が空でした"})
+        return SYNTH_ONCE_FAILED
+    ms = int((time.perf_counter() - started) * 1000)
+    _report(SYNTH_ONCE_MARKER, {"ok": True, "ms": ms, "bytes": len(wav)})
+    return SYNTH_ONCE_OK
+
+
 def _audio_to_wav_bytes(audio, sample_rate: int) -> bytes:
     """torch.Tensor / numpy array → 16-bit PCM mono wav バイト列。
 
@@ -833,6 +898,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="HF モデルを DL したら即終了 (download_irodori_assets ステップ 6 用)。"
         " uvicorn は立てない。",
     )
+    parser.add_argument(
+        "--synth-once",
+        action="store_true",
+        help="1 回だけ合成して結果を報告し、即終了する（更新の成否の確認用。v0.5.6 項目 3b）。"
+        " uvicorn は立てない。--voice-ref が必要",
+    )
+    parser.add_argument("--voice-ref", type=Path, default=None, help="--synth-once で使う参照 wav")
     # **モデルの正本は Rust 側** (v0.5.5 項目 3)。渡されなければ上の既定値を使う。
     # ここをハードコードのままにすると、`sidecar.py` は毎起動で上書きされるのに
     # 重みは初回 DL でしか取らないため、ID を変えた瞬間に重みだけ無い状態になる。
@@ -860,6 +932,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
         sys.stderr.write("[hf-download] モデル DL 完了\n")
         return 0
+
+    # --synth-once モード（v0.5.6 項目 3b）: 1 回だけ合成して即終了。--download-only と同じく、
+    # ポート確保と --ready-file の必須チェックより前に置く（HTTP は立てない）。モデルは取りに行かない
+    # （無ければ合成が失敗する ＝ 更新で重みが揃わなかったことを捕まえるのがこのモードの役目）。
+    if args.synth_once:
+        if args.voice_ref is None:
+            sys.stderr.write("sidecar.py: --synth-once には --voice-ref が必要です\n")
+            return SYNTH_ONCE_FAILED
+        return synth_once(asset_dir, args.voice_ref)
 
     port = args.port if args.port and args.port > 0 else pick_free_port(args.host)
     LOG.info("sidecar binding to %s:%d (mock=%s)", args.host, port, args.mock)

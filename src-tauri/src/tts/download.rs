@@ -127,7 +127,8 @@ pub fn run_downloader(
     .map_err(|e| format!("ダウンローダ起動に失敗: {e}"))?;
     let status = match ended {
         Ended::Exited(status) => status,
-        Ended::Stalled => {
+        // 締め切りは付けていない（`run_streaming` は無進捗でだけ止める）ので、`TimedOut` は来ない。
+        Ended::Stalled | Ended::TimedOut => {
             // 止めたときも、それまでに読み取った理由を捨てない（レート制限に当たったあとで
             // 黙り込む場合、PAT を入れる案内が消えてしまう）。
             let why = if rate_limited {
