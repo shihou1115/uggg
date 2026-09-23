@@ -120,7 +120,11 @@ fn main() {
                 // 1 つで数 GB を占めるので、残ったまま次を立てると合成が入らなくなる。
                 // ここで走らせるのは「まだ自分のサイドカーを 1 つも立てていない」時点だから。
                 let state_for_sweep = state.clone();
+                // 掃除の印は**ここで同期で取る**（v0.5.6 項目 3e）。導入・更新の入口がこれを待つ。
+                // タスクの中で取ると、走り出す前に来た更新が待たずに進みうる。
+                let sweeping = state.tts.irodori.begin_startup_sweep();
                 tauri::async_runtime::spawn(async move {
+                    let _sweeping = sweeping;
                     let stopped = crate::tts::sidecar::sweep_orphans(
                         &asset_root,
                         &state_for_sweep.tts.irodori.http_client(),

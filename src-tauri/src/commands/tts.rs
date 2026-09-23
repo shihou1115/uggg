@@ -378,23 +378,23 @@ pub async fn update_irodori_runtime(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<String>, String> {
-    // 初回 DL と同時に走ると、同じ site-packages を 2 経路が触って退避も復元も守れない。
-    let _busy = irodori_download::IrodoriBusyGuard::acquire().map_err(|e| format!("{e:#}"))?;
     let root = voice_ref::irodori_root().map_err(|e| format!("{e:#}"))?;
+    // 錠のファイルを置く前に作っておく（反証レビュー #13）。
+    std::fs::create_dir_all(&root).map_err(|e| format!("資産ルート作成失敗: {e:#}"))?;
+    // 初回 DL と同時に走ると、同じ site-packages を 2 経路が触って退避も復元も守れない。
+    // **もう 1 つの ugg とも排他にする**（v0.5.6 項目 3f）。
+    let _busy = irodori_download::IrodoriBusyGuard::acquire_for(&root).map_err(|e| format!("{e:#}"))?;
     let status = irodori_download::status(&root);
     if status.up_to_date {
         return Ok(Vec::new());
     }
-    // **稼働中のサイドカーを先に止める。** 止めないと (a) 入れ直しても合成は旧コードの
-    // まま（`ensure_sidecar_running` は版を見ずに既存ポートを返す）(b) 遅延 import する
-    // モジュールを差し替えると動いているプロセスが壊れる。次の合成で新しいコードが起動する。
-    let _ = state.tts.irodori.shutdown().await;
     let emit = {
         let app = app.clone();
         move |line: &str| {
             let _ = app.emit("irodori-download", line);
         }
     };
+    prepare_to_replace_runtime(state.inner(), &root, &emit).await?;
     // 対象は `status` が決める。**ここで自前に組み立てない** — 記録が無い環境で
     // `current_pins()` を丸ごと対象にしたところ、入れ直せない `python` が混ざって
     // Err で止まり、この機能が対象にしている環境がちょうど 1 つも更新できなかった。
@@ -407,6 +407,39 @@ pub async fn update_irodori_runtime(
         .map_err(|e| format!("{e:#}"))?;
     let _ = app.emit("irodori-download", "__done__");
     Ok(updated)
+}
+
+/// 導入・更新の入口の備え（v0.5.6 項目 3e。両方のコマンドが通る）。
+///
+/// 1. **自分のサイドカーを止める。** 止めないと (a) 入れ直しても合成は旧コードのまま
+///    （`ensure_sidecar_running` は版を見ずに既存ポートを返す）(b) 遅延 import するモジュールを差し替えると
+///    動いているプロセスが壊れる。次の合成で新しいコードが起動する
+/// 2. **起動時の孤児掃除が終わるのを待つ。** 掃除は起動時に投げっぱなしで、誰も待っていなかった
+/// 3. **記録にあるサイドカーで生きているものが残っていれば始めない。** 生きているサイドカーは torch の DLL を
+///    読み込んだままで、Windows はそれを消すことも上書きすることも拒む — 入れ替えも、失敗したときの全戻しも
+///    失敗する（反証レビュー #4）。**止めはしない**（もう 1 つの ugg のものかもしれない。所有者を見分けられるのは
+///    項目 4 から）
+async fn prepare_to_replace_runtime(
+    state: &Arc<AppState>,
+    root: &std::path::Path,
+    emit: &impl Fn(&str),
+) -> Result<(), String> {
+    let _ = state.tts.irodori.shutdown().await;
+    state
+        .tts
+        .irodori
+        .wait_for_startup_sweep(|| emit("前回の実行の後始末（残ったサイドカーの掃除）が終わるのを待っています…"))
+        .await;
+    let live = crate::tts::sidecar::live_sidecars(root, &state.tts.irodori.http_client()).await;
+    if live.is_empty() {
+        return Ok(());
+    }
+    let ports: Vec<String> = live.iter().map(u16::to_string).collect();
+    Err(format!(
+        "Irodori のサイドカーがほかに {} 件動いています（もう 1 つの ugg か、前回の実行の残り。port {}）。動いたまま入れ替えると、入れ替えも元に戻すことも失敗します。もう 1 つの ugg を終了するか、PC を再起動してから、もう一度お試しください",
+        live.len(),
+        ports.join(", ")
+    ))
 }
 
 /// Irodori 資産の導入状態 (v0.5.4 項目 2、spec §6.0)。
@@ -454,10 +487,12 @@ pub async fn download_irodori_assets(
     if !agreed {
         return Err("利用規約への同意が必要です".to_string());
     }
-    // 更新と同時に走らせない（同じ site-packages を 2 経路が触る）。
-    let _busy = irodori_download::IrodoriBusyGuard::acquire().map_err(|e| format!("{e:#}"))?;
     let asset_root = voice_ref::irodori_root().map_err(|e| format!("{e:#}"))?;
+    // 錠のファイルを置く前に作っておく（まっさらな端末ではまだ無い。反証レビュー #13）。
     std::fs::create_dir_all(&asset_root).map_err(|e| format!("資産ルート作成失敗: {e:#}"))?;
+    // 更新と同時に走らせない（同じ site-packages を 2 経路が触る）。**もう 1 つの ugg とも**（v0.5.6 項目 3f）。
+    let _busy =
+        irodori_download::IrodoriBusyGuard::acquire_for(&asset_root).map_err(|e| format!("{e:#}"))?;
 
     let emit = {
         let app = app.clone();
@@ -468,6 +503,9 @@ pub async fn download_irodori_assets(
 
     let sidecar_py = asset_root.join("sidecar.py");
     let result: Result<(), String> = async {
+        // 更新と同じ入口の備え（v0.5.6 項目 3e）。**初回導入は自分のサイドカーを止めていなかった**
+        // （更新の経路だけ止めていた）。Python が入っている環境で押し直すと、pip が掴まれた site-packages を触る。
+        prepare_to_replace_runtime(state.inner(), &asset_root, &emit).await?;
         irodori_download::ensure_python_embeddable(&asset_root, &emit)
             .await
             .map_err(|e| format!("{e:#}"))?;

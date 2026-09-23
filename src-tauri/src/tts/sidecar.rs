@@ -33,6 +33,13 @@ pub struct SidecarHandle {
     pub child: Child,
 }
 
+impl SidecarHandle {
+    /// このサイドカーの資産ルート（採用の時点で、導入・更新の錠を見るのに使う）。
+    pub(crate) fn asset_root(&self) -> &Path {
+        &self.asset_root
+    }
+}
+
 #[cfg(test)]
 impl SidecarHandle {
     /// テスト用。本物の起動を経ずに、採用の判定（`IrodoriClient::adopt_sidecar`）を確かめる。
@@ -157,17 +164,45 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 「応答しない」と取り違えて永久に残す。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn sweep_orphans_with(
-    asset_root: &Path,
-    client: &reqwest::Client,
-    probe_timeout: Duration,
-) -> usize {
+/// 前回までの実行が残したかもしれないサイドカーの記録（台帳 + 旧 `ready.json`）。
+/// 掃除（`sweep_orphans`）と、更新の前の確認（`live_sidecars`）で同じ集め方をする。
+fn orphan_candidates(asset_root: &Path) -> Vec<ReadyFile> {
     let mut candidates = read_ledger(asset_root);
     if let Ok(Some(port)) = try_read_port(&ready_path_for(asset_root)) {
         if !candidates.iter().any(|e| e.port == port) {
             candidates.push(ReadyFile { port, pid: 0 });
         }
     }
+    candidates
+}
+
+/// 記録にあるサイドカーのうち、**いま生きているもの**のポート（v0.5.6 項目 3e）。**読むだけで止めない。**
+///
+/// 更新の前に使う。生きているサイドカーは torch の DLL（`site-packages\torch\lib\c10.dll` など）を
+/// 読み込んだままで、Windows はそれを消すことも上書きすることも拒む。そのまま入れ替えを始めると、
+/// **入れ替えも、失敗したときの全戻しも**同じファイルで失敗する（反証レビュー #4）。
+/// 「生きている」は、応答の形が自分たちのもの（`Ours`）か、つながったのに答えない（`Unanswered`。
+/// 合成中・読み込み中）もの。
+///
+/// **止めないのは、所有者を見分けられないから**（項目 4 で台帳に所有者の欄が入るまで）。応答の形だけで
+/// 止めると、もう 1 つの ugg が使っている最中のサイドカーを止めうる。
+pub async fn live_sidecars(asset_root: &Path, client: &reqwest::Client) -> Vec<u16> {
+    let mut live = Vec::new();
+    for entry in orphan_candidates(asset_root) {
+        match identify_sidecar(client, entry.port, PROBE_TIMEOUT).await {
+            Probe::Ours | Probe::Unanswered => live.push(entry.port),
+            Probe::NotOurs => {}
+        }
+    }
+    live
+}
+
+async fn sweep_orphans_with(
+    asset_root: &Path,
+    client: &reqwest::Client,
+    probe_timeout: Duration,
+) -> usize {
+    let candidates = orphan_candidates(asset_root);
     if !candidates.is_empty() {
         // 開始と 1 件ごとの所要時間をログに残す（2026-09-14、実環境で起動から判定まで 22 秒
         // かかっていた原因を、ログから切り分けられなかったため）。
@@ -470,17 +505,36 @@ where
     }
 }
 
-/// `POST /shutdown` を打って 1 秒待ち、ダメなら `child.kill()` する。
-/// ポートだけで止める（孤児にはハンドルが無いので kill にフォールバックできない）。
+/// 止まったと確かめるまで待つ時間（v0.5.6 項目 3e）。Windows は閉じたポートへの接続が拒否されるまで
+/// 約 2 秒かかる（`CONNECT_TIMEOUT` の注記）ので、2 回は確かめられる長さにする。
+const STOP_CONFIRM: Duration = Duration::from_secs(8);
+
+/// 孤児に `POST /shutdown` を送り、**本当に止まったか**まで確かめる（v0.5.6 項目 3e）。
 ///
+/// 以前は**送れただけ**で成功とし（4xx / 5xx も成功扱い）、呼び出し側がすぐ台帳から消していたので、
+/// **答えたが止まらなかった孤児は台帳から消えて二度と追えなかった**。サイドカーの `/shutdown` は
+/// 200 を返してから 0.1 秒後に終わる（「答えた」は「終わった」ではない）。応答が 2xx で、そのあと
+/// **TCP が接続を拒否するようになったら**止まったとみなす。確かめられなければ偽（記録を残す）。
+///
+/// ポートだけで止める（孤児にはハンドルが無いので kill にはできない。自分のサイドカーは
+/// `shutdown_sidecar` がハンドルで終わりを確かめる）。
 /// **`looks_like_our_sidecar` で自分のものだと確かめてから呼ぶこと。**
 async fn request_shutdown(port: u16, http: &reqwest::Client) -> bool {
     let url = format!("http://127.0.0.1:{port}/shutdown");
-    http.post(&url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .is_ok()
+    match http.post(&url).timeout(Duration::from_secs(2)).send().await {
+        Ok(resp) if resp.status().is_success() => {}
+        _ => return false,
+    }
+    let deadline = Instant::now() + STOP_CONFIRM;
+    loop {
+        if tcp_reach(port, Duration::from_secs(3)).await == Reach::Refused {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 pub async fn shutdown_sidecar(mut handle: SidecarHandle, http: &reqwest::Client) -> Result<()> {
@@ -700,7 +754,18 @@ mod tests {
 
     /// `/health` に**自分たちの形**で答える偽のサイドカー。`/shutdown` に答えるかを選べる。
     /// 受けたリクエスト行を記録する。
-    fn fake_sidecar(answers_shutdown: bool) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    /// 偽サイドカーが `/shutdown` にどう応じるか。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum OnShutdown {
+        /// 答えて、待ち受けをやめる（本物と同じ）。
+        Exits,
+        /// 答えるが、待ち受けを続ける（止まらない）。
+        AnswersButStays,
+        /// 答えずに切る。
+        Ignores,
+    }
+
+    fn fake_sidecar(on_shutdown: OnShutdown) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -723,10 +788,11 @@ mod tests {
                     .unwrap_or("")
                     .to_string();
                 log.lock().unwrap().push(line.clone());
+                let shutdown = line.starts_with("POST /shutdown");
                 let body = if line.starts_with("GET /health") {
                     r#"{"status":"ok","gpu":null,"mock":true}"#
-                } else if line.starts_with("POST /shutdown") && answers_shutdown {
-                    r#"{"status":"bye"}"#
+                } else if shutdown && on_shutdown != OnShutdown::Ignores {
+                    r#"{"status":"ok"}"#
                 } else {
                     continue; // 答えずに切る
                 };
@@ -736,6 +802,9 @@ mod tests {
                     body.len(),
                     body
                 );
+                if shutdown && on_shutdown == OnShutdown::Exits {
+                    break; // 待ち受けをやめる（listener が落ちてポートが閉じる）
+                }
             }
         });
         (port, seen)
@@ -864,8 +933,8 @@ mod tests {
     #[tokio::test]
     async fn a_sweep_keeps_the_record_of_an_orphan_it_could_not_stop() {
         let dir = tempfile::tempdir().unwrap();
-        let (stoppable, stoppable_seen) = fake_sidecar(true);
-        let (stubborn, _) = fake_sidecar(false);
+        let (stoppable, stoppable_seen) = fake_sidecar(OnShutdown::Exits);
+        let (stubborn, _) = fake_sidecar(OnShutdown::Ignores);
         ledger_add(dir.path(), ReadyFile { port: stoppable, pid: 1 });
         ledger_add(dir.path(), ReadyFile { port: stubborn, pid: 2 });
 
@@ -883,6 +952,49 @@ mod tests {
         let got = read_ledger(dir.path());
         assert_eq!(got.len(), 1, "止められなかった記録だけ残る: {got:?}");
         assert_eq!(got[0].port, stubborn);
+    }
+
+    /// **止める要求に答えても、止まらなければ止めたと言わない**（v0.5.6 項目 3e）。記録を残す。
+    /// 以前は送れただけで成功とし、台帳から消していたので、止まらなかった孤児を二度と追えなかった。
+    #[tokio::test]
+    async fn an_orphan_that_answers_but_stays_is_not_counted_as_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (polite, polite_seen) = fake_sidecar(OnShutdown::AnswersButStays);
+        ledger_add(dir.path(), ReadyFile { port: polite, pid: 3 });
+
+        assert!(!request_shutdown(polite, &test_client()).await, "止まっていない");
+        let stopped = sweep_orphans(dir.path(), &test_client()).await;
+
+        assert_eq!(stopped, 0);
+        assert!(polite_seen.lock().unwrap().iter().any(|l| l.starts_with("POST /shutdown")));
+        assert_eq!(read_ledger(dir.path()).len(), 1, "止まらなかった記録は残す");
+    }
+
+    /// 答えて待ち受けをやめたら、止まったと確かめられる。
+    #[tokio::test]
+    async fn an_orphan_that_answers_and_exits_is_confirmed_stopped() {
+        let (exits, _) = fake_sidecar(OnShutdown::Exits);
+        assert!(request_shutdown(exits, &test_client()).await);
+    }
+
+    /// **更新の前の確認は、生きているサイドカーだけを数え、止めない**（v0.5.6 項目 3e）。
+    /// 死んだ記録（接続を拒否される）は数えない。
+    #[tokio::test]
+    async fn live_sidecars_are_counted_without_being_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alive, alive_seen) = fake_sidecar(OnShutdown::Exits);
+        let dead = free_port();
+        ledger_add(dir.path(), ReadyFile { port: alive, pid: 4 });
+        ledger_add(dir.path(), ReadyFile { port: dead, pid: 5 });
+
+        let live = live_sidecars(dir.path(), &test_client()).await;
+
+        assert_eq!(live, [alive], "生きているものだけ");
+        assert!(
+            !alive_seen.lock().unwrap().iter().any(|l| l.starts_with("POST /shutdown")),
+            "止めていない（所有者を見分けられないうちは止めない）"
+        );
+        assert_eq!(read_ledger(dir.path()).len(), 2, "記録も変えない");
     }
 
     /// 長く走る子プロセス（サイドカーの代役）。ポートは誰も待ち受けていないもの。

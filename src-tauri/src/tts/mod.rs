@@ -9,6 +9,7 @@
 
 pub(crate) mod child_process;
 pub mod download;
+pub(crate) mod file_lock;
 pub mod gpu;
 pub mod irodori;
 pub mod irodori_download;

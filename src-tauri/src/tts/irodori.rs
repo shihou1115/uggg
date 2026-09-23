@@ -177,6 +177,9 @@ pub struct IrodoriClient {
     /// 直近に送った本文とキャプション。サイドカーの stderr を伏せるのに使う（v0.5.6 項目 2）。
     /// stderr を読むタスクと共有するので `Arc`。
     recent_secrets: Arc<StdMutex<VecDeque<String>>>,
+    /// 起動時の孤児掃除が握る錠（v0.5.6 項目 3e）。導入・更新の入口はこれを待つ。
+    /// 掃除は起動時に投げっぱなしで、**誰も終わりを待てなかった**。
+    startup_sweep: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl IrodoriClient {
@@ -192,7 +195,26 @@ impl IrodoriClient {
             last_notified_unavailable: AtomicI64::new(0),
             disable_until: AtomicI64::new(0),
             recent_secrets: Arc::new(StdMutex::new(VecDeque::new())),
+            startup_sweep: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// 起動時の孤児掃除を始める印を**同期で**取る（v0.5.6 項目 3e）。掃除のタスクに渡し、終わったら落とす。
+    ///
+    /// 同期で取るのは、掃除のタスクが走り出す前に更新のコマンドが来ても待たせるため（setup の中で
+    /// 取るので、画面が操作できるようになる前に取れている）。取れなければ `None`（掃除が 2 重に走っている）。
+    pub fn begin_startup_sweep(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.startup_sweep.clone().try_lock_owned().ok()
+    }
+
+    /// 起動時の孤児掃除が終わるのを待つ（導入・更新の入口で使う。v0.5.6 項目 3e）。
+    /// まだ終わっていなければ `on_wait` を 1 回呼んでから待つ（画面に待っていることを出すため）。
+    pub async fn wait_for_startup_sweep(&self, on_wait: impl FnOnce()) {
+        if self.startup_sweep.try_lock().is_ok() {
+            return;
+        }
+        on_wait();
+        let _done = self.startup_sweep.lock().await;
     }
 
     /// 送る本文とキャプションを覚える（**送る前に**。stderr は応答より先に届きうる）。
@@ -370,7 +392,8 @@ impl IrodoriClient {
         // 入れ替え中の `site-packages` で起動すると、半分だけ新しい状態で読み込む。
         // すでに動いているものは止めない（上で `current_port()` を返している）— 走っている
         // 発話を切らないため。ここで弾くと `decide_fallback` が voicevox へ流す。
-        if crate::tts::irodori_download::is_busy() {
+        // **もう 1 つの ugg の更新も見る**（v0.5.6 項目 3f。錠をプロセスをまたぐものにした）。
+        if crate::tts::irodori_download::is_busy_for(asset_root) {
             return Err(TtsError::SidecarStart(
                 "Irodori ランタイムの導入または更新が進行中です。voicevox 経路で発話します"
                     .to_string(),
@@ -404,7 +427,7 @@ impl IrodoriClient {
             let mut guard = self.sidecar.lock().expect("irodori sidecar poisoned");
             if let Some(existing) = guard.as_ref() {
                 Adopt::Redundant(existing.port, handle)
-            } else if crate::tts::irodori_download::is_busy() {
+            } else if crate::tts::irodori_download::is_busy_for(handle.asset_root()) {
                 Adopt::Busy(handle)
             } else {
                 let port = handle.port;
@@ -770,6 +793,38 @@ mod tests {
             super::route_stderr_line("Traceback: ないしょのはなし", &recent),
             super::StderrRoute::Log("Traceback: «伏字»".to_string())
         );
+    }
+
+    /// **導入・更新の入口は、起動時の孤児掃除が終わるまで待つ**（v0.5.6 項目 3e）。
+    /// 掃除は起動時に投げっぱなしで、終わりを待つ手段が無かった。
+    #[tokio::test]
+    async fn the_update_waits_for_the_startup_sweep() {
+        let client = std::sync::Arc::new(super::IrodoriClient::new());
+        let sweeping = client.begin_startup_sweep().expect("掃除の印を取れる");
+        assert!(client.begin_startup_sweep().is_none(), "掃除を 2 重には始めない");
+
+        let waiter = client.clone();
+        let told = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let told_in = told.clone();
+        let waiting = tokio::spawn(async move {
+            waiter
+                .wait_for_startup_sweep(|| told_in.store(true, std::sync::atomic::Ordering::SeqCst))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished(), "掃除の途中は待つ");
+        assert!(told.load(std::sync::atomic::Ordering::SeqCst), "待っていることを知らせる");
+
+        drop(sweeping);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("掃除が終われば進む")
+            .unwrap();
+
+        // 終わったあとは待たず、知らせもしない
+        let mut told_again = false;
+        client.wait_for_startup_sweep(|| told_again = true).await;
+        assert!(!told_again);
     }
 
     /// **覚えた本文が、stderr の受け口を通って実際に伏せられる**（v0.5.6 項目 2）。

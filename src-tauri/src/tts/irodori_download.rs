@@ -955,11 +955,7 @@ where
     Ok(())
 }
 
-/// 更新の作業用ディレクトリ（site-packages の**外**に置く）。
-///
-/// site-packages の中に退避すると、名前次第で import されうるうえ、pip が
-/// dist-info を拾って混乱する。`asset_root` 直下に置いて完全に切り離す。
-/// 導入と更新を同時に走らせないための印。
+/// 導入と更新を同時に走らせないための印（プロセスの中）。
 ///
 /// **同じ `site-packages` を 2 つの経路が同時に触ると、退避 → 入れ直し → 復元の
 /// どの段も守れない中間状態になる。** 記録が無い環境では「ランタイムをダウンロード」と
@@ -976,18 +972,69 @@ pub fn is_busy() -> bool {
     IRODORI_BUSY.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// 導入・更新の錠のファイル（`asset_root` 直下。v0.5.6 項目 3f）。中身は使わない。消さない。
+const UPDATE_LOCK_FILE: &str = "update.lock";
+
 /// 取れたら作業してよい。drop で自動的に手放す（途中で return しても取り残さない）。
-pub struct IrodoriBusyGuard(());
+///
+/// **二段の錠**（v0.5.6 項目 3f）: プロセスの中の印（`IRODORI_BUSY`）と、プロセスをまたぐファイルの錠
+/// （`update.lock`）。順は プロセスの中 → ファイル。ファイルの錠はハンドル単位なので、一本にすると
+/// 同じ ugg の 2 本目とも衝突し、「もう 1 つの ugg が動いています」と誤った案内になる。
+pub struct IrodoriBusyGuard {
+    /// `acquire_for` で取ったときだけ持つ。drop でファイルの錠も外れる。
+    _cross_process: Option<crate::tts::file_lock::FileLock>,
+}
 
 impl IrodoriBusyGuard {
+    /// プロセスの中の印だけを取る（テストと、プロセスの中だけで足りる用途）。
     pub fn acquire() -> Result<Self> {
         if IRODORI_BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err(anyhow!(
                 "Irodori ランタイムの導入または更新がすでに進行中です。終わってからもう一度お試しください"
             ));
         }
-        Ok(Self(()))
+        Ok(Self {
+            _cross_process: None,
+        })
     }
+
+    /// **プロセスをまたいで**取る（導入・更新のコマンドが使う。v0.5.6 項目 3f）。
+    ///
+    /// ファイルの錠が取れなければ、プロセスの中の印も手放して Err（もう 1 つの ugg が導入か更新をしている）。
+    /// 錠のファイルを開けない環境は、導入・更新そのものも書き込めないので、同じく Err にする。
+    pub fn acquire_for(asset_root: &Path) -> Result<Self> {
+        // **同じ錠に積む**（別の錠を作って捨てると、捨てたほうの drop がプロセスの中の印を消す）。
+        // Err で返るときはこの錠が drop され、プロセスの中の印も手放す。
+        let mut guard = Self::acquire()?;
+        match crate::tts::file_lock::FileLock::try_acquire(&asset_root.join(UPDATE_LOCK_FILE)) {
+            Ok(Some(lock)) => {
+                guard._cross_process = Some(lock);
+                Ok(guard)
+            }
+            Ok(None) => Err(anyhow!(
+                "もう 1 つの ugg が Irodori ランタイムの導入か更新をしています。そちらが終わるか、そちらを終了してから、もう一度お試しください"
+            )),
+            Err(err) => Err(anyhow!(
+                "導入・更新の錠を取れません（{}）: {err}",
+                asset_root.join(UPDATE_LOCK_FILE).display()
+            )),
+        }
+    }
+}
+
+/// **この ugg かもう 1 つの ugg が**導入・更新をしているか（合成の側が見る。v0.5.6 項目 3f）。
+///
+/// プロセスの中の印が立っていればそれで足りる（ファイルの錠は自分が握っている）。立っていなければ、
+/// ファイルの錠を試して**すぐ放す**。試すのは**プロセスの中で 1 本ずつ**にする — ファイルの錠は
+/// ハンドル単位なので、掛け合いで 2 本同時にサイドカーを起こすと、片方が自分自身の試しに弾かれて
+/// 理由なく VOICEVOX へ倒れる（反証レビュー #12）。
+pub fn is_busy_for(asset_root: &Path) -> bool {
+    if is_busy() {
+        return true;
+    }
+    static PROBE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    crate::tts::file_lock::FileLock::is_held_elsewhere(&asset_root.join(UPDATE_LOCK_FILE))
 }
 
 impl Drop for IrodoriBusyGuard {
@@ -1006,6 +1053,10 @@ pub(crate) fn lock_busy_for_test() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 更新の作業用ディレクトリ（site-packages の**外**に置く）。
+///
+/// site-packages の中に退避すると、名前次第で import されうるうえ、pip が
+/// dist-info を拾って混乱する。`asset_root` 直下に置いて完全に切り離す。
 const UPDATE_BACKUP_DIR: &str = ".update-backup";
 
 /// pin ごとの「入れ直し方」。
@@ -4349,6 +4400,67 @@ mod update_tests {
         let port = src.find("    port = args.port if").expect("ポート確保");
         let ready = src.find("--ready-file が必要です").expect("--ready-file の必須チェック");
         assert!(branch < port && branch < ready, "分岐がポート確保・--ready-file の検査より後にある");
+    }
+
+    /// **導入と更新の両方のコマンドが、プロセスをまたぐ錠と入口の備えを通る**（v0.5.6 項目 3e・3f の配線）。
+    /// 片方だけ直して隣を残す形（初回導入は自分のサイドカーを止めていなかった）を繰り返さないため、
+    /// コマンドの本文をテキストで見る（AppState が要るので単体では通せない）。
+    #[test]
+    fn both_runtime_commands_take_the_cross_process_lock_and_prepare() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
+        )
+        .unwrap();
+        for name in ["pub async fn update_irodori_runtime", "pub async fn download_irodori_assets"] {
+            let body = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+            let body = &body[..body.find("
+}
+").unwrap()];
+            let lock = body.find("IrodoriBusyGuard::acquire_for(").unwrap_or_else(|| panic!("{name}: プロセスをまたぐ錠を取っていない"));
+            let mkdir = body.find("create_dir_all(").unwrap_or_else(|| panic!("{name}: フォルダを作っていない"));
+            assert!(mkdir < lock, "{name}: 錠のファイルを置く前にフォルダを作ること");
+            assert!(
+                body.contains("prepare_to_replace_runtime("),
+                "{name}: 入口の備え（自分のサイドカーを止める・掃除を待つ・生きているものを確かめる）を通っていない"
+            );
+            assert!(!body.contains("IrodoriBusyGuard::acquire()"), "{name}: プロセスの中だけの錠に戻っている");
+        }
+    }
+
+    /// **導入・更新の錠はプロセスをまたぐ**（v0.5.6 項目 3f）。握っている間は、この ugg の中の印も
+    /// ファイルの錠も立ったまま。放せば両方外れる。
+    #[test]
+    fn the_update_lock_holds_both_the_process_flag_and_the_file_lock() {
+        let _serial = lock_busy_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let guard = IrodoriBusyGuard::acquire_for(dir.path()).expect("取れる");
+        assert!(is_busy(), "握っている間はプロセスの中の印が立っている");
+        assert!(
+            crate::tts::file_lock::FileLock::is_held_elsewhere(&dir.path().join(UPDATE_LOCK_FILE)),
+            "ファイルの錠も握っている（もう 1 つの ugg から見える）"
+        );
+        drop(guard);
+        assert!(!is_busy(), "放したら印も外れる");
+        assert!(!crate::tts::file_lock::FileLock::is_held_elsewhere(&dir.path().join(UPDATE_LOCK_FILE)));
+    }
+
+    /// **もう 1 つの ugg が握っていたら始めない**。そのときプロセスの中の印は残さない
+    /// （残すと、この ugg の合成まで「更新中」として VOICEVOX へ倒れ続ける）。
+    #[test]
+    fn another_ugg_holding_the_update_lock_is_refused_without_leaving_a_flag() {
+        let _serial = lock_busy_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        // もう 1 つの ugg の代わりに、別のハンドルで錠を握っておく
+        let other = crate::tts::file_lock::FileLock::try_acquire(&dir.path().join(UPDATE_LOCK_FILE))
+            .unwrap()
+            .unwrap();
+        let err = IrodoriBusyGuard::acquire_for(dir.path()).err().expect("取れない");
+        assert!(format!("{err:#}").contains("もう 1 つの ugg"), "{err:#}");
+        assert!(!is_busy(), "断ったらプロセスの中の印を残さない");
+        // 合成の側からは「更新中」に見える
+        assert!(is_busy_for(dir.path()), "もう 1 つの ugg の更新を、合成の側も見る");
+        drop(other);
+        assert!(!is_busy_for(dir.path()), "終われば見えなくなる");
     }
 
     /// 導入と更新を同時に走らせない（監査 ①）。
