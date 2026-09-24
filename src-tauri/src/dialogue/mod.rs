@@ -304,31 +304,38 @@ async fn run_dispatch(
 ///
 /// **降格タイマーは張らない。** 超過の判定は `cost_exceeded` が毎回 DB を見て行うので、
 /// タイマーで解除されると「5 分後に課金が再開する」という以前の穴に戻る。
+///
+/// **届いたときにだけ済みにする**（v0.5.6 項目 6）。以前は出す前に済みにしていたので、隠している間に
+/// 上限に達するとその月は二度と告知しなかった（降格は画面に出る場所が無く、発話が唯一の伝達手段）。
 pub(crate) async fn announce_cost_limit_once(
     app: &AppHandle,
     state: &Arc<AppState>,
     settings: &crate::state::Settings,
 ) {
-    if cost::notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED) {
-        return;
+    let told = notify::once_reached(
+        cost::notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED),
+        || {
+            notify::notify(
+                app,
+                state,
+                NoticeKind::CostLimitExceeded {
+                    provider: settings.llm_provider.clone(),
+                },
+            )
+        },
+        || cost::mark_notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED),
+    )
+    .await;
+    if told.is_some_and(notify::NoticeOutcome::reached) {
+        notify::notify(
+            app,
+            state,
+            NoticeKind::ModeDegraded {
+                reason: DegradeReason::CostLimit,
+            },
+        )
+        .await;
     }
-    cost::mark_notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED);
-    notify::notify(
-        app,
-        state,
-        NoticeKind::CostLimitExceeded {
-            provider: settings.llm_provider.clone(),
-        },
-    )
-    .await;
-    notify::notify(
-        app,
-        state,
-        NoticeKind::ModeDegraded {
-            reason: DegradeReason::CostLimit,
-        },
-    )
-    .await;
 }
 
 /// 80% 到達の警告。呼び出し後のコスト記録を見て、その月に 1 回だけ出す。
@@ -352,14 +359,20 @@ pub(crate) async fn evaluate_cost_status(
     }
     if status.exceeded {
         announce_cost_limit_once(app, state, settings).await;
-    } else if status.reached_80 && !cost::notified_this_month(&state.db, cost::KEY_WARNED_80) {
-        cost::mark_notified_this_month(&state.db, cost::KEY_WARNED_80);
-        notify::notify(
-            app,
-            state,
-            NoticeKind::CostWarning80 {
-                provider: settings.llm_provider.clone(),
+    } else if status.reached_80 {
+        // 届いたときにだけ済みにする（v0.5.6 項目 6。以前は出す前に済みにしていた）。
+        notify::once_reached(
+            cost::notified_this_month(&state.db, cost::KEY_WARNED_80),
+            || {
+                notify::notify(
+                    app,
+                    state,
+                    NoticeKind::CostWarning80 {
+                        provider: settings.llm_provider.clone(),
+                    },
+                )
             },
+            || cost::mark_notified_this_month(&state.db, cost::KEY_WARNED_80),
         )
         .await;
     }
@@ -440,23 +453,30 @@ fn system_message_reply(state: &Arc<AppState>, key: &str) -> Option<DialogueResp
 /// 月次タグ (`cost::KEY_LIMIT_NOTIFIED` 等) を使わないのは意図的で、理由は
 /// `DialogueState::cost_unknown_notified` のコメントに書いた（記録先の DB 自体が
 /// 疑わしい状態なので、永続フラグに頼ると毎ターン告知しかねない）。
+///
+/// **届いたときにだけ済みにする**（v0.5.6 項目 6）。以前は出す前に済みにしていたので、隠している間に
+/// 集計できなくなると、その起動のあいだ二度と告知しなかった。
 pub(crate) async fn announce_cost_unknown_once(
     app: &AppHandle,
     state: &Arc<AppState>,
     settings: &crate::state::Settings,
 ) {
-    if state
-        .dialogue
-        .cost_unknown_notified
-        .swap(true, Ordering::SeqCst)
-    {
-        return;
-    }
-    notify::notify(
-        app,
-        state,
-        NoticeKind::CostUnknown {
-            provider: settings.llm_provider.clone(),
+    notify::once_reached(
+        state.dialogue.cost_unknown_notified.load(Ordering::SeqCst),
+        || {
+            notify::notify(
+                app,
+                state,
+                NoticeKind::CostUnknown {
+                    provider: settings.llm_provider.clone(),
+                },
+            )
+        },
+        || {
+            state
+                .dialogue
+                .cost_unknown_notified
+                .store(true, Ordering::SeqCst)
         },
     )
     .await;

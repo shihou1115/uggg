@@ -3,7 +3,8 @@
 //! - `update_feed_url` (settings) が未設定なら no-op
 //! - JSON フィード: `{ "latest": "0.2.0", "url": "https://...", "notes": "..." }`
 //! - 比較は major.minor.patch を u32 三項組で。プレリリースタグは無視 (本開発はシンプル運用)
-//! - 重複告知防止: `app_settings."update_notice_seen:<version>"` に "1" を書いて、同じ版は再告知しない
+//! - 重複告知防止: `app_settings."update_notice_seen:<version>"` に "1" を書いて、同じ版は再告知しない。
+//!   **書くのは届いたときだけ**（v0.5.6 項目 6。以前は届いたかを見ずに書き、隠している間に出るとその版は二度と出なかった）
 //!
 //! spec §5: 自動更新は行わない (コード署名がないため)。本機能は **手動 DL & 再インストール** を促す案内のみ。
 
@@ -51,18 +52,23 @@ pub async fn check_update_once(app: &AppHandle, state: &Arc<AppState>) -> Result
     }
 
     let seen_key = format!("update_notice_seen:{}", feed.latest);
-    if let Ok(Some(_)) = state.db.get_setting(&seen_key) {
-        return Ok(()); // 同じ版は二度告知しない
-    }
-    notify::notify(
-        app,
-        state,
-        NoticeKind::UpdateAvailable {
-            version: feed.latest.clone(),
+    // 同じ版は二度告知しない。**済みにするのは届いたときだけ**（v0.5.6 項目 6）
+    notify::once_reached(
+        matches!(state.db.get_setting(&seen_key), Ok(Some(_))),
+        || {
+            notify::notify(
+                app,
+                state,
+                NoticeKind::UpdateAvailable {
+                    version: feed.latest.clone(),
+                },
+            )
+        },
+        || {
+            let _ = state.db.set_setting(&seen_key, "1");
         },
     )
     .await;
-    let _ = state.db.set_setting(&seen_key, "1");
     Ok(())
 }
 

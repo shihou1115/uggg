@@ -2,6 +2,10 @@
 //!
 //! 辞書 `system_messages` にキーがあればそれを発話。無ければトーストフォールバックの
 //! 代わりに `system-toast` イベントをフロントへ流す (M2 段階では console.error 代替)。
+//!
+//! **見えていない間は出さずに保留し、届いたかを返す**（v0.5.6 項目 6、§4.6.1 と同じ判定）。
+//! 1 回だけ出す告知（コストの 80% 警告・上限到達・集計不能・アプリ更新）は `once_reached` で
+//! **届いたときにだけ済みにする**（以前は届いたかを見ずに済みにし、隠している間に出ると二度と出なかった）。
 
 use std::sync::Arc;
 
@@ -36,7 +40,7 @@ pub enum NoticeKind {
         reason: String,
     },
     /// Irodori-TTS が利用できない (GPU 不可 / サイドカー起動失敗 / ヘルスチェック失敗 等)。
-    /// architecture §11.2: severity = Important (現状は dialogue 経路のみ、トースト二段は将来)。
+    /// 5 分に 1 回（間隔は発話の前に刻む）。次の失敗でまた出るので、届いたかは見ない（v0.5.6 項目 6 の対象外）。
     /// M4c Phase G の `tasks::spawn_irodori_health_watcher` から発火する。
     IrodoriUnavailable {
         reason: String,
@@ -121,7 +125,67 @@ impl NoticeKind {
     }
 }
 
-pub async fn notify(app: &AppHandle, state: &Arc<AppState>, kind: NoticeKind) {
+/// 告知がどうなったか（v0.5.6 項目 6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeOutcome {
+    /// 吹き出しかトーストで出した。
+    Shown,
+    /// ウインドウが見えていない（隠している・最小化している）ので出さずに保留した。
+    Held,
+    /// 出せなかった（イベントを送れない）。
+    Failed,
+}
+
+impl NoticeOutcome {
+    /// ユーザーに届いたか。**済みにしてよいのはこのときだけ。**
+    pub fn reached(self) -> bool {
+        self == NoticeOutcome::Shown
+    }
+}
+
+/// 告知の出し方（純粋部分）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Hold,
+    Speak,
+    Toast,
+}
+
+/// 見えていなければ保留（§4.6.1 の配達と同じ「見えない間は届いていない」）。見えていれば辞書の行を
+/// 喋り、辞書に無ければトーストへ落とす（§3.1 のフォールバック）。
+fn route(visible: bool, has_line: bool) -> Route {
+    match (visible, has_line) {
+        (false, _) => Route::Hold,
+        (true, true) => Route::Speak,
+        (true, false) => Route::Toast,
+    }
+}
+
+/// 1 回だけ出す告知を、**届いたときにだけ済みにする**（v0.5.6 項目 6、spec §6.0）。
+///
+/// `done` が真なら何もしない（`None`）。`show` の結果が届いた（`Shown`）ときだけ `mark` を呼ぶ。
+/// 保留（見えていない）・失敗なら済みにしないので、次の機会（次のコスト判定・次の更新確認）にもう一度出る。
+/// 以前は 4 か所の呼び出し元が届いたかを見ずに済みにしていた（うち 3 か所は発話より前に）ので、隠している
+/// 間に出ると、コストの 2 件はその月、集計不能はその起動のあいだ、アプリ更新はその版では二度と出なかった。
+pub(crate) async fn once_reached<Fut>(
+    done: bool,
+    show: impl FnOnce() -> Fut,
+    mark: impl FnOnce(),
+) -> Option<NoticeOutcome>
+where
+    Fut: std::future::Future<Output = NoticeOutcome>,
+{
+    if done {
+        return None;
+    }
+    let outcome = show().await;
+    if outcome.reached() {
+        mark();
+    }
+    Some(outcome)
+}
+
+pub async fn notify(app: &AppHandle, state: &Arc<AppState>, kind: NoticeKind) -> NoticeOutcome {
     // **理由をログに残す** (v0.5.5 項目 1、spec §6.0)。
     // ユーザーに見せるのはキャラの台詞（辞書の行）でよいが、**辞書キーが存在すると
     // `fallback_text()` が使われず、`reason` がどこにも残らなかった**。
@@ -130,6 +194,12 @@ pub async fn notify(app: &AppHandle, state: &Arc<AppState>, kind: NoticeKind) {
     // 切り詰め済み（`sanitize_sidecar_error`）。資産 DL の失敗（`VoicevoxDlFailed` /
     // `IrodoriDlFailed`）は通信・ファイル操作のエラーで、そもそも会話を含まない（切り詰めもしない）。
     crate::ulog!("[notify] {}", kind.fallback_text());
+    // **見えていない間は出さない**（v0.5.6 項目 6）。以前は見えているかを見ずに出していたので、隠している
+    // 間の告知は誰にも届かないまま（1 回だけの告知は）済みになった。
+    if route(crate::system::deliver::window_is_visible(app), true) == Route::Hold {
+        crate::ulog!("[notify] ウインドウが見えていないので出さずに保留します");
+        return NoticeOutcome::Held;
+    }
     let key = kind.dict_key();
     let line = {
         let guard = state.ghost.lock().expect("ghost poisoned");
@@ -141,19 +211,125 @@ pub async fn notify(app: &AppHandle, state: &Arc<AppState>, kind: NoticeKind) {
         }
     };
 
-    match line {
-        Some(line) => {
+    let sent = match (route(true, line.is_some()), line) {
+        (Route::Speak, Some(line)) => {
             let resp: DialogueResponse = banter::pattern_1("system_message", "low", line);
-            if let Err(err) = app.emit("dialogue", &resp) {
-                crate::ulog!("[notify] dialogue emit failed: {err}");
-            }
+            app.emit("dialogue", &resp)
+                .map_err(|err| crate::ulog!("[notify] dialogue emit failed: {err}"))
         }
-        None => {
+        _ => {
             // 辞書未定義 → トースト fallback。フロントが拾わなければ console.error 相当。
-            if let Err(err) = app.emit("system-toast", kind.fallback_text()) {
-                crate::ulog!("[notify] toast emit failed: {err}");
-            }
+            app.emit("system-toast", kind.fallback_text())
+                .map_err(|err| crate::ulog!("[notify] toast emit failed: {err}"))
         }
+    };
+    if sent.is_ok() {
+        NoticeOutcome::Shown
+    } else {
+        NoticeOutcome::Failed
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use crate::db::Db;
+    use crate::system::cost;
+
+    /// 見えていなければ保留、見えていれば辞書の行を喋る（無ければトースト）。
+    #[test]
+    fn a_notice_is_held_while_the_window_is_not_visible() {
+        assert_eq!(route(false, true), Route::Hold);
+        assert_eq!(route(false, false), Route::Hold);
+        assert_eq!(route(true, true), Route::Speak);
+        assert_eq!(route(true, false), Route::Toast);
+        assert!(NoticeOutcome::Shown.reached());
+        assert!(!NoticeOutcome::Held.reached(), "保留は届いていない");
+        assert!(!NoticeOutcome::Failed.reached());
+    }
+
+    /// **操作列: 隠している間に告知が来る → 見えるようになってまた来る → もう一度来る**（v0.5.6 項目 6、
+    /// test-plan §3.2b）。月 1 回の 80% 警告を、実物の DB と当月タグで流す。隠している間は済みにせず、
+    /// 見えたときに出て済みになり、そのあとは出さない。以前は 1 回目（隠している間）で済みになり、その月は
+    /// 二度と出なかった。
+    #[tokio::test]
+    async fn a_notice_held_while_hidden_is_shown_later_and_only_once() {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        let key = cost::KEY_WARNED_80;
+        let shown = std::cell::Cell::new(0);
+        let tell = |visible: bool| {
+            let outcome = if visible {
+                shown.set(shown.get() + 1);
+                NoticeOutcome::Shown
+            } else {
+                NoticeOutcome::Held
+            };
+            async move { outcome }
+        };
+
+        let hidden = once_reached(
+            cost::notified_this_month(&db, key),
+            || tell(false),
+            || cost::mark_notified_this_month(&db, key),
+        )
+        .await;
+        assert_eq!(hidden, Some(NoticeOutcome::Held));
+        assert!(!cost::notified_this_month(&db, key), "隠している間は済みにしない");
+
+        let visible = once_reached(
+            cost::notified_this_month(&db, key),
+            || tell(true),
+            || cost::mark_notified_this_month(&db, key),
+        )
+        .await;
+        assert_eq!(visible, Some(NoticeOutcome::Shown));
+        assert!(cost::notified_this_month(&db, key), "届いたら済みにする");
+
+        let again = once_reached(
+            cost::notified_this_month(&db, key),
+            || tell(true),
+            || cost::mark_notified_this_month(&db, key),
+        )
+        .await;
+        assert_eq!(again, None, "済んだら出さない");
+        assert_eq!(shown.get(), 1, "見えている間に出たのは 1 回だけ");
+    }
+
+    /// **1 回だけ出す告知の呼び出し元は、すべて `once_reached` を通す**（v0.5.6 項目 6 の配線）。4 か所のうち
+    /// 片方だけ直して隣を残す形を繰り返さないため、本文をテキストで見る（AppHandle が要るので単体では通せない）。
+    #[test]
+    fn every_one_time_notice_is_marked_only_when_reached() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap().replace("\r\n", "\n");
+        let body_of = |src: &str, name: &str| -> String {
+            let at = src.find(name).unwrap_or_else(|| panic!("{name} が無い"));
+            let rest = &src[at..];
+            rest[..rest.find("\n}\n").unwrap()].to_string()
+        };
+        let dialogue = read("dialogue/mod.rs");
+        let update = read("system/update.rs");
+        for (src, name, mark) in [
+            (&dialogue, "pub(crate) async fn evaluate_cost_status", "mark_notified_this_month(&state.db, cost::KEY_WARNED_80)"),
+            (&dialogue, "pub(crate) async fn announce_cost_limit_once", "mark_notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED)"),
+            (&dialogue, "pub(crate) async fn announce_cost_unknown_once", ".store(true"),
+            (&update, "pub async fn check_update_once", "set_setting(&seen_key"),
+        ] {
+            let body = body_of(src, name);
+            let once = body
+                .find("once_reached(")
+                .unwrap_or_else(|| panic!("{name}: once_reached を通していない"));
+            let marked = body.find(mark).unwrap_or_else(|| panic!("{name}: {mark} が無い"));
+            assert!(once < marked, "{name}: 届いたかを見る前に済みにしている");
+            assert!(!body.contains("swap(true"), "{name}: 出す前に済みにする形（swap）が残っている");
+        }
+        // notify 自身が見えているかを問うこと（呼び出し元が済みにする前提）
+        let notify = body_of(&read("system/notify.rs"), "pub async fn notify(");
+        let asks = notify
+            .find("route(crate::system::deliver::window_is_visible(app)")
+            .expect("notify が見えているかを問うていない");
+        let emits = notify.find("app.emit(").unwrap();
+        assert!(asks < emits, "出したあとで見えているかを問うている");
     }
 }
 
