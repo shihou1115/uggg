@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.38）
+# ugg アーキテクチャ設計書（architecture.md v2.39）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -554,9 +554,9 @@ pub struct GhostBundle {
   └─ notify(kind, args) でゴースト発話 or トースト
 
 [終了]（詳細は §14.3）
-  ├─ トレイ「終了」→ quit / todo_quit を発話して待つ → 位置の即時保存 → サイドカー停止（POST /shutdown）→ exit
-  ├─ コンテキストメニュー「終了」→ サイドカー停止 → exit（挨拶なし）
-  └─ 終了シグナルを受ける処理は無い（強制終了で残ったサイドカーは次の起動の sweep_orphans が止める）
+  ├─ トレイ・右クリックメニューの「終了」（★v0.5.6 同じ経路）→ 見えていれば quit / todo_quit を発話して待つ → 位置の即時保存 → サイドカー停止（POST /shutdown）→ exit
+  │   （隠している・最小化しているときと、待っている間の 2 回目は、発話せずにすぐ）
+  └─ 終了シグナルを受ける処理は無い（強制終了ではサイドカーは Job Object で一緒に終わる ★v0.5.6。それより前の版が残したものは次の起動の sweep_orphans が止める）
 ```
 
 ---
@@ -571,7 +571,7 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `get_boot_payload` | なし | `BootPayload` | キャラ画像（data URL）、settings、`char_positions`（保存済みキャラ X 位置。無ければ null）等 |
 | `frontend_ready` | なし | `()` | boot 完了通知。起動挨拶（first_boot or boot）+ 更新チェック起動 |
-| `quit_app` | なし | `()` | 右クリックメニュー「終了」。Irodori サイドカーを best-effort shutdown 後に exit |
+| `quit_app` | なし | `()` | 右クリックメニュー「終了」。**★v0.5.6 トレイの「終了」と同じ `lifecycle::quit_with_farewell` を通る**（見えていれば終了前の確認かあいさつ → 位置の保存 → サイドカー停止 → exit。隠しているときはすぐ）。終了の処理を始めたら戻る（exit を待たない） |
 | `hide_window` | なし | `()` | メインウインドウを hide（トレイから再表示） |
 | `set_autostart` | `enabled: bool` | `()` | OS 自動起動の切替（tauri-plugin-autostart） |
 
@@ -1590,9 +1590,10 @@ pub async fn deliver_event(
   🔕 フィードバック（`feedback_speech`、§4.11）が backoff を線形に増やし、3 回で
   カテゴリトグル自体を OFF。backoff は `governance_backoff:<category>` に永続化し
   起動時 `governance::load_backoff` で復元する。
-- **終了前確認**（★M9、spec §4.6.2 後半・2026-07-17 裁定）: トレイ「終了」時に未完了の
+- **終了前確認**（★M9、spec §4.6.2 後半・2026-07-17 裁定）: 「終了」時に未完了の
   today ToDo があれば `events.todo_quit`（{count}）を `quit` の代わりに再生（ユーザー起点
-  につきゲート非対象）。コンテキストメニューの「終了」は M3 判断（即 exit）のまま。
+  につきゲート非対象）。**★v0.5.6 項目 5 でトレイと右クリックメニューの両方が同じ経路を通る**（以前はメニューの
+  「終了」が M3 判断のまま即 exit で、この確認が一度も出なかった）。見えていないときは出さずに終了する。
 - **カレンダー watcher**（★M10、tasks.rs、60 秒間隔・起動 25 秒後開始）: `system/calendar.rs`
   で全 ICS ソースを 30 分ごとに取得し `calendar_cache` へ near-term 展開して UPSERT。
   開始前通知は `calendar_notify_min` 分前（終日は当日ローカル 8:00）に達した未通知予定を
@@ -1768,18 +1769,16 @@ async fn install_asset(
 ### 14.3 終了
 
 ```
-[トレイ「終了」]（window::tray::quit_with_farewell）
+[トレイ・右クリックメニューの「終了」]（★v0.5.6 commands::lifecycle::quit_with_farewell。トレイは直接、メニューは quit_app から）
+  ├─ 隠している・最小化している（system::deliver::window_is_visible が偽）か、待っている間の 2 回目 → 発話せず下の後片付けへ
   ├─ daily_support_enabled で未完了の today ToDo があれば events.todo_quit、無ければ events.quit を発話
   ├─ 発話があれば (1600 + 60ms × 文字数).min(8000) + 500ms 待つ（最長 8.5s。発話が無ければ待たない）
   ├─ presence::window_pos::persist_now（位置の即時保存）
   ├─ state.tts.irodori.shutdown()（POST /shutdown → 1s で止まらなければ kill。未起動なら即 return）
   └─ app.exit(0)
 
-[コンテキストメニュー「終了」]（commands::lifecycle::quit_app）
-  ├─ state.tts.irodori.shutdown()
-  └─ app.exit(0)（挨拶なし・位置の即時保存なし）
-
-終了シグナルを受ける処理（RunEvent::ExitRequested 等）は無い。強制終了で残ったサイドカーは次の起動の sweep_orphans が止める
+終了シグナルを受ける処理（RunEvent::ExitRequested 等）は無い。強制終了（Alt+F4 を含む）ではあいさつは無く、サイドカーは
+ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項目 4）。それより前の版が残したものは次の起動の sweep_orphans が止める
 ```
 
 ---
@@ -1856,3 +1855,4 @@ async fn install_asset(
 | 2026-09-20 | v2.36 | **v0.5.6 項目 2 の残り（進捗を行ごとに・無進捗の中断・stderr の伏字）の実装に伴う改訂**。① §1 のモジュール表に `tts/child_process.rs` を追加（子プロセスの起動・行ごとの読み取り・無進捗の中断・Job Object）。`reader.rs` の行は「行に組み立てるのは呼ぶ側」に改めた。② §8.3 に取得の進捗の出し方を追記（**パイプ越しでは pip も huggingface_hub も進捗を出さない**ので、pip は `--progress-bar raw`、hub はモデル取得の間だけ判定を差し替える。失敗したら理由の行をエラーに添え、直前の 20 行を `ugg.log` に残す）。③ §15 のリスク表: 文字コードの行を実装に合わせ、**VOICEVOX のダウンローダの経路は v2.35 の時点では直っていなかった**（色付けの制御文字を落とす処理が 1 バイトずつ文字に積み直しており日本語が化けた）ことを明記。Job Object の行を「6 か所のうち 2 か所は v0.5.6 項目 2 で入れた（残りはサイドカーと zip の展開 ＝ 項目 4）」に改めた。子プロセスが固まる行を追加。**契約・設定フィールド・DB スキーマの変更なし。** |
 | 2026-09-23 | v2.37 | **v0.5.6 項目 3（更新を 1 つのトランザクションにする）の実装に伴う改訂**。§2.4 の資産表: `installed.json` がモデルの**読み先の正本**になったこと（書き込みは tmp → rename）、`update-versions.json`（版の控え）・`update.lock`（プロセスをまたぐ錠）・`.update-backup\` の退避の印・`.update-gate\`（ゲートの作業場所）を追加。契約表: `update_irodori_runtime` の「★2026-09-19: 途中の失敗では戻せていない」の注記を、実装した形（入口の備え → 前回の後始末 → 控え → 固定の段取り → 1 回合成のゲート → 全戻し）へ書き換え、`download_irodori_assets` も同じ入口を通ることを書いた（**初回導入は自分のサイドカーを止めていなかった**）。§8.1 の構成図、§8.3（読み先と取得先・一発合成のモード・`local_dir_use_symlinks` を渡さないこと）、§15 のリスク表（2 つの ugg の同時更新・更新の途中失敗）。**コマンド・イベント・設定フィールド・DB スキーマの変更なし**（`sidecar.py` の起動引数 `--synth-once` / `--voice-ref` を足した。子プロセスとして使うだけで、HTTP の契約は変えていない）。 |
 | 2026-09-24 | v2.38 | **v0.5.6 項目 4（孤児と二重起動）の実装に伴う改訂**。§1 の `child_process.rs` の行（ugg の寿命に結びつける Job・プロセスの開始時刻）。§2.4 の資産表: `sidecars.json` に持ち主の欄（`owner: {pid, started}`。1 件ずつ読む・差し替えで書く・v0.5.5 も読める）、`sidecars.lock`（台帳の錠。足すときは錠が取れなくても書き、消すときは見送る）を追加。§8.1 の構成図、§8.4 の `SidecarHandle`（`mock`）。契約表: 導入・更新の入口で**持ち主のいない孤児を止めてから**生きているものを数える（項目 3e で「所有者を見分けられるのは項目 4 から」と止めずにいたもの）。§15 のリスク表: 孤児の行を「Job Object が全部入った」へ、2 つの ugg の台帳の行を追加。**コマンド・イベント・設定フィールド・DB スキーマの変更なし。** |
+| 2026-09-24 | v2.39 | **v0.5.6 項目 5（終了のあいさつを揃える）の実装に伴う改訂**。§14.3 の終了経路を 1 本（`commands::lifecycle::quit_with_farewell`）へ: トレイと右クリックメニュー（`quit_app`）の両方が通り、見えていれば終了前の確認かあいさつをしてから、隠している・最小化しているとき（`deliver::window_is_visible`）と待っている間の 2 回目はすぐ終了する。起動・終了の概観、契約表の `quit_app`（引数と戻り値は変えない）、終了前確認の節も揃えた。**コマンド・イベント・設定フィールド・DB スキーマの変更なし。** |
