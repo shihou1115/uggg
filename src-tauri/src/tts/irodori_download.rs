@@ -22,6 +22,7 @@
 //!   取得中は画面が 1 行のまま固まった）。無進捗が続けば止める。仕組みは `tts::child_process`
 
 use std::io::Write;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -2333,12 +2334,18 @@ fn expand_zip_windows(zip: &Path, dest: &Path) -> Result<()> {
     );
     // 呼び出し元は非同期（`ensure_python_embeddable`）。待つ間ワーカーを塞がない（v0.5.6 項目 2）。
     let status = child_process::off_the_async_workers(|| {
-        Command::new("powershell.exe")
+        let mut child = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
+            .spawn()?;
+        // **ugg と一緒に終わらせる**（v0.5.6 項目 4）。展開の途中で ugg が落ちても、展開だけが裏で
+        // 続いて導入先を書き換え続けることはない。入れられなくても展開は続ける。
+        if let Err(err) = child_process::tie_to_ugg(child.as_raw_handle()) {
+            crate::ulog!("[irodori] zip の展開を ugg と一緒に終わらせる設定にできません: {err}");
+        }
+        child.wait()
     })
     .with_context(|| "Expand-Archive 起動失敗")?;
     if !status.success() {
@@ -4529,6 +4536,19 @@ mod update_tests {
             );
             assert!(!body.contains("IrodoriBusyGuard::acquire()"), "{name}: プロセスの中だけの錠に戻っている");
         }
+        // 入口の備えの順（v0.5.6 項目 3e・4）: 自分のを止める → 起動時の掃除を待つ → 持ち主のいない孤児を
+        // 止める → 生きているものが残っていれば始めない。掃除より先に確かめると、止められる孤児で断る。
+        let name = "async fn prepare_to_replace_runtime";
+        let body = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{name}: {needle} が無い"));
+        let order = [
+            at(".shutdown()"),
+            at("wait_for_startup_sweep("),
+            at("sweep_orphans("),
+            at("live_sidecars("),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{name}: 備えの順が違う {order:?}");
     }
 
     /// **導入・更新の錠はプロセスをまたぐ**（v0.5.6 項目 3f）。握っている間は、この ugg の中の印も

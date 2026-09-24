@@ -25,12 +25,16 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAndIoAccountingInformation,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     TerminateJobObject, JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// どちらの出力から来た行か。
@@ -228,26 +232,35 @@ struct Activity {
     io: u64,
 }
 
+/// 閉じたら中身ごと終わらせる設定の Job Object を作る。
+fn kill_on_close_job() -> windows::core::Result<HANDLE> {
+    // SAFETY: 作った HANDLE は呼び出し側が持つ。構造体は大きさを渡して読ませるだけ。
+    unsafe {
+        let job = CreateJobObjectW(None, windows::core::PCWSTR::null())?;
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Err(err) = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&limits) as u32,
+        ) {
+            let _ = CloseHandle(job);
+            return Err(err);
+        }
+        Ok(job)
+    }
+}
+
 /// 子プロセスを 1 つ入れる Job Object（閉じたら中身ごと終わらせる設定）。
 struct Job(HANDLE);
 
 impl Job {
     fn for_child(child: &Child) -> windows::core::Result<Job> {
-        // SAFETY: 作った HANDLE は `Job` が持ち、Drop で 1 回だけ閉じる。構造体は大きさを渡して
-        // 読み書きさせるだけで、所有権は移らない。子の HANDLE は `child` が生きている間は有効。
-        unsafe {
-            let job = Job(CreateJobObjectW(None, windows::core::PCWSTR::null())?);
-            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(
-                job.0,
-                JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const core::ffi::c_void,
-                std::mem::size_of_val(&limits) as u32,
-            )?;
-            AssignProcessToJobObject(job.0, HANDLE(child.as_raw_handle()))?;
-            Ok(job)
-        }
+        let job = Job(kill_on_close_job()?);
+        // SAFETY: 子の HANDLE は `child` が生きている間は有効。失敗しても `job` の Drop が閉じる。
+        unsafe { AssignProcessToJobObject(job.0, HANDLE(child.as_raw_handle()))? };
+        Ok(job)
     }
 
     /// 木全体の CPU 時間と読み書きの量。前回と違えば、何かしている。
@@ -297,6 +310,80 @@ impl Drop for Job {
             let _ = CloseHandle(self.0);
         }
     }
+}
+
+/// ugg が生きている間だけ中身を生かす Job（v0.5.6 項目 4、spec §6.0）。
+///
+/// **ハンドルは ugg が終わるまで閉じない。** ugg が強制終了・Alt+F4・異常終了で落ちても OS がハンドルを
+/// 閉じるので、中の子も一緒に終わる（以前は、直前に高品質音声を使っていればサイドカーが GPU を掴んだまま
+/// 残った。新しい版のインストーラは動いている ugg を確かめたうえで強制終了する）。
+struct LifetimeJob(HANDLE);
+
+// SAFETY: Job の HANDLE はどのスレッドから使ってもよい（カーネルのオブジェクト）。閉じるのはプロセスの終了時だけ。
+unsafe impl Send for LifetimeJob {}
+unsafe impl Sync for LifetimeJob {}
+
+static LIFETIME_JOB: std::sync::OnceLock<Option<LifetimeJob>> = std::sync::OnceLock::new();
+
+/// 子を ugg の寿命に結びつける（ugg が終われば、どう終わっても子も終わる）。
+///
+/// **ugg 自身は Job に入れない。** 入れると、あとから起動する子がすべて所属を引き継ぎ、取説を開いた
+/// メモ帳（ユーザーの窓）まで ugg と一緒に閉じる。対象の子を 1 つずつ入れる。子が起こす孫は
+/// 引き継ぎで入る。入れられなければ理由を返す（呼び出し側は起動を止めない — 従来の動きに戻るだけ）。
+pub(crate) fn tie_to_ugg(process: std::os::windows::io::RawHandle) -> Result<(), String> {
+    let job = LIFETIME_JOB.get_or_init(|| match kill_on_close_job() {
+        Ok(handle) => Some(LifetimeJob(handle)),
+        Err(err) => {
+            crate::ulog!("[child] ugg と一緒に終わらせる Job Object を作れません: {err}");
+            None
+        }
+    });
+    let Some(job) = job else {
+        return Err("Job Object を作れていません".to_string());
+    };
+    // SAFETY: `process` は呼び出し側が持つ、生きている子の HANDLE。
+    unsafe { AssignProcessToJobObject(job.0, HANDLE(process)) }.map_err(|e| e.to_string())
+}
+
+/// `GetExitCodeProcess` が「まだ動いている」ときに返す値。
+const STILL_ACTIVE: u32 = 259;
+
+/// そのプロセスがいま動いていれば、開始時刻（1601 年からの 100ns 単位）を返す（v0.5.6 項目 4）。
+///
+/// **pid だけでは同じプロセスだと言えない**（pid は再利用される）ので、台帳の所有者は pid と開始時刻の
+/// 組で見分ける。開けない・終わっている・時刻を取れないときは `None`（動いているとは言わない）。
+pub(crate) fn process_started(pid: u32) -> Option<u64> {
+    // SAFETY: 開いた HANDLE はこの関数の中で 1 回だけ閉じる。書き込み先は手元の変数。
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let started = started_while_running(handle);
+        let _ = CloseHandle(handle);
+        started
+    }
+}
+
+/// この ugg の開始時刻（`process_started` と同じ単位）。
+pub(crate) fn this_process_started() -> Option<u64> {
+    // SAFETY: `GetCurrentProcess` は閉じなくてよい疑似 HANDLE。
+    unsafe { started_while_running(GetCurrentProcess()) }
+}
+
+/// # Safety
+/// `handle` は `PROCESS_QUERY_LIMITED_INFORMATION` 以上で開いた、有効なプロセスの HANDLE であること。
+unsafe fn started_while_running(handle: HANDLE) -> Option<u64> {
+    let mut code = 0u32;
+    GetExitCodeProcess(handle, &mut code).ok()?;
+    if code != STILL_ACTIVE {
+        return None;
+    }
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user).ok()?;
+    Some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
 }
 
 /// 無進捗を見る間隔。
@@ -776,5 +863,103 @@ mod tests {
             );
             blocked.await.unwrap();
         });
+    }
+
+    /// `a_child_tied_to_ugg_ends_when_ugg_is_killed` が「強制終了される ugg」役として起動する。
+    /// 環境変数で頼まれたときだけ動く（単独で実行しても何もしない）。
+    #[test]
+    #[ignore = "a_child_tied_to_ugg_ends_when_ugg_is_killed の手伝い（単独では何もしない）"]
+    fn tie_to_ugg_helper() {
+        if std::env::var("UGG_TEST_TIE_HELPER").is_err() {
+            return;
+        }
+        let mut c = Command::new("powershell.exe");
+        c.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60"])
+            .creation_flags(crate::tts::irodori_download::CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = c.spawn().expect("子を起動できること");
+        tie_to_ugg(child.as_raw_handle()).expect("ugg の寿命に結びつけられること");
+        println!("UGG_TIED_CHILD={}", child.id());
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// **ugg が強制終了されたら、寿命に結びつけた子も終わる**（v0.5.6 項目 4）。
+    ///
+    /// この試験の実行ファイルを「ugg」役として起動し、その中で子を結びつけてから、「ugg」役を
+    /// 強制終了（TerminateProcess）する。`tie_to_ugg` を呼ばなければ、子は 60 秒生き残る。
+    #[test]
+    fn a_child_tied_to_ugg_ends_when_ugg_is_killed() {
+        use std::io::BufRead;
+        let mut helper = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "tts::child_process::tests::tie_to_ugg_helper",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("UGG_TEST_TIE_HELPER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("「ugg」役を起動できること");
+        let stdout = helper.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // 試験の枠組みが「test … ...」を改行せずに先に出すので、行の途中から探す。
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some((_, pid)) = line.split_once("UGG_TIED_CHILD=") {
+                    let _ = tx.send(pid.trim().parse::<u32>().ok());
+                    return;
+                }
+            }
+            let _ = tx.send(None);
+        });
+        let got = rx.recv_timeout(Duration::from_secs(60)).ok().flatten();
+        let Some(pid) = got else {
+            let _ = helper.kill();
+            panic!("「ugg」役から子の pid が届かない");
+        };
+        // pid は再利用されるので、開始時刻と組で同じプロセスかを見る。
+        let started = process_started(pid).expect("結びつけた子が動いていること");
+        helper.kill().expect("「ugg」役を強制終了できること");
+        let _ = helper.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process_started(pid) == Some(started) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let survived = process_started(pid) == Some(started);
+        if survived {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .output();
+        }
+        assert!(!survived, "ugg を強制終了しても、結びつけた子が残った");
+    }
+
+    /// 自分の開始時刻は、pid から引いたものと同じ（台帳の所有者の照合の前提）。
+    #[test]
+    fn this_process_is_found_by_its_pid_and_start_time() {
+        let mine = this_process_started().expect("自分の開始時刻を取れること");
+        assert_eq!(process_started(std::process::id()), Some(mine));
+    }
+
+    /// **終わったプロセスは、ハンドルが残っていても「動いている」と言わない。** 誰かがハンドルを
+    /// 握っている間は、終わったプロセスでも開けてしまう（ここでは `child` が握っている）。
+    #[test]
+    fn a_finished_process_is_not_running_even_while_its_handle_is_open() {
+        let mut child = cmd("exit 0").spawn().unwrap();
+        child.wait().unwrap();
+        assert_eq!(process_started(child.id()), None);
+    }
+
+    /// 無い pid は「動いていない」。
+    #[test]
+    fn an_unknown_pid_is_not_running() {
+        assert_eq!(process_started(0xFFFF_FFF0), None);
     }
 }

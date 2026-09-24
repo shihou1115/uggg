@@ -415,10 +415,11 @@ pub async fn update_irodori_runtime(
 ///    （`ensure_sidecar_running` は版を見ずに既存ポートを返す）(b) 遅延 import するモジュールを差し替えると
 ///    動いているプロセスが壊れる。次の合成で新しいコードが起動する
 /// 2. **起動時の孤児掃除が終わるのを待つ。** 掃除は起動時に投げっぱなしで、誰も待っていなかった
-/// 3. **記録にあるサイドカーで生きているものが残っていれば始めない。** 生きているサイドカーは torch の DLL を
+/// 3. **持ち主のいない孤児を止める**（v0.5.6 項目 4。台帳に持ち主の欄が入って、ほかの ugg が使っている
+///    ものと見分けられるようになった）
+/// 4. **記録にあるサイドカーで生きているものが残っていれば始めない。** 生きているサイドカーは torch の DLL を
 ///    読み込んだままで、Windows はそれを消すことも上書きすることも拒む — 入れ替えも、失敗したときの全戻しも
-///    失敗する（反証レビュー #4）。**止めはしない**（もう 1 つの ugg のものかもしれない。所有者を見分けられるのは
-///    項目 4 から）
+///    失敗する（反証レビュー #4）。ほかの ugg が使っているものは止めない
 async fn prepare_to_replace_runtime(
     state: &Arc<AppState>,
     root: &std::path::Path,
@@ -430,16 +431,53 @@ async fn prepare_to_replace_runtime(
         .irodori
         .wait_for_startup_sweep(|| emit("前回の実行の後始末（残ったサイドカーの掃除）が終わるのを待っています…"))
         .await;
-    let live = crate::tts::sidecar::live_sidecars(root, &state.tts.irodori.http_client()).await;
+    let client = state.tts.irodori.http_client();
+    let stopped = crate::tts::sidecar::sweep_orphans(root, &client).await;
+    if stopped > 0 {
+        emit(&format!("前回の実行が残したサイドカーを {stopped} 件止めました"));
+    }
+    let live = crate::tts::sidecar::live_sidecars(root, &client).await;
     if live.is_empty() {
         return Ok(());
     }
-    let ports: Vec<String> = live.iter().map(u16::to_string).collect();
-    Err(format!(
-        "Irodori のサイドカーがほかに {} 件動いています（もう 1 つの ugg か、前回の実行の残り。port {}）。動いたまま入れ替えると、入れ替えも元に戻すことも失敗します。もう 1 つの ugg を終了するか、PC を再起動してから、もう一度お試しください",
-        live.len(),
-        ports.join(", ")
-    ))
+    Err(why_the_runtime_cannot_be_replaced(&live))
+}
+
+/// 生きているサイドカーが残って入れ替えを始められないときの説明。**持ち主ごとに、することが違う。**
+fn why_the_runtime_cannot_be_replaced(live: &[crate::tts::sidecar::LiveSidecar]) -> String {
+    use crate::tts::sidecar::Holder;
+    let ports = |holder: Holder| -> Vec<String> {
+        live.iter()
+            .filter(|s| s.holder == holder)
+            .map(|s| s.port.to_string())
+            .collect()
+    };
+    let mut reasons = Vec::new();
+    let another = ports(Holder::AnotherUgg);
+    if !another.is_empty() {
+        reasons.push(format!(
+            "ほかの ugg が Irodori を使っています（port {}）。そちらの ugg を終了してから",
+            another.join(", ")
+        ));
+    }
+    let orphans = ports(Holder::Nobody);
+    if !orphans.is_empty() {
+        reasons.push(format!(
+            "前回の実行が残したサイドカーを止められませんでした（port {}。合成の途中で応答しないものを含みます）。PC を再起動してから",
+            orphans.join(", ")
+        ));
+    }
+    let mine = ports(Holder::Me);
+    if !mine.is_empty() {
+        reasons.push(format!(
+            "この ugg のサイドカーが止まりませんでした（port {}）。ugg を再起動してから",
+            mine.join(", ")
+        ));
+    }
+    format!(
+        "Irodori のサイドカーが動いているので、入れ替えを始めません（動いたまま入れ替えると、入れ替えも元に戻すことも失敗します）。{}、もう一度お試しください",
+        reasons.join("。")
+    )
 }
 
 /// Irodori 資産の導入状態 (v0.5.4 項目 2、spec §6.0)。
@@ -781,6 +819,26 @@ pub fn tts_params(settings: &Settings) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 入れ替えを始められないときの説明は、**持ち主ごとに、することを分けて言う**（v0.5.6 項目 4）。
+    /// ほかの ugg のものは「そちらを終了」、止められなかった孤児は「PC を再起動」。
+    #[test]
+    fn the_refusal_says_what_to_do_for_each_holder() {
+        use crate::tts::sidecar::{Holder, LiveSidecar};
+        let another = LiveSidecar { port: 50001, holder: Holder::AnotherUgg };
+        let orphan = LiveSidecar { port: 50002, holder: Holder::Nobody };
+
+        let msg = why_the_runtime_cannot_be_replaced(&[another]);
+        assert!(msg.contains("ほかの ugg") && msg.contains("50001") && msg.contains("終了"), "{msg}");
+        assert!(!msg.contains("再起動"), "ほかの ugg のものに PC の再起動は要らない: {msg}");
+
+        let msg = why_the_runtime_cannot_be_replaced(&[orphan]);
+        assert!(msg.contains("前回の実行") && msg.contains("50002") && msg.contains("PC を再起動"), "{msg}");
+        assert!(!msg.contains("ほかの ugg"), "{msg}");
+
+        let msg = why_the_runtime_cannot_be_replaced(&[another, orphan]);
+        assert!(msg.contains("50001") && msg.contains("50002"), "両方を言う: {msg}");
+    }
 
     #[test]
     fn decide_fallback_voice_ref_missing_returns_error() {

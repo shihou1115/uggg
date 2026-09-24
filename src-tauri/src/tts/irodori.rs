@@ -374,29 +374,42 @@ impl IrodoriClient {
     ///
     /// `disable_for()` で sticky cooldown が立っている間は即 `SidecarStart` で弾く。
     /// GPU 永続不在環境で 90 秒 churn を繰り返すのを防ぐ。
+    ///
+    /// **動いているサイドカーは、同じモード（実モデル / mock）のときだけ使う**（v0.5.6 項目 4）。以前は
+    /// モードを見ずに既存のポートを返していたので、実モデルの ON/OFF を切り替えても、サイドカーが
+    /// 止まるまで（アイドル 5 分か終了まで）効かなかった。違えば止めて起動し直す。
     pub async fn ensure_sidecar_running(
         &self,
         asset_root: &Path,
         mock: bool,
         app: Option<AppHandle>,
     ) -> Result<u16, TtsError> {
-        if let Some(port) = self.current_port() {
-            return Ok(port);
-        }
-        if self.currently_disabled() {
-            return Err(TtsError::SidecarStart(
-                "直近の失敗により一時停止中です (cooldown)。voicevox 経路で発話します".to_string(),
-            ));
-        }
-        // **導入・更新の最中は新しく起動しない** (v0.5.5 項目 4、spec §6.0)。
-        // 入れ替え中の `site-packages` で起動すると、半分だけ新しい状態で読み込む。
-        // すでに動いているものは止めない（上で `current_port()` を返している）— 走っている
-        // 発話を切らないため。ここで弾くと `decide_fallback` が voicevox へ流す。
+        // **導入・更新の最中は使わない** (v0.5.5 項目 4、spec §6.0)。入れ替え中の `site-packages` で
+        // 起動すると、半分だけ新しい状態で読み込む。**動いているものがあっても、この判定を先にする**
+        // （v0.5.6 項目 4。以前は既存のポートを先に返していた）— 新しい依頼を voicevox へ流すだけで、
+        // 走っている発話は切らない。ここで弾くと `decide_fallback` が voicevox へ流す。
         // **もう 1 つの ugg の更新も見る**（v0.5.6 項目 3f。錠をプロセスをまたぐものにした）。
         if crate::tts::irodori_download::is_busy_for(asset_root) {
             return Err(TtsError::SidecarStart(
                 "Irodori ランタイムの導入または更新が進行中です。voicevox 経路で発話します"
                     .to_string(),
+            ));
+        }
+        match self.running() {
+            Some((port, running_mock)) if running_mock == mock => return Ok(port),
+            Some(_) => {
+                crate::ulog!(
+                    "[irodori] 実モデルの設定が変わったので、サイドカーを起動し直します（{}）",
+                    if mock { "mock へ" } else { "実モデルへ" }
+                );
+                // 止め損ねても、手元のハンドルは外れている。起動し直しは続ける（孤児は次の掃除が拾う）。
+                let _ = self.shutdown().await;
+            }
+            None => {}
+        }
+        if self.currently_disabled() {
+            return Err(TtsError::SidecarStart(
+                "直近の失敗により一時停止中です (cooldown)。voicevox 経路で発話します".to_string(),
             ));
         }
         let script = asset_root.join("sidecar.py");
@@ -458,8 +471,13 @@ impl IrodoriClient {
     }
 
     fn current_port(&self) -> Option<u16> {
+        self.running().map(|(port, _)| port)
+    }
+
+    /// 動いているサイドカーのポートと、mock で起動したか。
+    fn running(&self) -> Option<(u16, bool)> {
         let guard = self.sidecar.lock().expect("irodori sidecar poisoned");
-        guard.as_ref().map(|h| h.port)
+        guard.as_ref().map(|h| (h.port, h.mock))
     }
 
     /// 既存サイドカーがあれば shutdown する。`lifecycle::quit_app` と
@@ -673,7 +691,7 @@ mod tests {
                 .local_addr()
                 .unwrap()
                 .port();
-            (super::SidecarHandle::for_test(dir.path(), port, pid, child), pid)
+            (super::SidecarHandle::for_test(dir.path(), port, pid, true, child), pid)
         };
         let client = super::IrodoriClient::new();
 
@@ -696,6 +714,62 @@ mod tests {
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
             .output();
+    }
+
+    /// **実モデルの ON/OFF を切り替えたら、動いているサイドカーを止めて起動し直す**（v0.5.6 項目 4）。
+    /// 以前はモードを見ずに既存のポートを返し、サイドカーが止まるまで切り替えが効かなかった。
+    /// **導入・更新の最中は、動いているものがあっても使わない**（判定を既存のポートより先にする）。
+    ///
+    /// 存在しない資産ルートを渡しているので、起動し直そうとすると「sidecar.py が無い」で落ちる
+    /// （本物のサイドカーは起動しない）。子プロセスには長く走る `ping` を使う。
+    #[tokio::test]
+    async fn switching_the_real_model_restarts_the_running_sidecar() {
+        let _serial = crate::tts::irodori_download::lock_busy_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let nowhere = std::path::Path::new("Z:/ugg-does-not-exist");
+        let child = tokio::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(false)
+            .spawn()
+            .expect("ping を起動できること");
+        let pid = child.id().unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = super::IrodoriClient::new();
+        *client.sidecar.lock().unwrap() =
+            Some(super::SidecarHandle::for_test(dir.path(), port, pid, true, child));
+
+        // 同じモードなら、動いているものを使う
+        assert_eq!(client.ensure_sidecar_running(nowhere, true, None).await.unwrap(), port);
+
+        // 更新の最中は、動いているものがあっても使わない
+        let guard = crate::tts::irodori_download::IrodoriBusyGuard::acquire().unwrap();
+        let err = client
+            .ensure_sidecar_running(nowhere, true, None)
+            .await
+            .expect_err("更新中は使わない");
+        assert!(format!("{err}").contains("進行中"), "{err}");
+        assert_eq!(client.current_port(), Some(port), "走っているものは止めない");
+        drop(guard);
+
+        // 実モデルへ切り替えたら、止めて起動し直す（ここでは資産が無いので起動は失敗する）
+        let err = client
+            .ensure_sidecar_running(nowhere, false, None)
+            .await
+            .expect_err("資産が無いので起動し直しは失敗する");
+        assert!(format!("{err}").contains("sidecar.py"), "起動し直そうとしたこと: {err}");
+        assert!(client.current_port().is_none(), "mock のサイドカーを使い続けない");
+        let still_running = crate::tts::child_process::process_started(pid).is_some();
+        if still_running {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .output();
+        }
+        assert!(!still_running, "切り替え前のサイドカーを止めること");
     }
 
     /// **JSON でエスケープされた発話も伏せる**（2026-09-14 監査で発覚）。
@@ -881,7 +955,7 @@ mod tests {
         let pid = child.id().unwrap();
         let client = super::IrodoriClient::new();
         *client.sidecar.lock().unwrap() =
-            Some(super::SidecarHandle::for_test(dir.path(), port, pid, child));
+            Some(super::SidecarHandle::for_test(dir.path(), port, pid, false, child));
 
         let _ = client
             .synthesize(dir.path(), "ないしょの本文です", std::path::Path::new("x.wav"), 1.0, Some("ないしょの声色".to_string()), false, None)

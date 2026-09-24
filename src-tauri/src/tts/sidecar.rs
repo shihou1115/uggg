@@ -29,6 +29,8 @@ pub struct SidecarHandle {
     pub port: u16,
     /// 台帳の記録を**ポートと pid の組**で消すために持つ（同じポートを後から別の子が取りうる）。
     pub pid: u32,
+    /// `--mock` で起動したか（v0.5.6 項目 4）。実モデルの ON/OFF を切り替えたら起動し直すのに使う。
+    pub mock: bool,
     /// `wait()` を呼ばずに保持し続けるとゾンビ化するため、`shutdown_sidecar` で wait する。
     pub child: Child,
 }
@@ -43,20 +45,81 @@ impl SidecarHandle {
 #[cfg(test)]
 impl SidecarHandle {
     /// テスト用。本物の起動を経ずに、採用の判定（`IrodoriClient::adopt_sidecar`）を確かめる。
-    pub(crate) fn for_test(asset_root: &Path, port: u16, pid: u32, child: Child) -> Self {
+    pub(crate) fn for_test(asset_root: &Path, port: u16, pid: u32, mock: bool, child: Child) -> Self {
         Self {
             asset_root: asset_root.to_path_buf(),
             port,
             pid,
+            mock,
             child,
         }
     }
 }
 
+/// `ready.json`（`sidecar.py` が起動のたびに書く）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReadyFile {
     port: u16,
     pid: u32,
+}
+
+/// 台帳の 1 件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LedgerEntry {
+    port: u16,
+    pid: u32,
+    /// 記録を書いた ugg（v0.5.6 項目 4）。**v0.5.5 が書いた記録には無い** — 無ければ、所有者はもう
+    /// 生きていないものとして従来どおり掃除する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<Owner>,
+}
+
+/// 台帳の記録を書いた ugg。**pid は再利用される**ので、開始時刻と組で見分ける（pid だけだと、
+/// 別のプロセスが同じ pid を取ったとき「所有者が生きている」と見て、孤児を永久に残す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct Owner {
+    pid: u32,
+    /// 開始時刻（1601 年からの 100ns 単位。`child_process::process_started`）。
+    started: u64,
+}
+
+impl Owner {
+    /// この ugg。開始時刻を取れなければ `None`（記録は所有者なしになり、v0.5.5 と同じ扱いに戻る）。
+    fn me() -> Option<Owner> {
+        crate::tts::child_process::this_process_started().map(|started| Owner {
+            pid: std::process::id(),
+            started,
+        })
+    }
+
+    fn is_alive(self) -> bool {
+        crate::tts::child_process::process_started(self.pid) == Some(self.started)
+    }
+}
+
+/// 記録のサイドカーを、いま誰が使っているか（v0.5.6 項目 4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Holder {
+    /// この ugg。
+    Me,
+    /// 生きている、ほかの ugg。**止めない**（使っている最中のものを止めると、そちらはヘルス監視で
+    /// 20 分止まり、キャラが「使えません」と告知する）。
+    AnotherUgg,
+    /// 誰も使っていない（所有者が終わっている・所有者の欄が無い）。孤児として掃除してよい。
+    Nobody,
+}
+
+/// 記録の持ち主を判定する（純粋部分。生きているかは `alive` で渡す）。
+fn holder_of(entry: &LedgerEntry, me: Option<Owner>, alive: impl Fn(Owner) -> bool) -> Holder {
+    match entry.owner {
+        Some(owner) if Some(owner) == me => Holder::Me,
+        Some(owner) if alive(owner) => Holder::AnotherUgg,
+        _ => Holder::Nobody,
+    }
+}
+
+fn holder(entry: &LedgerEntry) -> Holder {
+    holder_of(entry, Owner::me(), Owner::is_alive)
 }
 
 /// 起動したサイドカーの台帳 (v0.5.5 項目 2、spec §6.0)。
@@ -70,34 +133,122 @@ fn ledger_path(asset_root: &Path) -> PathBuf {
     asset_root.join(LEDGER_FILE)
 }
 
-fn read_ledger(asset_root: &Path) -> Vec<ReadyFile> {
+fn read_ledger(asset_root: &Path) -> Vec<LedgerEntry> {
     std::fs::read_to_string(ledger_path(asset_root))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Vec<ReadyFile>>(&t).ok())
+        .map(|text| parse_ledger(&text))
         .unwrap_or_default()
 }
 
-fn write_ledger(asset_root: &Path, entries: &[ReadyFile]) {
-    if let Ok(json) = serde_json::to_string(entries) {
-        let _ = std::fs::write(ledger_path(asset_root), json);
+/// **1 件ずつ読む**（v0.5.6 項目 4）。以前は全体を 1 回で読み、1 件でも読めなければ**台帳が丸ごと空**に
+/// なった — 書式を変える版（所有者の欄を足したこの版）と古い版が混ざると、孤児の手がかりを全部失う。
+/// 読めない記録だけを落とす（知らない欄は無視する）。
+fn parse_ledger(text: &str) -> Vec<LedgerEntry> {
+    let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(text) else {
+        return Vec::new();
+    };
+    let total = values.len();
+    let entries: Vec<LedgerEntry> = values
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
+    if entries.len() < total {
+        crate::ulog!(
+            "[irodori] 台帳に読めない記録が {} 件ありました（読めたものだけ使います）",
+            total - entries.len()
+        );
+    }
+    entries
+}
+
+/// **差し替えで書く**（v0.5.6 項目 4）。上書きの途中を別の ugg が読むと、壊れた JSON を「台帳なし」と
+/// 読み、その内容で書き戻して全部消す。一時ファイルは pid で分ける（2 つの ugg が同じ名前を使わないように）。
+/// 差し替えに失敗したら（ウイルス対策が開いている、など）そのまま上書きする — 記録を失うよりよい。
+fn write_ledger(asset_root: &Path, entries: &[LedgerEntry]) {
+    let Ok(json) = serde_json::to_string(entries) else {
+        return;
+    };
+    let path = ledger_path(asset_root);
+    let tmp = asset_root.join(format!("{LEDGER_FILE}.{}.tmp", std::process::id()));
+    let replaced = std::fs::write(&tmp, &json).and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(err) = replaced {
+        let _ = std::fs::remove_file(&tmp);
+        crate::ulog!("[irodori] 台帳を差し替えられないので上書きします: {err}");
+        let _ = std::fs::write(&path, json);
     }
 }
 
-/// 台帳の「読む → 書き戻す」を直列にする（2026-09-13）。
+/// 台帳の「読む → 書き戻す」を直列にする錠（2026-09-13 / v0.5.6 項目 4）。
 ///
 /// **排他が無いと、後から書いた側が先の変更を消す。** 孤児掃除は起動直後に非同期で走り、
 /// 同じ時期に起動時の挨拶がサイドカーを立てて `ledger_add` しうる。両者が同じ内容を読んで
 /// それぞれ書き戻すと、**新しく立てた子の記録が消え、次に強制終了されたとき孤児を追えない**。
+///
+/// **プロセスをまたぐ**（v0.5.6 項目 4）。プロセスの中の錠だけでは、2 つの ugg が同時に書くと同じ形で
+/// 片方の記録が消える。プロセスの中の錠（同じプロセスの 2 本目を先に並ばせる。ファイルの錠はハンドル
+/// 単位なので、同じプロセスの中でも衝突する）と、ファイルのバイト範囲の錠（3f と同じ種類）の二段。
 static LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn lock_ledger() -> std::sync::MutexGuard<'static, ()> {
+const LEDGER_LOCK_FILE: &str = "sidecars.lock";
+
+/// 台帳の錠を待つ上限。握る側は小さなファイルを読んで書くだけなので、ふつうは数ミリ秒で空く。
+const LEDGER_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// 台帳の錠を取れなかったときにどうするか。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IfLockBusy {
+    /// 錠なしで書く（**足すときはこちら**。記録を失うと、強制終了されたとき孤児を二度と追えない）。
+    WriteAnyway,
+    /// 見送る（**消すときはこちら**。錠なしで書くと、ほかの ugg が足した記録を消しうる。消し損ねた
+    /// 記録は、次の掃除で死んだものとして片付く）。
+    Skip,
+}
+
+struct LedgerLock {
+    // 落とす順はこの並び（ファイルの錠を放してから、プロセスの中の錠を放す）。
+    _file: Option<crate::tts::file_lock::FileLock>,
+    _in_process: std::sync::MutexGuard<'static, ()>,
+}
+
+fn lock_ledger(asset_root: &Path, wait: Duration, if_busy: IfLockBusy) -> Option<LedgerLock> {
     // 中身を持たない錠なので、毒されていても続行してよい。
-    LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    let in_process = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = asset_root.join(LEDGER_LOCK_FILE);
+    let deadline = Instant::now() + wait;
+    let why = loop {
+        match crate::tts::file_lock::FileLock::try_acquire(&path) {
+            Ok(Some(file)) => {
+                return Some(LedgerLock {
+                    _file: Some(file),
+                    _in_process: in_process,
+                })
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => break "ほかの ugg が握ったままです".to_string(),
+            Err(err) => break err.to_string(),
+        }
+    };
+    match if_busy {
+        IfLockBusy::WriteAnyway => {
+            crate::ulog!("[irodori] 台帳の錠を取れないまま記録を足します（{why}）");
+            Some(LedgerLock {
+                _file: None,
+                _in_process: in_process,
+            })
+        }
+        IfLockBusy::Skip => {
+            crate::ulog!("[irodori] 台帳の錠を取れないので、記録を消すのを見送ります（{why}。次の掃除で片付きます）");
+            None
+        }
+    }
 }
 
 /// 台帳へ 1 件足す（起動直後に呼ぶ）。
-fn ledger_add(asset_root: &Path, entry: ReadyFile) {
-    let _guard = lock_ledger();
+fn ledger_add(asset_root: &Path, entry: LedgerEntry) {
+    ledger_add_waiting(asset_root, entry, LEDGER_LOCK_WAIT);
+}
+
+fn ledger_add_waiting(asset_root: &Path, entry: LedgerEntry, wait: Duration) {
+    let _guard = lock_ledger(asset_root, wait, IfLockBusy::WriteAnyway);
     let mut entries = read_ledger(asset_root);
     entries.retain(|e| e.port != entry.port);
     entries.push(entry);
@@ -109,17 +260,23 @@ fn ledger_add(asset_root: &Path, entry: ReadyFile) {
 /// **ポートだけでなく pid も一致したものだけを消す。** 同じポートを後から新しい子が取ると、
 /// `ledger_add` はその記録を新しい子の pid で置き換える。ポートだけで消すと、
 /// **いま生きている自分の子の記録**を消してしまう。
-fn ledger_remove(asset_root: &Path, record: &ReadyFile) {
-    let _guard = lock_ledger();
+fn ledger_remove(asset_root: &Path, port: u16, pid: u32) {
+    ledger_remove_waiting(asset_root, port, pid, LEDGER_LOCK_WAIT);
+}
+
+fn ledger_remove_waiting(asset_root: &Path, port: u16, pid: u32, wait: Duration) {
+    let Some(_guard) = lock_ledger(asset_root, wait, IfLockBusy::Skip) else {
+        return;
+    };
     let mut entries = read_ledger(asset_root);
-    entries.retain(|e| !(e.port == record.port && e.pid == record.pid));
+    entries.retain(|e| !(e.port == port && e.pid == pid));
     write_ledger(asset_root, &entries);
 }
 
 /// 台帳のそのポートを、候補とは**別の子**（pid が違う）がいま持っているか。
 ///
 /// 掃除の最中に同じポートで新しい子が立ったなら、それは自分で立てたもの。触らない。
-fn taken_by_a_new_child(ledger: &[ReadyFile], candidate: &ReadyFile) -> bool {
+fn taken_by_a_new_child(ledger: &[LedgerEntry], candidate: &LedgerEntry) -> bool {
     ledger
         .iter()
         .any(|e| e.port == candidate.port && e.pid != candidate.pid)
@@ -141,6 +298,10 @@ pub(crate) fn looks_like_our_sidecar(body: &serde_json::Value) -> bool {
 }
 
 /// 前回の実行が残したサイドカーを止める (v0.5.5 項目 2)。
+///
+/// 止めるのは**持ち主のいない**記録だけ（v0.5.6 項目 4。この ugg の記録と、生きているほかの ugg の
+/// 記録には触らない）。導入・更新の入口でも呼ぶ（持ち主を見分けられるようになったので、孤児を止めてから
+/// 入れ替えられる）。
 ///
 /// **サイドカーを 1 つも起動する前に呼ぶこと。** 後から呼ぶと、掃除対象のポートを
 /// 新しいサイドカーが取っている可能性があり、自分で立てたものを止めてしまう。
@@ -166,31 +327,43 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 前回までの実行が残したかもしれないサイドカーの記録（台帳 + 旧 `ready.json`）。
 /// 掃除（`sweep_orphans`）と、更新の前の確認（`live_sidecars`）で同じ集め方をする。
-fn orphan_candidates(asset_root: &Path) -> Vec<ReadyFile> {
+/// 旧 `ready.json` の記録には所有者が無い（孤児として扱う）。
+fn orphan_candidates(asset_root: &Path) -> Vec<LedgerEntry> {
     let mut candidates = read_ledger(asset_root);
     if let Ok(Some(port)) = try_read_port(&ready_path_for(asset_root)) {
         if !candidates.iter().any(|e| e.port == port) {
-            candidates.push(ReadyFile { port, pid: 0 });
+            candidates.push(LedgerEntry {
+                port,
+                pid: 0,
+                owner: None,
+            });
         }
     }
     candidates
 }
 
-/// 記録にあるサイドカーのうち、**いま生きているもの**のポート（v0.5.6 項目 3e）。**読むだけで止めない。**
+/// 記録にある、いま生きているサイドカー（v0.5.6 項目 3e・4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveSidecar {
+    pub port: u16,
+    pub holder: Holder,
+}
+
+/// 記録にあるサイドカーのうち、**いま生きているもの**と、その持ち主（v0.5.6 項目 3e・4）。**読むだけで止めない。**
 ///
 /// 更新の前に使う。生きているサイドカーは torch の DLL（`site-packages\torch\lib\c10.dll` など）を
 /// 読み込んだままで、Windows はそれを消すことも上書きすることも拒む。そのまま入れ替えを始めると、
 /// **入れ替えも、失敗したときの全戻しも**同じファイルで失敗する（反証レビュー #4）。
 /// 「生きている」は、応答の形が自分たちのもの（`Ours`）か、つながったのに答えない（`Unanswered`。
-/// 合成中・読み込み中）もの。
-///
-/// **止めないのは、所有者を見分けられないから**（項目 4 で台帳に所有者の欄が入るまで）。応答の形だけで
-/// 止めると、もう 1 つの ugg が使っている最中のサイドカーを止めうる。
-pub async fn live_sidecars(asset_root: &Path, client: &reqwest::Client) -> Vec<u16> {
+/// 合成中・読み込み中）もの。止めるのは呼び出し側で、持ち主のいない孤児だけを `sweep_orphans` で止める。
+pub(crate) async fn live_sidecars(asset_root: &Path, client: &reqwest::Client) -> Vec<LiveSidecar> {
     let mut live = Vec::new();
     for entry in orphan_candidates(asset_root) {
         match identify_sidecar(client, entry.port, PROBE_TIMEOUT).await {
-            Probe::Ours | Probe::Unanswered => live.push(entry.port),
+            Probe::Ours | Probe::Unanswered => live.push(LiveSidecar {
+                port: entry.port,
+                holder: holder(&entry),
+            }),
             Probe::NotOurs => {}
         }
     }
@@ -222,6 +395,20 @@ async fn sweep_orphans_with(
         // 台帳は起動直後に書かれるので、ここを見れば「いま生きている自分の子」が分かる。
         if taken_by_a_new_child(&read_ledger(asset_root), entry) {
             continue;
+        }
+        // **持ち主が生きているものは止めない**（v0.5.6 項目 4）。以前は応答の形だけで「自分のもの」と
+        // 見ていたので、2 つ目の ugg の掃除が、1 つ目が使っている最中のサイドカーを止めえた。
+        match holder(entry) {
+            Holder::Me => continue,
+            Holder::AnotherUgg => {
+                crate::ulog!(
+                    "[irodori] ほかの ugg が使っているサイドカーなので触りません (port={} ugg の pid={})",
+                    entry.port,
+                    entry.owner.map_or(0, |o| o.pid)
+                );
+                continue;
+            }
+            Holder::Nobody => {}
         }
         let started = Instant::now();
         let probe = identify_sidecar(client, entry.port, probe_timeout).await;
@@ -266,7 +453,7 @@ async fn sweep_orphans_with(
                 );
             }
         }
-        ledger_remove(asset_root, entry);
+        ledger_remove(asset_root, entry.port, entry.pid);
     }
     stopped
 }
@@ -434,6 +621,13 @@ where
         .spawn()
         .with_context(|| format!("python サイドカー起動失敗: {}", python.display()))?;
     let pid = child.id().unwrap_or(0);
+    // **ugg と一緒に終わらせる**（v0.5.6 項目 4）。強制終了・Alt+F4・異常終了のときも、GPU を掴んだ
+    // サイドカーを残さない。入れられなくても起動は続ける（孤児は次の起動の掃除が拾う）。
+    if let Some(handle) = child.raw_handle() {
+        if let Err(err) = crate::tts::child_process::tie_to_ugg(handle) {
+            crate::ulog!("[irodori] サイドカーを ugg と一緒に終わらせる設定にできません (pid={pid}): {err}");
+        }
+    }
 
     // stderr を別タスクで非同期 read。サイドカー終了で EOF → タスクも終わる。
     if let Some(stderr) = child.stderr.take() {
@@ -456,11 +650,19 @@ where
         }
     };
 
-    ledger_add(asset_root, ReadyFile { port, pid });
+    ledger_add(
+        asset_root,
+        LedgerEntry {
+            port,
+            pid,
+            owner: Owner::me(),
+        },
+    );
     Ok(SidecarHandle {
         asset_root: asset_root.to_path_buf(),
         port,
         pid,
+        mock,
         child,
     })
 }
@@ -538,10 +740,6 @@ async fn request_shutdown(port: u16, http: &reqwest::Client) -> bool {
 }
 
 pub async fn shutdown_sidecar(mut handle: SidecarHandle, http: &reqwest::Client) -> Result<()> {
-    let record = ReadyFile {
-        port: handle.port,
-        pid: handle.pid,
-    };
     let url = format!("http://127.0.0.1:{}/shutdown", handle.port);
     // shutdown 要求はベストエフォート: 失敗しても kill にフォールバック
     let _ = http
@@ -569,7 +767,7 @@ pub async fn shutdown_sidecar(mut handle: SidecarHandle, http: &reqwest::Client)
     // 以前は冒頭で消していた。止めている数秒の間にアプリが落ちたときや kill に失敗したとき、
     // **生きているサイドカーの記録だけが消え**、次の起動の掃除が届かない。
     if stopped.is_ok() {
-        ledger_remove(&handle.asset_root, &record);
+        ledger_remove(&handle.asset_root, handle.port, handle.pid);
     }
     stopped
 }
@@ -671,19 +869,19 @@ mod tests {
     #[test]
     fn the_ledger_keeps_every_sidecar() {
         let dir = tempfile::tempdir().unwrap();
-        super::ledger_add(dir.path(), super::ReadyFile { port: 50073, pid: 1 });
-        super::ledger_add(dir.path(), super::ReadyFile { port: 59533, pid: 2 });
+        super::ledger_add(dir.path(), orphan(50073, 1));
+        super::ledger_add(dir.path(), orphan(59533, 2));
         let got = super::read_ledger(dir.path());
         assert_eq!(got.len(), 2, "2 つ目で 1 つ目を消してはいけない: {got:?}");
 
         // 正常に止めた分だけ消える
-        super::ledger_remove(dir.path(), &super::ReadyFile { port: 50073, pid: 1 });
+        super::ledger_remove(dir.path(), 50073, 1);
         let got = super::read_ledger(dir.path());
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].port, 59533);
 
         // ポートが同じでも pid が違えば**別の子**（後から同じポートを取った新しい子）。消さない
-        super::ledger_remove(dir.path(), &super::ReadyFile { port: 59533, pid: 7 });
+        super::ledger_remove(dir.path(), 59533, 7);
         assert_eq!(
             super::read_ledger(dir.path()).len(),
             1,
@@ -695,8 +893,8 @@ mod tests {
     #[test]
     fn the_ledger_does_not_duplicate_a_port() {
         let dir = tempfile::tempdir().unwrap();
-        super::ledger_add(dir.path(), super::ReadyFile { port: 50073, pid: 1 });
-        super::ledger_add(dir.path(), super::ReadyFile { port: 50073, pid: 9 });
+        super::ledger_add(dir.path(), orphan(50073, 1));
+        super::ledger_add(dir.path(), orphan(50073, 9));
         let got = super::read_ledger(dir.path());
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].pid, 9, "新しい方で置き換わること");
@@ -715,13 +913,7 @@ mod tests {
                 let root = root.clone();
                 std::thread::spawn(move || {
                     for i in 0..50u16 {
-                        super::ledger_add(
-                            &root,
-                            super::ReadyFile {
-                                port: 10_000 + t * 100 + i,
-                                pid: 1,
-                            },
-                        );
+                        super::ledger_add(&root, orphan(10_000 + t * 100 + i, 1));
                     }
                 })
             })
@@ -737,6 +929,24 @@ mod tests {
     }
 
     use super::*;
+
+    /// 前回の実行が残した記録（v0.5.5 の書式 — 所有者の欄が無い。持ち主はいないものとして扱われる）。
+    fn orphan(port: u16, pid: u32) -> LedgerEntry {
+        LedgerEntry {
+            port,
+            pid,
+            owner: None,
+        }
+    }
+
+    /// この ugg が立てた子の記録。
+    fn mine(port: u16, pid: u32) -> LedgerEntry {
+        LedgerEntry {
+            port,
+            pid,
+            owner: Owner::me(),
+        }
+    }
 
     /// テスト用の HTTP クライアント（環境の proxy 設定に左右されないように）。
     fn test_client() -> reqwest::Client {
@@ -822,8 +1032,8 @@ mod tests {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let silent_port = silent.local_addr().unwrap().port();
         let dead_port = free_port();
-        ledger_add(dir.path(), ReadyFile { port: silent_port, pid: 1 });
-        ledger_add(dir.path(), ReadyFile { port: dead_port, pid: 2 });
+        ledger_add(dir.path(), orphan(silent_port, 1));
+        ledger_add(dir.path(), orphan(dead_port, 2));
 
         let client = test_client();
         let interrupted = tokio::time::timeout(
@@ -859,9 +1069,9 @@ mod tests {
         let new_child = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         new_child.set_nonblocking(true).unwrap();
         let child_port = new_child.local_addr().unwrap().port();
-        ledger_add(dir.path(), ReadyFile { port: busy_port, pid: 1 });
-        ledger_add(dir.path(), ReadyFile { port: dead_port, pid: 2 });
-        ledger_add(dir.path(), ReadyFile { port: child_port, pid: 3 });
+        ledger_add(dir.path(), orphan(busy_port, 1));
+        ledger_add(dir.path(), orphan(dead_port, 2));
+        ledger_add(dir.path(), orphan(child_port, 3));
 
         let root = dir.path().to_path_buf();
         // 確かめる時間は、閉じたポートの拒否（Windows で約 2 秒）より長くとる
@@ -870,7 +1080,7 @@ mod tests {
         });
         // 1 件目（応答しない相手）を確かめている間に、新しい子が同じポートで立つ
         tokio::time::sleep(Duration::from_millis(200)).await;
-        ledger_add(dir.path(), ReadyFile { port: child_port, pid: 999 });
+        ledger_add(dir.path(), mine(child_port, 999));
         assert_eq!(sweep.await.unwrap(), 0);
 
         let mut got: Vec<(u16, u32)> = read_ledger(dir.path())
@@ -935,8 +1145,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (stoppable, stoppable_seen) = fake_sidecar(OnShutdown::Exits);
         let (stubborn, _) = fake_sidecar(OnShutdown::Ignores);
-        ledger_add(dir.path(), ReadyFile { port: stoppable, pid: 1 });
-        ledger_add(dir.path(), ReadyFile { port: stubborn, pid: 2 });
+        ledger_add(dir.path(), orphan(stoppable, 1));
+        ledger_add(dir.path(), orphan(stubborn, 2));
 
         let stopped = sweep_orphans(dir.path(), &test_client()).await;
 
@@ -960,7 +1170,7 @@ mod tests {
     async fn an_orphan_that_answers_but_stays_is_not_counted_as_stopped() {
         let dir = tempfile::tempdir().unwrap();
         let (polite, polite_seen) = fake_sidecar(OnShutdown::AnswersButStays);
-        ledger_add(dir.path(), ReadyFile { port: polite, pid: 3 });
+        ledger_add(dir.path(), orphan(polite, 3));
 
         assert!(!request_shutdown(polite, &test_client()).await, "止まっていない");
         let stopped = sweep_orphans(dir.path(), &test_client()).await;
@@ -978,21 +1188,28 @@ mod tests {
     }
 
     /// **更新の前の確認は、生きているサイドカーだけを数え、止めない**（v0.5.6 項目 3e）。
-    /// 死んだ記録（接続を拒否される）は数えない。
+    /// 死んだ記録（接続を拒否される）は数えない。止めるのは `sweep_orphans` の役目（持ち主のいないものだけ）。
     #[tokio::test]
     async fn live_sidecars_are_counted_without_being_stopped() {
         let dir = tempfile::tempdir().unwrap();
         let (alive, alive_seen) = fake_sidecar(OnShutdown::Exits);
         let dead = free_port();
-        ledger_add(dir.path(), ReadyFile { port: alive, pid: 4 });
-        ledger_add(dir.path(), ReadyFile { port: dead, pid: 5 });
+        ledger_add(dir.path(), orphan(alive, 4));
+        ledger_add(dir.path(), orphan(dead, 5));
 
         let live = live_sidecars(dir.path(), &test_client()).await;
 
-        assert_eq!(live, [alive], "生きているものだけ");
+        assert_eq!(
+            live,
+            [LiveSidecar {
+                port: alive,
+                holder: Holder::Nobody
+            }],
+            "生きているものだけ（v0.5.5 の書式の記録は持ち主なし）"
+        );
         assert!(
             !alive_seen.lock().unwrap().iter().any(|l| l.starts_with("POST /shutdown")),
-            "止めていない（所有者を見分けられないうちは止めない）"
+            "数えるだけで止めない"
         );
         assert_eq!(read_ledger(dir.path()).len(), 2, "記録も変えない");
     }
@@ -1010,6 +1227,7 @@ mod tests {
             asset_root: asset_root.to_path_buf(),
             port: free_port(),
             pid,
+            mock: false,
             child,
         }
     }
@@ -1026,7 +1244,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handle = long_running_handle(dir.path());
         let (port, pid) = (handle.port, handle.pid);
-        ledger_add(dir.path(), ReadyFile { port, pid });
+        ledger_add(dir.path(), mine(port, pid));
         let interrupted =
             tokio::time::timeout(Duration::from_millis(100), shutdown_sidecar(handle, &client))
                 .await;
@@ -1043,13 +1261,7 @@ mod tests {
         // 最後まで走れば消える
         let dir = tempfile::tempdir().unwrap();
         let handle = long_running_handle(dir.path());
-        ledger_add(
-            dir.path(),
-            ReadyFile {
-                port: handle.port,
-                pid: handle.pid,
-            },
-        );
+        ledger_add(dir.path(), mine(handle.port, handle.pid));
         shutdown_sidecar(handle, &client).await.unwrap();
         assert!(read_ledger(dir.path()).is_empty(), "止まったら記録は消える");
     }
@@ -1183,5 +1395,258 @@ mod tests {
         assert_eq!(got.len(), 2, "{got:?}");
         assert_eq!(got[0], "one");
         assert!(got[1].contains("pipe broke"), "止まった理由が残っていない: {got:?}");
+    }
+    // === v0.5.6 項目 4: 台帳の持ち主・読み方・錠 ===
+
+    /// **v0.5.5 の書式の台帳も読め、読めない記録が 1 件あっても全体を失わない**（v0.5.6 項目 4）。
+    /// 以前は全体を 1 回で読み、1 件でも読めなければ台帳が丸ごと空になった。知らない欄は無視する。
+    #[test]
+    fn an_old_or_damaged_ledger_keeps_what_can_be_read() {
+        let text = r#"[
+            {"port": 50001, "pid": 11},
+            {"port": "壊れた記録"},
+            {"port": 50002, "pid": 12, "owner": {"pid": 900, "started": 42}},
+            {"port": 50003, "pid": 13, "これから足される欄": true}
+        ]"#;
+        let got = parse_ledger(text);
+        assert_eq!(
+            got,
+            [
+                orphan(50001, 11),
+                LedgerEntry {
+                    port: 50002,
+                    pid: 12,
+                    owner: Some(Owner { pid: 900, started: 42 })
+                },
+                orphan(50003, 13),
+            ]
+        );
+        assert!(parse_ledger("書きかけ").is_empty(), "JSON でなければ空（壊れた台帳で止まらない）");
+    }
+
+    /// **この版が書いた台帳を、v0.5.5 も読める**（新旧の ugg が同時に動いても、古い方の掃除が
+    /// 台帳を丸ごと失わない）。v0.5.5 は `{port, pid}` の並びとして読む。持ち主の無い記録には欄を書かない。
+    #[test]
+    fn the_ledger_this_version_writes_is_readable_by_v055() {
+        let dir = tempfile::tempdir().unwrap();
+        ledger_add(dir.path(), mine(50011, 21));
+        ledger_add(dir.path(), orphan(50012, 22));
+        let text = std::fs::read_to_string(ledger_path(dir.path())).unwrap();
+        let as_v055: Vec<ReadyFile> = serde_json::from_str(&text).expect("v0.5.5 の読み方で読めること");
+        assert_eq!(as_v055.len(), 2);
+        let raw: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        assert!(raw[0].get("owner").is_some(), "この ugg の記録には持ち主を書く: {text}");
+        assert!(raw[1].get("owner").is_none(), "持ち主の無い記録に欄を書かない: {text}");
+    }
+
+    /// 持ち主の見分け方（純粋部分）。**pid だけで生きていると見ない**（開始時刻も一致すること）。
+    #[test]
+    fn a_record_belongs_to_me_another_live_ugg_or_nobody() {
+        let me = Some(Owner { pid: 100, started: 1_000 });
+        let other = Owner { pid: 200, started: 2_000 };
+        let alive = |o: Owner| o == other;
+        let entry = |owner: Option<Owner>| LedgerEntry { port: 1, pid: 1, owner };
+
+        assert_eq!(holder_of(&entry(me), me, alive), Holder::Me);
+        assert_eq!(holder_of(&entry(Some(other)), me, alive), Holder::AnotherUgg);
+        assert_eq!(
+            holder_of(&entry(Some(Owner { pid: 300, started: 3_000 })), me, alive),
+            Holder::Nobody,
+            "持ち主が終わっている"
+        );
+        assert_eq!(holder_of(&entry(None), me, alive), Holder::Nobody, "v0.5.5 の記録");
+        assert_eq!(
+            holder_of(&entry(Some(Owner { pid: 100, started: 999 })), me, alive),
+            Holder::Nobody,
+            "同じ pid でも開始時刻が違えば、前にその pid を使っていた別の ugg（もう終わっている）"
+        );
+    }
+
+    /// 実物のプロセスで: 自分は生きている。同じ pid でも開始時刻が違えば生きていない（pid の再利用）。
+    #[test]
+    fn an_owner_is_alive_only_with_the_same_pid_and_start_time() {
+        let me = Owner::me().expect("自分の開始時刻を取れること");
+        assert!(me.is_alive());
+        assert!(!Owner { started: me.started + 1, ..me }.is_alive());
+    }
+
+    /// 長く走る子（「ほかの ugg」「終わった ugg」の役）の持ち主の欄。
+    fn owner_of(child: &std::process::Child) -> Owner {
+        let pid = child.id();
+        Owner {
+            pid,
+            started: crate::tts::child_process::process_started(pid).expect("子が動いていること"),
+        }
+    }
+
+    fn sleeper() -> std::process::Child {
+        std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("powershell を起動できること")
+    }
+
+    /// **生きているほかの ugg のサイドカーは、掃除で止めない。持ち主が終わっていれば止める**（v0.5.6 項目 4）。
+    /// 以前は応答の形だけで「自分のもの」と見ていたので、2 つ目の ugg の掃除が、1 つ目が使っている
+    /// 最中のサイドカーを止めえた（そちらはヘルス監視で 20 分止まる）。この ugg の記録にも触らない。
+    #[tokio::test]
+    async fn a_sweep_leaves_a_live_uggs_sidecar_alone_and_stops_a_dead_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut another_ugg = sleeper();
+        let mut finished_ugg = sleeper();
+        let finished = owner_of(&finished_ugg);
+        finished_ugg.kill().unwrap();
+        let _ = finished_ugg.wait();
+
+        let (theirs, theirs_seen) = fake_sidecar(OnShutdown::Exits);
+        let (left_behind, left_seen) = fake_sidecar(OnShutdown::Exits);
+        let (my_own, my_seen) = fake_sidecar(OnShutdown::Exits);
+        ledger_add(
+            dir.path(),
+            LedgerEntry { port: theirs, pid: 31, owner: Some(owner_of(&another_ugg)) },
+        );
+        ledger_add(dir.path(), LedgerEntry { port: left_behind, pid: 32, owner: Some(finished) });
+        ledger_add(dir.path(), mine(my_own, 33));
+
+        let stopped = sweep_orphans(dir.path(), &test_client()).await;
+        let live = live_sidecars(dir.path(), &test_client()).await;
+        let _ = another_ugg.kill();
+        let _ = another_ugg.wait();
+
+        let shut = |seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>| {
+            seen.lock().unwrap().iter().any(|l| l.starts_with("POST /shutdown"))
+        };
+        assert_eq!(stopped, 1, "止めるのは持ち主が終わった 1 件だけ");
+        assert!(shut(&left_seen), "持ち主が終わった孤児は止める");
+        assert!(!shut(&theirs_seen), "生きているほかの ugg のものは止めない");
+        assert!(!shut(&my_seen), "この ugg のものは止めない");
+        let mut ports: Vec<u16> = read_ledger(dir.path()).iter().map(|e| e.port).collect();
+        ports.sort();
+        let mut want = vec![theirs, my_own];
+        want.sort();
+        assert_eq!(ports, want, "止めなかった 2 件の記録は残す");
+        let mut holders: Vec<(u16, Holder)> = live.iter().map(|s| (s.port, s.holder)).collect();
+        holders.sort_by_key(|(p, _)| *p);
+        let mut want = vec![(theirs, Holder::AnotherUgg), (my_own, Holder::Me)];
+        want.sort_by_key(|(p, _)| *p);
+        assert_eq!(holders, want, "残ったものの持ち主を言える");
+    }
+
+    /// 別のプロセス（PowerShell）に台帳の錠を握らせる。握り終えたら返る。
+    fn hold_ledger_lock_elsewhere(asset_root: &Path) -> std::process::Child {
+        let ready = asset_root.join("held.flag");
+        let script = format!(
+            "$f=[System.IO.File]::Open('{}','OpenOrCreate','ReadWrite','ReadWrite'); $f.Lock(0,1); \
+             Set-Content -LiteralPath '{}' -Value x; Start-Sleep -Seconds 60",
+            asset_root.join(LEDGER_LOCK_FILE).display(),
+            ready.display()
+        );
+        let other = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("powershell を起動できること");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready.exists(), "別のプロセスが錠を掛け終えていない");
+        other
+    }
+
+    /// **台帳の錠はプロセスをまたぐ**（v0.5.6 項目 4）。ほかの ugg が握っている間、**足す記録は錠なしでも
+    /// 書く**（失うと強制終了のとき孤児を追えない）が、**消すのは見送る**（錠なしで書くと、ほかの ugg が
+    /// 足した記録を消しうる）。握っていたプロセスが落ちれば、また消せる。
+    #[test]
+    fn the_ledger_lock_is_shared_with_other_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        ledger_add(root, orphan(50021, 41));
+        let mut other = hold_ledger_lock_elsewhere(root);
+
+        let short = Duration::from_millis(300);
+        ledger_add_waiting(root, orphan(50022, 42), short);
+        ledger_remove_waiting(root, 50021, 41, short);
+        let while_held: Vec<u16> = read_ledger(root).iter().map(|e| e.port).collect();
+
+        other.kill().unwrap();
+        let _ = other.wait();
+        ledger_remove_waiting(root, 50021, 41, short);
+        let after: Vec<u16> = read_ledger(root).iter().map(|e| e.port).collect();
+
+        assert_eq!(while_held, [50021, 50022], "足すのは書き、消すのは見送る");
+        assert_eq!(after, [50022], "握っていたプロセスが落ちたら消せる");
+    }
+
+    /// **書いている途中の台帳を読ませない**（v0.5.6 項目 4）。上書き（中身を空にしてから書く）だと、
+    /// その間に読んだ別の ugg は壊れた JSON を「台帳なし」と読み、その内容で書き戻して全部消す。
+    /// 足し続ける間、ファイルをそのまま読み続けて、いつも JSON の配列として読めることを見る。
+    #[test]
+    fn a_reader_never_sees_a_half_written_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        ledger_add(&root, orphan(40_000, 1));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (root, done) = (root.clone(), done.clone());
+            std::thread::spawn(move || {
+                for i in 1..400u16 {
+                    ledger_add(&root, orphan(40_000 + i, 1));
+                }
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let path = ledger_path(&root);
+        let (mut reads, mut torn) = (0u32, Vec::new());
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                reads += 1;
+                if serde_json::from_str::<Vec<serde_json::Value>>(&text).is_err() {
+                    torn.push(text.len());
+                }
+            }
+        }
+        writer.join().unwrap();
+        assert!(reads > 100, "前提: 書いている間に何度も読めていること ({reads} 回)");
+        assert!(
+            torn.is_empty(),
+            "書きかけを {} 回読んだ（長さ {:?}）",
+            torn.len(),
+            &torn[..torn.len().min(5)]
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "一時ファイルを残さない: {leftovers:?}");
+    }
+
+    /// **長く走る子は ugg と一緒に終わらせる**（v0.5.6 項目 4 の配線）。本番で子を起動する場所のうち、
+    /// 結びつける対象は 2 か所（サイドカー・zip の展開）。残りは次のとおりで、ここでは見ない:
+    /// `run_python` と VOICEVOX のダウンローダと 1 回合成のゲートは `child_process::run_streaming(_until)` の
+    /// Job の中で走る（そちらも ugg が落ちれば閉じる）。取説を開くメモ帳と ShellExecuteW はユーザーの窓なので
+    /// 結びつけない（ugg と一緒に閉じてはいけない）。
+    #[test]
+    fn long_running_children_are_tied_to_ugg() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts");
+        for (file, name) in [
+            ("sidecar.rs", "pub async fn start_sidecar"),
+            ("irodori_download.rs", "fn expand_zip_windows"),
+        ] {
+            let src = std::fs::read_to_string(root.join(file)).unwrap().replace("\r\n", "\n");
+            let body = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            let spawn = body.find(".spawn()").unwrap_or_else(|| panic!("{name}: 起動していない"));
+            let tie = body
+                .find("tie_to_ugg(")
+                .unwrap_or_else(|| panic!("{name}: ugg と一緒に終わらせていない"));
+            assert!(spawn < tie, "{name}: 起動してから結びつけること");
+            assert!(!body.contains(".status()"), "{name}: 起動と待ちを 1 度にすると結びつける隙が無い");
+        }
     }
 }
