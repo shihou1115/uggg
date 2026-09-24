@@ -41,6 +41,11 @@ pub(crate) fn quit_with_farewell(app: AppHandle, state: Arc<AppState>) {
     );
     tauri::async_runtime::spawn(async move {
         if speak {
+            // **あいさつを待つ間、自発発話を止める**（2026-09-24 実機で発覚: 待っている間に独り言が流れ、
+            // あいさつを置き換えた）。自発発話はすべて `deliver_event` の busy の permit を取ってから喋るので、
+            // 同じ permit を握っておけば見送られる。取れなくても（いま喋っている最中）待たずに進む — 終了を
+            // 止めない。
+            let _hold_back_others = state.dialogue.busy.clone().try_acquire_owned().ok();
             if let Some(resp) = say_farewell(&app, &state) {
                 tokio::time::sleep(farewell_hold(&resp)).await;
             }
@@ -247,5 +252,14 @@ mod tests {
 
         let quit = body_of(&lifecycle, "pub(crate) fn quit_with_farewell");
         assert!(quit.contains("window_is_visible("), "見えているかを見ていない");
+        // あいさつを待つ間は自発発話を止める（2026-09-24 実機で、待っている間の独り言があいさつを置き換えた）
+        let hold = quit.find("busy.clone().try_acquire_owned()").expect("あいさつの間、自発発話を止めていない");
+        let say = quit.find("say_farewell(").unwrap();
+        assert!(hold < say, "あいさつより先に止めること");
+        let deliver = read("system/deliver.rs");
+        assert!(
+            body_of(&deliver, "pub async fn deliver_event").contains("busy.try_acquire()"),
+            "自発発話の単一経路が busy を見ていない（止める前提が崩れている）"
+        );
     }
 }
