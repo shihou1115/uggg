@@ -75,6 +75,25 @@ impl FileLock {
     pub(crate) fn is_held_elsewhere(path: &Path) -> bool {
         matches!(Self::try_acquire(path), Ok(None))
     }
+
+    /// `wait` の間だけ取り直す。取れなければ `None`（ファイルを開けないなどは `Err`）。
+    ///
+    /// **1 回だけ試すと、「試してすぐ放す」ほかの取得（`is_held_elsewhere`）の一瞬に重なって、
+    /// 本当は空いている錠を「握られている」と取り違える**（v0.5.6 リリース前監査で発覚。更新が
+    /// 「もう 1 つの ugg が更新しています」と事実と違う理由で断られた）。本当に握っている側（更新・台帳の
+    /// 書き換え）と、一瞬だけ握る側を、少し待って見分ける。
+    pub(crate) fn acquire_within(path: &Path, wait: std::time::Duration) -> std::io::Result<Option<FileLock>> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match Self::try_acquire(path)? {
+                Some(lock) => return Ok(Some(lock)),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                None => return Ok(None),
+            }
+        }
+    }
 }
 
 impl Drop for FileLock {
@@ -91,6 +110,32 @@ impl Drop for FileLock {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// **一瞬だけ握られた錠は、少し待てば取れる**（v0.5.6 リリース前監査）。1 回だけ試すと、ほかの
+    /// 「試してすぐ放す」取得に重なって取り違える。握り続けられていれば、待っても取れない。
+    #[test]
+    fn a_briefly_held_lock_is_taken_after_a_short_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.lock");
+        let brief = FileLock::try_acquire(&path).unwrap().expect("1 本目は取れる");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(brief);
+        });
+        assert!(FileLock::try_acquire(&path).unwrap().is_none(), "前提: 1 回だけ試すと取れない");
+        let waited = FileLock::acquire_within(&path, Duration::from_secs(2)).unwrap();
+        releaser.join().unwrap();
+        assert!(waited.is_some(), "放されるまで待てば取れる");
+
+        let held = waited.unwrap();
+        let started = Instant::now();
+        assert!(
+            FileLock::acquire_within(&path, Duration::from_millis(200)).unwrap().is_none(),
+            "握り続けられていれば取れない"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200), "待つ時間いっぱい試す");
+        drop(held);
+    }
 
     /// 同じプロセスでも、別の取得とは衝突する（錠はハンドル単位）。放せばまた取れる。
     #[test]

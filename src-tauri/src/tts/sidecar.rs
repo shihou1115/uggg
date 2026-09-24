@@ -213,19 +213,15 @@ fn lock_ledger(asset_root: &Path, wait: Duration, if_busy: IfLockBusy) -> Option
     // 中身を持たない錠なので、毒されていても続行してよい。
     let in_process = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = asset_root.join(LEDGER_LOCK_FILE);
-    let deadline = Instant::now() + wait;
-    let why = loop {
-        match crate::tts::file_lock::FileLock::try_acquire(&path) {
-            Ok(Some(file)) => {
-                return Some(LedgerLock {
-                    _file: Some(file),
-                    _in_process: in_process,
-                })
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => break "ほかの ugg が握ったままです".to_string(),
-            Err(err) => break err.to_string(),
+    let why = match crate::tts::file_lock::FileLock::acquire_within(&path, wait) {
+        Ok(Some(file)) => {
+            return Some(LedgerLock {
+                _file: Some(file),
+                _in_process: in_process,
+            })
         }
+        Ok(None) => "ほかの ugg が握ったままです".to_string(),
+        Err(err) => err.to_string(),
     };
     match if_busy {
         IfLockBusy::WriteAnyway => {

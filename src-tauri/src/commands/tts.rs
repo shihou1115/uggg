@@ -565,6 +565,9 @@ pub async fn download_irodori_assets(
         // **すべて成功したあとにだけ記録する** (v0.5.4 項目 1)。
         // 途中で失敗した状態に記録を残すと、次回「入っている」と誤認する。
         irodori_download::record_installed(&asset_root, &emit).map_err(|e| format!("{e:#}"))?;
+        // 全部入れ直せたので、前回の更新の残り（戻しそびれた退避と版の控え）を片付ける（v0.5.6 リリース前監査）。
+        // 残すと、次の更新の入口が、いま入れたものを古い退避と控えで書き戻す。
+        irodori_download::discard_update_leftovers(&asset_root, &emit);
         Ok(())
     }
     .await;

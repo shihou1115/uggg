@@ -976,6 +976,9 @@ pub fn is_busy() -> bool {
 /// 導入・更新の錠のファイル（`asset_root` 直下。v0.5.6 項目 3f）。中身は使わない。消さない。
 const UPDATE_LOCK_FILE: &str = "update.lock";
 
+/// 導入・更新の錠を取り直す時間（`acquire_within`）。合成の側が「試してすぐ放す」一瞬を越えれば足りる。
+const UPDATE_LOCK_WAIT: Duration = Duration::from_millis(500);
+
 /// 取れたら作業してよい。drop で自動的に手放す（途中で return しても取り残さない）。
 ///
 /// **二段の錠**（v0.5.6 項目 3f）: プロセスの中の印（`IRODORI_BUSY`）と、プロセスをまたぐファイルの錠
@@ -1007,7 +1010,13 @@ impl IrodoriBusyGuard {
         // **同じ錠に積む**（別の錠を作って捨てると、捨てたほうの drop がプロセスの中の印を消す）。
         // Err で返るときはこの錠が drop され、プロセスの中の印も手放す。
         let mut guard = Self::acquire()?;
-        match crate::tts::file_lock::FileLock::try_acquire(&asset_root.join(UPDATE_LOCK_FILE)) {
+        // **少し待って取り直す**（v0.5.6 リリース前監査）。合成の側は錠を「試してすぐ放す」ので、その一瞬に
+        // 重なると、空いている錠を「もう 1 つの ugg が更新している」と取り違えて断っていた。本当に更新している
+        // ugg は分単位で握るので、0.5 秒待てば見分けられる。
+        match crate::tts::file_lock::FileLock::acquire_within(
+            &asset_root.join(UPDATE_LOCK_FILE),
+            UPDATE_LOCK_WAIT,
+        ) {
             Ok(Some(lock)) => {
                 guard._cross_process = Some(lock);
                 Ok(guard)
@@ -1521,6 +1530,27 @@ fn restore_all_backups(site: &Path, backup_root: &Path) -> Result<()> {
     } else {
         Err(anyhow!("退避を戻せません: {}", failed.join(", ")))
     }
+}
+
+/// 初回導入（全部の入れ直し）が成功したあと、前回の更新の残り（退避と版の控え）を片付ける（v0.5.6 リリース前監査）。
+///
+/// 残るのは、更新の全戻しが通信の無さなどで失敗したとき。そのあと「ランタイムをダウンロード」で入れ直すと、記録は
+/// 最新になるのに残りは消えず、**次に更新が出た回の入口（`recover_interrupted_update`）が、入れたばかりのものを
+/// 古い退避と控えで書き戻していた**。全部入れ直せたので、残りはもう戻す先ではない。片付けたら真を返す。
+pub fn discard_update_leftovers<F>(asset_root: &Path, mut on_line: F) -> bool
+where
+    F: FnMut(&str),
+{
+    let backup_root = asset_root.join(UPDATE_BACKUP_DIR);
+    let snapshot = versions_snapshot_path(asset_root);
+    if !backup_root.exists() && !snapshot.exists() {
+        return false;
+    }
+    let _ = std::fs::remove_dir_all(&backup_root);
+    remove_versions_snapshot(asset_root);
+    on_line("前回の更新の残り（退避と版の控え）を片付けました（全部入れ直したので、もう使いません）");
+    crate::ulog!("[irodori] 初回導入が済んだので、前回の更新の残りを片付けました: {}", backup_root.display());
+    true
 }
 
 /// 前回の更新が途中で止まっていたら、先に元へ戻す（v0.5.4 項目 3 / v0.5.6 項目 3d）。
@@ -4566,6 +4596,58 @@ mod update_tests {
         drop(guard);
         assert!(!is_busy(), "放したら印も外れる");
         assert!(!crate::tts::file_lock::FileLock::is_held_elsewhere(&dir.path().join(UPDATE_LOCK_FILE)));
+    }
+
+    /// **初回導入が全部済んだら、前回の更新の残り（退避と版の控え）を片付ける**（v0.5.6 リリース前監査）。
+    /// 残すと、次の更新の入口が、入れたばかりのものを古い退避と控えで書き戻す。残りが無ければ何もしない。
+    #[test]
+    fn a_full_install_discards_the_leftovers_of_a_failed_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(UPDATE_BACKUP_DIR).join("dacvae")).unwrap();
+        std::fs::write(versions_snapshot_path(root), r#"{"tqdm":"4.67.3"}"#).unwrap();
+        let mut said = Vec::new();
+
+        assert!(discard_update_leftovers(root, |l| said.push(l.to_string())));
+        assert!(!root.join(UPDATE_BACKUP_DIR).exists(), "退避を片付ける");
+        assert!(read_versions_snapshot(root).is_none(), "版の控えを片付ける");
+        assert_eq!(said.len(), 1, "片付けたことを伝える");
+
+        assert!(!discard_update_leftovers(root, |l| said.push(l.to_string())), "残りが無ければ何もしない");
+        assert_eq!(said.len(), 1);
+    }
+
+    /// 初回導入のコマンドは、記録を書いた**あと**で残りを片付ける（途中で失敗したら、残りは戻す先のまま）。
+    #[test]
+    fn the_full_install_discards_leftovers_only_after_recording() {
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let name = "pub async fn download_irodori_assets";
+        let body = &src[src.find(name).unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let recorded = body.find("record_installed(").expect("記録していない");
+        let discarded = body.find("discard_update_leftovers(").expect("残りを片付けていない");
+        assert!(recorded < discarded, "記録より先に片付けている");
+    }
+
+    /// **合成の側が錠を「試してすぐ放す」一瞬に重なっても、更新は断られない**（v0.5.6 リリース前監査）。
+    /// 以前は 1 回だけ試していたので、その一瞬に重なると「もう 1 つの ugg が更新しています」と事実と違う
+    /// 理由で断った。ここでは別のハンドルが 100ms だけ握って放す。
+    #[test]
+    fn a_momentary_probe_does_not_make_the_update_refuse() {
+        let _serial = lock_busy_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let probe = crate::tts::file_lock::FileLock::try_acquire(&dir.path().join(UPDATE_LOCK_FILE))
+            .unwrap()
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(probe);
+        });
+        let guard = IrodoriBusyGuard::acquire_for(dir.path());
+        releaser.join().unwrap();
+        assert!(guard.is_ok(), "一瞬の握りで断らない: {:?}", guard.err());
     }
 
     /// **もう 1 つの ugg が握っていたら始めない**。そのときプロセスの中の印は残さない

@@ -185,6 +185,15 @@ where
     Some(outcome)
 }
 
+/// 見えていない間に保留をログへ書いた告知（同じ告知の保留を毎回書かない）。見えている間に告知を出したら空にする。
+static HELD_LOGGED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// この告知の保留をまだ書いていなければ真（純粋部分）。
+fn first_time_held(logged: &mut std::collections::BTreeSet<String>, text: &str) -> bool {
+    logged.insert(text.to_string())
+}
+
 pub async fn notify(app: &AppHandle, state: &Arc<AppState>, kind: NoticeKind) -> NoticeOutcome {
     // **理由をログに残す** (v0.5.5 項目 1、spec §6.0)。
     // ユーザーに見せるのはキャラの台詞（辞書の行）でよいが、**辞書キーが存在すると
@@ -193,13 +202,22 @@ pub async fn notify(app: &AppHandle, state: &Arc<AppState>, kind: NoticeKind) ->
     // 載せる理由に会話の本文は入らない。合成失敗（`IrodoriUnavailable`）は生成元で伏字・
     // 切り詰め済み（`sanitize_sidecar_error`）。資産 DL の失敗（`VoicevoxDlFailed` /
     // `IrodoriDlFailed`）は通信・ファイル操作のエラーで、そもそも会話を含まない（切り詰めもしない）。
-    crate::ulog!("[notify] {}", kind.fallback_text());
+    let text = kind.fallback_text();
     // **見えていない間は出さない**（v0.5.6 項目 6）。以前は見えているかを見ずに出していたので、隠している
     // 間の告知は誰にも届かないまま（1 回だけの告知は）済みになった。
     if route(crate::system::deliver::window_is_visible(app), true) == Route::Hold {
-        crate::ulog!("[notify] ウインドウが見えていないので出さずに保留します");
+        // **同じ告知の保留は 1 回だけ書く**（v0.5.6 リリース前監査）。1 回だけの告知は済みにしないので、
+        // 呼び出し元が毎分試すと（上限で止まった独り言の補充）、隠している間じゅう毎分 2 行ずつ増え、
+        // `ugg.log`（2MB・1 世代）の診断に要る古い行を押し出した。
+        let mut logged = HELD_LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+        if first_time_held(&mut logged, &text) {
+            crate::ulog!("[notify] {text}");
+            crate::ulog!("[notify] ウインドウが見えていないので出さずに保留します（同じ告知の保留は、見えるまで書き直しません）");
+        }
         return NoticeOutcome::Held;
     }
+    HELD_LOGGED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    crate::ulog!("[notify] {text}");
     let key = kind.dict_key();
     let line = {
         let guard = state.ghost.lock().expect("ghost poisoned");
@@ -246,6 +264,18 @@ mod delivery_tests {
         assert!(NoticeOutcome::Shown.reached());
         assert!(!NoticeOutcome::Held.reached(), "保留は届いていない");
         assert!(!NoticeOutcome::Failed.reached());
+    }
+
+    /// **同じ告知の保留は 1 回だけ書く**（v0.5.6 リリース前監査）。上限で止まった独り言の補充は毎分試すので、
+    /// 隠している間じゅう毎分 2 行ずつ `ugg.log` が増えていた。違う告知は書き、見えている間に出したら数え直す。
+    #[test]
+    fn a_held_notice_is_logged_once_until_the_window_is_shown() {
+        let mut logged = std::collections::BTreeSet::new();
+        assert!(first_time_held(&mut logged, "上限を超過しました"));
+        assert!(!first_time_held(&mut logged, "上限を超過しました"), "同じ告知は書き直さない");
+        assert!(first_time_held(&mut logged, "集計できません"), "違う告知は書く");
+        logged.clear(); // 見えている間に出した
+        assert!(first_time_held(&mut logged, "上限を超過しました"), "見えたあとの保留はまた書く");
     }
 
     /// **操作列: 隠している間に告知が来る → 見えるようになってまた来る → もう一度来る**（v0.5.6 項目 6、
@@ -330,6 +360,9 @@ mod delivery_tests {
             .expect("notify が見えているかを問うていない");
         let emits = notify.find("app.emit(").unwrap();
         assert!(asks < emits, "出したあとで見えているかを問うている");
+        let once = notify.find("first_time_held(").expect("保留のログを 1 回に絞っていない");
+        let held = notify.find("return NoticeOutcome::Held").unwrap();
+        assert!(asks < once && once < held, "保留の分岐で 1 回だけ書いていない");
     }
 }
 
