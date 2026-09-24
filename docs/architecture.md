@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.39）
+# ugg アーキテクチャ設計書（architecture.md v2.40）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1444,85 +1444,55 @@ function reposition(balloonSlot: "main" | "sub" | "extra") {
 
 ### 11.1 notify() サービス
 
+実装（`system/notify.rs`）。**★v0.5.6 項目 6 で実装どおりに書き直した**（以前ここにあった severity 付きの素案と二段トーストは
+実装されず、spec §3.1 の二段トーストとともに取り下げた）。
+
 ```rust
-// system/notify.rs
+pub enum NoticeOutcome { Shown, Held, Failed }  // reached() は Shown のときだけ真
 
-pub enum NoticeKind {
-    CostWarning80 { provider: String, percent: u8 },
-    CostLimitExceeded { provider: String },
-    ModeDegraded { reason: DegradeReason },
-    ModeRecovered,
-    UpdateAvailable { version: String },
-    VoicevoxDlComplete,
-    VoicevoxDlFailed { reason: String },
-    IrodoriUnavailable { reason: String },
-    ReminderFired { text: String },
+pub async fn notify(app: &AppHandle, state: &Arc<AppState>, kind: NoticeKind) -> NoticeOutcome {
+    ulog!("[notify] {}", kind.fallback_text());          // 理由は必ずログへ（v0.5.5 項目 1）
+    if !deliver::window_is_visible(app) { return Held }  // 見えていない間は出さない（§4.6.1 と同じ判定）
+    match dictionary.pick_system_message(kind.dict_key()) {
+        Some(line) => emit("dialogue", pattern_1("system_message", line)),  // ゴースト発話
+        None       => emit("system-toast", kind.fallback_text()),           // spec §3.1 のフォールバック
+    }                                                    // 送れたら Shown、送れなければ Failed
 }
 
-pub struct NoticeOptions {
-    pub severity: Severity,    // Minor | Important | Critical
-}
-
-pub enum Severity {
-    Minor,        // ゴースト発話のみ（or トースト fallback）
-    Important,    // ゴースト発話 + トースト二段表示
-    Critical,     // トーストのみ（ゴースト未ロード等の安全マージン）
-}
-
-pub async fn notify(
-    app: &AppHandle,
-    state: &Arc<AppState>,
-    kind: NoticeKind,
-    opt: NoticeOptions,
-) {
-    let key = kind.dict_key();    // e.g. "cost_warning_80"
-    let args = kind.into_args();   // when 評価用のメタデータ
-
-    let dict = state.ghost.lock().await;
-    let resp = dict.dictionary.system_message(&key, &args);  // when 条件評価込み
-
-    match (opt.severity, resp) {
-        (Severity::Critical, _) => {
-            emit_toast(app, kind.fallback_text()).await;
-        }
-        (_, Some(resp)) => {
-            dialogue::persist_and_speak(app, state, &resp).await;
-            if opt.severity == Severity::Important {
-                emit_toast(app, kind.fallback_text()).await;  // 二段表示
-            }
-        }
-        (_, None) => {
-            // 辞書未定義 → トーストへフォールバック
-            emit_toast(app, kind.fallback_text()).await;
-        }
-    }
-}
+/// 1 回だけ出す告知: 済んでいなければ出し、届いたとき（Shown）だけ mark する
+pub(crate) async fn once_reached(done: bool, show: impl FnOnce() -> Fut, mark: impl FnOnce()) -> Option<NoticeOutcome>
 ```
 
-### 11.2 NoticeKind 一覧（§6.5 と対応）
+- 見えていない間は `Held` を返して出さない。**保留した告知を後から自動で出す仕組みは持たない** — 1 回だけの告知は済みに
+  しないので次の機会にもう一度出る。それ以外は出さずに終わる（下の表）
+- ★v0.5.6 以前は見えているかを見ずに出し、結果も返さなかった。1 回だけの告知の呼び出し元 4 か所は届いたかを見ずに済みにして
+  いた（うち 3 か所は発話より前に）ため、隠している間に出ると、コストの 2 件はその月、集計不能はその起動のあいだ、アプリ更新は
+  その版では二度と出なかった
 
-| kind | severity 既定 |
-|---|---|
-| CostWarning80 | Minor |
-| CostLimitExceeded | Important |
-| CostUnknown ★v0.5.3 | Important |
-| ModeDegraded | Important |
-| ModeRecovered | Minor |
-| UpdateAvailable | Minor |
-| VoicevoxDlComplete | Minor |
-| VoicevoxDlFailed | Important |
-| IrodoriUnavailable | Important |
+### 11.2 NoticeKind 一覧
 
-※ 実装の notify() は severity 二段トーストを持たない（発話 or トースト fallback の二択）。**二段トーストは spec §6.0 v0.5.6 項目 6（2026-09-19 ユーザー裁定）で取り下げた。** §11.1 / §11.2 の素案（告知の種類の一覧・既定の表も実装から外れている）は項目 6 の実装時に書き直す。
+| kind | 辞書キー（`system_messages`） | 済みの記録 |
+|---|---|---|
+| CostWarning80 | `cost_warning_80` | 月 1 回（`cost_warned_80_month`）。**届いたときだけ**記録 |
+| CostLimitExceeded | `cost_limit_exceeded` | 月 1 回（`cost_limit_notified_month`）。**届いたときだけ**記録し、続けて ModeDegraded も出す。チャットの turn では返答そのものとして出す |
+| CostUnknown ★v0.5.3 | `cost_unknown` | 起動中 1 回（`cost_unknown_notified`）。**届いたときだけ**記録。チャットの turn では返答として出す |
+| ModeDegraded | `mode_degraded` | 毎回（降格のたび） |
+| ModeRecovered | `mode_recovered` | 毎回 |
+| VoicevoxDlComplete / VoicevoxDlFailed | `voicevox_dl_complete` / `voicevox_dl_failed` | 毎回（見えていなければ出さずに終わる。結果は設定パネルにも出る） |
+| IrodoriUnavailable | `irodori_unavailable` | 5 分に 1 回（間隔は発話の前に刻む。次の失敗でまた出るので、届いたかは見ない） |
+| IrodoriDlComplete / IrodoriDlFailed | `irodori_dl_complete` / `irodori_dl_failed` | 毎回（同上） |
+| UpdateAvailable | `update_available` | 版ごとに 1 回（`update_notice_seen:<版>`）。**届いたときだけ**記録 |
+
+辞書キーが既定辞書に実在することは `notify::dict_key_contract` が突き合わせる。
 ★M7: `ReminderFired` variant は削除（§11.4 の deliver_event 経路へ一本化）。
 
 ### 11.3 呼び出し点
 
-- `system/cost.rs`: ポストLLM呼び出しでコスト計算 → 80% 検出で `notify(CostWarning80, ...)`
-- `dialogue/mod.rs`: モード自動降格時に `notify(ModeDegraded, ...)`
-- `system/update.rs`: 新バージョン検出時に `notify(UpdateAvailable, ...)`
-- `tts/download.rs`: 資産DL完了/失敗時に `notify(VoicevoxDlComplete, ...)`
-- `tts/irodori.rs`: GPU不可検出/サイドカー起動失敗時に `notify(IrodoriUnavailable, ...)`
+- `dialogue/mod.rs`: コストの 80% 警告・上限到達・集計不能（`evaluate_cost_status` / `announce_cost_limit_once` /
+  `announce_cost_unknown_once`。どれも `once_reached` を通す）、モードの自動降格・復帰
+- `system/update.rs`: 新しい版の検出（`once_reached` を通す）
+- `commands/tts.rs`: VOICEVOX・Irodori の資産 DL の完了・失敗、合成に失敗して VOICEVOX へ落ちたとき（`IrodoriUnavailable`）
+- `tasks.rs`: Irodori のヘルスチェックが 3 回続けて失敗したとき（`IrodoriUnavailable`）
 
 ### 11.4 通知配達サービスと発話ガバナンス（★M7、daily-support-design §3/§4 が正）
 
@@ -1856,3 +1826,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-23 | v2.37 | **v0.5.6 項目 3（更新を 1 つのトランザクションにする）の実装に伴う改訂**。§2.4 の資産表: `installed.json` がモデルの**読み先の正本**になったこと（書き込みは tmp → rename）、`update-versions.json`（版の控え）・`update.lock`（プロセスをまたぐ錠）・`.update-backup\` の退避の印・`.update-gate\`（ゲートの作業場所）を追加。契約表: `update_irodori_runtime` の「★2026-09-19: 途中の失敗では戻せていない」の注記を、実装した形（入口の備え → 前回の後始末 → 控え → 固定の段取り → 1 回合成のゲート → 全戻し）へ書き換え、`download_irodori_assets` も同じ入口を通ることを書いた（**初回導入は自分のサイドカーを止めていなかった**）。§8.1 の構成図、§8.3（読み先と取得先・一発合成のモード・`local_dir_use_symlinks` を渡さないこと）、§15 のリスク表（2 つの ugg の同時更新・更新の途中失敗）。**コマンド・イベント・設定フィールド・DB スキーマの変更なし**（`sidecar.py` の起動引数 `--synth-once` / `--voice-ref` を足した。子プロセスとして使うだけで、HTTP の契約は変えていない）。 |
 | 2026-09-24 | v2.38 | **v0.5.6 項目 4（孤児と二重起動）の実装に伴う改訂**。§1 の `child_process.rs` の行（ugg の寿命に結びつける Job・プロセスの開始時刻）。§2.4 の資産表: `sidecars.json` に持ち主の欄（`owner: {pid, started}`。1 件ずつ読む・差し替えで書く・v0.5.5 も読める）、`sidecars.lock`（台帳の錠。足すときは錠が取れなくても書き、消すときは見送る）を追加。§8.1 の構成図、§8.4 の `SidecarHandle`（`mock`）。契約表: 導入・更新の入口で**持ち主のいない孤児を止めてから**生きているものを数える（項目 3e で「所有者を見分けられるのは項目 4 から」と止めずにいたもの）。§15 のリスク表: 孤児の行を「Job Object が全部入った」へ、2 つの ugg の台帳の行を追加。**コマンド・イベント・設定フィールド・DB スキーマの変更なし。** |
 | 2026-09-24 | v2.39 | **v0.5.6 項目 5（終了のあいさつを揃える）の実装に伴う改訂**。§14.3 の終了経路を 1 本（`commands::lifecycle::quit_with_farewell`）へ: トレイと右クリックメニュー（`quit_app`）の両方が通り、見えていれば終了前の確認かあいさつをしてから、隠している・最小化しているとき（`deliver::window_is_visible`）と待っている間の 2 回目はすぐ終了する。起動・終了の概観、契約表の `quit_app`（引数と戻り値は変えない）、終了前確認の節も揃えた。**コマンド・イベント・設定フィールド・DB スキーマの変更なし。** |
+| 2026-09-24 | v2.40 | **v0.5.6 項目 6（告知は「届いた」と確かめてから済みにする）の実装に伴う改訂**。§11.1〜§11.3 を実装どおりに書き直した: `notify()` は見えていなければ出さずに `Held` を返し、出したら `Shown`（`NoticeOutcome`）。1 回だけ出す告知 4 か所は `once_reached`（届いたときだけ済みにする）を通す。§11.2 の表を「severity 既定」から「辞書キーと済みの記録」へ（severity の素案と二段トーストは実装されないまま取り下げた）。§11.3 の呼び出し点を実在の場所へ直した（`system/cost.rs` は呼んでいない、`tts/irodori.rs` ではなく `commands/tts.rs` と `tasks.rs`）。**コマンド・イベント・設定フィールド・DB スキーマの変更なし。** |
