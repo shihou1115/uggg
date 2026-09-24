@@ -1,8 +1,7 @@
 //! タスクトレイ (spec §4.1.7)。
 //! 左クリック → ウインドウ表示/非表示トグル。右クリックメニュー: 表示/モード/静音/設定/終了。
-//! 終了時は events.quit を再生してから exit。
+//! 「終了」は `commands::lifecycle::quit_with_farewell`（右クリックメニューと同じ経路。v0.5.6 項目 5）。
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -10,8 +9,6 @@ use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::dialogue::{self, low};
-use crate::ghost::dict::WhenContext;
 use crate::state::{AppState, DialogueMode};
 
 const ID_TOGGLE_WINDOW: &str = "toggle_window";
@@ -104,7 +101,8 @@ fn handle_menu(app: &AppHandle, state: &Arc<AppState>, id: &str) {
                 let _ = w.set_focus();
             }
         }
-        ID_QUIT => quit_with_farewell(app.clone(), state.clone()),
+        // 右クリックメニューの「終了」と同じ経路（v0.5.6 項目 5）
+        ID_QUIT => crate::commands::lifecycle::quit_with_farewell(app.clone(), state.clone()),
         _ => {}
     }
 }
@@ -148,77 +146,4 @@ fn persist_and_broadcast(app: &AppHandle, state: &Arc<AppState>, settings: &crat
         let _ = state.db.set_setting("settings", &json);
     }
     let _ = app.emit("settings-changed", settings);
-}
-
-/// 終了挨拶を再生してから exit。
-/// M9 終了前確認 (spec §4.6.2、2026-07-17 裁定): 未完了の today ToDo があれば
-/// events.todo_quit ({count}) を優先し、無ければ従来の events.quit。
-/// どちらも辞書に無い場合や ghost ロード失敗時は即 exit。
-/// ユーザー起点の終了操作なのでガバナンスゲートは通さない (§4.2)。
-fn quit_with_farewell(app: AppHandle, state: Arc<AppState>) {
-    // 同時起動防止: greeted のように単発フラグは置かないが、
-    // タイマー競合は無視できる短さなので素直に動かす。
-    tauri::async_runtime::spawn(async move {
-        let open_today = {
-            let daily_on = state
-                .settings
-                .lock()
-                .expect("settings poisoned")
-                .daily_support_enabled;
-            if daily_on {
-                state.db.count_open_todos(Some("today")).unwrap_or(0)
-            } else {
-                0
-            }
-        };
-        let resp = if open_today > 0 {
-            let count = open_today.to_string();
-            crate::system::deliver::speak_event_now(
-                &app,
-                &state,
-                "todo_quit",
-                &[("count", count.as_str())],
-            )
-        } else {
-            None
-        };
-        // todo_quit が辞書に無い/未完なし → 従来の quit
-        let resp = match resp {
-            Some(r) => Some(r),
-            None => {
-                let ctx = WhenContext::now();
-                let quit_line = {
-                    let guard = state.ghost.lock().expect("ghost poisoned");
-                    match guard.as_ref() {
-                        Ok(b) => low::event(&b.dictionary, "quit", &ctx, b.sub_available()),
-                        Err(_) => None,
-                    }
-                };
-                quit_line.map(|r| {
-                    dialogue::persist_and_speak(&app, &state, &r);
-                    r
-                })
-            }
-        };
-        let hold_ms = match &resp {
-            Some(r) => {
-                let total = r.main.text.chars().count()
-                    + r.sub.as_ref().map(|s| s.text.chars().count()).unwrap_or(0);
-                // フロントの hold (~1.6s + 60ms/char) + 余裕を持って exit
-                (1600 + total as u64 * 60).min(8000) + 500
-            }
-            None => 0,
-        };
-        if hold_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
-        }
-        // ウインドウ位置を即時保存してから終了
-        crate::presence::window_pos::persist_now(&app, &state);
-        // greeted は ATOMIC 操作で先に下ろしておく (短期間で再起動した場合の重複挨拶を防ぐ ―
-        // ただし frontend_ready が greeted を見るのは初回のみなので影響軽微)
-        state.dialogue.greeted.store(false, Ordering::SeqCst);
-        // M4c Phase E: Irodori サイドカーも best-effort で shutdown (未起動なら即 return)
-        let _ = state.tts.irodori.shutdown().await;
-        app.exit(0);
-    });
 }
