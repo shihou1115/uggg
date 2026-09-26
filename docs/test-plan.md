@@ -1,4 +1,4 @@
-# ugg テスト計画（test-plan.md v1.53）
+# ugg テスト計画（test-plan.md v1.54）
 
 **フェーズ**: 本開発 Phase 3 確定版
 **作成日**: 2026-06-18
@@ -515,6 +515,25 @@ spec.md の §4 機能仕様の構造に従う。各項目に **○/×/該当な
   - 自動テストで固定済み: 型と callback 名の両方で判定する・ほかは既定のハンドラへ渡す・lifespan で付ける（本文のテキスト）。
         振る舞いは手元の asyncio で確かめた（落とすのは 1 つの形だけ、別の例外と別の場所の接続切れは残る）
 
+  **受け入れ条件（spec §6.0）**
+  - [ ] A1 更新を済ませて ugg を 1 回起動したあと（`sidecar.py` は起動のたびに `%APPDATA%\ugg\irodori\` へ置き直される）、
+        **ugg を終了して**（VRAM を空ける）PowerShell で流す。`<参照音声>` は `refs\` の中の、いま使っている `main_*.wav`:
+        ```powershell
+        $r = "$env:APPDATA\ugg\irodori"
+        & "$r\python\python.exe" "$r\sidecar.py" --asset-dir $r --acceptance "$env:USERPROFILE\Desktop\ugg-acceptance" --voice-ref "$r\refs\<参照音声>.wav"
+        ```
+        終了コード 0。`acceptance.json` の `caption.differs` と `caption.control_identical` が true（**S4' を兼ねる**）、
+        `emoji.unknown` が空、`watermark.on.found` が true で `watermark.off.found` が false
+  - [ ] A2 出力先の `caption_none.wav` と `caption_on_1.wav` を聴く（caption の効きの強さは条件にしない。spec §6.5）。
+        声（既定の 16 ステップ・bf16）が自分の参照音声で許容できる。**終わったら出力先のフォルダを消す**
+  - [ ] A3 速さ: インストール版の `ugg.log` の合成の所要時間が spec §6.0 の表の ±20% に収まる
+  - [ ] A4 設定の「実モデルを使う (β)」を切り替えると、v4.1 でも次の発話から効く
+  - [ ] A5 実データで更新を通す（spec §6.0 の (a)〜(c)。手段は E-10 と同じく `installed.json` を控えて欄を書き換える）:
+        (a) 成功（1〜10 の確認と同じ回でよい）(b) 途中で失敗 → transformers 4 まで全部戻って v3 で喋れる・新しく入った配布は
+        残る・透かしの重みを黙って取らない (c) VRAM 不足で保留 → VRAM を空けて更新 → ゲートだけで成功（6c と同じ）
+  - 自動テストで固定済み: 絵文字の並びが `IRODORI_EMOJIS` と同じ・seed を固定するのはこの経路だけ（HTTP の要求・設定に無い）。
+        判定の流れは身代わりの runtime で 6 通り確かめた（2026-09-27）
+
 ### 5.6 F. 天気・定例会話（§4.7）
 
 **天気（§4.7.2、M11 実装済み）**:
@@ -897,10 +916,10 @@ advanced = LM Studio `huihui-qwen3.8-27b-abliterated`（ローカル・課金な
 
 #### テキスト読み上げツール 台本形式（docs/script-reader-spec.md §5.2）
 
-**前提**: S4・S9・S11 は Irodori 実モデル導入済み環境で行う。未導入環境では代替として
-sidecar ログで `SamplingRequest.caption` に値が透過されることを確認する (S4')。
-（★2026-09-19 注記: sidecar にそのようなログを出す箇所は無く、caption は伏字の対象でもあるので、この代替は実行できない。
-v0.5.7 の差し替え時に書き換える。spec §6.0）
+**前提**: S4・S9・S11 は Irodori 実モデル導入済み環境で行う。**S4 の期待値は v0.5.7 で書き換えた**（script-reader-spec §5.2）:
+S4 は「caption 行でも読み上げが進む」まで、**caption が合成に効いていること**は S4'（`sidecar.py --acceptance` の
+`caption.differs` と `caption.control_identical`。E-11 の受け入れ条件 A1）で確かめる。以前の S4' の「sidecar ログの
+`SamplingRequest.caption`」は、そのログを出す箇所が無く caption は伏字の対象でもあるので実行できなかった（2026-09-19 注記）
 
 **実機結果**: S1〜S12 全項目 PASS (2026-07-04 実機、dev ビルド)。
 
@@ -1052,3 +1071,4 @@ CI（GitHub Actions など）は**置いていない**（v0.4.1 で見送り）�
 | 2026-09-27 | v1.51 | **E-11 に項目 9 の確認を足した**（9a: 「いま取得」で取れなかった取得元／9b: 背景の取得の失敗の告知が 1 回だけで、ログに URL が無い／任意 9c: 隠している間の失敗）。§3.2b に操作列テスト 7 を足し、§3.3 にソースのテキストを読むテストは CRLF を正規化することを足した（新規チェックアウトでだけ落ちるテストが 6 本あった）。 |
 | 2026-09-27 | v1.52 | **E-11 に項目 10 の確認を足した**（10a: 更新の成功後に v4.1 と固定したコーデックだけが残り、v3 の変換結果が消える／10b: 保留のあとは v3 が残る）。 |
 | 2026-09-27 | v1.53 | **E-11 に項目 11 の確認を足した**（11a: 高品質モードで喋らせたあと、ugg.log に接続切れのトレースバックが無い）。 |
+| 2026-09-27 | v1.54 | **E-11 に受け入れ条件 A1〜A5 を足した**（`sidecar.py --acceptance` の流し方と見る欄・声と caption を聴く・速さ・実モデルの ON/OFF・実データで更新を通す (a)〜(c)）。台本形式の前提の S4 / S4' を書き換えた（S4 は読み上げが進むまで、caption が効くことは A1 の caption の欄）。 |

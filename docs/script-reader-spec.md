@@ -22,7 +22,7 @@ upstream Irodori-TTS が採用する台本形式 (Markdown 内 JSON コードブ
 | S1 | 台本ファイルの受け取り | 読み上げパネル表示中の DnD に **`.md`** を追加受理 (.txt と同じ規約: 非表示時は無視、ghost/shell 経路に流さない、1MB 上限)。台本形式でない .md には専用エラー (§2.3) |
 | S2 | 話者切替 | 台本の話者 ID を ugg のスロット (main / sub) にマッピングする **`slot` キー規約** (§2.3)。行ごとに `synthesize_voice(slot=...)` を切替 |
 | S3 | 行ごとの速度 | speed オフセットを既存の再生側 playbackRate に合成 (§2.4)。両エンジン一律・sidecar 変更不要 |
-| S4 | 行ごとの声質指示 (caption) | sidecar 合成 API に caption を配線 (§3.3)。Irodori 実モデル時のみ有効 (§2.5。★v3 本体では音声に反映されない) |
+| S4 | 行ごとの声質指示 (caption) | sidecar 合成 API に caption を配線 (§3.3)。Irodori 実モデル時のみ有効 (§2.5。★v3 本体では音声に反映されない。v0.5.7 の v4.1-Small で反映される) |
 | S5 | 行間の間 (pause) | チャンクごとの `pause_after_ms` に一元化 (§2.6)。既定値解決はロード時に Rust 側で完結 |
 | S6 | 不正な台本 | **ロード時に全行検証し fail-fast** (§2.8)。部分的に読めても再生を開始しない。エラーは種別 + 位置 (`lines[i].key`) 付き |
 | S7 | 使用 slot の声が未設定 | **再生開始前に検証** (§2.7)。Irodori 実モデル時、台本が使う slot の参照音声が未生成なら再生を開始しない |
@@ -49,7 +49,7 @@ upstream Irodori-TTS が採用する台本形式 (Markdown 内 JSON コードブ
 - 台本は upstream Irodori-TTS 形式: Markdown 内に **必須の ` ```json speakers ` /
   ` ```json lines `** と**任意の ` ```json defaults `** コードブロックを記述する。
 - エンジンは設定の `tts_engine` に従う。縮退表 (§2.10) のとおり、caption は
-  Irodori 実モデル時のみ有効（★v3 本体では音声に反映されない。§2.5）。voicevox でも話者切替・速度・間は有効。
+  Irodori 実モデル時のみ有効（★v3 本体では音声に反映されない。v0.5.7 の v4.1-Small で反映される。§2.5）。voicevox でも話者切替・速度・間は有効。
 - 停止・クローズ・自発発話抑制・失敗チャンクスキップ・進捗表示は .txt 読みと共通。
 
 ### 2.2 対象外 (この改訂では実装しない)
@@ -366,17 +366,17 @@ slot / playbackRate / pause の 3 パラメタ適用、再生開始前の slot �
 
 ### 5.2 実機手動テスト (S 節。実施記録は docs/test-plan.md §5.9 = 旧 quality_checklist)
 
-**前提**: S4・S9 は Irodori 実モデル導入済み環境で行う。未導入環境では代替として
-sidecar ログで `SamplingRequest.caption` に値が透過されることを確認する (S4')。
-（★2026-09-19 注記: sidecar にそのようなログを出す箇所は無く、caption は伏字の対象でもあるので、この代替は実行できない。
-v0.5.7 の差し替え時に書き換える。spec.md §6.0）
+**前提**: S4・S9 は Irodori 実モデル導入済み環境で行う。**★v0.5.7 で S4 / S4' を書き換えた**: caption の効きは耳では
+判定しにくい（どのモデルでも弱い。spec.md §6.5）ので、効いていることは S4' で seed を固定して確かめる。以前の S4' の
+「sidecar ログの `SamplingRequest.caption`」は、そのログを出す箇所が無く caption は伏字の対象でもあるので実行できなかった。
 
 | # | 手順 | 期待 |
 |---|---|---|
 | S1 | 台本 .md を DnD (voicevox) | host 行=main の声、guest 行=sub の声で交互に読む |
 | S2 | speed 指定行 (±0.15) | 該当行だけ速度が変わる。実効レートは [0.5, 2.0] に収まる |
 | S3 | pause_after 0.6 の行 | 行の後の間が明確に長い |
-| S4 | **Irodori 実モデル + caption 行** (「驚いて大声で」等) | 演技が音声に乗る。sidecar ログの SamplingRequest.caption に値が入る（★2026-09 注記: v3 本体は caption を条件付けに使わないため、演技は音声に乗らない。期待値のログは sidecar に出す箇所が無く caption は伏字の対象なので、この確認が何を裏付けたかは記録から確かめられない。v0.5.7 の差し替え時に書き換える。§2.5・spec.md §6.0 参照） |
+| S4 | **Irodori 実モデル（v4.1）+ caption 行** (「驚いて大声で」等) | caption の無い行と同じように読み上げが進む（エラーにも注記にもならない）。演技の強さは条件にしない（★v0.5.7 で書き換え。以前の期待値「sidecar ログの SamplingRequest.caption に値が入る」はログが無く確かめられなかった。v3 本体は caption を条件付けに使わない。§2.5） |
+| S4' | `sidecar.py --acceptance`（test-plan E-11 の受け入れ条件 A1） | `acceptance.json` の `caption.differs` と `caption.control_identical` がどちらも true（seed を固定して caption なしとありで差が出て、同じ caption の 2 回はビット同一） |
 | S5 | voicevox で caption 入り台本 | エラーにならず読む + パネルに注記が**再生終了まで**表示。caption なし台本、および Irodori 実モデル可判定の環境では注記が出ない |
 | S6 | 不正台本 (未定義話者 / ref_wav / JSON 破損 / speed 範囲外 / 通常の Markdown 文書) | 再生開始せず、種別ごとの文言 (§2.3/§2.8) で原因が分かる |
 | S7 | プレーン .txt (回帰) | v0.1.1 と同一挙動 (順序・速度・間・停止) |
