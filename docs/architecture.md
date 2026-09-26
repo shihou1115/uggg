@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.48）
+# ugg アーキテクチャ設計書（architecture.md v2.49）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -620,7 +620,7 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `get_chat_log` | `limit: u32` | `LogEntry[]` | 新しい順 |
 | `clear_history` | `include_profile: bool` | `ClearResult` | |
-| `export_data` | `include_profile: bool` | `String` | 保存パス返却。**★v0.5.1: キャッシュ 3 つ（`calendar_cache` / `topics_cache` / `monologue_cache`）を除く全 9 テーブル**（schema `ugg-export-v2`）。除外したことは payload の `omitted_caches` に明記。**★v0.5.3: 部分救出**。`build_export_payload` へ切り出し、テーブルごとに `rescue()` で「出せた / 出せなかった」を振り分ける。失敗しても打ち切らず、`failed_tables` に名前と理由を残して値は `null`。schema `ugg-export-v3` |
+| `export_data` | `include_profile: bool` | `{ path: string, failed_tables: string[] }`（★v0.5.7 で `String` から改めた） | 保存パスと読めなかったテーブルの名前を返し、画面が読めなかったものを出す（`write_export`）。**★v0.5.1: キャッシュ 3 つ（`calendar_cache` / `topics_cache` / `monologue_cache`）を除く全 9 テーブル**（schema `ugg-export-v2`）。除外したことは payload の `omitted_caches` に明記。**★v0.5.3: 部分救出**。`build_export_payload` へ切り出し、テーブルごとに `rescue()` で「出せた / 出せなかった」を振り分ける。失敗しても打ち切らず、`failed_tables` に名前と理由を残して値は `null`。schema `ugg-export-v3` |
 | `check_update_now` | なし | `()` | 設定パネル「いますぐチェック」。`update_feed_url` 未設定なら Err、結果は notify 経由で発話 |
 | `get_db_health` | なし | `DbIntegrity` | **★v0.5.1**（spec §4.5.5）。起動時 `PRAGMA quick_check` の結果と、破損時に作った退避先（原本コピー / `VACUUM INTO` 救出コピー）を返す。**正常時は何も検知せず退避コピーも作らない。破損しても DB は作り直さず起動も止めない**（データを取り出せる状態を優先）。**保全は破損 1 件につき 1 回**（既存の退避があれば作り直さずそのパスを返す。毎起動コピーは、まさに対象ユーザーのディスクを食い潰す）。原本コピーは `-wal` / `-shm` も同じ規則で運ぶ（本体だけだと未チェックポイント分が抜ける）。**★v0.5.2: 破損時は `migrate()` の失敗を伝播させない**（`AppState::initialize`。健全な DB での失敗は従来どおり致命）。`VACUUM INTO` 失敗時の 0 バイト残骸は削除する。**★v0.5.3: 整合性検査を pragma より前に実行**し、pragma 失敗は健全時のみ致命。既存の退避・救出コピーは `is_usable_preserved` で妥当性（空でない / 救出コピーは `quick_check` 通過）を確認してから採用する |
 
@@ -717,7 +717,7 @@ pub struct GhostBundle {
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
 | `get_calendar_events` | `days?: u32`（省略時 2＝今日明日） | `CalendarEvent[]` | 表示窓の予定を開始順で |
-| `refresh_calendar` | — | `usize`（取得件数） | 全ソースを今すぐ再取得 |
+| `refresh_calendar` | — | `{ total: number, failed: string[] }`（★v0.5.7 で `usize` から改めた） | 全ソースを今すぐ再取得。`failed` は取れなかった取得元の呼び名（`CalendarSource::label`。URL は出さずホスト名かファイル名） |
 | `add_calendar_source` | `source: CalendarSource`（`{kind:"file",path}`\|`{kind:"url",url}`） | `CalendarSource[]` | 追加。source_id は index ベースのため**キャッシュを全 clear**して再取得 |
 | `remove_calendar_source` | `index: usize` | `CalendarSource[]` | 削除。同上でキャッシュ全 clear |
 
@@ -988,6 +988,7 @@ when:                                        # ⑥ 確率
 | `irodori_no_gpu` ★v0.5.7 | GPU が見えない（ヘルスの 503・`no_gpu`） | `{ reason }` |
 | `irodori_vram` ★v0.5.7 | GPU のメモリが足りない（合成の OOM） | `{ reason }` |
 | `irodori_update_available` ★v0.5.7 | Irodori のランタイムに更新がある | `{ targets }` |
+| `calendar_fetch_failed` ★v0.5.7 | カレンダーの取得に失敗し始めた | `{ sources }`（呼び名。URL は入れない） |
 
 各キーは省略可（辞書未定義時はトーストへフォールバック）。
 ★M7: `reminder_fired` は system_messages から **events へ移動**した（deliver_event +
@@ -1538,6 +1539,7 @@ pub(crate) async fn once_reached(done: bool, show: impl FnOnce() -> Fut, mark: i
 | IrodoriUpdateAvailable ★v0.5.7 | `irodori_update_available` | 更新の対象の組ごとに 1 回（`irodori_update_notice_seen:<対象の組>`）。**届いたときだけ**記録。導入済みで更新の錠が空いているときだけ確かめる |
 | IrodoriDlComplete / IrodoriDlFailed | `irodori_dl_complete` / `irodori_dl_failed` | 毎回（同上） |
 | UpdateAvailable | `update_available` | 版ごとに 1 回（`update_notice_seen:<版>`）。**届いたときだけ**記録 |
+| CalendarFetchFailed ★v0.5.7 | `calendar_fetch_failed` | 取得元ごとに、失敗が続き始めたら 1 回（監視の `FetchFailures`。起動のたびに数え直し、成功で戻す）。**届いたときだけ**記録。消した・書き直した取得元は落とす |
 
 辞書キーが既定辞書に実在することは `notify::dict_key_contract` が突き合わせる。
 ★M7: `ReminderFired` variant は削除（§11.4 の deliver_event 経路へ一本化）。
@@ -1624,7 +1626,10 @@ pub async fn deliver_event(
   で全 ICS ソースを 30 分ごとに取得し `calendar_cache` へ near-term 展開して UPSERT。
   開始前通知は `calendar_notify_min` 分前（終日は当日ローカル 8:00）に達した未通知予定を
   `calendar_upcoming`（Notice）で 1 回。到達で `notified=1`。取得失敗はソース単位でログして
-  他を続行し既存キャッシュを維持（オフライン動作）。ソース未設定なら何もしない（既定オフ）。
+  他を続行し既存キャッシュを維持（オフライン動作）。**★v0.5.7 取得の失敗の告知**: `fetch_all_calendars` は取得元ごとの
+  成否（`CalendarFetch`）を返し、監視は `FetchFailures`（取得元 → 告知が届いたか）に記録する。毎 tick
+  `announce_calendar_failures` が、失敗が続いていて告知がまだ届いていない取得元をまとめて `CalendarFetchFailed` で出し、
+  `once_reached` で届いたときだけ済みにする。成功した取得元は外し、設定から消えた取得元も毎 tick 落とす。ソース未設定なら何もしない（既定オフ）。
   **TZ は日本前提の簡易解決**（Z=UTC / 浮動・TZID=ローカル / VALUE=DATE=ローカル 0:00）、
   **RRULE は DAILY/WEEKLY を BYDAY/INTERVAL/UNTIL/COUNT/EXDATE 込みで展開**、
   MONTHLY/YEARLY は同日ステップの best-effort、解釈不能な RRULE は当日分のみ
@@ -1891,3 +1896,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-27 | v2.46 | **v0.5.7 項目 5・6 の実装に伴う改訂**。§8.2 に一発合成の `--gate-dir`（生成も試す・結果の `voice_design` と `stage`）、VRAM 不足の保留、`--fetch-watermark`（透かしの重みの先取り）を足した。失敗の表に v0.5.7 の全戻しの残りと保留を足した。 |
 | 2026-09-27 | v2.47 | **v0.5.7 項目 7 の実装に伴う改訂**。告知の表に辞書キー 5 つ（`irodori_updating` / `irodori_model_missing` / `irodori_no_gpu` / `irodori_vram` / `irodori_update_available`）と `IrodoriUpdateAvailable` の済みの記録、§8.5 に合成の失敗の応答の形、§8.6 に理由の種類の振り分けを足した。**イベント・コマンド・設定の契約は変わらない**（告知と辞書キーの追加のみ）。 |
 | 2026-09-27 | v2.48 | **v0.5.7 項目 8 の実装に伴う改訂**。§8.1 の site-packages の大きさを実測（約 5.4 GB）に、§8.3 に取得量の数字の正本と突き合わせ・更新の確認の出し分け・空き容量の確認・hub 1.33 の進捗の変換・確認ダイアログの倫理条項を足した。契約は変わらない。 |
+| 2026-09-27 | v2.49 | **v0.5.7 項目 9 の実装に伴う改訂**。コマンド表の `export_data` の戻り値を `{ path, failed_tables }` に、掃討で同じ形だった `refresh_calendar` を `{ total, failed }` に改めた（契約の改訂）。告知の表と NoticeKind 一覧に `calendar_fetch_failed` / `CalendarFetchFailed`、§11.4 のカレンダー watcher に取得元ごとの失敗の続きと告知を足した。 |
