@@ -742,6 +742,19 @@ def _is_out_of_memory(exc: BaseException) -> bool:
         return False
 
 
+def synth_failure_kind(exc: BaseException) -> str:
+    """合成の失敗の種類（v0.5.7 項目 7。Rust の `SynthFailure` と同じ組）。
+
+    Rust はこれでキャラの説明を言い分ける（以前は理由によらず「GPU 環境が整っていない」と言った）。
+    モデルの重み・トークナイザが無いときは `FileNotFoundError`（`_build_runtime` と上流の読み込み）。
+    """
+    if _is_out_of_memory(exc):
+        return "oom"
+    if isinstance(exc, FileNotFoundError):
+        return "model_missing"
+    return "other"
+
+
 # --- 更新の成否を確かめる一発合成 (spec §6.0 v0.5.6 項目 3b) -----------------
 
 # 報告の目印。Rust 側（irodori_download）と同じ文字列にする（契約テストが見張る）。
@@ -924,7 +937,10 @@ def build_app(asset_dir: Path, mock: bool, backend: Optional[RealModelBackend]) 
             except NotImplementedError as exc:
                 raise HTTPException(501, str(exc))
             except Exception as exc:
-                raise HTTPException(500, f"Irodori 合成失敗: {exc}")
+                # v0.5.7 項目 7: 理由の種類を添える（`{"detail": {"kind": ..., "message": ...}}`）
+                raise HTTPException(
+                    500, {"kind": synth_failure_kind(exc), "message": f"Irodori 合成失敗: {exc}"}
+                )
         return Response(content=wav_bytes, media_type="audio/wav")
 
     @app.post("/v1/voice_ref/generate")

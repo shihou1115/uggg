@@ -641,6 +641,23 @@ system_messages:
   irodori_dl_failed:
     - main: { text: "高品質モードの準備でつまずいちゃった…", pose: troubled }
       sub: { text: "ネット接続か GitHub レート制限の問題かもしれない", pose: normal }
+  # v0.5.7: 高品質モードが使えない理由を言い分ける（以前は理由によらず「GPU 環境が整っていない」と言い、
+  # 更新中やモデルが無いときも事実と違う説明をしていた）。irodori_unavailable は理由が分からないとき。
   irodori_unavailable:
     - main: { text: "高品質モードが使えないから、いつもの声で話すね", pose: normal }
-      sub: { text: "GPU 環境が整っていないようだ。VOICEVOX で代用する", pose: normal }
+      sub: { text: "高品質モードの準備がうまくいかない。VOICEVOX で代用する", pose: normal }
+  irodori_updating:
+    - main: { text: "高品質モードを更新してるあいだは、いつもの声で話すね", pose: normal }
+      sub: { text: "更新が終われば戻る。それまで VOICEVOX だ", pose: normal }
+  irodori_model_missing:
+    - main: { text: "高品質モードの声のもとが足りないみたい。いつもの声で話すね", pose: troubled }
+      sub: { text: "モデルが揃っていない。設定の「更新する」で入れ直せるはずだ", pose: normal }
+  irodori_no_gpu:
+    - main: { text: "高品質モードが使えないから、いつもの声で話すね", pose: normal }
+      sub: { text: "GPU が見つからない。VOICEVOX で代用する", pose: normal }
+  irodori_vram:
+    - main: { text: "GPU のメモリがいっぱいみたい…いつもの声で話すね", pose: troubled }
+      sub: { text: "VRAM が足りない。ほかに GPU を使っているアプリを止めれば戻る", pose: normal }
+  irodori_update_available:
+    - main: { text: "高品質モードに新しいのが来てるみたい！", pose: happy }
+      sub: { text: "設定の「更新する」から入れられる。時間のあるときにどうぞ", pose: normal }

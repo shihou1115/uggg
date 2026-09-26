@@ -42,8 +42,15 @@ pub enum NoticeKind {
     /// Irodori-TTS が利用できない (GPU 不可 / サイドカー起動失敗 / ヘルスチェック失敗 等)。
     /// 5 分に 1 回（間隔は発話の前に刻む）。次の失敗でまた出るので、届いたかは見ない（v0.5.6 項目 6 の対象外）。
     /// M4c Phase G の `tasks::spawn_irodori_health_watcher` から発火する。
+    /// **理由の種類で言い分ける**（v0.5.7 項目 7、spec §6.0）。以前は理由によらず「GPU 環境が整っていない」と言っていた。
     IrodoriUnavailable {
         reason: String,
+        kind: UnavailableKind,
+    },
+    /// **Irodori のランタイムに更新がある**（v0.5.7 項目 7）。以前は設定パネルを開いた人にしか見えず、
+    /// 乗り換えが届いたことに気付けなかった。更新の対象の組ごとに 1 回、届いたときだけ済みにする（`once_reached`）。
+    IrodoriUpdateAvailable {
+        targets: Vec<String>,
     },
     /// Irodori Python ランタイム + 共通依存 DL が完了 (M4c Phase C 以降)。
     IrodoriDlComplete,
@@ -58,6 +65,21 @@ pub enum NoticeKind {
     // M7: ReminderFired variant は削除した。リマインダー発火は
     // `system::deliver::deliver_event` + 辞書 events.reminder_fired 経路に一本化
     // (daily-support-design §3/§7.1)。
+}
+
+/// Irodori が使えない理由の種類（v0.5.7 項目 7）。辞書の行を言い分ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnavailableKind {
+    /// 導入・更新の最中（ユーザーが自分で始めた。終われば戻る）。
+    Updating,
+    /// モデルの重みやトークナイザが無い（更新が要る）。
+    ModelMissing,
+    /// GPU が見えない。
+    NoGpu,
+    /// GPU のメモリ（VRAM）が足りない。
+    Vram,
+    /// そのほか（サイドカーの起動に失敗した・応答しない 等）。
+    Other,
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +104,14 @@ impl NoticeKind {
             NoticeKind::ModeRecovered => "mode_recovered",
             NoticeKind::VoicevoxDlComplete => "voicevox_dl_complete",
             NoticeKind::VoicevoxDlFailed { .. } => "voicevox_dl_failed",
-            NoticeKind::IrodoriUnavailable { .. } => "irodori_unavailable",
+            NoticeKind::IrodoriUnavailable { kind, .. } => match kind {
+                UnavailableKind::Updating => "irodori_updating",
+                UnavailableKind::ModelMissing => "irodori_model_missing",
+                UnavailableKind::NoGpu => "irodori_no_gpu",
+                UnavailableKind::Vram => "irodori_vram",
+                UnavailableKind::Other => "irodori_unavailable",
+            },
+            NoticeKind::IrodoriUpdateAvailable { .. } => "irodori_update_available",
             NoticeKind::IrodoriDlComplete => "irodori_dl_complete",
             NoticeKind::IrodoriDlFailed { .. } => "irodori_dl_failed",
             NoticeKind::UpdateAvailable { .. } => "update_available",
@@ -109,9 +138,13 @@ impl NoticeKind {
             NoticeKind::VoicevoxDlFailed { reason } => {
                 format!("VOICEVOX 音声資産のダウンロードに失敗しました: {reason}")
             }
-            NoticeKind::IrodoriUnavailable { reason } => {
+            NoticeKind::IrodoriUnavailable { reason, .. } => {
                 format!("Irodori-TTS が利用できません: {reason}。VOICEVOX 経路で発話します")
             }
+            NoticeKind::IrodoriUpdateAvailable { targets } => format!(
+                "Irodori-TTS のランタイムに更新があります（{}）。設定の「更新する」から入れられます",
+                targets.join(" / ")
+            ),
             NoticeKind::IrodoriDlComplete => {
                 "Irodori-TTS の Python ランタイム導入が完了しました".to_string()
             }
@@ -344,6 +377,8 @@ mod delivery_tests {
             (&dialogue, "pub(crate) async fn announce_cost_limit_once", "mark_notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED)"),
             (&dialogue, "pub(crate) async fn announce_cost_unknown_once", ".store(true"),
             (&update, "pub async fn check_update_once", "set_setting(&seen_key"),
+            // v0.5.7 項目 7
+            (&update, "pub async fn check_irodori_update_once", "set_setting(&seen_key"),
         ] {
             let body = body_of(src, name);
             let once = body
@@ -351,6 +386,14 @@ mod delivery_tests {
                 .unwrap_or_else(|| panic!("{name}: once_reached を通していない"));
             let marked = body.find(mark).unwrap_or_else(|| panic!("{name}: {mark} が無い"));
             assert!(once < marked, "{name}: 届いたかを見る前に済みにしている");
+            // **済みにするのは告知を出す closure より後ろ**（v0.5.7 の変異テストで発覚）。`once_reached` の最初の
+            // 引数（済んでいるかの判定）の中で先に済みにする形は、上の順序だけでは捕まらない。
+            let shown = body[once..]
+                .find("notify::notify(")
+                .map(|at| once + at)
+                .unwrap_or_else(|| panic!("{name}: once_reached の中で告知を出していない"));
+            assert!(shown < marked, "{name}: 告知を出す前（済んでいるかの判定の中など）で済みにしている");
+            assert_eq!(body.matches(mark).count(), 1, "{name}: 済みにする処理が 2 か所ある");
             assert!(!body.contains("swap(true"), "{name}: 出す前に済みにする形（swap）が残っている");
         }
         // notify 自身が見えているかを問うこと（呼び出し元が済みにする前提）
@@ -390,7 +433,12 @@ mod dict_key_contract {
             NoticeKind::ModeRecovered,
             NoticeKind::VoicevoxDlComplete,
             NoticeKind::VoicevoxDlFailed { reason: "x".into() },
-            NoticeKind::IrodoriUnavailable { reason: "x".into() },
+            NoticeKind::IrodoriUnavailable { reason: "x".into(), kind: UnavailableKind::Updating },
+            NoticeKind::IrodoriUnavailable { reason: "x".into(), kind: UnavailableKind::ModelMissing },
+            NoticeKind::IrodoriUnavailable { reason: "x".into(), kind: UnavailableKind::NoGpu },
+            NoticeKind::IrodoriUnavailable { reason: "x".into(), kind: UnavailableKind::Vram },
+            NoticeKind::IrodoriUnavailable { reason: "x".into(), kind: UnavailableKind::Other },
+            NoticeKind::IrodoriUpdateAvailable { targets: vec!["transformers".into()] },
             NoticeKind::IrodoriDlComplete,
             NoticeKind::IrodoriDlFailed { reason: "x".into() },
             NoticeKind::UpdateAvailable { version: "1.0".into() },
@@ -403,7 +451,7 @@ mod dict_key_contract {
         let keys: BTreeSet<_> = all_kinds().iter().map(|k| k.dict_key()).collect();
         assert_eq!(
             keys.len(),
-            11,
+            16,
             "NoticeKind の変種を増やしたら all_kinds() にも足すこと（現在のキー: {keys:?}）"
         );
     }

@@ -72,6 +72,63 @@ pub async fn check_update_once(app: &AppHandle, state: &Arc<AppState>) -> Result
     Ok(())
 }
 
+/// **Irodori のランタイムに更新があれば告知する**（v0.5.7 項目 7、spec §6.0）。以前は設定パネルを開いた人にしか
+/// 見えず、乗り換え（数 GB の更新で届く）が届いたことに気付けなかった。**導入済みの人だけ**、**更新の錠が
+/// 空いているときだけ**確かめる（`status()` は記録に基準値を書き足し、python.exe を起動することもある）。
+/// 更新の対象の組ごとに 1 回、**届いたときだけ済みにする**（`once_reached`。v0.5.6 項目 6）。
+pub async fn check_irodori_update_once(app: &AppHandle, state: &Arc<AppState>) -> Result<()> {
+    let root = crate::tts::voice_ref::irodori_root()?;
+    let targets = tauri::async_runtime::spawn_blocking(move || {
+        irodori_update_targets(
+            crate::tts::irodori_download::assets_ready(&root),
+            crate::tts::irodori_download::is_busy_for(&root),
+            || crate::tts::irodori_download::status(&root).outdated,
+        )
+    })
+    .await
+    .map_err(|e| anyhow!("Irodori の更新の確認が中断しました: {e}"))?;
+    let Some(targets) = targets else {
+        return Ok(());
+    };
+    let seen_key = irodori_update_seen_key(&targets);
+    notify::once_reached(
+        matches!(state.db.get_setting(&seen_key), Ok(Some(_))),
+        || {
+            notify::notify(
+                app,
+                state,
+                NoticeKind::IrodoriUpdateAvailable { targets: targets.clone() },
+            )
+        },
+        || {
+            let _ = state.db.set_setting(&seen_key, "1");
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// 告知する更新の対象（純関数）。**導入済みで、錠が空いていて、対象があるときだけ** `Some`。
+/// `outdated` は錠を見たあとでしか呼ばない（呼ぶと記録に書き足しうる）。
+pub(crate) fn irodori_update_targets(
+    present: bool,
+    busy: bool,
+    outdated: impl FnOnce() -> Vec<String>,
+) -> Option<Vec<String>> {
+    if !present || busy {
+        return None;
+    }
+    let targets = outdated();
+    (!targets.is_empty()).then_some(targets)
+}
+
+/// 同じ更新の対象の組は二度告知しない（組が変われば、それは新しい更新なのでまた告知する）。
+pub(crate) fn irodori_update_seen_key(targets: &[String]) -> String {
+    let mut sorted = targets.to_vec();
+    sorted.sort();
+    format!("irodori_update_notice_seen:{}", sorted.join(","))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct UpdateFeed {
     latest: String,
@@ -98,6 +155,40 @@ fn is_newer(latest: (u32, u32, u32), current: (u32, u32, u32)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **導入済みで、更新の錠が空いていて、対象があるときだけ告知する**（v0.5.7 項目 7）。錠が握られている・
+    /// 未導入のときは**対象を確かめること自体をしない**（`status()` は記録に書き足し、python.exe を起動しうる）。
+    #[test]
+    fn the_irodori_update_is_told_only_when_installed_idle_and_outdated() {
+        use std::cell::Cell;
+        let asked = Cell::new(0);
+        let outdated = |v: &'static [&'static str]| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                v.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(irodori_update_targets(false, false, outdated(&["transformers"])), None, "未導入");
+        assert_eq!(irodori_update_targets(true, true, outdated(&["transformers"])), None, "錠が握られている");
+        assert_eq!(asked.get(), 0, "未導入・錠のときは対象を確かめない");
+        assert_eq!(irodori_update_targets(true, false, outdated(&[])), None, "最新");
+        assert_eq!(
+            irodori_update_targets(true, false, outdated(&["model_synth", "transformers"])),
+            Some(vec!["model_synth".to_string(), "transformers".to_string()])
+        );
+    }
+
+    /// 同じ対象の組は二度告知しない（並びが違っても同じ組）。組が変われば新しい更新として告知する。
+    #[test]
+    fn the_irodori_update_is_told_once_per_set_of_targets() {
+        let a = irodori_update_seen_key(&["transformers".into(), "model_synth".into()]);
+        let b = irodori_update_seen_key(&["model_synth".into(), "transformers".into()]);
+        let c = irodori_update_seen_key(&["model_synth".into()]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("irodori_update_notice_seen:"));
+    }
 
     #[test]
     fn parse_basic() {

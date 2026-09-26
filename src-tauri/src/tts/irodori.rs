@@ -337,9 +337,9 @@ impl IrodoriClient {
 
     /// 起動済みサイドカーの `/health` を 1 回 ping して true/false を返す (未起動なら true 扱い = no-op)。
     /// `tasks::spawn_irodori_health_watcher` から呼ばれる。
-    pub async fn health_ping(&self) -> bool {
+    pub async fn health_ping(&self) -> HealthPing {
         let Some(port) = self.current_port() else {
-            return true;
+            return HealthPing::Ok;
         };
         let url = format!("http://127.0.0.1:{port}/health");
         match self
@@ -349,8 +349,13 @@ impl IrodoriClient {
             .send()
             .await
         {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
+            Ok(resp) if resp.status().is_success() => HealthPing::Ok,
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                health_ping_from(status, &body)
+            }
+            Err(_) => HealthPing::Down,
         }
     }
 
@@ -390,10 +395,7 @@ impl IrodoriClient {
         // 走っている発話は切らない。ここで弾くと `decide_fallback` が voicevox へ流す。
         // **もう 1 つの ugg の更新も見る**（v0.5.6 項目 3f。錠をプロセスをまたぐものにした）。
         if crate::tts::irodori_download::is_busy_for(asset_root) {
-            return Err(TtsError::SidecarStart(
-                "Irodori ランタイムの導入または更新が進行中です。voicevox 経路で発話します"
-                    .to_string(),
-            ));
+            return Err(TtsError::Updating);
         }
         match self.running() {
             Some((port, running_mock)) if running_mock == mock => return Ok(port),
@@ -537,10 +539,15 @@ impl IrodoriClient {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
             let caption_ref = body.caption.as_deref().unwrap_or("");
-            return Err(TtsError::Http(format!(
+            let message = format!(
                 "{status}: {}",
                 sanitize_sidecar_error(&body_text, &secret_variants([text, caption_ref]))
-            )));
+            );
+            // v0.5.7 項目 7: サイドカーが返した理由の種類で、キャラの説明を言い分ける
+            return Err(match synth_failure_from_body(&body_text) {
+                Some(kind) => TtsError::Synth { kind, message },
+                None => TtsError::Http(message),
+            });
         }
         let bytes = resp
             .bytes()
@@ -636,6 +643,58 @@ pub enum TtsError {
     Http(String),
     #[error("参照音声 (slot={0}) が未生成です。設定パネルから生成してください")]
     VoiceRefMissing(String),
+    /// 導入・更新の最中（v0.5.7 項目 7 で `SidecarStart` から分けた。理由を言い分けるため）。
+    #[error("Irodori ランタイムの導入または更新が進行中です。voicevox 経路で発話します")]
+    Updating,
+    /// サイドカーが合成に失敗し、理由の種類を返した（v0.5.7 項目 7）。`message` は伏字・切り詰め済み。
+    #[error("Irodori の合成に失敗しました: {message}")]
+    Synth { kind: SynthFailure, message: String },
+}
+
+/// サイドカーが返す合成の失敗の種類（v0.5.7 項目 7。`sidecar.py` の `synth_failure_kind` と同じ組）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SynthFailure {
+    /// モデルの重み・トークナイザが無い（`FileNotFoundError`）。更新が要る。
+    ModelMissing,
+    /// GPU のメモリが足りない。
+    OutOfMemory,
+    /// そのほか。
+    Other,
+}
+
+/// サイドカーの失敗の応答（`{"detail": {"kind": ..., "message": ...}}`）から種類を読む（純関数）。
+/// 読めなければ `None`（古い `sidecar.py` の `{"detail": "..."}` など）。
+pub(crate) fn synth_failure_from_body(body: &str) -> Option<SynthFailure> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    match v.get("detail")?.get("kind")?.as_str()? {
+        "model_missing" => Some(SynthFailure::ModelMissing),
+        "oom" => Some(SynthFailure::OutOfMemory),
+        "other" => Some(SynthFailure::Other),
+        _ => None,
+    }
+}
+
+/// `/health` の失敗の応答を種類に分ける（純関数）。GPU が見えないときは 503 と `{"status": "no_gpu"}`。
+pub(crate) fn health_ping_from(status: u16, body: &str) -> HealthPing {
+    let no_gpu = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s == "no_gpu"))
+        .unwrap_or(false);
+    if status == 503 && no_gpu {
+        HealthPing::NoGpu
+    } else {
+        HealthPing::Down
+    }
+}
+
+/// ヘルスチェックの結果（v0.5.7 項目 7。GPU が見えない 503 を、ほかの異常と言い分ける）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthPing {
+    Ok,
+    /// 実モデルのサイドカーが GPU を見つけられない（`/health` が 503・`status: no_gpu`）。
+    NoGpu,
+    /// 応答しない・ほかの異常。
+    Down,
 }
 
 #[cfg(test)]
@@ -1210,6 +1269,64 @@ mod tests {
             src.contains("(s.tts_speed, s.tts_irodori_use_real_model, s.tts_irodori_steps)"),
             "設定のステップ数を読んでいない"
         );
+    }
+
+    /// **サイドカーの失敗の応答から理由の種類を読む**（v0.5.7 項目 7）。読めない形は `None`（古い sidecar.py の
+    /// 文字列の `detail` を含む）— そのときは今までどおりの `Http` になり、キャラは「理由が分からない」側で言う。
+    #[test]
+    fn the_synth_failure_kind_is_read_from_the_sidecar_body() {
+        let body = |k: &str| format!(r#"{{"detail":{{"kind":"{k}","message":"Irodori 合成失敗: x"}}}}"#);
+        assert_eq!(synth_failure_from_body(&body("model_missing")), Some(SynthFailure::ModelMissing));
+        assert_eq!(synth_failure_from_body(&body("oom")), Some(SynthFailure::OutOfMemory));
+        assert_eq!(synth_failure_from_body(&body("other")), Some(SynthFailure::Other));
+        assert_eq!(synth_failure_from_body(&body("unknown")), None);
+        assert_eq!(synth_failure_from_body(r#"{"detail":"Irodori 合成失敗: x"}"#), None, "古い形");
+        assert_eq!(synth_failure_from_body("Internal Server Error"), None);
+    }
+
+    /// **`/health` の 503 は、GPU が見えないときだけ「GPU が無い」**（v0.5.7 項目 7）。
+    #[test]
+    fn a_503_with_no_gpu_is_told_apart() {
+        assert_eq!(health_ping_from(503, r#"{"status":"no_gpu","gpu":null,"mock":false}"#), HealthPing::NoGpu);
+        assert_eq!(health_ping_from(503, r#"{"status":"busy"}"#), HealthPing::Down);
+        assert_eq!(health_ping_from(500, r#"{"status":"no_gpu"}"#), HealthPing::Down);
+        assert_eq!(health_ping_from(503, "not json"), HealthPing::Down);
+    }
+
+    /// **サイドカーの応答の形と、Rust の読み取りが噛み合う**（v0.5.7 項目 7。本文のテキストで固定する）。
+    #[test]
+    fn the_sidecar_speech_error_carries_the_kind_rust_reads() {
+        let py = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
+        )
+        .unwrap();
+        assert!(
+            py.contains("500, {\"kind\": synth_failure_kind(exc), \"message\": f\"Irodori 合成失敗: {exc}\"}"),
+            "合成の失敗の応答に種類を入れていない"
+        );
+        let body = &py[py.find("def synth_failure_kind(exc: BaseException) -> str:").expect("synth_failure_kind が無い")..];
+        let body = &body[..body.find("\n\n\n").unwrap()];
+        let oom = body.find("    if _is_out_of_memory(exc):\n        return \"oom\"").expect("VRAM 不足を見分けていない");
+        let missing = body
+            .find("    if isinstance(exc, FileNotFoundError):\n        return \"model_missing\"")
+            .expect("モデルが無いのを見分けていない");
+        assert!(oom < missing && body.contains("    return \"other\""));
+        // Rust の読み取りは同じ 3 つの文字列を知っている
+        let rs = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori.rs"),
+        )
+        .unwrap();
+        // **合成のメソッドの本文だけを見る**。このテスト自身が同じ文字列を持つので、ファイル全体で探すと
+        // 本体を壊しても自分に当たって通る（v0.5.7 の変異テストで発覚）。
+        let synth = &rs[rs.find("    pub async fn synthesize(").expect("synthesize が無い")..];
+        let synth = &synth[..synth.find("\n    }\n").unwrap()];
+        assert!(
+            synth.contains("return Err(match synth_failure_from_body(&body_text) {"),
+            "合成の失敗の応答から種類を読んでいない"
+        );
+        for k in ["\"model_missing\" => Some(SynthFailure::ModelMissing)", "\"oom\" => Some(SynthFailure::OutOfMemory)", "\"other\" => Some(SynthFailure::Other)"] {
+            assert!(rs.contains(k), "Rust の読み取りに無い: {k}");
+        }
     }
 
     // test23 (docs/script-reader-spec.md §5.1): SpeechRequest の caption 直列化。

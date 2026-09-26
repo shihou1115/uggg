@@ -1086,9 +1086,23 @@ pub fn spawn_update_watcher(app: AppHandle, state: Arc<AppState>) {
             if let Err(err) = crate::system::update::check_update_once(&app, &state).await {
                 crate::ulog!("[update] check failed: {err:#}");
             }
+            // v0.5.7 項目 7: Irodori のランタイムの更新も、設定パネルの外で知らせる
+            if let Err(err) = crate::system::update::check_irodori_update_once(&app, &state).await {
+                crate::ulog!("[update] Irodori の更新の確認に失敗: {err:#}");
+            }
             tokio::time::sleep(Duration::from_secs(PERIOD_SECS)).await;
         }
     });
+}
+
+/// ヘルスチェックが続けて失敗したときに、キャラが言う理由の種類（v0.5.7 項目 7。純関数）。
+pub(crate) fn health_unavailable_kind(
+    ping: crate::tts::irodori::HealthPing,
+) -> crate::system::notify::UnavailableKind {
+    match ping {
+        crate::tts::irodori::HealthPing::NoGpu => crate::system::notify::UnavailableKind::NoGpu,
+        _ => crate::system::notify::UnavailableKind::Other,
+    }
 }
 
 /// `spawn_irodori_health_watcher` の連続失敗カウンタ判定 (pure)。
@@ -1131,7 +1145,8 @@ pub fn spawn_irodori_health_watcher(app: AppHandle, state: Arc<AppState>) {
         let mut fails: u32 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
-            let ok = state.tts.irodori.health_ping().await;
+            let ping = state.tts.irodori.health_ping().await;
+            let ok = ping == crate::tts::irodori::HealthPing::Ok;
             let tick = next_health_tick(fails, ok, FAIL_THRESHOLD);
             fails = tick.fails_after;
             if !tick.should_trigger {
@@ -1154,7 +1169,11 @@ pub fn spawn_irodori_health_watcher(app: AppHandle, state: Arc<AppState>) {
                 crate::system::notify::notify(
                     &app,
                     &state,
-                    crate::system::notify::NoticeKind::IrodoriUnavailable { reason },
+                    crate::system::notify::NoticeKind::IrodoriUnavailable {
+                        reason,
+                        // v0.5.7 項目 7: GPU が見えない 503 はそうと言う（ほかの異常と言い分ける）
+                        kind: health_unavailable_kind(ping),
+                    },
                 )
                 .await;
             }
@@ -1165,6 +1184,29 @@ pub fn spawn_irodori_health_watcher(app: AppHandle, state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ヘルスチェックが続けて失敗したとき、GPU が見えない 503 なら「GPU が無い」と言う（v0.5.7 項目 7）。
+    /// 起動のたびに Irodori の更新も確かめる（設定パネルの外で知らせる）。どちらも配線を本文のテキストで固定する。
+    #[test]
+    fn the_health_watcher_tells_no_gpu_and_the_update_watcher_checks_irodori() {
+        use crate::system::notify::UnavailableKind;
+        use crate::tts::irodori::HealthPing;
+        assert_eq!(health_unavailable_kind(HealthPing::NoGpu), UnavailableKind::NoGpu);
+        assert_eq!(health_unavailable_kind(HealthPing::Down), UnavailableKind::Other);
+        let src = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tasks.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        // 監視の本文だけを見る（このテスト自身が同じ文字列を持つので、ファイル全体だと自分に当たる）
+        let health = &src[src.find("pub fn spawn_irodori_health_watcher").unwrap()..];
+        let health = &health[..health.find("\n}\n").unwrap()];
+        assert!(health.contains("kind: health_unavailable_kind(ping),"), "ヘルス監視が理由の種類を渡していない");
+        let watcher = &src[src.find("pub fn spawn_update_watcher").unwrap()..];
+        let watcher = &watcher[..watcher.find("\n}\n").unwrap()];
+        assert!(
+            watcher.contains("crate::system::update::check_irodori_update_once(&app, &state)"),
+            "起動後の確認で Irodori の更新を見ていない"
+        );
+    }
 
     #[test]
     fn next_health_tick_resets_on_success() {

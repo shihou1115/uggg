@@ -12,7 +12,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::db::VoiceRefRow;
 use crate::state::{AppState, Settings};
-use crate::system::notify::{self, NoticeKind};
+use crate::system::notify::{self, NoticeKind, UnavailableKind};
 use crate::system::secrets;
 use crate::tts::irodori::TtsError;
 use crate::tts::{download, gpu, irodori_download, preprocess, voice_ref, voicevox};
@@ -31,7 +31,25 @@ pub(crate) fn decide_fallback(err: &TtsError) -> FallbackAction {
         TtsError::VoiceRefMissing(_) => FallbackAction::ReturnError,
         TtsError::NotImplemented
         | TtsError::SidecarStart(_)
-        | TtsError::Http(_) => FallbackAction::FallbackToVoicevox,
+        | TtsError::Http(_)
+        | TtsError::Updating
+        | TtsError::Synth { .. } => FallbackAction::FallbackToVoicevox,
+    }
+}
+
+/// 合成の失敗を、キャラが言う理由の種類へ（v0.5.7 項目 7、spec §6.0）。以前は理由によらず辞書の
+/// `irodori_unavailable`（「GPU 環境が整っていないようだ」）を言い、更新中やモデルが無いときも事実と違う説明をした。
+pub(crate) fn unavailable_kind(err: &TtsError) -> UnavailableKind {
+    use crate::tts::irodori::SynthFailure;
+    match err {
+        TtsError::Updating => UnavailableKind::Updating,
+        TtsError::Synth { kind: SynthFailure::ModelMissing, .. } => UnavailableKind::ModelMissing,
+        TtsError::Synth { kind: SynthFailure::OutOfMemory, .. } => UnavailableKind::Vram,
+        TtsError::Synth { kind: SynthFailure::Other, .. }
+        | TtsError::SidecarStart(_)
+        | TtsError::Http(_)
+        | TtsError::NotImplemented
+        | TtsError::VoiceRefMissing(_) => UnavailableKind::Other,
     }
 }
 
@@ -123,6 +141,7 @@ pub async fn synthesize_voice(
                                         &state_arc,
                                         NoticeKind::IrodoriUnavailable {
                                             reason: reason.clone(),
+                                            kind: unavailable_kind(&err),
                                         },
                                     )
                                     .await;
@@ -854,6 +873,33 @@ pub fn tts_params(settings: &Settings) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **合成の失敗を、キャラが言う理由の種類へ**（v0.5.7 項目 7）。更新中・モデルが無い・VRAM 不足を言い分け、
+    /// 分からないものは「その他」（以前は理由によらず「GPU 環境が整っていない」と言った）。どれも VOICEVOX へ落とす。
+    #[test]
+    fn a_failure_is_told_by_its_reason() {
+        use crate::tts::irodori::SynthFailure;
+        let synth = |kind| TtsError::Synth { kind, message: "x".into() };
+        assert_eq!(unavailable_kind(&TtsError::Updating), UnavailableKind::Updating);
+        assert_eq!(unavailable_kind(&synth(SynthFailure::ModelMissing)), UnavailableKind::ModelMissing);
+        assert_eq!(unavailable_kind(&synth(SynthFailure::OutOfMemory)), UnavailableKind::Vram);
+        assert_eq!(unavailable_kind(&synth(SynthFailure::Other)), UnavailableKind::Other);
+        assert_eq!(unavailable_kind(&TtsError::SidecarStart("x".into())), UnavailableKind::Other);
+        assert_eq!(unavailable_kind(&TtsError::Http("x".into())), UnavailableKind::Other);
+        for err in [TtsError::Updating, synth(SynthFailure::ModelMissing), synth(SynthFailure::OutOfMemory)] {
+            assert_eq!(decide_fallback(&err), FallbackAction::FallbackToVoicevox, "{err}");
+        }
+        // 告知には理由の種類を渡している（本文のテキスト）
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        // コマンドの本文だけを見る（このテスト自身が同じ文字列を持つので、ファイル全体だと自分に当たる）
+        let body = &src[src.find("pub async fn synthesize_voice(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("kind: unavailable_kind(&err),"), "告知に理由の種類を渡していない");
+    }
 
     /// **導入済みの環境で「ランタイムをダウンロード」を押しても、全段は入れ直さない**（v0.5.7 項目 1）。
     /// 全段の入れ直しには版の控えも全戻しも合成のゲートも無いので、依存の major 移行が失敗しても戻らない。
