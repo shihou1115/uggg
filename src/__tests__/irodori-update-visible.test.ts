@@ -258,10 +258,45 @@ describe("操作列: 更新が届いていないランタイムを開く", () =>
     vi.resetModules();
     loadIndexHtml();
     await open();
+    const confirm = vi.mocked((await import("../confirm")).uggConfirm);
+    confirm.mockClear();
     downloadBtn().dispatchEvent(new Event("click"));
     await settle();
     expect(called("download_irodori_assets"), "未導入なら導入する").toBe(true);
     expect(called("update_irodori_runtime")).toBe(false);
+    // v0.5.7 項目 8: 初回導入の確認で、取得量（正本と同じ数字）と倫理条項を出す
+    const message = String(confirm.mock.calls[0][0]);
+    expect(message).toContain("約 7 GB");
+    expect(message).toContain("約 9 GB");
+    expect(message).toContain("倫理条項");
+  });
+
+  it("AI モデルが変わる更新だけ、声が変わることと古いモデルを消すことを伝え、倫理条項はいつも出す", async () => {
+    // v0.5.7 項目 8。パッケージだけの更新で「声が変わる」「モデルを消す」と言うと事実と違う。
+    const confirm = vi.mocked((await import("../confirm")).uggConfirm);
+    const settle = () => new Promise((r) => setTimeout(r, 0));
+    const messageOf = async (outdated: string[]) => {
+      irodoriStatus = status({ present: true, has_record: true, up_to_date: false, outdated });
+      confirmAnswer = false;
+      invoked.length = 0;
+      confirm.mockClear();
+      vi.resetModules();
+      loadIndexHtml();
+      await open();
+      updateBtn().dispatchEvent(new Event("click"));
+      await settle();
+      expect(confirm).toHaveBeenCalledTimes(1);
+      return String(confirm.mock.calls[0][0]);
+    };
+    const withModel = await messageOf(["model_synth", "transformers"]);
+    expect(withModel).toContain("声の質感が変わります");
+    expect(withModel).toContain("古いモデルは消します");
+    expect(withModel).toContain("約 3.6 GB");
+    expect(withModel).toContain("倫理条項");
+    const packagesOnly = await messageOf(["transformers"]);
+    expect(packagesOnly).not.toContain("声の質感");
+    expect(packagesOnly).not.toContain("古いモデル");
+    expect(packagesOnly).toContain("倫理条項");
   });
 
   it("確認で断ったら、入れ直しを始めない", async () => {

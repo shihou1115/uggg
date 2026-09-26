@@ -998,7 +998,7 @@ where
     F: FnMut(&str),
 {
     let py_exe = asset_root.join("python").join("python.exe");
-    on_line("PyTorch (CUDA 12.8) をインストールしています… (1〜2GB ダウンロードします)");
+    on_line(&format!("PyTorch (CUDA 12.8) をインストールしています…（{TORCH_DOWNLOAD}ダウンロードします）"));
     let mut args: Vec<&str> = vec!["--upgrade", "--index-url", TORCH_CUDA_INDEX_URL];
     args.extend(TORCH_PACKAGES);
     run_pip_install(&py_exe, &args, |l| on_line(l))?;
@@ -1786,7 +1786,7 @@ where
     // ① 名前付き要件。torch 系を先に（その他の要件が新しい torch を前提にしていても、PyPI から
     //    取りに行かせないため）。
     if !plan.torch.is_empty() {
-        on_line("PyTorch を入れ直しています…（CUDA 12.8 の index から。1〜2GB あります）");
+        on_line(&format!("PyTorch を入れ直しています…（CUDA 12.8 の index から。{TORCH_DOWNLOAD}あります）"));
         let mut args: Vec<&str> = vec!["--upgrade", "--index-url", TORCH_CUDA_INDEX_URL];
         args.extend(plan.torch.iter().map(String::as_str));
         run_pip_install(py_exe, &args, |l| on_line(l)).context("PyTorch の入れ直しに失敗しました")?;
@@ -2263,6 +2263,83 @@ fn probe_cuda(py_exe: &Path) -> Option<bool> {
 /// 5. 失敗・不合格なら全部戻す（`roll_back_update`）。成功したら退避と控えを捨てて記録する
 ///
 /// 戻り値は「入れ直せた名前」。呼び出し側はこれで記録を部分的に更新する。
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// **取得量の目安の正本**（v0.5.7 項目 8）。確認の文言（`settings.ts`）と取説（`manual.md`）は同じ文字列を書き、
+/// 契約テストが突き合わせる（以前は 3 か所で「約 2〜3 GB」「約 2〜4 GB」「合計 10 GB 前後」と食い違っていた）。
+/// 初回導入の取得（PyTorch 2.87 GB・v4.1-Small 3.07 GB・コーデック 0.43 GB・ほかの依存 約 0.25 GB・透かし 0.07 GB）。
+pub(crate) const FIRST_INSTALL_DOWNLOAD: &str = "約 7 GB";
+/// 初回導入のあとに使うディスク（Python と依存 約 5.4 GB・モデル 約 3.5 GB）。
+pub(crate) const FIRST_INSTALL_DISK: &str = "約 9 GB";
+/// AI モデルが変わる更新の取得（v4.1-Small 3.07 GB・コーデック 0.43 GB・透かし 0.07 GB・依存の差分）。
+pub(crate) const MODEL_UPDATE_DOWNLOAD: &str = "約 3.6 GB";
+/// AI モデル本体の取得（v4.1-Small とコーデック）。
+pub(crate) const MODEL_DOWNLOAD: &str = "約 3.5 GB";
+/// PyTorch（CUDA 12.8）の取得（torch 2.10.0+cu128 の wheel が 2.87 GB。2026-09-27 に配布元へ大きさを問い合わせた）。
+pub(crate) const TORCH_DOWNLOAD: &str = "約 2.9 GB";
+
+/// **初回導入に要るディスクの空き**（v0.5.7 項目 8）。取得は約 7 GB（PyTorch 2.87 GB・v4.1-Small 3.07 GB・
+/// コーデック 0.43 GB・ほか）、入れた後は約 9 GB、pip の一時ファイルの分を足して余裕を持たせる。
+pub(crate) const REQUIRED_FREE_FIRST_INSTALL: u64 = 11 * GIB;
+
+/// **更新に要るディスクの空き**（v0.5.7 項目 8、純関数）。更新が成功するまで旧モデルも残るが、既にディスクに
+/// あるので足さない。モデルが変わるなら約 3.6 GB の取得、PyTorch が変わるなら約 3 GB の取得に余裕を足す。
+fn required_free_for_update(plan: &UpdatePlan) -> u64 {
+    let mut need = GIB;
+    if !plan.torch.is_empty() {
+        need += 4 * GIB;
+    }
+    if plan.models {
+        need += 5 * GIB;
+    }
+    need
+}
+
+/// 空きが足りなければ理由（純関数）。空きが分からなければ止めない（分からないことを理由に断らない）。
+fn lacking_free_space(required: u64, free: Option<u64>) -> Option<String> {
+    let free = free?;
+    if free >= required {
+        return None;
+    }
+    let gb = |b: u64| b as f64 / GIB as f64;
+    Some(format!(
+        "ディスクの空きが足りません（要る量の目安 {:.1} GB、いまの空き {:.1} GB）。あと {:.1} GB ほど空けてから、もう一度お試しください（何も変えていません）",
+        gb(required),
+        gb(free),
+        gb(required - free)
+    ))
+}
+
+/// `path` のあるドライブの空き容量（バイト）。分からなければ `None`。
+fn free_bytes(path: &Path) -> Option<u64> {
+    let mut at = path;
+    while !at.exists() {
+        at = at.parent()?;
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let mut free: u64 = 0;
+        let wide = windows::core::HSTRING::from(at.as_os_str());
+        // SAFETY: 出力先はこの関数の中の u64。ほかの 2 つは受け取らない。
+        unsafe { GetDiskFreeSpaceExW(&wide, Some(&mut free as *mut u64), None, None) }.ok()?;
+        Some(free)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = at;
+        None
+    }
+}
+
+/// 初回導入の前に空きを確かめる（v0.5.7 項目 8）。足りなければ始めずに、要る量を伝える。
+pub fn check_free_space_for_first_install(asset_root: &Path) -> Result<()> {
+    match lacking_free_space(REQUIRED_FREE_FIRST_INSTALL, free_bytes(asset_root)) {
+        Some(why) => Err(anyhow!(why)),
+        None => Ok(()),
+    }
+}
+
 /// VRAM 不足で保留したときに、記録を進めてよい名前（v0.5.7 項目 6）。**モデルは進めない** — 記録が読み先の正本
 /// （v0.5.6 項目 3a）なので、進めると確かめていない新しいモデルを読みに行く。パッケージ（名前付き要件と固定 URL）は
 /// 入れ替え済みなので進める（進めないと、次の更新が入れ直しをまた最初からやる）。
@@ -2300,6 +2377,11 @@ where
     let plan = update_plan(outdated);
     for name in &plan.skipped {
         on_line(&format!("{name} は入れ直しの対象外です (skip)"));
+    }
+    // **空きを確かめてから始める**（v0.5.7 項目 8）。成功するまで旧モデルと新しいモデルが同時に残る。
+    if let Some(why) = lacking_free_space(required_free_for_update(&plan), free_bytes(asset_root)) {
+        on_line(&why);
+        return Err(anyhow!(why));
     }
 
     // 入れ直す前に「いま何が使えるか」を控える。ここを控えずに絶対値で判定すると、
@@ -2468,7 +2550,7 @@ where
             sidecar_py.display()
         ));
     }
-    on_line("Aratako/Irodori-TTS の HF モデル (約 2〜4GB) を取得しています…");
+    on_line(&format!("Irodori-TTS の AI モデル（{MODEL_DOWNLOAD}）を確認して、要るものを取得しています…"));
     let asset_root_str = asset_root.to_string_lossy().into_owned();
     let sidecar_py_str = sidecar_py.to_string_lossy().into_owned();
     let models = model_args_for_fetch();
@@ -2645,11 +2727,12 @@ where
     let mut cmd = Command::new(python_exe);
     cmd.args(args);
     let mut progress = PipProgress::default();
+    let mut hf = HfProgress::default();
     let mut tail = OutputTail::default();
     // 呼び出し元の多くは非同期の関数。待つ間ワーカーを塞がない（v0.5.4 で見送った件）。
     let ended = child_process::off_the_async_workers(|| {
         child_process::run_streaming(cmd, None, Some(PYTHON_STALL_AFTER), |line| {
-            if let Some(shown) = progress.describe(line.text) {
+            if let Some(shown) = progress.describe(line.text).or_else(|| hf.describe(line.text)) {
                 if let Some(text) = shown {
                     on_line(Line {
                         text: &text,
@@ -2790,6 +2873,108 @@ impl PipProgress {
             Some(Some(format!("  取得中 {:.0} MB", done as f64 / MB)))
         }
     }
+}
+
+/// huggingface_hub の取得の進捗の行を、画面向けに直す（v0.5.7 項目 8、spec §6.0）。
+///
+/// hub 1.33（hf-xet）の大きなファイルは「`NAME: reconstructing file:  40%|███| 1.2GB / 3.06GB`」（全体と割合あり）と
+/// 「`NAME: downloading bytes: ███ | 956MB, 24.6MB/s`」（量と速度だけ）を交互に出し、小さなファイルはいつもの tqdm
+/// （「`NAME:  45%|███| 1.38G/3.06G [00:55<01:07, 25.0MB/s]`」）。どれも `\r` の上書きで、そのまま流すと棒グラフの文字が
+/// 並ぶ。**割合が分かる行を優先**し、割合が変わったときだけ出す。割合の行が無いファイルは量が 50 MB 進むごとに出す。
+#[derive(Default)]
+struct HfProgress {
+    shown_percent: std::collections::BTreeMap<String, u64>,
+    has_percent: std::collections::BTreeSet<String>,
+    shown_bytes: std::collections::BTreeMap<String, u64>,
+}
+
+/// 「`1.38G`」「`3.06GB`」「`956MB`」「`668`」を、バイト数へ（tqdm と hf-xet の書き方）。
+fn parse_progress_size(s: &str) -> Option<f64> {
+    let s = s.trim().trim_end_matches('B').trim_end_matches('i');
+    let (num, mult) = match s.chars().last()? {
+        'k' | 'K' => (&s[..s.len() - 1], 1e3),
+        'M' => (&s[..s.len() - 1], 1e6),
+        'G' => (&s[..s.len() - 1], 1e9),
+        'T' => (&s[..s.len() - 1], 1e12),
+        _ => (s, 1.0),
+    };
+    num.trim().parse::<f64>().ok().map(|n| n * mult)
+}
+
+/// 画面向けの量（1 GB 以上は小数 2 桁の GB、それ未満は MB）。
+fn human_size(bytes: f64) -> String {
+    if bytes >= 1e9 {
+        format!("{:.2} GB", bytes / 1e9)
+    } else {
+        format!("{:.0} MB", bytes / 1e6)
+    }
+}
+
+impl HfProgress {
+    /// 取得の進捗の行なら `Some`（中身は出す文言。今回は出さないなら `None`）。進捗でなければ `None`。
+    fn describe(&mut self, line: &str) -> Option<Option<String>> {
+        let (name, rest) = line.split_once(": ")?;
+        let name = name.trim();
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return None; // 「Warning: …」のような普通の行
+        }
+        if let Some(r) = rest.strip_prefix("reconstructing file:") {
+            let (pct, sizes) = split_percent_and_sizes(r)?;
+            let (done, total) = sizes.split_once(" / ")?;
+            // 末尾にカーソルを上へ戻す並び（`\x1b[A`）や空白が付くので、最初のまとまりだけを読む
+            let total = total.split_whitespace().next()?;
+            let (done, total) = (parse_progress_size(done)?, parse_progress_size(total)?);
+            self.has_percent.insert(name.to_string());
+            return Some(self.percent_line(name, pct, done, total));
+        }
+        if let Some(r) = rest.strip_prefix("downloading bytes:") {
+            if self.has_percent.contains(name) {
+                return Some(None);
+            }
+            let after = r.rsplit_once('|')?.1;
+            let (done, speed) = match after.split_once(',') {
+                Some((d, sp)) => (d, sp.split_whitespace().next().map(str::to_string)),
+                None => (after.split_whitespace().next().unwrap_or(""), None),
+            };
+            let done = parse_progress_size(done)?;
+            const STEP: f64 = 50e6;
+            let prev = self.shown_bytes.get(name).copied();
+            if let Some(prev) = prev {
+                if (done as u64) < prev + STEP as u64 {
+                    return Some(None);
+                }
+            }
+            self.shown_bytes.insert(name.to_string(), done as u64);
+            return Some(Some(match speed {
+                Some(sp) => format!("  取得中 {name} {}（{sp}）", human_size(done)),
+                None => format!("  取得中 {name} {}", human_size(done)),
+            }));
+        }
+        // いつもの tqdm（小さなファイル・hub 0.x）
+        let (pct, sizes) = split_percent_and_sizes(rest)?;
+        let sizes = sizes.split(" [").next()?;
+        let (done, total) = sizes.split_once('/')?;
+        let (done, total) = (parse_progress_size(done)?, parse_progress_size(total)?);
+        self.has_percent.insert(name.to_string());
+        Some(self.percent_line(name, pct, done, total))
+    }
+
+    fn percent_line(&mut self, name: &str, pct: u64, done: f64, total: f64) -> Option<String> {
+        if self.shown_percent.get(name) == Some(&pct) {
+            return None;
+        }
+        self.shown_percent.insert(name.to_string(), pct);
+        Some(format!("  取得中 {name} {} / {}（{pct}%）", human_size(done), human_size(total)))
+    }
+}
+
+/// 「`  40%|███   |  1.2GB / 3.06GB   …`」→ (40, 「1.2GB / 3.06GB   …」)。
+fn split_percent_and_sizes(r: &str) -> Option<(u64, &str)> {
+    let r = r.trim_start();
+    let (pct, rest) = r.split_once('%')?;
+    let pct: u64 = pct.trim().parse().ok()?;
+    let after_bar = rest.strip_prefix('|')?.split_once('|')?.1;
+    Some((pct, after_bar.trim()))
 }
 
 /// `pip install` を走らせる（共通の引数はここで付ける）。
@@ -4846,6 +5031,166 @@ mod update_tests {
 
     fn json(text: &str) -> serde_json::Value {
         serde_json::from_str(text).unwrap()
+    }
+
+    /// **取得量の数字は 1 か所（ここの定数）で決め、画面の確認の文言と取説は同じ文字列を書く**（v0.5.7 項目 8）。
+    /// 以前は 3 か所で「約 2〜3 GB」「約 2〜4 GB」「合計 10 GB 前後」と食い違っていた。
+    #[test]
+    fn download_sizes_agree_between_code_screen_and_manual() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let ts = std::fs::read_to_string(root.join("src/panels/settings.ts")).unwrap();
+        let manual = std::fs::read_to_string(root.join("docs/manual.md")).unwrap();
+        let html = std::fs::read_to_string(root.join("index.html")).unwrap();
+        assert!(
+            html.contains(&format!("ダウンロードには{FIRST_INSTALL_DOWNLOAD} の通信（入れたあとはディスクを{FIRST_INSTALL_DISK} 使います）")),
+            "設定パネルの注記の数字が正本と違う"
+        );
+        for (name, value) in [
+            ("IRODORI_FIRST_DOWNLOAD", FIRST_INSTALL_DOWNLOAD),
+            ("IRODORI_FIRST_DISK", FIRST_INSTALL_DISK),
+            ("IRODORI_MODEL_UPDATE_DOWNLOAD", MODEL_UPDATE_DOWNLOAD),
+        ] {
+            assert!(ts.contains(&format!("const {name} = \"{value}\";")), "settings.ts の {name} が {value} でない");
+            assert!(manual.contains(value), "取説に {value} が無い（{name}）");
+        }
+        for stale in ["約 2〜3 GB", "約 2〜4GB", "約 2〜4 GB", "10GB 前後", "10 GB 前後", "1〜2 GB の通信", "1〜2GB"] {
+            assert!(
+                !ts.contains(stale) && !manual.contains(stale) && !html.contains(stale),
+                "古い数字が残っている: {stale}"
+            );
+        }
+        let torch = &rs_install_torch_body();
+        assert!(torch.contains("{TORCH_DOWNLOAD}"), "PyTorch の取得の文言に正本の数字を使っていない");
+        let rs = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs")).unwrap();
+        let body = &rs[rs.find("pub async fn install_irodori_models<F>(").unwrap()..];
+        assert!(body.contains("{MODEL_DOWNLOAD}"), "モデルの取得の進捗に正本の数字を使っていない");
+    }
+
+    fn rs_install_torch_body() -> String {
+        let rs = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body = &rs[rs.find("pub async fn install_torch_cuda<F>(").unwrap()..];
+        body[..body.find("\n}\n").unwrap()].to_string()
+    }
+
+    /// **更新に要る空き**（v0.5.7 項目 8）: モデルが変わると約 3.6 GB、PyTorch が変わると約 3 GB の取得に余裕を足す。
+    #[test]
+    fn the_free_space_needed_follows_what_the_update_fetches() {
+        let plan = |names: &[&str]| update_plan(&names.iter().map(|n| n.to_string()).collect::<Vec<_>>());
+        assert_eq!(required_free_for_update(&plan(&["transformers"])), GIB);
+        assert_eq!(required_free_for_update(&plan(&["model_synth"])), 6 * GIB);
+        assert_eq!(required_free_for_update(&plan(&["torch"])), 5 * GIB);
+        assert_eq!(required_free_for_update(&plan(&["torch", "model_synth"])), 10 * GIB);
+    }
+
+    /// 空きが足りなければ要る量を伝えて止める。**空きが分からなければ止めない**（分からないことを理由に断らない）。
+    #[test]
+    fn a_lack_of_free_space_stops_before_anything_changes() {
+        assert_eq!(lacking_free_space(6 * GIB, None), None);
+        assert_eq!(lacking_free_space(6 * GIB, Some(6 * GIB)), None);
+        let why = lacking_free_space(6 * GIB, Some(2 * GIB)).expect("足りない");
+        assert!(why.contains("6.0 GB") && why.contains("2.0 GB") && why.contains("4.0 GB"), "{why}");
+        assert!(why.contains("何も変えていません"), "{why}");
+        // 実物の API で空きが読める（無いフォルダは、あるところまで遡る）
+        let dir = tempfile::tempdir().unwrap();
+        assert!(free_bytes(&dir.path().join("まだ無い").join("フォルダ")).is_some_and(|b| b > 0));
+    }
+
+    /// 更新は**何も変える前**に、初回導入は Python を置く前に空きを確かめる（配線を本文のテキストで固定する）。
+    #[test]
+    fn the_free_space_is_checked_before_anything_changes() {
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body = &src[src.find("pub async fn update_irodori_runtime<F>(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let check = body
+            .find("lacking_free_space(required_free_for_update(&plan), free_bytes(asset_root))")
+            .expect("更新で空きを確かめていない");
+        for later in ["import_report(&py_exe)", "write_versions_snapshot(", "apply_update_plan("] {
+            let at = body.find(later).unwrap_or_else(|| panic!("{later} が無い"));
+            assert!(check < at, "空きを {later} より後で確かめている");
+        }
+        let cmd = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body = &cmd[cmd.find("pub async fn download_irodori_assets").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let check = body.find("check_free_space_for_first_install(&asset_root)").expect("初回導入で空きを確かめていない");
+        let python = body.find("ensure_python_embeddable(").unwrap();
+        assert!(check < python, "Python を置いてから空きを確かめている");
+    }
+
+    /// **huggingface_hub の取得の進捗を、画面向けに直す**（v0.5.7 項目 8）。行は spike（hub 1.33・hf-xet）で実際に出たもの。
+    #[test]
+    fn hub_download_progress_is_turned_into_readable_lines() {
+        let mut hf = HfProgress::default();
+        // 大きなファイル: 組み立ての行（全体と割合）が出たら、それを優先する
+        assert_eq!(
+            hf.describe("model.safetensors: reconstructing file:   0%|          |  0.00B / 3.06GB            \x1b[A"),
+            Some(Some("  取得中 model.safetensors 0 MB / 3.06 GB（0%）".to_string()))
+        );
+        assert_eq!(
+            hf.describe("model.safetensors: reconstructing file:   0%|          | 89.4kB / 3.06GB            \x1b[A"),
+            Some(None),
+            "割合が変わらなければ出さない"
+        );
+        assert_eq!(
+            hf.describe("model.safetensors: reconstructing file:  41%|████      | 1.26GB / 3.06GB            \x1b[A"),
+            Some(Some("  取得中 model.safetensors 1.26 GB / 3.06 GB（41%）".to_string()))
+        );
+        assert_eq!(
+            hf.describe("model.safetensors: downloading bytes: ███       |  956MB, 24.6MB/s  "),
+            Some(None),
+            "割合の行があるファイルの量だけの行は出さない"
+        );
+        // 量だけの行しか無いファイル: 50 MB 進むごと
+        let mut only = HfProgress::default();
+        assert_eq!(
+            only.describe("weights.pth: downloading bytes:           |  154kB, 4.29kB/s  "),
+            Some(Some("  取得中 weights.pth 0 MB（4.29kB/s）".to_string()))
+        );
+        assert_eq!(only.describe("weights.pth: downloading bytes: █  | 30.0MB, 20.1MB/s  "), Some(None));
+        assert_eq!(
+            only.describe("weights.pth: downloading bytes: ██ | 60.2MB, 21.0MB/s  "),
+            Some(Some("  取得中 weights.pth 60 MB（21.0MB/s）".to_string()))
+        );
+        // 小さなファイル: いつもの tqdm
+        let mut small = HfProgress::default();
+        assert_eq!(
+            small.describe("tokenizer.json: 100%|██████████| 6.72M/6.72M [00:00<00:00, 51.9MB/s]"),
+            Some(Some("  取得中 tokenizer.json 7 MB / 7 MB（100%）".to_string()))
+        );
+        // 進捗でない行はそのまま流す
+        assert_eq!(small.describe("Warning: You are sending unauthenticated requests to the HF Hub."), None);
+        assert_eq!(small.describe("[hf-download] Aratako/X を確認中…"), None);
+        assert_eq!(small.describe("Progress 10 of 100"), None);
+    }
+
+    /// 進捗の変換は、Python の出力を流す処理で pip の変換の次に通す（配線を本文のテキストで固定する）。
+    #[test]
+    fn the_hub_progress_converter_is_wired_into_python_output() {
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body = &src[src.find("fn run_python_lines<F>(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("let mut hf = HfProgress::default();"), "hub の進捗の変換を作っていない");
+        assert!(
+            body.contains("progress.describe(line.text).or_else(|| hf.describe(line.text))"),
+            "hub の進捗の変換を通していない"
+        );
+    }
+
+    #[test]
+    fn progress_sizes_are_read_in_both_notations() {
+        assert_eq!(parse_progress_size("3.06GB"), Some(3.06e9));
+        assert_eq!(parse_progress_size("6.72M"), Some(6.72e6));
+        assert_eq!(parse_progress_size("89.4kB"), Some(89.4e3));
+        assert_eq!(parse_progress_size("668"), Some(668.0));
+        assert_eq!(parse_progress_size("0.00B"), Some(0.0));
+        assert_eq!(parse_progress_size("abc"), None);
     }
 
     /// **合格の文面に透かしの状態を出す**（v0.5.7 項目 5）。効いていなくても合格は合格（透かしが無くても合成は

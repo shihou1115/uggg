@@ -149,6 +149,20 @@ let onSaved: ((s: Settings) => void) | null = null;
 // (ランタイム DL 導線) を表示し続ける必要がある (クリーンインストールでの詰み防止)。
 // refreshIrodoriState が更新し、updateVoiceEngineVisibility が参照する。
 let irodoriAssetsReady = false;
+/// 最後に確かめた「更新の対象」（v0.5.7 項目 8。AI モデルが変わるときだけ、確認の文言で声と旧モデルのことを伝える）。
+let irodoriOutdated: string[] = [];
+
+/// **取得量の目安**（v0.5.7 項目 8）。正本は Rust の `irodori_download.rs`（FIRST_INSTALL_DOWNLOAD ほか）で、
+/// 取説と同じ文字列であることを契約テストが突き合わせる。
+const IRODORI_FIRST_DOWNLOAD = "約 7 GB";
+const IRODORI_FIRST_DISK = "約 9 GB";
+const IRODORI_MODEL_UPDATE_DOWNLOAD = "約 3.6 GB";
+
+/// **倫理条項の提示**（v0.5.7 項目 8、2026-09-25 ユーザー裁定: 提示だけ、同意は記録しない）。
+const IRODORI_ETHICS =
+  "Irodori-TTS のモデルカードの倫理条項: 本人の明示的な同意なく、他人（声優・著名人・公人を含む）の声を" +
+  "クローンしたり、なりすましに使ったりしないこと。人を欺く目的のディープフェイクや偽情報に使わないこと" +
+  "（出典: huggingface.co/Aratako/Irodori-TTS-v4.1-Small）。";
 
 export async function mountSettingsPanel(): Promise<void> {
   inputs = collectInputs();
@@ -546,6 +560,7 @@ async function refreshIrodoriState(): Promise<void> {
         : "導入済み (更新あり)";
     inputs.irodoriAssetsState.classList.toggle("has-key", st.present && st.up_to_date);
     inputs.irodoriUpdateBtn.hidden = !st.present || st.up_to_date;
+    irodoriOutdated = st.outdated;
     inputs.irodoriUpdateBtn.title = st.has_record
       ? `更新対象: ${st.outdated.join(" / ")}`
       : "いつ導入したかの記録がありません。入れ直して記録を作ります";
@@ -651,12 +666,23 @@ async function onIrodoriUpdate(): Promise<void> {
   // おり、同意の本文が実装より先行していた）。v0.5.6 項目 3d から、途中で失敗したら入れ替えたものを
   // 全部戻す。ただし個別のパッケージは「控えた版を入れ直す」ので通信が要り、戻せないことがある
   // （そのときはバック側がメッセージで何が戻らなかったかを返す）。モデルは戻さない。
-  const ok = await uggConfirm(
-    "Irodori-TTS のランタイムに更新があります。変わったものだけを入れ直します。\n" +
-      "AI モデルが変わっているときは数 GB の取得になります。更新中は VOICEVOX の声で話します。\n" +
-      "途中で失敗したら、入れ替えたものを元の版へ戻します（個別のパッケージを戻すには通信が要ります。戻せなかったときはその旨を表示します）。続行しますか?",
-    "更新確認",
+  // v0.5.7 項目 8: AI モデルが変わるときは、声が変わること・成功したら古いモデルを消すことを伝える
+  const modelChanges = irodoriOutdated.some((n) => n.startsWith("model_"));
+  const lines = [
+    "Irodori-TTS のランタイムに更新があります。変わったものだけを入れ直します。更新中は VOICEVOX の声で話します。",
+  ];
+  if (modelChanges) {
+    lines.push(
+      `AI モデルが変わります（${IRODORI_MODEL_UPDATE_DOWNLOAD}ほどの取得）。声の質感が変わります（参照音声はそのまま使います）。`,
+      "更新が成功したら古いモデルは消します（古いモデルに戻すには、もう一度の取得が要ります）。",
+    );
+  }
+  lines.push(
+    "途中で失敗したら、入れ替えたものを元の版へ戻します（個別のパッケージを戻すには通信が要ります。戻せなかったときはその旨を表示します）。",
+    IRODORI_ETHICS,
+    "続行しますか?",
   );
+  const ok = await uggConfirm(lines.join("\n"), "更新確認");
   if (!ok) return;
   showIrodoriProgress("更新しています…", false);
   inputs.irodoriUpdateBtn.disabled = true;
@@ -702,8 +728,11 @@ async function onIrodoriDownload(): Promise<void> {
   }
   const ok = await uggConfirm(
     "Irodori-TTS (高品質モード) の Python ランタイム + PyTorch (CUDA 12.8) + " +
-      "実モデル実行時ランタイム (irodori-tts / dacvae / silentcipher など) をダウンロードします。\n" +
-      "約 2〜3 GB の通信が発生し、10〜20 分かかります。続行しますか?",
+      "実モデル実行時ランタイム (irodori-tts / dacvae / silentcipher など) + AI モデル (Irodori-TTS v4.1-Small) を" +
+      "ダウンロードします。\n" +
+      `${IRODORI_FIRST_DOWNLOAD}の通信が発生し、10〜20 分かかります（ディスクは${IRODORI_FIRST_DISK}使います）。\n` +
+      IRODORI_ETHICS +
+      "\n続行しますか?",
     "ダウンロード確認",
   );
   if (!ok) return;

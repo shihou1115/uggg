@@ -590,6 +590,8 @@ pub async fn download_irodori_assets(
         // 更新と同じ入口の備え（v0.5.6 項目 3e）。**初回導入は自分のサイドカーを止めていなかった**
         // （更新の経路だけ止めていた）。Python が入っている環境で押し直すと、pip が掴まれた site-packages を触る。
         prepare_to_replace_runtime(state.inner(), &asset_root, &emit).await?;
+        // 空きを確かめてから始める（v0.5.7 項目 8。取得は約 7 GB、入れた後は約 9 GB）
+        irodori_download::check_free_space_for_first_install(&asset_root).map_err(|e| format!("{e:#}"))?;
         irodori_download::ensure_python_embeddable(&asset_root, &emit)
             .await
             .map_err(|e| format!("{e:#}"))?;

@@ -24,7 +24,10 @@ export function mountCredit(): void {
 }
 
 /// TTS が有効になった or 話者が変わったときに呼ぶ。
-/// engine が "voicevox_core" 以外 (Irodori 等) のときは規約上の帰属表示義務がないので非表示。
+/// 表示するのは VOICEVOX のときだけ（VOICEVOX の音声ライブラリの規約が「VOICEVOX:話者名」の表示を求める）。
+/// Irodori-TTS のモデル（MIT）には音声へのクレジット表示の定めが無い。ただし**モデルカードの倫理条項**（本人の
+/// 同意なく他人の声をクローン・なりすましに使わない／人を欺く目的で使わない）があり、ugg は取得と更新の確認と
+/// 取説で提示する（v0.5.7 項目 8、spec §6.0）。以前は「規約上の帰属表示義務がない」と言い切っていた。
 export async function refreshCredit(
   enabled: boolean,
   engine: string,
