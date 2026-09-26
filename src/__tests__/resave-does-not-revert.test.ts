@@ -117,6 +117,8 @@ function baseSettings(): Settings {
     tts_speed: 1,
     tts_volume: 1,
     tts_irodori_use_real_model: false,
+    // 既定（16）ではない値。フォームへの読み込みと保存の両方を通ったことが分かる（v0.5.7 項目 4）
+    tts_irodori_steps: 40,
     autostart: false,
     update_feed_url: null,
     topics_enabled: false,
@@ -162,6 +164,22 @@ describe("操作列: ゴーストを切り替えて保存 → もう一度保存
     vi.resetModules();
   });
 
+  it("合成のステップ数は、開いたときに保存済みの値を出し、選び直した値で保存される", async () => {
+    // v0.5.7 項目 4。読み込み（保存済みの 40 を出す）と保存（選び直した 8 を送る）の両方を見る。
+    // 片方だけだと「画面の値を無視して元の値を送る」壊れ方を捕まえられない（元の値も 40 なので）。
+    const panel = await import("../panels/settings");
+    await panel.mountSettingsPanel();
+    await panel.openSettingsPanel();
+
+    const steps = document.getElementById("settings-irodori-steps") as HTMLSelectElement;
+    expect(steps.value, "保存済みの値を出す").toBe("40");
+
+    steps.value = "8";
+    document.getElementById("settings-save")!.dispatchEvent(new Event("click"));
+    await vi.waitFor(() => expect(savedPayloads()).toHaveLength(1));
+    expect(savedPayloads()[0].tts_irodori_steps, "選び直した値で保存される").toBe(8);
+  });
+
   it("default_shell の追従が、2 回目の保存で取り消されない", async () => {
     const panel = await import("../panels/settings");
     await panel.mountSettingsPanel();
@@ -181,6 +199,10 @@ describe("操作列: ゴーストを切り替えて保存 → もう一度保存
     await vi.waitFor(() => expect(savedPayloads()).toHaveLength(1));
 
     expect(savedPayloads()[0].shell_id, "保存時点ではまだ旧シェル").toBe("default");
+    expect(
+      savedPayloads()[0].tts_irodori_steps,
+      "合成のステップ数がフォームを通って保存される（既定の 16 に戻らない）",
+    ).toBe(40);
     expect(
       shellSelect.value,
       "追従した結果がフォームへ戻っていること (ここが本体)",

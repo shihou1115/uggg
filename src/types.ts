@@ -56,6 +56,8 @@ export interface Settings {
   tts_speed: number;
   tts_volume: number;
   tts_irodori_use_real_model: boolean;
+  /// 合成のステップ数（v0.5.7 項目 4）。8 / 16 / 40、既定 16。v4.1 にだけ効く。
+  tts_irodori_steps: number;
   autostart: boolean;
   update_feed_url: string | null;
   topics_enabled: boolean;

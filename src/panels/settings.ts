@@ -62,6 +62,7 @@ interface Inputs {
   irodoriDownloadBtn: HTMLButtonElement;
   irodoriUpdateBtn: HTMLButtonElement;
   irodoriUseRealModel: HTMLInputElement;
+  irodoriSteps: HTMLSelectElement;
   irodoriProgress: HTMLElement;
   voiceRefMainState: HTMLElement;
   voiceRefMainCaption: HTMLInputElement;
@@ -295,6 +296,7 @@ function collectInputs(): Inputs {
     irodoriDownloadBtn: byId<HTMLButtonElement>("settings-irodori-download"),
     irodoriUpdateBtn: byId<HTMLButtonElement>("settings-irodori-update"),
     irodoriUseRealModel: byId<HTMLInputElement>("settings-irodori-use-real-model"),
+    irodoriSteps: byId<HTMLSelectElement>("settings-irodori-steps"),
     irodoriProgress: byId("settings-irodori-progress"),
     voiceRefMainState: byId("settings-voiceref-main-state"),
     voiceRefMainCaption: byId<HTMLInputElement>("settings-voiceref-main-caption"),
@@ -1439,6 +1441,7 @@ function applySettingsToForm(s: Settings): void {
     s.tts_engine === "irodori" ? "irodori" : "voicevox_core";
   updateVoiceEngineVisibility(inputs.ttsEngine.value);
   inputs.irodoriUseRealModel.checked = s.tts_irodori_use_real_model;
+  inputs.irodoriSteps.value = String(s.tts_irodori_steps ?? 16);
   inputs.autostart.checked = s.autostart;
   inputs.updateFeedUrl.value = s.update_feed_url ?? "";
   inputs.topicsEnabled.checked = s.topics_enabled;
@@ -1533,6 +1536,7 @@ async function onSave(): Promise<void> {
     tts_speed: Number(inputs.ttsSpeed.value) || current.tts_speed,
     tts_volume: Number(inputs.ttsVolume.value) || current.tts_volume,
     tts_irodori_use_real_model: inputs.irodoriUseRealModel.checked,
+    tts_irodori_steps: Number(inputs.irodoriSteps.value) || current.tts_irodori_steps,
     autostart: inputs.autostart.checked,
     update_feed_url: inputs.updateFeedUrl.value.trim() || null,
     topics_enabled: inputs.topicsEnabled.checked,

@@ -126,6 +126,12 @@ pub struct Settings {
     /// M4c Phase G 時点では既定 false (実 Aratako/Irodori-TTS モデルの結線は実機検証で確定する)。
     #[serde(default)]
     pub tts_irodori_use_real_model: bool,
+    /// Irodori-TTS の通常合成のステップ数（v0.5.7 項目 4、spec §6.0）。`IRODORI_STEP_CHOICES` のどれか（既定 16）。
+    /// 多いほど品質が上がり、時間がかかる（ユーザーの聴感と実測で比例とみなす）。**v4.1 にだけ効く** —
+    /// v3 で喋っている間（更新前・失敗して戻った後・保留中）はサイドカーが無視し、v0.5.6 の sway 8 を使う。
+    /// 参照音声の生成には効かない（40 固定）。
+    #[serde(default = "default_tts_irodori_steps")]
+    pub tts_irodori_steps: u32,
     /// M5-H: OS ログイン時の自動起動 (既定 false、spec §4.5.4)。
     /// 値変更時にフロントから `set_autostart` を呼んでプラグイン側の状態と同期する。
     #[serde(default)]
@@ -316,6 +322,22 @@ mod tests {
     }
 
     #[test]
+    fn irodori_steps_default_to_16_and_only_take_the_three_choices() {
+        assert_eq!(Settings::default().tts_irodori_steps, 16);
+        // v0.5.6 以前の設定（欄が無い）は既定の 16 で読む
+        let mut json = serde_json::to_value(Settings::default()).unwrap();
+        json.as_object_mut().unwrap().remove("tts_irodori_steps").expect("欄がある");
+        let old: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(old.tts_irodori_steps, 16);
+        for (given, want) in [(8, 8), (16, 16), (40, 40), (4, 16), (0, 16), (24, 16), (1000, 16)] {
+            let mut s = Settings::default();
+            s.tts_irodori_steps = given;
+            s.clamp();
+            assert_eq!(s.tts_irodori_steps, want, "{given}");
+        }
+    }
+
+    #[test]
     fn clamp_masks_regular_days_to_seven_bits() {
         let mut s = Settings::default();
         s.regular_morning_days = 0xFF;
@@ -394,6 +416,15 @@ fn default_tts_volume() -> f64 {
     1.0
 }
 
+/// 合成のステップ数の選択肢（v0.5.7 項目 4）。測った 3 点（spec §6.0 の spike）をそのまま置く。
+/// **4 のような極端に少ない値は置かない** — RF の 4 ステップでは話者類似度が崩れる（上流の JVS 評価）。
+/// `sidecar.py` の `V4_STEP_SCHEDULES` と同じ組（契約テストが見張る）。
+pub const IRODORI_STEP_CHOICES: [u32; 3] = [8, 16, 40];
+
+fn default_tts_irodori_steps() -> u32 {
+    16
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -420,6 +451,7 @@ impl Default for Settings {
             tts_speed: default_tts_speed(),
             tts_volume: default_tts_volume(),
             tts_irodori_use_real_model: false,
+            tts_irodori_steps: default_tts_irodori_steps(),
             autostart: false,
             update_feed_url: None,
             topics_enabled: false,
@@ -495,6 +527,10 @@ impl Settings {
         // monologue_interval_min は 0 (無効) を許容、上限のみ常識的に丸める
         if self.monologue_interval_min > 1440 {
             self.monologue_interval_min = 1440;
+        }
+        // 選択肢に無いステップ数は既定へ（手で書き換えた設定・将来の版の値など）
+        if !IRODORI_STEP_CHOICES.contains(&self.tts_irodori_steps) {
+            self.tts_irodori_steps = default_tts_irodori_steps();
         }
         // TTS パラメータ clamp
         if !self.tts_speed.is_finite() || self.tts_speed < 0.5 {

@@ -365,6 +365,17 @@
               <input type="checkbox" id="settings-irodori-use-real-model" />
               <span>実モデルを使う (β)</span>
             </label>
+            <label class="row">
+              <span>合成のステップ数</span>
+              <select id="settings-irodori-steps">
+                <option value="8">8（速さ優先）</option>
+                <option value="16">16（標準）</option>
+                <option value="40">40（品質優先）</option>
+              </select>
+            </label>
+            <p class="panel-hint">
+              多いほど声の品質が上がり、合成に時間がかかります。v4.1 のモデルのときに効きます（更新前の v3 では変わりません）。
+            </p>
             <p class="panel-hint">
               ダウンロードには 1〜2 GB の通信と GPU (NVIDIA / CUDA 12.x) が必要です。
               Python (3.11.9 embeddable) と PyTorch、関連ライブラリを <code>%APPDATA%\ugg\irodori\</code> に配置します。

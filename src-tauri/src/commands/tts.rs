@@ -203,9 +203,9 @@ async fn synthesize_irodori(
         crate::ulog!("[irodori] kana preprocess fell back to raw text: {err}");
         text.to_string()
     });
-    let (speed, use_real) = {
+    let (speed, use_real, steps) = {
         let s = state.settings.lock().expect("settings poisoned");
-        (s.tts_speed, s.tts_irodori_use_real_model)
+        (s.tts_speed, s.tts_irodori_use_real_model, s.tts_irodori_steps)
     };
 
     state
@@ -217,6 +217,7 @@ async fn synthesize_irodori(
             std::path::Path::new(&voice_ref_row.file_path),
             speed,
             caption,
+            steps,
             !use_real,
             app,
         )

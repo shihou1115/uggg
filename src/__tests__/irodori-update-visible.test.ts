@@ -110,6 +110,7 @@ function baseSettings(): Settings {
     tts_volume: 1,
     // **更新が届いていないだけのユーザー**は、実モデルを使う設定のまま
     tts_irodori_use_real_model: true,
+    tts_irodori_steps: 16,
     autostart: false,
     update_feed_url: null,
     topics_enabled: false,

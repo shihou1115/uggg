@@ -144,10 +144,16 @@ V4_STEP_SCHEDULES = {8: "sway", 16: "linear", 40: "linear"}
 WEIGHT_FILE_PATTERNS = ("model.safetensors", "tokenizer/*")
 
 
-def synth_sampler(repo: str) -> tuple[int, str]:
-    """通常合成のステップ数とサンプラー。v4 系は既定の 16・linear、ほかは v0.5.6 の sway 8。"""
+def synth_sampler(repo: str, steps: Optional[int] = None) -> tuple[int, str]:
+    """通常合成のステップ数とサンプラー (v0.5.7 項目 4)。
+
+    v4 系は設定のステップ数（`steps`。選択肢に無い・渡されないときは既定の 16）、**ほかのモデル（v3）は
+    `steps` を無視して v0.5.6 の sway 8**（2026-09-26 ユーザー裁定。v3 で喋るのは更新前・失敗して戻った後・
+    保留中で、そのとき音と速さを変えない）。
+    """
     if repo in V4_MODELS:
-        return V4_DEFAULT_STEPS, V4_STEP_SCHEDULES[V4_DEFAULT_STEPS]
+        chosen = steps if steps in V4_STEP_SCHEDULES else V4_DEFAULT_STEPS
+        return chosen, V4_STEP_SCHEDULES[chosen]
     return SYNTH_NUM_STEPS, SYNTH_T_SCHEDULE
 # 参照音声の生成（VoiceDesign・no_ref）は据え置く。sway 8 を測ったのは参照音声つきの合成だけで、
 # 生成は一度きりなので速さより品質が効く。用途 2 つの値を分けるだけで、設定の仕組みは作らない。
@@ -217,6 +223,8 @@ class SpeechRequest(BaseModel):
     response_format: str = Field("wav", description="現状 wav のみサポート")
     speed: float = Field(1.0, ge=0.25, le=4.0)
     caption: Optional[str] = Field(None, description="台本の声質・演技指示 (実モデルのみ有効)")
+    # v0.5.7 項目 4: 設定のステップ数。使うかどうかは読み込んでいるモデルで決める（`synth_sampler`）。
+    num_steps: Optional[int] = Field(None, description="通常合成のステップ数 (v4 系のみ有効)")
 
 
 class VoiceRefGenerateRequest(BaseModel):
@@ -527,9 +535,10 @@ class RealModelBackend:
         caption: Optional[str],
         ref_wav: Optional[str],
         ref_latent: Optional[str],
+        steps: Optional[int] = None,
     ):
         """通常合成（参照音声つき）のリクエスト。ステップ数とサンプラーは読み込むモデルで決める。"""
-        steps, schedule = synth_sampler(MODEL_REPO_SYNTH)
+        steps, schedule = synth_sampler(MODEL_REPO_SYNTH, steps)
         return self._make_request(
             text=text,
             caption=caption,
@@ -601,6 +610,7 @@ class RealModelBackend:
         voice_ref_path: Path,
         speed: float,
         caption: Optional[str] = None,
+        steps: Optional[int] = None,
     ) -> bytes:
         # speed 引数は OpenAI 互換 / API 拡張性のためにシグネチャに残してあるが、
         # 速度補正は Web Audio 側 (playbackRate) で一律に行う設計に揃えるため、
@@ -612,12 +622,12 @@ class RealModelBackend:
         latent, created = self._reference_latent(runtime, voice_ref_path)
         if latent is None:
             result = runtime.synthesize(
-                self._synth_request(text, caption, str(voice_ref_path), None), log_fn=None
+                self._synth_request(text, caption, str(voice_ref_path), None, steps), log_fn=None
             )
         else:
             try:
                 result = runtime.synthesize(
-                    self._synth_request(text, caption, None, latent), log_fn=None
+                    self._synth_request(text, caption, None, latent, steps), log_fn=None
                 )
             except Exception as exc:
                 if _is_out_of_memory(exc):
@@ -628,7 +638,7 @@ class RealModelBackend:
                 )
                 # 参照 wav でも失敗したら、例外はそのまま上へ返る（本文などの問題で、変換結果は消さない）。
                 result = runtime.synthesize(
-                    self._synth_request(text, caption, str(voice_ref_path), None), log_fn=None
+                    self._synth_request(text, caption, str(voice_ref_path), None, steps), log_fn=None
                 )
                 # 参照 wav なら合成できた＝変換結果の側が合わない（壊れている等）。消して、このサイドカーが
                 # 止まるまで使わない（作り直しても同じなら、毎回「失敗してやり直し」になって遅くなる）。
@@ -642,11 +652,11 @@ class RealModelBackend:
         # 変換結果を作った回はその時間も入るので、そうと分かるように書く。
         reference = "wav" if latent is None else ("latent（今回作成）" if created else "latent")
         # v0.5.7 項目 2: どのモデルと精度で喋ったかも残す（v3 で喋っている間と乗り換え後を見分ける）。
-        steps, schedule = synth_sampler(MODEL_REPO_SYNTH)
+        used_steps, schedule = synth_sampler(MODEL_REPO_SYNTH, steps)
         _diag(
             f"[irodori] 合成 {(time.perf_counter() - started) * 1000:.0f} ms"
             f"（{MODEL_REPO_SYNTH.rsplit('/', 1)[-1]}・{model_precision(MODEL_REPO_SYNTH)}・"
-            f"{steps} ステップ・{schedule}・参照 {reference}）"
+            f"{used_steps} ステップ・{schedule}・参照 {reference}）"
         )
         return _audio_to_wav_bytes(result.audio, int(result.sample_rate))
 
@@ -829,6 +839,7 @@ def build_app(asset_dir: Path, mock: bool, backend: Optional[RealModelBackend]) 
                     voice_ref_path=Path(req.voice),
                     speed=req.speed,
                     caption=req.caption,
+                    steps=req.num_steps,
                 )
             except NotImplementedError as exc:
                 raise HTTPException(501, str(exc))

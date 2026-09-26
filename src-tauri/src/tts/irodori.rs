@@ -509,6 +509,7 @@ impl IrodoriClient {
         voice_ref_path: &Path,
         speed: f64,
         caption: Option<String>,
+        steps: u32,
         mock: bool,
         app: Option<AppHandle>,
     ) -> Result<Vec<u8>, TtsError> {
@@ -523,6 +524,7 @@ impl IrodoriClient {
             response_format: "wav".to_string(),
             speed,
             caption,
+            num_steps: steps,
         };
         let resp = self
             .client
@@ -604,6 +606,9 @@ struct SpeechRequest {
     /// (旧 sidecar 互換)。`ReadingChunk.caption` (常に `null` を出力) とは対照的な規約。
     #[serde(skip_serializing_if = "Option::is_none")]
     caption: Option<String>,
+    /// 通常合成のステップ数（v0.5.7 項目 4。設定 `tts_irodori_steps`）。**使うかどうかはサイドカーが
+    /// 読み込んでいるモデルで決める**（v4.1 なら使い、v3 なら無視して v0.5.6 の sway 8）。
+    num_steps: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -958,7 +963,7 @@ mod tests {
             Some(super::SidecarHandle::for_test(dir.path(), port, pid, false, child));
 
         let _ = client
-            .synthesize(dir.path(), "ないしょの本文です", std::path::Path::new("x.wav"), 1.0, Some("ないしょの声色".to_string()), false, None)
+            .synthesize(dir.path(), "ないしょの本文です", std::path::Path::new("x.wav"), 1.0, Some("ないしょの声色".to_string()), 16, false, None)
             .await;
         let _ = client
             .generate_voice_ref(dir.path(), "べつの声色の説明", &dir.path().join("o.wav"), false, None)
@@ -1112,11 +1117,99 @@ mod tests {
             response_format: "wav".into(),
             speed: 1.2,
             caption: None,
+            num_steps: 16,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"response_format\":\"wav\""));
         assert!(json.contains("\"voice\":\"C:/refs/main_1.wav\""));
         assert!(json.contains("\"speed\":1.2"));
+        assert!(json.contains("\"num_steps\":16"), "ステップ数を送る（v0.5.7 項目 4）: {json}");
+    }
+
+    /// **合成のステップ数の選択肢と既定値は、設定・`sidecar.py`・画面で同じ組**（v0.5.7 項目 4）。
+    /// 食い違うと、画面で選んだ値をサイドカーが知らずに既定の 16 へ倒す（黙って効かない）。
+    #[test]
+    fn step_choices_match_between_settings_sidecar_and_screen() {
+        use crate::state::{Settings, IRODORI_STEP_CHOICES};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let py = std::fs::read_to_string(root.join("python").join("sidecar.py")).unwrap();
+        let line = py
+            .lines()
+            .find(|l| l.starts_with("V4_STEP_SCHEDULES = {"))
+            .expect("sidecar.py に V4_STEP_SCHEDULES が無い");
+        let mut keys: Vec<u32> = line
+            .trim_start_matches("V4_STEP_SCHEDULES = {")
+            .trim_end_matches('}')
+            .split(',')
+            .map(|kv| kv.split(':').next().unwrap().trim().parse().unwrap())
+            .collect();
+        keys.sort();
+        assert_eq!(keys, IRODORI_STEP_CHOICES.to_vec(), "sidecar.py の選択肢が設定と違う: {line}");
+        let default = Settings::default().tts_irodori_steps;
+        assert!(
+            py.lines().any(|l| l == format!("V4_DEFAULT_STEPS = {default}")),
+            "sidecar.py の既定のステップ数が設定の既定（{default}）と違う"
+        );
+        let html = std::fs::read_to_string(root.join("..").join("index.html")).unwrap();
+        let select = &html[html.find("<select id=\"settings-irodori-steps\">").expect("画面に選択肢が無い")..];
+        let select = &select[..select.find("</select>").unwrap()];
+        let mut shown: Vec<u32> = select
+            .match_indices("<option value=\"")
+            .map(|(i, m)| {
+                let rest = &select[i + m.len()..];
+                rest[..rest.find('"').unwrap()].parse().unwrap()
+            })
+            .collect();
+        shown.sort();
+        assert_eq!(shown, IRODORI_STEP_CHOICES.to_vec(), "画面の選択肢が設定と違う");
+    }
+
+    /// **`sidecar.py` はステップ数を v4 系のときだけ使い、v3 では無視して v0.5.6 の sway 8 のまま**
+    /// （v0.5.7 項目 4、2026-09-26 ユーザー裁定）。要求の値は合成まで渡る。`sidecar.py` は単体で動かせない
+    /// （fastapi などが要る）ので、本文のテキストで固定する。
+    #[test]
+    fn the_sidecar_uses_steps_only_for_v4_models() {
+        let py = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
+        )
+        .unwrap();
+        let body = &py[py.find("def synth_sampler(repo: str, steps: Optional[int] = None)").expect("synth_sampler が無い")..];
+        let body = &body[..body.find("\n\n\n").unwrap()];
+        let v4 = body.find("    if repo in V4_MODELS:").expect("v4 系の分岐が無い");
+        let chosen = body
+            .find("chosen = steps if steps in V4_STEP_SCHEDULES else V4_DEFAULT_STEPS")
+            .expect("v4 系で設定のステップ数を使っていない");
+        let v3 = body.find("    return SYNTH_NUM_STEPS, SYNTH_T_SCHEDULE").expect("v3 の値が無い");
+        assert!(v4 < chosen && chosen < v3, "v4 系の分岐の中だけで設定を使う形になっていない");
+        assert!(!body[v3..].contains("steps if"), "v3 の側で設定を使っている");
+        // 要求 → 合成 → リクエストまで渡る
+        for needle in [
+            "    num_steps: Optional[int] = Field(",
+            "                    steps=req.num_steps,",
+            "        steps, schedule = synth_sampler(MODEL_REPO_SYNTH, steps)",
+        ] {
+            assert!(py.contains(needle), "ステップ数が途中で途切れている: {needle}");
+        }
+        assert_eq!(
+            py.matches("self._synth_request(text, caption, str(voice_ref_path), None, steps)").count()
+                + py.matches("self._synth_request(text, caption, None, latent, steps)").count(),
+            3,
+            "合成の 3 つの呼び出し口のどれかでステップ数を渡していない"
+        );
+    }
+
+    /// 合成のコマンドは設定のステップ数を渡す（配線を本文のテキストで固定する）。
+    #[test]
+    fn the_synth_command_passes_the_steps_setting() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        assert!(
+            src.contains("(s.tts_speed, s.tts_irodori_use_real_model, s.tts_irodori_steps)"),
+            "設定のステップ数を読んでいない"
+        );
     }
 
     // test23 (docs/script-reader-spec.md §5.1): SpeechRequest の caption 直列化。
@@ -1131,6 +1224,7 @@ mod tests {
             response_format: "wav".into(),
             speed: 1.0,
             caption: Some("驚いて大声で".into()),
+            num_steps: 16,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"caption\":\"驚いて大声で\""), "unexpected: {json}");
@@ -1145,6 +1239,7 @@ mod tests {
             response_format: "wav".into(),
             speed: 1.0,
             caption: None,
+            num_steps: 16,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("caption"), "unexpected: {json}");
