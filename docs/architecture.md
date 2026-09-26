@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.46）
+# ugg アーキテクチャ設計書（architecture.md v2.47）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -982,7 +982,12 @@ when:                                        # ⑥ 確率
 | `update_available` | 新バージョン検出 | `{ version: "x.y.z" }` |
 | `voicevox_dl_complete` | 資産DL完了 | |
 | `voicevox_dl_failed` | 資産DL失敗 | `{ reason }` |
-| `irodori_unavailable` | GPU 不可・サイドカー起動失敗 | `{ reason }` |
+| `irodori_unavailable` | サイドカー起動失敗など、理由が分からないとき（★v0.5.7 で言い分けた残り） | `{ reason }` |
+| `irodori_updating` ★v0.5.7 | 導入・更新の最中 | `{ reason }` |
+| `irodori_model_missing` ★v0.5.7 | モデルの重み・トークナイザが無い（更新が要る） | `{ reason }` |
+| `irodori_no_gpu` ★v0.5.7 | GPU が見えない（ヘルスの 503・`no_gpu`） | `{ reason }` |
+| `irodori_vram` ★v0.5.7 | GPU のメモリが足りない（合成の OOM） | `{ reason }` |
+| `irodori_update_available` ★v0.5.7 | Irodori のランタイムに更新がある | `{ targets }` |
 
 各キーは省略可（辞書未定義時はトーストへフォールバック）。
 ★M7: `reminder_fired` は system_messages から **events へ移動**した（deliver_event +
@@ -1312,6 +1317,9 @@ async fn idle_watcher() {
     "num_steps": 16                          // ★v0.5.7 設定 tts_irodori_steps（8 / 16 / 40）
   }
   ```
+- **★v0.5.7 合成の失敗の応答**: 500 `{"detail": {"kind": "model_missing" | "oom" | "other", "message": "Irodori 合成失敗: …"}}`
+  （`FileNotFoundError` → モデルが無い、GPU のメモリ不足 → oom）。Rust は `TtsError::Synth { kind, message }` で受け、
+  読めない古い形（文字列の `detail`）は今までどおり `TtsError::Http`
 - **★v0.5.7 `num_steps` を使うかはサイドカーが決める**（spec §6.0 項目 4）: 読み込んでいるモデルが v4 系
   （`V4_MODELS`）なら使い（選択肢に無ければ 16。8 は sway、16・40 は linear）、v3 なら無視して sway 8。
   選択肢は Rust の `IRODORI_STEP_CHOICES`・`sidecar.py` の `V4_STEP_SCHEDULES`・画面で同じ組（契約テスト）
@@ -1342,6 +1350,9 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 //   → notify(IrodoriUnavailable)（synthesize_voice と共有の 5 分クールダウン）
 // 合成の失敗（VoiceRefMissing 以外）は synthesize_voice が理由を ugg.log へ残して voicevox_core で再合成し、
 //   成功したときだけ notify(IrodoriUnavailable)（commands::tts::decide_fallback）
+// ★v0.5.7 理由の種類（commands::tts::unavailable_kind / tasks::health_unavailable_kind）:
+//   TtsError::Updating → 更新中 / TtsError::Synth{ModelMissing} → モデルが無い / Synth{OutOfMemory} → VRAM /
+//   ヘルスの 503 + status: no_gpu（HealthPing::NoGpu）→ GPU が無い / それ以外 → その他
 ```
 
 ### 8.7 参照音声管理（R1+R3 ハイブリッド）
@@ -1516,7 +1527,8 @@ pub(crate) async fn once_reached(done: bool, show: impl FnOnce() -> Fut, mark: i
 | ModeDegraded | `mode_degraded` | 毎回（降格のたび） |
 | ModeRecovered | `mode_recovered` | 毎回 |
 | VoicevoxDlComplete / VoicevoxDlFailed | `voicevox_dl_complete` / `voicevox_dl_failed` | 毎回（見えていなければ出さずに終わる。結果は設定パネルにも出る） |
-| IrodoriUnavailable | `irodori_unavailable` | 5 分に 1 回（間隔は発話の前に刻む。次の失敗でまた出るので、届いたかは見ない） |
+| IrodoriUnavailable | `irodori_unavailable` / ★v0.5.7 理由の種類（`UnavailableKind`）で `irodori_updating` / `irodori_model_missing` / `irodori_no_gpu` / `irodori_vram` | 5 分に 1 回（間隔は発話の前に刻む。次の失敗でまた出るので、届いたかは見ない） |
+| IrodoriUpdateAvailable ★v0.5.7 | `irodori_update_available` | 更新の対象の組ごとに 1 回（`irodori_update_notice_seen:<対象の組>`）。**届いたときだけ**記録。導入済みで更新の錠が空いているときだけ確かめる |
 | IrodoriDlComplete / IrodoriDlFailed | `irodori_dl_complete` / `irodori_dl_failed` | 毎回（同上） |
 | UpdateAvailable | `update_available` | 版ごとに 1 回（`update_notice_seen:<版>`）。**届いたときだけ**記録 |
 
@@ -1870,3 +1882,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-26 | v2.44 | **v0.5.7 項目 2・3 の実装に伴う改訂**。§8.1 の構成図に v4.1-Small のフォルダ（`tokenizer\` を含む。合成と生成で同じ）とrevision を固定したコーデックを足した。§8.3 にモデルの一覧・取得するもの・精度とサンプラーをモデルで決めること・生成のランタイムの使い回し・揃っているかの判定（`present` は変えない）を足した。コマンド・イベント・設定の契約は変わらない。 |
 | 2026-09-26 | v2.45 | **v0.5.7 項目 4 の実装に伴う改訂**。§8.5 の要求に `caption`（既存。書き落としていた）と `num_steps`（新規。設定 `tts_irodori_steps`）を足し、使うかどうかをサイドカーが読み込んでいるモデルで決めることを書いた。**設定フィールドを 1 つ追加**（`tts_irodori_steps`、既定 16。`app_settings` の JSON に入り、export もそのまま出る）。 |
 | 2026-09-27 | v2.46 | **v0.5.7 項目 5・6 の実装に伴う改訂**。§8.2 に一発合成の `--gate-dir`（生成も試す・結果の `voice_design` と `stage`）、VRAM 不足の保留、`--fetch-watermark`（透かしの重みの先取り）を足した。失敗の表に v0.5.7 の全戻しの残りと保留を足した。 |
+| 2026-09-27 | v2.47 | **v0.5.7 項目 7 の実装に伴う改訂**。告知の表に辞書キー 5 つ（`irodori_updating` / `irodori_model_missing` / `irodori_no_gpu` / `irodori_vram` / `irodori_update_available`）と `IrodoriUpdateAvailable` の済みの記録、§8.5 に合成の失敗の応答の形、§8.6 に理由の種類の振り分けを足した。**イベント・コマンド・設定の契約は変わらない**（告知と辞書キーの追加のみ）。 |
