@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.43）
+# ugg アーキテクチャ設計書（architecture.md v2.44）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1169,6 +1169,10 @@ raw テキストフォールバックに委ねる。
 │   ├── Lib\site-packages\  -- pip install で配置（torch, fastapi 等、~2GB）
 │   └── ... (標準ライブラリ)
 ├── model\               -- Irodori-TTS モデル（HF から DL、数GB。リポジトリと revision ごとに別フォルダで、旧版を上書きしない）
+│   ├── Aratako__Irodori-TTS-v4.1-Small@<commit>\   -- ★v0.5.7 合成と参照音声の生成（同じフォルダ）
+│   │   ├── model.safetensors
+│   │   └── tokenizer\    -- ★v0.5.7 tokenizer.json / tokenizer_config.json（無いと上流が合成時に黙って取る）
+│   └── Aratako__Semantic-DACVAE-Japanese-32dim@<commit>\  -- ★v0.5.7 コーデック（revision を固定。weights.pth をパスで読む）
 ├── refs\                -- 参照音声 wav 格納
 │   ├── main_<id>.wav
 │   ├── main_<id>.<合成モデル>+<コーデック>.<精度>.<前処理>.latent.pt  -- ★v0.5.6 事前変換の結果（§2.4）
@@ -1202,6 +1206,16 @@ raw テキストフォールバックに委ねる。
 ### 8.3 モデル配布（HF DL）
 
 - HuggingFace `Aratako/Irodori-TTS-*` モデルを初回 DL
+- **★v0.5.7 モデルの一覧**（`MODEL_PINS`、spec §6.0 項目 2・3）: 合成と参照音声の生成は
+  `Aratako/Irodori-TTS-v4.1-Small@2b28324d…`（**欄は 2 つのまま同じ値**。消すと読み先の決定が引数を渡さず
+  `sidecar.py` の既定値が使われる）、コーデックは `Aratako/Semantic-DACVAE-Japanese-32dim@47376ee2…`。
+  取得は `model.safetensors` と `tokenizer/*`（`WEIGHT_FILE_PATTERNS`）を `snapshot_download` で、同じ repo@revision は
+  1 回だけ。**精度とサンプラーは `sidecar.py` が読み込むモデルで決める**（`V4_MODELS`: v4.1 は bf16・16 ステップ linear、
+  それ以外の v3・v2-VoiceDesign は fp32・sway 8）。生成と合成が同じ repo@revision なら、生成は合成のランタイムを使い回す
+- **★v0.5.7 揃っているかの判定**: 記録がいまのビルドのモデルを指しているのに、`MODEL_FILES` のファイル（v4.1 は
+  トークナイザ 2 本を含む）が欠けていれば `outdated` に数える。**`present`（`irodori_assets_ready`）の意味は変えない**
+  （モデルを見ると、更新前の人の設定が消え更新ボタンも隠れる — §4.7 の注記と同じ理由）。置き場所の名前は
+  `sidecar.py` の `model_dir_name` と同じ規則を Rust に写し、契約テストで見張る
 - 規約同意のチェックや同意文言は無い（spec §4.5.1 が規約同意を求めるのは voicevox_core のみ）。「ランタイムをダウンロード」押下時に、取得物（Python ランタイム・PyTorch (CUDA 12.8)・実モデル実行時ランタイム）と通信量（約 2〜3 GB）・所要時間（10〜20 分）を示す確認ダイアログを出し、OK なら `download_irodori_assets` を `agreed: true` で呼ぶ
 - **★v0.5.7 導入済みなら全段を入れ直さない**（spec §6.0 項目 1）。全段の入れ直しには版の控えも全戻しもゲートも無く、
   依存の major 移行が失敗しても戻らない。`download_irodori_assets` は**錠を取る前に** `assets_ready` を見て、
@@ -1839,3 +1853,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-24 | v2.41 | **v0.5.6 リリース前監査の是正**。§2.4 の資産表と §8.1 の構成図に `update-constraints.txt`（torch の縛り。更新の pip の間だけ）が抜けていたのを足した。`update.lock` の行に取り直し（0.5 秒。合成の側の「試してすぐ放す」一瞬に重なって事実と違う理由で断っていた）、`update-versions.json` の行に初回導入の成功で残りを片付けること（残すと次の更新の入口が入れたばかりのものを古い退避と控えで書き戻した）を足した。**コマンド・イベント・設定フィールド・DB スキーマの変更なし。** |
 | 2026-09-26 | v2.42 | **v0.5.7 スコープ確定に伴う注記の更新**。caption の注記が「v0.5.7 の差し替え（MF）で効くかを確かめる」のままだった。乗り換え先は v4.1-Small（`use_caption_condition: true`）に改まり、spike で効くことを確かめた（spec §6.0）。契約の改訂（設定 `tts_irodori_steps`・告知・サイドカーの応答の理由・`export_data` の戻り値ほか）は各項目の実装時に行う。 |
 | 2026-09-26 | v2.43 | **v0.5.7 項目 1 の実装に伴う改訂**。§8.2 に依存の版の固定（spike で確かめた組み合わせ・基準値は変えない）、§8.3 に「導入済みならダウンロードを更新へ振り向ける」（錠を取る前に振り分ける）を足した。コマンド・イベント・設定の契約は変わらない。 |
+| 2026-09-26 | v2.44 | **v0.5.7 項目 2・3 の実装に伴う改訂**。§8.1 の構成図に v4.1-Small のフォルダ（`tokenizer\` を含む。合成と生成で同じ）とrevision を固定したコーデックを足した。§8.3 にモデルの一覧・取得するもの・精度とサンプラーをモデルで決めること・生成のランタイムの使い回し・揃っているかの判定（`present` は変えない）を足した。コマンド・イベント・設定の契約は変わらない。 |
