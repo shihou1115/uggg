@@ -141,7 +141,7 @@ clamp を行うのは実効再生レートの最終合成 (§2.4) のみで、�
 - `caption` は Irodori 実モデル (500M-v3) の caption 条件付けに渡す
   (`cfg_scale_caption` は sidecar 内の既存値 3.0 のまま)。
   **★2026-09 注記: 500M-v3 本体の checkpoint は `use_caption_condition: false` のため、渡しても
-  条件付けに入らず音声に反映されない（spec.md §6.0 の v0.5.7 引き継ぎ）。下記の「有効判定」は
+  条件付けに入らず音声に反映されない（v0.5.7 で乗り換える v4.1-Small は `use_caption_condition: true` で反映される。spec.md §6.0）。下記の「有効判定」は
   「caption を渡す経路が生きている」ことの判定であり、反映されることは意味しない。**
 - **有効判定は再生開始前にフロントで行う**。専用コマンドは追加せず、**既存 Tauri コマンド
   `irodori_assets_ready` (資産の存在確認、architecture.md §4.7) と設定 `tts_engine` の組合せ**
