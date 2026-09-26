@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.47）
+# ugg アーキテクチャ設計書（architecture.md v2.48）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1171,7 +1171,7 @@ raw テキストフォールバックに委ねる。
 ├── python\              -- M1: 公式 Embeddable Python 3.11.9（Windows x64, 約 10MB）
 │   ├── python.exe
 │   ├── python311.dll
-│   ├── Lib\site-packages\  -- pip install で配置（torch, fastapi 等、~2GB）
+│   ├── Lib\site-packages\  -- pip install で配置（torch, fastapi 等、約 5.4 GB。★v0.5.7 で実測に合わせた）
 │   └── ... (標準ライブラリ)
 ├── model\               -- Irodori-TTS モデル（HF から DL、数GB。リポジトリと revision ごとに別フォルダで、旧版を上書きしない）
 │   ├── Aratako__Irodori-TTS-v4.1-Small@<commit>\   -- ★v0.5.7 合成と参照音声の生成（同じフォルダ）
@@ -1221,16 +1221,23 @@ raw テキストフォールバックに委ねる。
   トークナイザ 2 本を含む）が欠けていれば `outdated` に数える。**`present`（`irodori_assets_ready`）の意味は変えない**
   （モデルを見ると、更新前の人の設定が消え更新ボタンも隠れる — §4.7 の注記と同じ理由）。置き場所の名前は
   `sidecar.py` の `model_dir_name` と同じ規則を Rust に写し、契約テストで見張る
-- 規約同意のチェックや同意文言は無い（spec §4.5.1 が規約同意を求めるのは voicevox_core のみ）。「ランタイムをダウンロード」押下時に、取得物（Python ランタイム・PyTorch (CUDA 12.8)・実モデル実行時ランタイム）と通信量（約 2〜3 GB）・所要時間（10〜20 分）を示す確認ダイアログを出し、OK なら `download_irodori_assets` を `agreed: true` で呼ぶ
+- 規約同意のチェックや同意文言は無い（spec §4.5.1 が規約同意を求めるのは voicevox_core のみ）。「ランタイムをダウンロード」押下時に、取得物（Python ランタイム・PyTorch (CUDA 12.8)・実モデル実行時ランタイム・AI モデル）と通信量（★v0.5.7 約 7 GB、入れたあと約 9 GB）・所要時間（10〜20 分）・Irodori の倫理条項を示す確認ダイアログを出し、OK なら `download_irodori_assets` を `agreed: true` で呼ぶ
 - **★v0.5.7 導入済みなら全段を入れ直さない**（spec §6.0 項目 1）。全段の入れ直しには版の控えも全戻しもゲートも無く、
   依存の major 移行が失敗しても戻らない。`download_irodori_assets` は**錠を取る前に** `assets_ready` を見て、
   導入済みなら `update_irodori_runtime` へ渡す。フロントも「ランタイムをダウンロード」を更新の確認文言へ振り向ける
+- **★v0.5.7 取得量の数字の正本**（spec §6.0 項目 8）: `irodori_download.rs` の `FIRST_INSTALL_DOWNLOAD` / `FIRST_INSTALL_DISK` /
+  `MODEL_UPDATE_DOWNLOAD` / `MODEL_DOWNLOAD` / `TORCH_DOWNLOAD`。確認の文言・設定パネルの注記・取説は同じ文字列を書き、契約テストが
+  突き合わせる。更新の確認は、対象に AI モデル（`model_*`）があるときだけ声の変化と旧モデルの削除を伝え、倫理条項はいつも出す
+- **★v0.5.7 空き容量の確認**: 更新は計画を立てた直後・何も変える前（`required_free_for_update`: 共通 1 GB、PyTorch +4 GB、モデル +5 GB）、
+  初回導入は Python を置く前（11 GB）。足りなければ要る量と空きを伝えて止まる。空きが分からなければ止めない（`GetDiskFreeSpaceExW`）
 - DL 進捗は `irodori-download` イベント。**行が届いたときに流す**（★v0.5.6 項目 2。以前は子プロセスが
   終わってからまとめて流しており、数 GB の取得中は画面が 1 行のまま固まった）
 - **パイプ越しでは pip も huggingface_hub も取得中の進捗を出さない**（★v0.5.6 で判明。pip の rich は
   端末でないと描かず、hub の tqdm は `disable=None` の既定で端末でないと出ない）。そこで pip には
   `--progress-bar raw`（pip 24.1 以降。入っている版を見てから付ける）を渡し、`Progress N of M` の行を
-  「取得中 N / M MB（P%）」へ直して割合が変わったときだけ流す。`sidecar.py` は `--download-only` の
+  「取得中 N / M MB（P%）」へ直して割合が変わったときだけ流す。**★v0.5.7 hub 1.33（hf-xet）の行も直す**（`HfProgress`）:
+  「reconstructing file」（全体と割合）を優先して「取得中 <ファイル> 1.26 GB / 3.06 GB（41%）」、割合の行が無いファイルは
+  「downloading bytes」を 50 MB ごと、小さなファイルはいつもの tqdm。行末のカーソル移動を読み飛ばす。`sidecar.py` は `--download-only` の
   取得の間だけ hub の判定（`is_tqdm_disabled`）を「自動なら出す」に差し替える
 - 失敗したときは**理由**（pip の `ERROR:` の行・例外の行）をエラーに添え、直前の 20 行を `ugg.log`
   （`[irodori:python]`）に残す。進捗の上書きの行は残さない
@@ -1883,3 +1890,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-26 | v2.45 | **v0.5.7 項目 4 の実装に伴う改訂**。§8.5 の要求に `caption`（既存。書き落としていた）と `num_steps`（新規。設定 `tts_irodori_steps`）を足し、使うかどうかをサイドカーが読み込んでいるモデルで決めることを書いた。**設定フィールドを 1 つ追加**（`tts_irodori_steps`、既定 16。`app_settings` の JSON に入り、export もそのまま出る）。 |
 | 2026-09-27 | v2.46 | **v0.5.7 項目 5・6 の実装に伴う改訂**。§8.2 に一発合成の `--gate-dir`（生成も試す・結果の `voice_design` と `stage`）、VRAM 不足の保留、`--fetch-watermark`（透かしの重みの先取り）を足した。失敗の表に v0.5.7 の全戻しの残りと保留を足した。 |
 | 2026-09-27 | v2.47 | **v0.5.7 項目 7 の実装に伴う改訂**。告知の表に辞書キー 5 つ（`irodori_updating` / `irodori_model_missing` / `irodori_no_gpu` / `irodori_vram` / `irodori_update_available`）と `IrodoriUpdateAvailable` の済みの記録、§8.5 に合成の失敗の応答の形、§8.6 に理由の種類の振り分けを足した。**イベント・コマンド・設定の契約は変わらない**（告知と辞書キーの追加のみ）。 |
+| 2026-09-27 | v2.48 | **v0.5.7 項目 8 の実装に伴う改訂**。§8.1 の site-packages の大きさを実測（約 5.4 GB）に、§8.3 に取得量の数字の正本と突き合わせ・更新の確認の出し分け・空き容量の確認・hub 1.33 の進捗の変換・確認ダイアログの倫理条項を足した。契約は変わらない。 |
