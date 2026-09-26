@@ -1934,7 +1934,11 @@ const SYNTH_ONCE_NO_GPU: i32 = 3;
 const GATE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 /// 落ちたときに「VRAM 不足の疑い」とみなす、開始時の空き VRAM（MB）。
-/// v3・fp32 の VRAM のピークは実測 3.5 GB（spec §6.0 の実測表）。
+///
+/// **v0.5.7 項目 6 で根拠を v4.1-Small・bf16 に取り直した**（値は同じ）: 1 プロセスに 1 つだけ読み込み、透かし込みで
+/// 16 ステップの合成と 40 ステップの参照音声の生成を通したときの torch の確保量のピークは 3.31 GB
+/// （spec §6.0 の spike。v3・fp32 は 3.73 GB）。CUDA の文脈（数百 MB）を足して 4 GB を下回れば、足りなかったと見る。
+/// ゲートは合成と生成で同じランタイムを使い回すので、生成を足しても 2 つ分にはならない。
 const GATE_VRAM_SUSPECT_MB: u64 = 4096;
 
 /// ゲートの作業場所（参照音声の写しと、事前変換の結果が置かれる。終わったら消す）。
@@ -1956,8 +1960,9 @@ enum GateExit {
 enum GateOutcome {
     /// 合成できた（モデルの読み込みを含めた時間）。`watermark` は透かしが効いていたか（v0.5.7 項目 5。
     /// 古い `sidecar.py` は返さないので `None`。合否には使わない — 透かしが無くても合成はできる）。
-    Passed { ms: u64, watermark: Option<bool> },
-    /// 参照音声が 1 つも無い（ユーザー裁定: 確かめられなかったとして更新は成立させる）。
+    Passed { ms: u64, watermark: Option<bool>, voice_design: bool },
+    /// 参照音声が 1 つも無く、生成も試さない呼び出しだった（戻したあとの確かめ直し。v0.5.7 項目 6 からの
+    /// 更新のゲートは生成した声で合成するので、これにならない）。
     NoVoiceRef,
     /// torch から GPU が見えない。
     NoGpu,
@@ -1999,7 +2004,13 @@ fn classify_gate(
     if ok && bytes > 0 && exit == GateExit::Code(Some(0)) {
         let ms = result.get("ms").and_then(serde_json::Value::as_u64).unwrap_or(0);
         let watermark = result.get("watermark").and_then(serde_json::Value::as_bool);
-        return GateOutcome::Passed { ms, watermark };
+        // v0.5.7 項目 6: 参照音声の生成も確かめたか（古い sidecar.py は返さない＝確かめていない）
+        let voice_design = result
+            .get("voice_design")
+            .and_then(|v| v.get("ok"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        return GateOutcome::Passed { ms, watermark, voice_design };
     }
     match result.get("kind").and_then(serde_json::Value::as_str) {
         Some("oom") => GateOutcome::OutOfMemory,
@@ -2022,8 +2033,10 @@ enum GateVerdict {
     /// 確かめられなかったが、更新は成立させる（ユーザー裁定 2026-09-20: 参照音声が無い・元から GPU が
     /// 見えない環境）。
     Skip(String),
-    /// VRAM が足りない。「移行の失敗」とは別の案内で全部戻す（spec の裁定: 既定は戻して「空けてからもう一度」）。
-    RollBackForVram(String),
+    /// VRAM が足りない。**全部は戻さず保留する**（v0.5.7 項目 6、2026-09-26 ユーザー裁定。v0.5.6 項目 3b が
+    /// 「v3 が transformers 5 で動くと分かれば再判断する」とした件 — spike で動くと確かめた）。新しい依存と取得済みの
+    /// モデルは残し、記録は依存だけを進め、モデルの欄は旧のまま（声は旧モデルのまま）。次の更新はゲートだけになる。
+    HoldForVram(String),
     /// 更新で壊れた疑い。全部戻し、元の状態でもう一度試して切り分ける。
     RollBack(String),
 }
@@ -2035,9 +2048,10 @@ enum GateVerdict {
 /// なった**なら更新のせいとして戻す。元から使えない（または分からない）環境だけ飛ばす。
 fn gate_verdict(outcome: &GateOutcome, cuda_before: Option<bool>) -> GateVerdict {
     match outcome {
-        GateOutcome::Passed { ms, watermark } => GateVerdict::Pass(format!(
-            "合成できました（モデルの読み込みを含めて {:.1} 秒{}）",
+        GateOutcome::Passed { ms, watermark, voice_design } => GateVerdict::Pass(format!(
+            "合成できました（モデルの読み込みを含めて {:.1} 秒{}{}）",
             *ms as f64 / 1000.0,
+            if *voice_design { "。参照音声の生成も確かめました" } else { "" },
             // v0.5.7 項目 5: 効いていないことがまた見えなくならないように（v0.5.4 は一度も効いていないことに
             // 実機検証で初めて気づいた）
             match watermark {
@@ -2055,13 +2069,13 @@ fn gate_verdict(outcome: &GateOutcome, cuda_before: Option<bool>) -> GateVerdict
         GateOutcome::NoGpu => GateVerdict::Skip(
             "GPU が見えないので、合成は確かめられませんでした（更新は済ませました）".to_string(),
         ),
-        GateOutcome::OutOfMemory => GateVerdict::RollBackForVram(
+        GateOutcome::OutOfMemory => GateVerdict::HoldForVram(
             "GPU のメモリ（VRAM）が足りず、合成で確かめられませんでした".to_string(),
         ),
         GateOutcome::Crashed {
             vram_free_mb: Some(free),
             ..
-        } if *free < GATE_VRAM_SUSPECT_MB => GateVerdict::RollBackForVram(format!(
+        } if *free < GATE_VRAM_SUSPECT_MB => GateVerdict::HoldForVram(format!(
             "合成の確認の途中で Python が終了しました。始めたときの空き VRAM が {free} MB で、足りなかったと見られます"
         )),
         GateOutcome::Crashed { code, .. } => GateVerdict::RollBack(format!(
@@ -2125,31 +2139,79 @@ fn pick_gate_voice_ref(asset_root: &Path) -> Option<PathBuf> {
 
 /// 1 回だけ合成して確かめる（v0.5.6 項目 3b）。`model_args` は試すモデル（取得したいまのビルドの値か、
 /// 戻したあとの読み先）。**HTTP は使わない**（更新中は錠で塞がっている）ので、子プロセスとして走らせる。
-fn run_synth_gate<F>(asset_root: &Path, py_exe: &Path, model_args: &[String], mut on_line: F) -> GateOutcome
+/// ゲートの子プロセスに渡す引数（純関数。v0.5.7 項目 6）。生成も試すなら作業場所（`--gate-dir`）を渡し、
+/// 参照音声の写しがあれば `--voice-ref` も渡す（無ければ生成した声で合成する）。
+fn gate_args(
+    asset_root: &Path,
+    work: &Path,
+    voice_copy: Option<&Path>,
+    with_voice_design: bool,
+    model_args: &[String],
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        asset_root.join("sidecar.py").into(),
+        "--asset-dir".into(),
+        asset_root.into(),
+        "--synth-once".into(),
+    ];
+    if let Some(copy) = voice_copy {
+        args.push("--voice-ref".into());
+        args.push(copy.into());
+    }
+    if with_voice_design {
+        args.push("--gate-dir".into());
+        args.push(work.into());
+    }
+    args.extend(model_args.iter().map(std::ffi::OsString::from));
+    args
+}
+
+/// 1 回合成して確かめる（v0.5.6 項目 3b）。**`with_voice_design` なら参照音声の生成も 1 回試す**（v0.5.7 項目 6。
+/// 乗り換えでは生成も新しいモデルにまとめ、成功したら旧モデルを消すので、生成を確かめずに通さない）。
+/// 参照音声が無くても、生成した声で合成すれば両方を確かめられる。**戻したあとの確かめ直しは合成だけ**
+/// （旧モデルでは合成と生成が別のモデルで、生成まで試すと VRAM を余計に使い、確かめ直しそのものが落ちうる）。
+fn run_synth_gate<F>(
+    asset_root: &Path,
+    py_exe: &Path,
+    model_args: &[String],
+    with_voice_design: bool,
+    mut on_line: F,
+) -> GateOutcome
 where
     F: FnMut(&str),
 {
-    let Some(voice) = pick_gate_voice_ref(asset_root) else {
+    let voice = pick_gate_voice_ref(asset_root);
+    if voice.is_none() && !with_voice_design {
         return GateOutcome::NoVoiceRef;
-    };
+    }
     // 参照音声は**写しを渡す**。事前変換の結果は参照 wav の隣に作られるので、元の場所で走らせると
     // ユーザーの refs に試験の変換結果が残る。他のプロセスが掴んでいるファイルで落ちることも避けられる。
+    // 生成した声も同じ作業場所に置き、終わったら消す。
     let work = asset_root.join(GATE_DIR);
     let _ = std::fs::remove_dir_all(&work);
-    let copy = work.join("ref.wav");
-    if let Err(err) = std::fs::create_dir_all(&work).and_then(|()| std::fs::copy(&voice, &copy).map(|_| ())) {
-        let _ = std::fs::remove_dir_all(&work);
-        return GateOutcome::Failed(format!("参照音声を作業場所へ写せません: {err}"));
+    if let Err(err) = std::fs::create_dir_all(&work) {
+        return GateOutcome::Failed(format!("作業場所を作れません: {err}"));
     }
-    on_line("更新したランタイムで 1 回合成して確かめています…（モデルの読み込みに時間がかかります）");
+    let copy = work.join("ref.wav");
+    if let Some(voice) = &voice {
+        if let Err(err) = std::fs::copy(voice, &copy) {
+            let _ = std::fs::remove_dir_all(&work);
+            return GateOutcome::Failed(format!("参照音声を作業場所へ写せません: {err}"));
+        }
+    }
+    on_line(if with_voice_design {
+        "更新したランタイムで、参照音声の生成と合成を 1 回ずつ試して確かめています…（モデルの読み込みに時間がかかります）"
+    } else {
+        "1 回合成して確かめています…（モデルの読み込みに時間がかかります）"
+    });
     let mut cmd = Command::new(py_exe);
-    cmd.arg(asset_root.join("sidecar.py"))
-        .arg("--asset-dir")
-        .arg(asset_root)
-        .arg("--synth-once")
-        .arg("--voice-ref")
-        .arg(&copy)
-        .args(model_args);
+    cmd.args(gate_args(
+        asset_root,
+        &work,
+        voice.as_ref().map(|_| copy.as_path()),
+        with_voice_design,
+        model_args,
+    ));
     let mut start: Option<serde_json::Value> = None;
     let mut result: Option<serde_json::Value> = None;
     let ended = child_process::off_the_async_workers(|| {
@@ -2201,6 +2263,14 @@ fn probe_cuda(py_exe: &Path) -> Option<bool> {
 /// 5. 失敗・不合格なら全部戻す（`roll_back_update`）。成功したら退避と控えを捨てて記録する
 ///
 /// 戻り値は「入れ直せた名前」。呼び出し側はこれで記録を部分的に更新する。
+/// VRAM 不足で保留したときに、記録を進めてよい名前（v0.5.7 項目 6）。**モデルは進めない** — 記録が読み先の正本
+/// （v0.5.6 項目 3a）なので、進めると確かめていない新しいモデルを読みに行く。パッケージ（名前付き要件と固定 URL）は
+/// 入れ替え済みなので進める（進めないと、次の更新が入れ直しをまた最初からやる）。
+fn names_committed_on_hold(plan: &UpdatePlan) -> Vec<String> {
+    let models = current_models();
+    plan.names.iter().filter(|n| !models.contains_key(*n)).cloned().collect()
+}
+
 pub async fn update_irodori_runtime<F>(
     asset_root: &Path,
     outdated: &[String],
@@ -2281,9 +2351,9 @@ where
     // 試しても「コードだけ新しくて重みが無い」を捕まえられない）。
     // 入れ直すものが無い呼び出し（前回の後始末だけ）では確かめない（何も変えていない）。
     let outcome = if plan.names.is_empty() {
-        GateOutcome::Passed { ms: 0, watermark: None }
+        GateOutcome::Passed { ms: 0, watermark: None, voice_design: false }
     } else {
-        run_synth_gate(asset_root, &py_exe, &model_args_for_fetch(), |l| on_line(l))
+        run_synth_gate(asset_root, &py_exe, &model_args_for_fetch(), true, |l| on_line(l))
     };
     match gate_verdict(&outcome, cuda_before) {
         GateVerdict::Pass(_) if plan.names.is_empty() => {}
@@ -2296,18 +2366,29 @@ where
             crate::ulog!("[irodori] 更新の確認: {message}");
             on_line(&message);
         }
-        GateVerdict::RollBackForVram(why) => {
-            let err = anyhow!(
-                "{why}。VRAM を空けてから（GPU を使うほかのアプリを止めてから）、もう一度更新してください"
+        GateVerdict::HoldForVram(why) => {
+            // **全部は戻さず保留する**（v0.5.7 項目 6、ユーザー裁定）。新しい依存の上の旧モデルは spike で
+            // 確かめた組み合わせ（spec §6.0 の 1.）。数 GB を消しては取り直す往復をしない。
+            let _ = std::fs::remove_dir_all(asset_root.join(UPDATE_BACKUP_DIR));
+            remove_versions_snapshot(asset_root);
+            let held = names_committed_on_hold(&plan);
+            record_after_install(asset_root, &held, |l| on_line(l))
+                .context("パッケージの入れ替えは済みましたが、導入記録を書けませんでした")?;
+            let message = format!(
+                "{why}。パッケージの入れ替えは済ませ、声はいままでのモデルのままにしています（保留）。\
+                 GPU を使うほかのアプリを止めて VRAM を空けてから、もう一度「更新する」を押してください\
+                 （モデルは取得済みなので、取り直さずに確かめだけを行います）"
             );
-            return Err(roll_back_update(asset_root, &py_exe, versions, err, |l| on_line(l)));
+            crate::ulog!("[irodori] 更新を保留しました: {message}");
+            on_line(&message);
+            return Err(anyhow!(message));
         }
         GateVerdict::RollBack(why) => {
             let err = roll_back_update(asset_root, &py_exe, versions, anyhow!(why), |l| on_line(l));
             // **絶対値で「更新のせい」と決めない**（反証レビュー #2）。戻した状態でもう一度試して切り分ける。
             on_line("元に戻した状態でも合成できるかを確かめています…（更新のせいかを切り分けます）");
             let (read_args, _) = model_args_for_read(asset_root);
-            let recheck = run_synth_gate(asset_root, &py_exe, &read_args, |l| on_line(l));
+            let recheck = run_synth_gate(asset_root, &py_exe, &read_args, false, |l| on_line(l));
             return Err(explain_after_recheck(err, &recheck));
         }
     }
@@ -4293,7 +4374,7 @@ mod update_tests {
         println!("[gate] 材料: {:?}", pick_gate_voice_ref(&root));
 
         let fetch = model_args_for_fetch();
-        let passed = run_synth_gate(&root, &py, &fetch, |l| println!("  | {l}"));
+        let passed = run_synth_gate(&root, &py, &fetch, true, |l| println!("  | {l}"));
         println!("[gate] いまのビルドの値で: {passed:?} → {:?}", gate_verdict(&passed, None));
         assert!(
             matches!(passed, GateOutcome::Passed { .. }),
@@ -4307,7 +4388,7 @@ mod update_tests {
             .position(|a| a == "--model-synth-revision")
             .expect("revision の引数がある");
         bogus[at + 1] = "ugg-no-such-revision".to_string();
-        let failed = run_synth_gate(&root, &py, &bogus, |l| println!("  | {l}"));
+        let failed = run_synth_gate(&root, &py, &bogus, true, |l| println!("  | {l}"));
         println!("[gate] 重みの無い読み先で: {failed:?} → {:?}", gate_verdict(&failed, None));
         assert!(
             matches!(gate_verdict(&failed, None), GateVerdict::RollBack(_)),
@@ -4771,7 +4852,7 @@ mod update_tests {
     /// できる）。v0.5.4 は、一度も効いていないことに実機検証で初めて気づいた。
     #[test]
     fn the_gate_says_whether_the_watermark_works() {
-        let say = |w: Option<bool>| match gate_verdict(&GateOutcome::Passed { ms: 7900, watermark: w }, Some(true)) {
+        let say = |w: Option<bool>| match gate_verdict(&GateOutcome::Passed { ms: 7900, watermark: w, voice_design: false }, Some(true)) {
             GateVerdict::Pass(m) => m,
             other => panic!("合格にならない: {other:?}"),
         };
@@ -4841,7 +4922,7 @@ mod update_tests {
         let ok = json(r#"{"ok":true,"ms":41234,"bytes":90000}"#);
         assert_eq!(
             classify_gate(GateExit::Code(Some(0)), Some(&start), Some(&ok)),
-            GateOutcome::Passed { ms: 41234, watermark: None },
+            GateOutcome::Passed { ms: 41234, watermark: None, voice_design: false },
             "透かしを返さない古い sidecar.py は「分からない」"
         );
         // v0.5.7 項目 5: 透かしが効いていたかを読む（合否には使わない）
@@ -4849,7 +4930,7 @@ mod update_tests {
             let r = json(&format!(r#"{{"ok":true,"ms":5,"bytes":9,"watermark":{field}}}"#));
             assert_eq!(
                 classify_gate(GateExit::Code(Some(0)), Some(&start), Some(&r)),
-                GateOutcome::Passed { ms: 5, watermark: want },
+                GateOutcome::Passed { ms: 5, watermark: want, voice_design: false },
                 "{field}"
             );
         }
@@ -4897,17 +4978,17 @@ mod update_tests {
         assert!(matches!(gate_verdict(&GateOutcome::NoGpu, Some(false)), GateVerdict::Skip(_)));
         assert!(matches!(gate_verdict(&GateOutcome::NoGpu, None), GateVerdict::Skip(_)));
         assert!(matches!(gate_verdict(&GateOutcome::NoVoiceRef, Some(true)), GateVerdict::Skip(_)));
-        assert!(matches!(gate_verdict(&GateOutcome::Passed { ms: 1, watermark: None }, Some(true)), GateVerdict::Pass(_)));
+        assert!(matches!(gate_verdict(&GateOutcome::Passed { ms: 1, watermark: None, voice_design: false }, Some(true)), GateVerdict::Pass(_)));
     }
 
-    /// **VRAM 不足は「移行の失敗」と別の案内で戻す**（spec の裁定）。例外にならず落ちたときは、
-    /// 始めたときの空き VRAM が少なければ VRAM 不足とみなす。
+    /// **VRAM 不足は「移行の失敗」と分け、全部は戻さず保留する**（v0.5.7 項目 6、ユーザー裁定）。例外にならず
+    /// 落ちたときは、始めたときの空き VRAM が少なければ VRAM 不足とみなす。
     #[test]
     fn a_vram_shortage_is_told_apart_from_a_broken_update() {
-        assert!(matches!(gate_verdict(&GateOutcome::OutOfMemory, None), GateVerdict::RollBackForVram(_)));
+        assert!(matches!(gate_verdict(&GateOutcome::OutOfMemory, None), GateVerdict::HoldForVram(_)));
         assert!(matches!(
             gate_verdict(&GateOutcome::Crashed { code: Some(1), vram_free_mb: Some(900) }, None),
-            GateVerdict::RollBackForVram(_)
+            GateVerdict::HoldForVram(_)
         ));
         assert!(matches!(
             gate_verdict(&GateOutcome::Crashed { code: Some(1), vram_free_mb: Some(12000) }, None),
@@ -4925,7 +5006,7 @@ mod update_tests {
     #[test]
     fn the_recheck_after_the_rollback_says_whose_fault_it_was() {
         let base = || anyhow!("更新したランタイムで合成できませんでした: X");
-        let caused = format!("{:#}", explain_after_recheck(base(), &GateOutcome::Passed { ms: 1, watermark: None }));
+        let caused = format!("{:#}", explain_after_recheck(base(), &GateOutcome::Passed { ms: 1, watermark: None, voice_design: false }));
         assert!(caused.contains("更新が原因"), "{caused}");
         let before = format!(
             "{:#}",
@@ -4964,18 +5045,104 @@ mod update_tests {
         assert_eq!(pick_gate_voice_ref(dir.path()), Some(newest_main));
     }
 
-    /// 参照音声が 1 つも無ければ、合成は確かめず（python も起動せず）「材料なし」を返す。
+    /// **生成を試さない呼び出し（戻したあとの確かめ直し）で参照音声が 1 つも無ければ**、合成は確かめず
+    /// （python も起動せず）「材料なし」を返す。
     #[test]
-    fn without_a_reference_voice_the_gate_is_not_run() {
+    fn without_a_reference_voice_the_recheck_is_not_run() {
         let dir = tempfile::tempdir().unwrap();
         let py = dir.path().join("python").join("python.exe");
-        let mut lines = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
         assert_eq!(
-            run_synth_gate(dir.path(), &py, &[], |l| lines.push(l.to_string())),
+            run_synth_gate(dir.path(), &py, &[], false, |l| lines.push(l.to_string())),
             GateOutcome::NoVoiceRef
         );
         assert!(lines.is_empty(), "何も始めていない: {lines:?}");
         assert!(!dir.path().join(GATE_DIR).exists());
+    }
+
+    /// **更新のゲートは参照音声が無くても走る**（v0.5.7 項目 6）。生成した声で合成するので、「材料なし」で
+    /// 確かめずに通さない（通すと、生成しか手段の無い人が旧モデルを消されたあと戻る先を失う）。
+    #[test]
+    fn without_a_reference_voice_the_gate_still_runs_with_a_generated_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("python").join("python.exe");
+        let mut lines: Vec<String> = Vec::new();
+        let got = run_synth_gate(dir.path(), &py, &[], true, |l| lines.push(l.to_string()));
+        assert_ne!(got, GateOutcome::NoVoiceRef, "参照音声が無くても確かめに行く");
+        assert!(matches!(got, GateOutcome::Failed(_)), "この一時フォルダには python が無いので起動に失敗する: {got:?}");
+        assert!(!dir.path().join(GATE_DIR).exists(), "作業場所は片付ける");
+    }
+
+    /// ゲートに渡す引数（v0.5.7 項目 6）: 生成も試すなら `--gate-dir`、参照音声の写しがあれば `--voice-ref`。
+    #[test]
+    fn the_gate_passes_a_work_dir_for_the_voice_design_and_the_copy_if_any() {
+        let root = Path::new("R");
+        let work = Path::new("R/.update-gate");
+        let copy = Path::new("R/.update-gate/ref.wav");
+        let joined = |a: Vec<std::ffi::OsString>| {
+            a.iter().map(|x| x.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ")
+        };
+        let both = joined(gate_args(root, work, Some(copy), true, &["--model-synth".into(), "X".into()]));
+        assert!(both.contains("--synth-once"), "{both}");
+        assert!(both.contains(&format!("--voice-ref {}", copy.display())), "{both}");
+        assert!(both.contains(&format!("--gate-dir {}", work.display())), "{both}");
+        assert!(both.ends_with("--model-synth X"), "{both}");
+        let generated_only = joined(gate_args(root, work, None, true, &[]));
+        assert!(generated_only.contains("--gate-dir") && !generated_only.contains("--voice-ref"), "{generated_only}");
+        let recheck = joined(gate_args(root, work, Some(copy), false, &[]));
+        assert!(recheck.contains("--voice-ref") && !recheck.contains("--gate-dir"), "確かめ直しは合成だけ: {recheck}");
+    }
+
+    /// **VRAM 不足で保留したら、記録はパッケージだけ進め、モデルは進めない**（v0.5.7 項目 6）。記録は読み先の正本
+    /// なので、モデルを進めると確かめていない新しいモデルを読みに行く。
+    #[test]
+    fn a_hold_commits_the_packages_but_not_the_models() {
+        let outdated: Vec<String> = ["huggingface_hub", "irodori_tts", "model_codec", "model_synth", "model_voice_design", "transformers"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let plan = update_plan(&outdated);
+        assert!(plan.models, "前提: モデルも入れ直す計画");
+        let held = names_committed_on_hold(&plan);
+        assert_eq!(held, vec!["huggingface_hub", "irodori_tts", "transformers"]);
+    }
+
+    /// 保留の分岐は**戻さない**（全戻しを呼ばない）で、退避と控えを片付け、パッケージの分だけ記録する（配線を本文の
+    /// テキストで固定する。子プロセスの python が要るので単体では通せない）。
+    #[test]
+    fn the_hold_branch_keeps_the_new_packages_and_records_only_them() {
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body = &src[src.find("        GateVerdict::HoldForVram(why) => {").expect("保留の分岐が無い")..];
+        let body = &body[..body.find("\n        }\n").unwrap()];
+        assert!(!body.contains("roll_back_update"), "保留で全戻しを呼んでいる");
+        assert!(body.contains("remove_dir_all(asset_root.join(UPDATE_BACKUP_DIR))"), "退避を片付けていない");
+        assert!(body.contains("remove_versions_snapshot(asset_root)"), "版の控えを片付けていない");
+        assert!(body.contains("let held = names_committed_on_hold(&plan);"), "記録する名前を絞っていない");
+        assert!(body.contains("record_after_install(asset_root, &held,"), "パッケージの分を記録していない");
+    }
+
+    /// 生成も確かめたかを読み、合格の文面に出す（v0.5.7 項目 6。項目 10 は、これが真のときだけ旧モデルを消す）。
+    #[test]
+    fn the_gate_reads_whether_the_voice_design_was_checked() {
+        let r = json(r#"{"ok":true,"ms":9000,"bytes":9,"watermark":true,"voice_design":{"ok":true,"ms":1200}}"#);
+        let got = classify_gate(GateExit::Code(Some(0)), None, Some(&r));
+        assert_eq!(got, GateOutcome::Passed { ms: 9000, watermark: Some(true), voice_design: true });
+        let GateVerdict::Pass(msg) = gate_verdict(&got, Some(true)) else { panic!("合格にならない") };
+        assert!(msg.contains("参照音声の生成も確かめました"), "{msg}");
+        for field in ["null", r#"{"ok":false}"#] {
+            let r = json(&format!(r#"{{"ok":true,"ms":1,"bytes":9,"voice_design":{field}}}"#));
+            assert!(
+                matches!(classify_gate(GateExit::Code(Some(0)), None, Some(&r)), GateOutcome::Passed { voice_design: false, .. }),
+                "{field}"
+            );
+        }
+        // 生成で失敗した報告は不合格（更新したモデルで参照音声を作れない）
+        let r = json(r#"{"ok":false,"kind":"other","stage":"voice_design","error":"参照音声の生成: X"}"#);
+        let got = classify_gate(GateExit::Code(Some(1)), None, Some(&r));
+        assert!(matches!(&got, GateOutcome::Failed(why) if why.contains("参照音声の生成")), "{got:?}");
+        assert!(matches!(gate_verdict(&got, Some(true)), GateVerdict::RollBack(_)));
     }
 
     /// **ゲートは取得したいまのビルドの値で試し、戻したあとの確認は読み先で試す**（v0.5.6 項目 3b の配線）。
@@ -4992,15 +5159,34 @@ mod update_tests {
 }
 ").unwrap()];
         let gate = body
-            .find("run_synth_gate(asset_root, &py_exe, &model_args_for_fetch()")
-            .expect("ゲートが取得したいまのビルドの値で試していない");
+            .find("run_synth_gate(asset_root, &py_exe, &model_args_for_fetch(), true,")
+            .expect("ゲートが取得したいまのビルドの値で、生成も含めて試していない（v0.5.7 項目 6）");
         let read = body
             .find("let (read_args, _) = model_args_for_read(asset_root);")
             .expect("戻したあとの確認が読み先を使っていない");
         let recheck = body
-            .find("run_synth_gate(asset_root, &py_exe, &read_args")
-            .expect("戻したあとにもう一度試していない");
+            .find("run_synth_gate(asset_root, &py_exe, &read_args, false,")
+            .expect("戻したあとにもう一度、合成だけで試していない（v0.5.7 項目 6）");
         assert!(gate < read && read < recheck, "順序が崩れている");
+    }
+
+    /// **`sidecar.py` の一発合成は、作業場所を渡されたら先に参照音声を生成し、参照音声が無ければ生成した声で
+    /// 合成し、結果に生成の欄を返す**（v0.5.7 項目 6。本文のテキストで固定する）。
+    #[test]
+    fn the_sidecar_synth_once_tries_the_voice_design_first() {
+        let py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"))
+            .unwrap();
+        let body = &py[py.find("def synth_once(asset_dir: Path, voice_ref: Optional[Path], gate_dir: Optional[Path] = None) -> int:")
+            .expect("synth_once が作業場所を受け取らない")..];
+        let body = &body[..body.find("\n\n\ndef ").unwrap()];
+        let design = body.find("backend.generate_voice_ref(SYNTH_ONCE_CAPTION, generated)").expect("生成を試していない");
+        let fallback = body.find("        if voice_ref is None:\n            voice_ref = generated").expect("参照音声が無いとき生成した声を使っていない");
+        let synth = body.find("wav = backend.synthesize(SYNTH_ONCE_TEXT, voice_ref, 1.0, None)").expect("合成していない");
+        assert!(design < fallback && fallback < synth, "生成 → 生成した声の代用 → 合成の順になっていない");
+        assert!(body.contains("\"voice_design\": voice_design,"), "結果に生成の欄を返していない");
+        assert!(body.contains("\"stage\": \"voice_design\""), "生成の失敗を見分けられない");
+        assert!(py.contains("        return synth_once(asset_dir, args.voice_ref, args.gate_dir)"), "作業場所を渡していない");
+        assert!(py.contains("        \"--gate-dir\","), "--gate-dir の引数が無い");
     }
 
     /// **`sidecar.py` の一発合成と噛み合っていること**（目印の文字列・終了コード・分岐の位置）。

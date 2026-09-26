@@ -754,6 +754,8 @@ SYNTH_ONCE_OOM = 2
 SYNTH_ONCE_NO_GPU = 3
 # 読み上げる固定文。**発話の本文は渡さない**（失敗の理由がログに残るため）。
 SYNTH_ONCE_TEXT = "こんにちは。更新の確認です。"
+# 更新の確認で参照音声の生成を試すときのキャプション（v0.5.7 項目 6）。作った声はゲートの作業場所に置き、終わったら消す。
+SYNTH_ONCE_CAPTION = "落ち着いた声で、はっきりと話す。"
 
 
 def _report(marker: str, payload: dict) -> None:
@@ -761,8 +763,13 @@ def _report(marker: str, payload: dict) -> None:
     sys.stdout.flush()
 
 
-def synth_once(asset_dir: Path, voice_ref: Path) -> int:
+def synth_once(asset_dir: Path, voice_ref: Optional[Path], gate_dir: Optional[Path] = None) -> int:
     """更新の成否を確かめるため、1 回だけ合成する (spec §6.0 v0.5.6 項目 3b)。
+
+    **v0.5.7 項目 6: 参照音声の生成も 1 回試す**（`gate_dir` を渡されたとき）。乗り換えでは生成も新しいモデルに
+    まとめ、成功したら旧モデルを消すので、生成を試さずに通すと、生成しか手段の無い人（参照音声が無い人）が
+    戻る先を失う。生成した声は `gate_dir` に置き、`voice_ref` が無ければその声で合成する（参照音声が無い人でも
+    合成と生成の両方を確かめられる）。
 
     更新中は HTTP の経路が錠で塞がっているので、更新処理の子プロセスとして走らせる。結果は stdout の
     目印付きの 1 行と終了コードで返す。**VRAM 不足では例外にならずプロセスごと落ちることがある**
@@ -790,20 +797,51 @@ def synth_once(asset_dir: Path, voice_ref: Path) -> int:
         return SYNTH_ONCE_NO_GPU
     started = time.perf_counter()
     backend = RealModelBackend(asset_dir)
+    voice_design = None
+    if gate_dir is not None:
+        generated = gate_dir / "generated.wav"
+        vd_started = time.perf_counter()
+        try:
+            backend.generate_voice_ref(SYNTH_ONCE_CAPTION, generated)
+            if not generated.is_file() or generated.stat().st_size == 0:
+                raise RuntimeError("生成した参照音声が空でした")
+        except Exception as exc:
+            if _is_out_of_memory(exc):
+                _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "oom", "stage": "voice_design", "error": type(exc).__name__})
+                return SYNTH_ONCE_OOM
+            _report(SYNTH_ONCE_MARKER, {
+                "ok": False,
+                "kind": "other",
+                "stage": "voice_design",
+                "error": f"参照音声の生成: {type(exc).__name__}: {exc}",
+            })
+            return SYNTH_ONCE_FAILED
+        voice_design = {"ok": True, "ms": int((time.perf_counter() - vd_started) * 1000)}
+        if voice_ref is None:
+            voice_ref = generated
+    if voice_ref is None:
+        _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "other", "error": "合成に使う参照音声がありません"})
+        return SYNTH_ONCE_FAILED
     try:
         wav = backend.synthesize(SYNTH_ONCE_TEXT, voice_ref, 1.0, None)
     except Exception as exc:
         if _is_out_of_memory(exc):
-            _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "oom", "error": type(exc).__name__})
+            _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "oom", "stage": "synth", "error": type(exc).__name__})
             return SYNTH_ONCE_OOM
-        _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "other", "error": f"{type(exc).__name__}: {exc}"})
+        _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "other", "stage": "synth", "error": f"{type(exc).__name__}: {exc}"})
         return SYNTH_ONCE_FAILED
     if not wav:
         _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "other", "error": "合成結果が空でした"})
         return SYNTH_ONCE_FAILED
     ms = int((time.perf_counter() - started) * 1000)
     # v0.5.7 項目 5: 透かしが効いているかも返す（効いていなくても合成はできるので合否には使わない）。
-    _report(SYNTH_ONCE_MARKER, {"ok": True, "ms": ms, "bytes": len(wav), "watermark": backend.watermark_ready()})
+    _report(SYNTH_ONCE_MARKER, {
+        "ok": True,
+        "ms": ms,
+        "bytes": len(wav),
+        "watermark": backend.watermark_ready(),
+        "voice_design": voice_design,
+    })
     return SYNTH_ONCE_OK
 
 
@@ -1009,6 +1047,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--voice-ref", type=Path, default=None, help="--synth-once で使う参照 wav")
     parser.add_argument(
+        "--gate-dir",
+        type=Path,
+        default=None,
+        help="--synth-once で参照音声の生成も試す作業場所（v0.5.7 項目 6）。生成した声はここに置く",
+    )
+    parser.add_argument(
         "--fetch-watermark",
         action="store_true",
         help="透かしの重みを共有 HF キャッシュへ先に取って即終了する（v0.5.7 項目 5）。uvicorn は立てない",
@@ -1054,10 +1098,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ポート確保と --ready-file の必須チェックより前に置く（HTTP は立てない）。モデルは取りに行かない
     # （無ければ合成が失敗する ＝ 更新で重みが揃わなかったことを捕まえるのがこのモードの役目）。
     if args.synth_once:
-        if args.voice_ref is None:
-            sys.stderr.write("sidecar.py: --synth-once には --voice-ref が必要です\n")
+        if args.voice_ref is None and args.gate_dir is None:
+            sys.stderr.write("sidecar.py: --synth-once には --voice-ref か --gate-dir が必要です\n")
             return SYNTH_ONCE_FAILED
-        return synth_once(asset_dir, args.voice_ref)
+        return synth_once(asset_dir, args.voice_ref, args.gate_dir)
 
     port = args.port if args.port and args.port > 0 else pick_free_port(args.host)
     LOG.info("sidecar binding to %s:%d (mock=%s)", args.host, port, args.mock)
