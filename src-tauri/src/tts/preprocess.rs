@@ -195,6 +195,32 @@ fn katakana_to_hiragana(c: char) -> char {
 mod tests {
     use super::*;
 
+    /// **受け入れ条件の確かめ（`sidecar.py --acceptance`）が見る絵文字は、ここの 45 種と同じ並び**（v0.5.7）。
+    /// 正本はこちら。`sidecar.py` は結合子（U+200D）と異体字セレクタ（U+FE0F）を `\u` のエスケープで書く。
+    #[test]
+    fn the_acceptance_check_sees_the_same_45_emojis() {
+        let py = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let body = &py[py.find("ACCEPTANCE_EMOJIS = (\n").expect("ACCEPTANCE_EMOJIS が無い")..];
+        let body = &body[..body.find("\n)\n").unwrap()];
+        let listed: Vec<String> = body
+            .lines()
+            .skip(1)
+            .map(|l| {
+                l.trim()
+                    .trim_end_matches(',')
+                    .trim_matches('"')
+                    .replace("\\u200d", "\u{200D}")
+                    .replace("\\ufe0f", "\u{FE0F}")
+            })
+            .collect();
+        let expected: Vec<String> = IRODORI_EMOJIS.iter().map(|e| e.to_string()).collect();
+        assert_eq!(listed, expected, "sidecar.py の絵文字の並びが IRODORI_EMOJIS と違う");
+    }
+
     #[test]
     fn convert_katakana_chars() {
         assert_eq!(katakana_to_hiragana('ア'), 'あ');

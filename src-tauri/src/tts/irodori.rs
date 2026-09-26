@@ -1330,6 +1330,38 @@ mod tests {
         assert!(!py.contains(".on_event("), "on_event を使っている");
     }
 
+    /// **seed を固定するのは受け入れ条件の確かめ（`--acceptance`）だけ**（spec §6.0 v0.5.7 の受け入れ条件）。HTTP の要求・
+    /// ユーザー向けの設定・通常の合成・更新のゲートには足さない（固定すると毎回同じ揺らぎになる）。
+    #[test]
+    fn only_the_acceptance_check_fixes_the_seed() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let py = std::fs::read_to_string(root.join("python").join("sidecar.py"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body_of = |start: &str| -> &str {
+            let rest = &py[py.find(start).unwrap_or_else(|| panic!("無い: {start}"))..];
+            &rest[..rest.find("\n\n\n").unwrap()]
+        };
+        // 既定は固定しない
+        assert!(py.contains("        seed: Optional[int] = None,\n    ):\n        \"\"\"upstream infer.py"));
+        assert!(py.contains("            seed=seed,\n            t_schedule_mode=t_schedule_mode,"));
+        // 固定の値を渡すのは受け入れ条件の確かめの中の 1 か所だけ
+        assert_eq!(py.matches("seed=ACCEPTANCE_SEED").count(), 1, "受け入れ条件の確かめの外で seed を固定している");
+        assert!(body_of("def acceptance_check(asset_dir: Path, voice_ref: Path, out_dir: Path) -> int:").contains("seed=ACCEPTANCE_SEED"));
+        // HTTP の要求とユーザー向けの設定には無い
+        let speech = &py[py.find("class SpeechRequest(BaseModel):").unwrap()..];
+        let speech = &speech[..speech.find("\n\n\n").unwrap()];
+        assert!(!speech.contains("seed"), "HTTP の要求に seed がある");
+        for p in ["src/state.rs", "../src/types.ts"] {
+            let text = std::fs::read_to_string(root.join(p)).unwrap();
+            assert!(!text.contains("seed"), "{p}: 設定に seed がある");
+        }
+        // 受け入れ条件の確かめは HTTP を立てる前に分岐し、参照音声を要る
+        let acceptance = py.find("    if args.acceptance is not None:").expect("--acceptance の分岐が無い");
+        assert!(acceptance < py.find("    port = args.port if args.port and args.port > 0").unwrap());
+        assert!(py[acceptance..].starts_with("    if args.acceptance is not None:\n        if args.voice_ref is None:"));
+    }
+
     /// **サイドカーの応答の形と、Rust の読み取りが噛み合う**（v0.5.7 項目 7。本文のテキストで固定する）。
     #[test]
     fn the_sidecar_speech_error_carries_the_kind_rust_reads() {

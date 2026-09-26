@@ -522,6 +522,7 @@ class RealModelBackend:
         duration_scale: float,
         num_steps: int,
         t_schedule_mode: str,
+        seed: Optional[int] = None,
     ):
         """upstream infer.py のデフォルト引数群を写し取った SamplingRequest を組み立てる。
 
@@ -562,7 +563,8 @@ class RealModelBackend:
             speaker_kv_min_t=None,
             speaker_kv_max_layers=None,
             speaker_uncond_mode="mask",
-            seed=None,
+            # 通常は固定しない。固定するのは受け入れ条件の確かめ（`acceptance_check`）だけ（spec §6.0 v0.5.7）
+            seed=seed,
             t_schedule_mode=t_schedule_mode,
             sway_coeff=-1.0,
             trim_tail=True,
@@ -579,6 +581,7 @@ class RealModelBackend:
         ref_wav: Optional[str],
         ref_latent: Optional[str],
         steps: Optional[int] = None,
+        seed: Optional[int] = None,
     ):
         """通常合成（参照音声つき）のリクエスト。ステップ数とサンプラーは読み込むモデルで決める。"""
         steps, schedule = synth_sampler(MODEL_REPO_SYNTH, steps)
@@ -591,6 +594,7 @@ class RealModelBackend:
             duration_scale=1.0,
             num_steps=steps,
             t_schedule_mode=schedule,
+            seed=seed,
         )
 
     def _reference_latent(self, runtime, voice_ref_path: Path) -> tuple[Optional[str], bool]:
@@ -861,6 +865,187 @@ def synth_once(asset_dir: Path, voice_ref: Optional[Path], gate_dir: Optional[Pa
     return SYNTH_ONCE_OK
 
 
+# --- 受け入れ条件の確かめ（試験の経路だけ。spec §6.0 v0.5.7） ----------------------------
+
+ACCEPTANCE_SEED = 1234
+ACCEPTANCE_TEXT = "今日はいい天気ですね。少し散歩に行きませんか。"
+# 台本の caption の例（script-reader-spec の S4 と同じ）
+ACCEPTANCE_CAPTION = "驚いて大声で"
+# 透かしの中身（"IRDTS"）。上流の `irodori_tts/watermark.py` が埋める値
+WATERMARK_PAYLOAD = [73, 82, 68, 84, 83]
+# 上流の EMOJI_ANNOTATIONS.md の 45 種。**Rust の `preprocess::IRODORI_EMOJIS` と同じ並び**（契約テストが突き合わせる）
+ACCEPTANCE_EMOJIS = (
+    "👂",
+    "😮\u200d💨",
+    "⏸\ufe0f",
+    "🤭",
+    "🥵",
+    "📢",
+    "😏",
+    "🥺",
+    "🌬\ufe0f",
+    "😮",
+    "👅",
+    "💋",
+    "🫶",
+    "😭",
+    "😱",
+    "😪",
+    "😴",
+    "⏩",
+    "📞",
+    "🐢",
+    "🥤",
+    "🤧",
+    "😒",
+    "😰",
+    "😆",
+    "💥",
+    "😠",
+    "😲",
+    "🥱",
+    "😖",
+    "😟",
+    "🫣",
+    "🙄",
+    "😊",
+    "😎",
+    "👌",
+    "🙏",
+    "🥴",
+    "🎵",
+    "🤐",
+    "😌",
+    "🤔",
+    "💪",
+    "👃",
+    "📖",
+)
+
+
+def _mono(audio):
+    """合成結果（torch.Tensor の (channels, samples) か numpy）を 1 次元の numpy にする。"""
+    try:
+        import torch  # type: ignore
+
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().float().cpu().numpy()
+    except ImportError:
+        pass
+    if getattr(audio, "ndim", 1) == 2:
+        audio = audio[0]
+    return audio
+
+
+def acceptance_check(asset_dir: Path, voice_ref: Path, out_dir: Path) -> int:
+    """v0.5.7 の受け入れ条件のうち、手元の実物で確かめる 3 つ (spec §6.0)。**試験の経路だけに置く**
+    （seed を固定する手段を HTTP の要求やユーザー向けの設定に足さない）。
+
+    1. caption: seed を固定し、同じ文・同じ参照音声で caption なしとありを合成して差が出る。対照として、
+       同じ seed・同じ caption の 2 回がビット同一（seed を固定しない比較は、何を足しても必ず差が出る）
+    2. 絵文字 45 種: 合成モデルのトークナイザで未知語にならない（音が変わるかは条件にしない）
+    3. 透かし: 出力から IRDTS を読み取れる。対照として、透かしを外した出力からは読み取れない
+
+    結果は `out_dir/acceptance.json` と聴き比べ用の wav に残す。参照音声は `out_dir` へ写してから使う
+    （ユーザーの refs には何も書かない）。終了コードは全部通れば 0、どれか落ちれば 1、確かめられなければ 2。
+    """
+    import hashlib
+    import shutil
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report: dict = {"model": f"{MODEL_REPO_SYNTH}@{MODEL_REVISION_SYNTH}", "seed": ACCEPTANCE_SEED}
+
+    def finish(code: int) -> int:
+        report["passed"] = code == 0
+        (out_dir / "acceptance.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return code
+
+    try:
+        import numpy as np  # type: ignore
+        import soundfile as sf  # type: ignore
+        import torch  # type: ignore
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        return finish(2)
+    if not torch.cuda.is_available():
+        report["error"] = "GPU が見えません"
+        return finish(2)
+    if not voice_ref.is_file():
+        report["error"] = f"参照音声がありません: {voice_ref}"
+        return finish(2)
+    ref = out_dir / "ref.wav"
+    shutil.copyfile(voice_ref, ref)
+
+    backend = RealModelBackend(asset_dir)
+    runtime = backend._load_synth()
+
+    def synth(name: str, caption: Optional[str]) -> dict:
+        req = backend._synth_request(ACCEPTANCE_TEXT, caption, str(ref), None, None, seed=ACCEPTANCE_SEED)
+        res = runtime.synthesize(req, log_fn=None)
+        audio = np.ascontiguousarray(_mono(res.audio), dtype=np.float32)
+        sr = int(res.sample_rate)
+        sf.write(str(out_dir / f"{name}.wav"), audio, sr)
+        return {"audio": audio, "sr": sr, "sha": hashlib.sha256(audio.tobytes()).hexdigest()}
+
+    # 1. caption
+    plain = synth("caption_none", None)
+    with_caption = synth("caption_on_1", ACCEPTANCE_CAPTION)
+    with_caption_again = synth("caption_on_2", ACCEPTANCE_CAPTION)
+    report["caption"] = {
+        "caption": ACCEPTANCE_CAPTION,
+        "differs": plain["sha"] != with_caption["sha"],
+        "control_identical": with_caption["sha"] == with_caption_again["sha"],
+    }
+
+    # 2. 絵文字
+    tok = runtime.tokenizer.tokenizer
+    unk = tok.unk_token_id
+    unknown = [e for e in ACCEPTANCE_EMOJIS if unk is not None and unk in tok.encode(e, add_special_tokens=False)]
+    report["emoji"] = {"count": len(ACCEPTANCE_EMOJIS), "unknown": unknown}
+
+    # 3. 透かし（`plain` は透かしが入った出力。外した出力を同じ seed で作って比べる）
+    watermarker = getattr(runtime, "watermarker", None)
+    report["watermark"] = {"ready": bool(getattr(watermarker, "ready", False))}
+    if watermarker is not None and getattr(watermarker, "model", None) is not None:
+        saved = watermarker.model
+        watermarker.model = None
+        try:
+            unmarked = synth("watermark_off", None)
+        finally:
+            watermarker.model = saved
+        import librosa  # type: ignore
+        import silentcipher  # type: ignore
+
+        detector = silentcipher.get_model(model_type="44.1k", device="cuda")
+
+        def read(item: dict) -> dict:
+            y, sr = item["audio"], item["sr"]
+            if sr != 44100:
+                y = librosa.resample(y, orig_sr=sr, target_sr=44100)
+                sr = 44100
+            r = detector.decode_wav(y, sr, phase_shift_decoding=False)
+            messages = [list(map(int, m)) for m in (r.get("messages") or [])]
+            return {
+                "status": bool(r.get("status")),
+                "messages": messages,
+                "confidences": [round(float(c), 3) for c in (r.get("confidences") or [])],
+                "found": WATERMARK_PAYLOAD in messages,
+            }
+
+        report["watermark"]["on"] = read(plain)
+        report["watermark"]["off"] = read(unmarked)
+
+    ok = (
+        report["caption"]["differs"]
+        and report["caption"]["control_identical"]
+        and not report["emoji"]["unknown"]
+        and report["watermark"].get("on", {}).get("found", False)
+        and not report["watermark"].get("off", {}).get("found", True)
+    )
+    return finish(0 if ok else 1)
+
+
 def _audio_to_wav_bytes(audio, sample_rate: int) -> bytes:
     """torch.Tensor / numpy array → 16-bit PCM mono wav バイト列。
 
@@ -1109,6 +1294,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="透かしの重みを共有 HF キャッシュへ先に取って即終了する（v0.5.7 項目 5）。uvicorn は立てない",
     )
+    parser.add_argument(
+        "--acceptance",
+        type=Path,
+        default=None,
+        help="受け入れ条件（caption・絵文字・透かし）を確かめて、結果と wav をこのフォルダに置いて終了する"
+        "（試験の経路だけ。spec §6.0 v0.5.7）。--voice-ref が必要。uvicorn は立てない",
+    )
     # **モデルの正本は Rust 側** (v0.5.5 項目 3)。渡されなければ上の既定値を使う。
     # ここをハードコードのままにすると、`sidecar.py` は毎起動で上書きされるのに
     # 重みは初回 DL でしか取らないため、ID を変えた瞬間に重みだけ無い状態になる。
@@ -1145,6 +1337,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
         sys.stderr.write("[hf-download] モデル DL 完了\n")
         return 0
+
+    # --acceptance モード（v0.5.7 の受け入れ条件）: 試験の経路だけ。HTTP は立てない。
+    if args.acceptance is not None:
+        if args.voice_ref is None:
+            sys.stderr.write("sidecar.py: --acceptance には --voice-ref が必要です\n")
+            return 2
+        return acceptance_check(asset_dir, args.voice_ref, args.acceptance)
 
     # --synth-once モード（v0.5.6 項目 3b）: 1 回だけ合成して即終了。--download-only と同じく、
     # ポート確保と --ready-file の必須チェックより前に置く（HTTP は立てない）。モデルは取りに行かない
