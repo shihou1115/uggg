@@ -2339,6 +2339,117 @@ fn names_committed_on_hold(plan: &UpdatePlan) -> Vec<String> {
     plan.names.iter().filter(|n| !models.contains_key(*n)).cloned().collect()
 }
 
+/// 記録の値（`repo@revision`）からモデルの置き場所の名前を作る（`model_args_from` と同じ切り方）。
+fn model_dir_of(value: &str) -> String {
+    match value.rsplit_once('@') {
+        Some((repo, rev)) if !repo.is_empty() && !rev.is_empty() => model_dir_name(repo, rev),
+        _ => model_dir_name(value, "main"),
+    }
+}
+
+/// 更新で使われなくなったモデルの置き場所（純関数、v0.5.7 項目 10）。更新の前に読んでいた先（`before`）のうち、
+/// いまの読み先（`now`）の置き場所に入らないもの。v3 から v4.1 への更新なら、v3・v2-VoiceDesign・revision を固定する
+/// 前のコーデックの写しの 3 つ。**`before` に無いものは挙げない**（`model\` にあっても ugg が読んでいた証拠が無い）。
+fn old_model_dirs(
+    before: &std::collections::BTreeMap<String, String>,
+    now: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let keep: std::collections::BTreeSet<String> = now.values().map(|v| model_dir_of(v)).collect();
+    let old: std::collections::BTreeSet<String> = before
+        .values()
+        .map(|v| model_dir_of(v))
+        .filter(|d| !keep.contains(d))
+        .collect();
+    old.into_iter().collect()
+}
+
+/// 旧モデルの片付けの結果。
+#[derive(Debug, Default, PartialEq)]
+struct OldModelCleanup {
+    /// 消したモデルの置き場所の名前。
+    removed_models: Vec<String>,
+    /// 消した参照音声の変換結果の数。
+    removed_latents: usize,
+    /// 消せなかったもの（パスと理由）。
+    failed: Vec<String>,
+}
+
+/// **旧モデルを片付ける**（v0.5.7 項目 10、spec §6.0）。**ゲートで合成と生成の両方が通って記録を書いたあとにだけ呼ぶ**
+/// （確かめられなかったとき・保留したときは呼ばない。旧モデルは全戻しと v3 の材料）。
+///
+/// - `model\` のうち、更新の前に読んでいて、いまの読み先に入らない置き場所（約 4 GB）
+/// - 参照音声の隣の変換結果（`<stem>.<合成>+<コーデック>.<精度>.<前処理>.latent.pt`、書きかけの `.tmp` を含む）のうち、
+///   いまの読み先のモデルのものでないもの（`sidecar.py` の `ref_latent_path` と同じ名前の形）
+///
+/// **共有 HF キャッシュには触れない**（v3 が合成時に取ったトークナイザなどは据え置く）。パッケージも消さない。
+/// 更新そのものは済んでいるので、消せなくても止めずに理由を返す。
+fn clean_up_old_models(
+    asset_root: &Path,
+    before: &std::collections::BTreeMap<String, String>,
+    now: &std::collections::BTreeMap<String, String>,
+) -> OldModelCleanup {
+    let mut out = OldModelCleanup::default();
+    let model_root = asset_root.join("model");
+    for name in old_model_dirs(before, now) {
+        let dir = model_root.join(&name);
+        if !dir.exists() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => out.removed_models.push(name),
+            Err(e) => out.failed.push(format!("{}（{e}）", dir.display())),
+        }
+    }
+    // 変換結果は、いまの合成とコーデックの組のものだけ残す。組が分からなければ触らない。
+    let (Some(synth), Some(codec)) = (now.get("model_synth"), now.get("model_codec")) else {
+        return out;
+    };
+    let current = format!(".{}+{}.", model_dir_of(synth), model_dir_of(codec));
+    let suffix = crate::tts::voice_ref::REF_LATENT_SUFFIX;
+    let tmp_suffix = format!("{suffix}.tmp");
+    let Ok(entries) = std::fs::read_dir(asset_root.join("refs")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let Some(file) = file.to_str() else { continue };
+        let is_latent = file.ends_with(suffix) || file.ends_with(&tmp_suffix);
+        if !is_latent || file.contains(&current) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => out.removed_latents += 1,
+            Err(e) => out.failed.push(format!("{}（{e}）", entry.path().display())),
+        }
+    }
+    out
+}
+
+/// 片付けの結果を画面とログに出す。
+fn report_old_model_cleanup(cleanup: &OldModelCleanup, mut on_line: impl FnMut(&str)) {
+    if !cleanup.removed_models.is_empty() || cleanup.removed_latents > 0 {
+        let message = format!(
+            "古いモデルを片付けました（{}。参照音声の変換結果 {} 件）",
+            if cleanup.removed_models.is_empty() {
+                "モデルは無し".to_string()
+            } else {
+                cleanup.removed_models.join(" / ")
+            },
+            cleanup.removed_latents
+        );
+        crate::ulog!("[irodori] {message}");
+        on_line(&message);
+    }
+    if !cleanup.failed.is_empty() {
+        let message = format!(
+            "古いモデルのうち消せなかったものがあります（使っていないので、手で消して構いません）: {}",
+            cleanup.failed.join(" / ")
+        );
+        crate::ulog!("[irodori] {message}");
+        on_line(&message);
+    }
+}
+
 /// 古くなった分だけを入れ直す (v0.5.4 項目 3 / v0.5.6 項目 3c・3d、spec §6.0)。
 ///
 /// **1 つのトランザクションにする。** 途中のどこで失敗しても、入れ替えたものを**全部**戻す
@@ -2377,6 +2488,8 @@ where
     }
 
     recover_interrupted_update(asset_root, &py_exe, |l| on_line(l))?;
+    // 更新の前に読んでいたモデル（v0.5.7 項目 10。成功したら、ここに入っていて使われなくなったものを片付ける）
+    let models_before = models_to_read(read_stamp(asset_root).as_ref());
 
     let plan = update_plan(outdated);
     for name in &plan.skipped {
@@ -2487,6 +2600,13 @@ where
     // 「入れ直したのに `up_to_date` が false のまま」を自動で検出できなかった。
     record_after_install(asset_root, &plan.names, |l| on_line(l))
         .context("入れ直しは成功しましたが、導入記録を書けませんでした")?;
+
+    // ⑤ **旧モデルを片付ける**（v0.5.7 項目 10）。**合成と生成の両方を確かめ、記録を書いたあとだけ。**
+    // 確かめられなかったとき（GPU が無い等）はここに来ても消さない。保留は上で返っている。
+    if matches!(outcome, GateOutcome::Passed { voice_design: true, .. }) {
+        let now = models_to_read(read_stamp(asset_root).as_ref());
+        report_old_model_cleanup(&clean_up_old_models(asset_root, &models_before, &now), |l| on_line(l));
+    }
 
     Ok(plan.names)
 }
@@ -5552,6 +5672,116 @@ mod update_tests {
         let port = src.find("    port = args.port if").expect("ポート確保");
         let ready = src.find("--ready-file が必要です").expect("--ready-file の必須チェック");
         assert!(branch < port && branch < ready, "分岐がポート確保・--ready-file の検査より後にある");
+    }
+
+    /// **使われなくなったモデルの置き場所だけを挙げる**（v0.5.7 項目 10）。v3 から v4.1 への更新なら、v3・
+    /// v2-VoiceDesign・revision を固定する前のコーデックの写しの 3 つ。前後が同じなら無し。
+    #[test]
+    fn old_model_dirs_are_those_no_longer_read() {
+        let before = v054_baseline_models();
+        let now = current_models();
+        assert_eq!(
+            old_model_dirs(&before, &now),
+            vec![
+                "Aratako__Irodori-TTS-500M-v2-VoiceDesign".to_string(),
+                "Aratako__Irodori-TTS-500M-v3".to_string(),
+                "Aratako__Semantic-DACVAE-Japanese-32dim".to_string(),
+            ]
+        );
+        assert!(old_model_dirs(&now, &now).is_empty(), "変わっていなければ何も消さない");
+        // 生成と合成が同じ置き場所（v4.1）なら 1 つに数え、いまの読み先に入っているものは挙げない
+        let mut half = before.clone();
+        half.insert("model_synth".into(), now["model_synth"].clone());
+        assert_eq!(
+            old_model_dirs(&half, &now),
+            vec!["Aratako__Irodori-TTS-500M-v2-VoiceDesign".to_string(), "Aratako__Semantic-DACVAE-Japanese-32dim".to_string()]
+        );
+    }
+
+    /// **旧モデルの置き場所と、旧モデルのための参照音声の変換結果だけを消す**（v0.5.7 項目 10）。ugg が読んでいた
+    /// 証拠の無い置き場所・いまのモデルの変換結果・参照音声そのものは残す。
+    #[test]
+    fn cleaning_up_removes_only_the_old_models_and_their_latents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let before = v054_baseline_models();
+        let now = current_models();
+        let model = root.join("model");
+        let make_model = |name: &str| {
+            std::fs::create_dir_all(model.join(name)).unwrap();
+            std::fs::write(model.join(name).join("model.safetensors"), b"x").unwrap();
+        };
+        for v in before.values().chain(now.values()) {
+            make_model(&model_dir_of(v));
+        }
+        make_model("someone-else");
+        let refs = root.join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        let key = |m: &std::collections::BTreeMap<String, String>| {
+            format!("{}+{}", model_dir_of(&m["model_synth"]), model_dir_of(&m["model_codec"]))
+        };
+        let (old_key, new_key) = (key(&before), key(&now));
+        let files = [
+            "main_1.wav".to_string(),
+            format!("main_1.{old_key}.fp32-fp32.n-16_e1_s30.latent.pt"),
+            format!("sub_2.{old_key}.fp32-fp32.n-16_e1_s30.latent.pt.tmp"),
+            format!("main_1.{new_key}.bf16-fp32.n-16_e1_s30.latent.pt"),
+        ];
+        for f in &files {
+            std::fs::write(refs.join(f), b"x").unwrap();
+        }
+
+        let out = clean_up_old_models(root, &before, &now);
+
+        assert_eq!(out.removed_models, old_model_dirs(&before, &now));
+        assert_eq!(out.removed_latents, 2);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        let mut left: Vec<String> = std::fs::read_dir(&model)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut expected: Vec<String> = now.values().map(|v| model_dir_of(v)).collect();
+        expected.push("someone-else".into());
+        expected.sort();
+        expected.dedup();
+        assert_eq!(left, expected, "いまのモデルと、読んでいた証拠の無いものは残す");
+        for f in [&files[0], &files[3]] {
+            assert!(refs.join(f).is_file(), "消してはいけない: {f}");
+        }
+        for f in [&files[1], &files[2]] {
+            assert!(!refs.join(f).exists(), "旧モデルの変換結果が残っている: {f}");
+        }
+    }
+
+    /// **旧モデルは、ゲートで合成と生成の両方を確かめ、記録を書いたあとにだけ消す**（v0.5.7 項目 10）。更新の前に
+    /// 読んでいた先を、入れ替える前に控える。保留・全戻しの経路では消さない（旧モデルは全戻しと v3 の材料）。
+    /// AppHandle も python も要らないが、ゲートは実物の python が要るので、配線を本文のテキストで固定する。
+    #[test]
+    fn old_models_are_cleaned_up_only_after_both_checks_and_the_record() {
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body = &src[src.find("pub async fn update_irodori_runtime<F>(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("無い: {s}"));
+        assert!(
+            at("let models_before = models_to_read(read_stamp(asset_root).as_ref());") < at("let applied = apply_update_plan("),
+            "入れ替える前に、読んでいた先を控えていない"
+        );
+        let record = at("record_after_install(asset_root, &plan.names,");
+        let only_if = at("if matches!(outcome, GateOutcome::Passed { voice_design: true, .. }) {");
+        let clean = at("clean_up_old_models(asset_root, &models_before, &now)");
+        assert!(record < only_if && only_if < clean, "記録の後・両方を確かめたときだけ、になっていない");
+        assert_eq!(body.matches("clean_up_old_models(").count(), 1, "保留や全戻しの経路でも消している");
+        // 変換結果の名前の組（合成 + コーデック）は sidecar.py と同じ
+        let py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(
+            py.contains("model_dir_name(MODEL_REPO_SYNTH, MODEL_REVISION_SYNTH)\n            + \"+\"\n            + model_dir_name(MODEL_REPO_CODEC, MODEL_REVISION_CODEC),"),
+            "sidecar.py の変換結果の名前の組が、片付けの探し方（<合成>+<コーデック>）と違う"
+        );
     }
 
     /// **導入と更新の両方のコマンドが、プロセスをまたぐ錠と入口の備えを通る**（v0.5.6 項目 3e・3f の配線）。

@@ -46,7 +46,8 @@ pub fn ref_path_in_dir(dir: &Path, slot: &str, id: i64) -> Result<PathBuf> {
 }
 
 /// 参照音声の事前変換の結果の拡張子（`sidecar.py` の `REF_LATENT_SUFFIX` と揃える）。
-const REF_LATENT_SUFFIX: &str = ".latent.pt";
+/// 更新後の旧モデルの片付け（`irodori_download::clean_up_old_models`）もこれで探す。
+pub(crate) const REF_LATENT_SUFFIX: &str = ".latent.pt";
 
 /// 既存参照音声ファイルを削除する。存在しない場合は Ok を返す。
 ///

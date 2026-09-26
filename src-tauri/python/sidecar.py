@@ -202,7 +202,9 @@ def ref_latent_path(ref_wav: Path, model_key: str, precision: str) -> Path:
     つないで渡す。どれかが変われば別のファイルになり、古い結果を読まない）。ただし revision が
     `main` の間は、上流が中身を差し替えても名前は変わらない（固定の revision へ上げるまでの限界）。
     参照音声を消す・作り直すときは、Rust 側の `voice_ref::delete_file` が参照 wav と同じ
-    ディレクトリの `<参照 wav の stem>.*.latent.pt`（書きかけの `.tmp` を含む）を一緒に消す —
+    ディレクトリの `<参照 wav の stem>.*.latent.pt`（書きかけの `.tmp` を含む）を一緒に消す。
+    更新で旧モデルを片付けるとき（v0.5.7 項目 10）は `irodori_download::clean_up_old_models` が、
+    いまの `<合成>+<コーデック>` を含まない変換結果を消す —
     **置き場所・名前の形・`.tmp` の付け方を変えるなら向こうも直す**（契約テストが見張る）。
     """
     prep = f"n{REF_NORMALIZE_DB:g}_e{int(REF_ENSURE_MAX)}_s{MAX_REF_SECONDS:g}"
