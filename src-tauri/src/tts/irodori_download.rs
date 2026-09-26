@@ -44,10 +44,15 @@ const TORCH_CUDA_INDEX_URL: &str = "https://download.pytorch.org/whl/cu128";
 
 /// Phase C で確実にインストールする共通依存。バージョン固定で再現性を担保。
 /// torch 系は CUDA index 経由で別途インストールする (`install_torch_cuda`)。
+///
+/// `huggingface_hub` は **transformers 5 が連鎖して入れる版そのもの**に固定する（v0.5.7 項目 1）。
+/// 以前は `==0.27.0` と書きながら、transformers の依存に押し上げられて実物は 0.36.2 だった
+/// （要件と記録が食い違い、「版を固定して再現性を担保」が成り立っていなかった）。
+/// 配布名の綴りは記録の名前になるので変えない（`huggingface-hub` と書くと別の名前として残る）。
 const COMMON_REQUIREMENTS: &[&str] = &[
     "fastapi==0.115.6",
     "uvicorn[standard]==0.32.1",
-    "huggingface_hub==0.27.0",
+    "huggingface_hub==1.33.0",
     "numpy<2",
     "soundfile==0.12.1",
 ];
@@ -59,9 +64,17 @@ const TORCH_PACKAGES: &[&str] = &["torch>=2.10.0,<2.11.0", "torchaudio>=2.10.0,<
 /// Irodori-TTS が要求する追加 pip パッケージ (Phase G)。
 /// upstream pyproject の dependencies と Phase G で実 InferenceRuntime に必要な周辺ライブラリを
 /// 過不足なく揃える (`dacvae` / `silentcipher` / `irodori-tts` 本体は GitHub アーカイブで別途)。
+///
+/// **transformers 5 系は spike で確かめた組み合わせに固定する**（v0.5.7 項目 1、spec §6.0）。
+/// 上流は `transformers>=5.12.1,<6` と範囲で宣言しているが、範囲で入れると利用者の環境が
+/// 確かめていない組み合わせになり、将来の 5.x が求める hub と `huggingface_hub` の固定が衝突して
+/// 更新が失敗し続けうる。`tokenizers` は transformers の依存だが、同じ理由で版を明示する。
+/// `pydub` は `silentcipher`（透かし）の import に要る（無いと一度も透かしが効かなかった。項目 5）。
 const IRODORI_EXTRA_REQUIREMENTS: &[&str] = &[
     "torchcodec>=0.10.0,<0.11.0",
-    "transformers<5",
+    "transformers==5.17.0",
+    "tokenizers==0.23.2",
+    "pydub==0.25.1",
     "accelerate>=1.0.0",
     "peft>=0.18.0",
     "safetensors>=0.7.0",
@@ -92,14 +105,16 @@ const DACVAE_ZIPBALL: &str =
     "https://github.com/facebookresearch/dacvae/archive/414c20785fc3a28373073ea8ef7a1316eeeaca6e.zip";
 
 /// Irodori-TTS 本体 (Aratako) の**固定 commit** zipball。`infer.py` / `irodori_tts.inference_runtime`
-/// を提供する。pin: 2026-08-11 時点の main HEAD。
+/// を提供する。pin: 2026-09-12 時点の main HEAD（`89f9d8fb`、MeanFlow と v4-Large の対応。v0.5.7 項目 1）。
+/// `8224daf` から `pyproject.toml` は変わっていない（どちらも `transformers>=5.12.1,<6` を宣言）。
+/// 参照音声の事前変換に使う非公開の `_load_reference_latent` の形も同じ（spec §6.0 の spike）。
 ///
 /// **3 資産すべてを commit 固定にする** (v0.4 負債返済 D4)。以前は本体と dacvae が
 /// `refs/heads/main` 追随で、上流の破壊的変更がそのまま配布版の初回 DL を壊しうる状態だった
 /// (silentcipher だけが pin 済みという非一貫)。更新するときは
 /// **ここを手で上げて実機で DL・合成まで通す**こと。
 const IRODORI_TTS_ZIPBALL: &str =
-    "https://github.com/Aratako/Irodori-TTS/archive/8224dafb46d0aba89209a8f905f1cb7e3299d9c1.zip";
+    "https://github.com/Aratako/Irodori-TTS/archive/89f9d8fbd4d51ea019867ee1197725ede1df13c5.zip";
 
 /// Python 配置ディレクトリ (`%APPDATA%\ugg\irodori\python\`)。
 /// Phase D 以降の `sidecar.py` 起動で使う。
@@ -3103,9 +3118,10 @@ mod stamp_tests {
 
     /// **記録するのは「指定した版」ではなく「実際に入った版」** (v0.5.4)。
     ///
-    /// `huggingface_hub==0.27.0` と指定しているのに実機は 0.36.2 だった
+    /// v0.5.6 までは `huggingface_hub==0.27.0` と指定しているのに実機は 0.36.2 だった
     /// （transformers の依存に押し上げられた）。この食い違いを記録できなければ、
     /// 「版を固定して再現性を担保」という宣言が成立していないことに気づけない。
+    /// v0.5.7 で指定を実物に合わせた（1.33.0）後も、記録が実測値を残す規則は変わらない。
     #[test]
     fn resolved_can_differ_from_the_requested_pin() {
         let dir = tempfile::tempdir().unwrap();
@@ -3126,8 +3142,8 @@ mod stamp_tests {
         assert!(
             COMMON_REQUIREMENTS
                 .iter()
-                .any(|r| *r == "huggingface_hub==0.27.0"),
-            "前提: 指定は 0.27.0"
+                .any(|r| *r == "huggingface_hub==1.33.0"),
+            "前提: 指定は 1.33.0（記録した実測の 0.36.2 と違う）"
         );
         assert_eq!(
             got.resolved.get("huggingface_hub").map(String::as_str),
@@ -3371,7 +3387,7 @@ mod stamp_tests {
         // ＝ 既存環境へ届けなければならない。
         assert_eq!(
             current_requirements().get("transformers").map(String::as_str),
-            Some("transformers<5"),
+            Some("transformers==5.17.0"),
             "前提が変わったらこのテストも直す"
         );
         reqs.insert("transformers".to_string(), "transformers<4".to_string());
@@ -3388,7 +3404,8 @@ mod stamp_tests {
     /// 実機で確認できているので全部対象にしてよい。**要件とモデルは違う** — 記録に
     /// 欄が無いのは v0.5.4 以前が書いた記録だからで、中身が古い証拠にはならない。
     /// ここを対象にすると、v0.5.4 から上げただけのユーザーに **torch を含む数 GB の
-    /// 再取得**を強いる。v0.5.5 は要件を変えていないので、基準値で読んでも対象は出ない。
+    /// 再取得**を強いる。基準値で読むので、対象になるのは**このビルドが基準値から変えたもの
+    /// だけ**（v0.5.5・v0.5.6 は何も変えていないので空、v0.5.7 は transformers などを変えた）。
     #[test]
     fn a_missing_record_does_not_accuse_requirements_or_models() {
         let dir = tempfile::tempdir().unwrap();
@@ -3398,15 +3415,19 @@ mod stamp_tests {
             &Default::default(),
             &Default::default(),
         );
-        for name in ["transformers", "huggingface_hub", "torch"] {
+        for name in ["torch", "torchaudio", "fastapi", "numpy"] {
             assert!(
                 !got.iter().any(|n| n == name),
                 "{name} を数 GB かけて入れ直す理由が無い: {got:?}"
             );
         }
-        for name in ["model_synth", "model_codec"] {
-            assert!(!got.iter().any(|n| n == name), "{name} も同じ: {got:?}");
-        }
+        let pins = ["dacvae", "irodori_tts", "silentcipher"];
+        let named: Vec<String> = got.iter().filter(|n| !pins.contains(&n.as_str())).cloned().collect();
+        assert_eq!(
+            named,
+            changed_since_baseline(),
+            "要件とモデルで対象になるのは、基準値から変えたものだけ"
+        );
         // 固定 URL の 3 本は従来どおり対象（記録が無い＝ pin 前が入っていると分かっている）
         for pkg in ["dacvae", "irodori_tts", "silentcipher"] {
             assert!(got.iter().any(|n| n == pkg), "{pkg} は対象のまま: {got:?}");
@@ -3469,11 +3490,35 @@ mod stamp_tests {
         let persisted = read_stamp(dir.path()).unwrap();
         assert_eq!(persisted.requirements, v054_baseline_requirements(), "保存されていない");
 
-        // 基準値が入ったあとは、変更したものだけが対象になる
+        // 基準値が入ったあとは、このビルドが基準値から変えたものだけが対象になる
+        let base = outdated_list(dir.path(), &persisted.pins, &persisted.requirements, &persisted.models);
+        assert_eq!(base, changed_since_baseline(), "基準値から変えたものだけ: {base:?}");
+        // 記録の側で 1 本だけ違えば、その 1 本が足される（ほかは巻き込まない）
         let mut reqs = persisted.requirements.clone();
-        reqs.insert("transformers".to_string(), "transformers<4".to_string());
+        reqs.insert("einops".to_string(), "einops<0".to_string());
         let got = outdated_list(dir.path(), &persisted.pins, &reqs, &persisted.models);
-        assert_eq!(got, ["transformers"], "変えた 1 本だけ: {got:?}");
+        let mut expected = base.clone();
+        expected.push("einops".to_string());
+        expected.sort();
+        assert_eq!(got, expected, "変えた 1 本だけ足される: {got:?}");
+    }
+
+    /// このビルドが v0.5.4 の基準値から変えた要件とモデルの名前（並べ替え済み）。
+    fn changed_since_baseline() -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (current, baseline) in [
+            (current_requirements(), v054_baseline_requirements()),
+            (current_models(), v054_baseline_models()),
+        ] {
+            out.extend(
+                current
+                    .iter()
+                    .filter(|(name, value)| baseline.get(*name) != Some(value))
+                    .map(|(name, _)| name.clone()),
+            );
+        }
+        out.sort();
+        out
     }
 
     /// **欄が空の記録を「いまの要求どおり」と読まない**（2026-09-14 監査で発覚）。
@@ -3545,15 +3590,65 @@ mod stamp_tests {
         assert_eq!(untouched.models, current_models());
     }
 
-    /// 固定の基準値の写しが正しいこと（**v0.5.5 のうちは、いまの要求と一致する**）。
+    /// **v0.5.6 までの環境から見て、v0.5.7 で変えた要件が漏れなく「更新が要る」に入る**（v0.5.7 項目 1）。
     ///
-    /// v0.5.4 と v0.5.5 は要件もモデルも変えていないので、写し間違いならここで分かる。
-    /// **v0.5.7 で要件やモデルを変えたら、この等式は崩れるのが正しい**（v0.5.6 は変えない）。そのときは
-    /// このテストを消す（`V054_BASELINE_*` の定数は変えない）。
+    /// v0.5.6 までは基準値といまの要求が一致しており、`the_frozen_baseline_was_copied_correctly` が
+    /// その等式で写し間違いを見張っていた（v0.5.7 で要件を変えたら消す、と決めてあった）。等式が崩れた
+    /// いまは、**崩れ方**を固定する: 基準値（＝ v0.5.4〜v0.5.6 が入れた版）から見て、要件の差は
+    /// 版を上げた 3 つと新しく足した 1 つだけ。ほかの要件を巻き込まない（巻き込むと torch を含む数 GB を
+    /// 取り直す）。**`V054_BASELINE_*` の定数は変えない。**
     #[test]
-    fn the_frozen_baseline_was_copied_correctly() {
-        assert_eq!(v054_baseline_requirements(), current_requirements());
+    fn the_v057_requirement_changes_reach_a_v056_install() {
+        let baseline = v054_baseline_requirements();
+        let current = current_requirements();
+        let mut got = outdated_section(&baseline, &baseline, &current);
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["huggingface_hub", "pydub", "tokenizers", "transformers"],
+            "v0.5.6 の環境で入れ直すのはこの 4 つだけ"
+        );
+        // 記録の欄が空の環境（v0.5.4 が書いた記録・記録なし）も、基準値で読んで同じ結果になる。
+        let mut from_empty = outdated_section(&Default::default(), &baseline, &current);
+        from_empty.sort();
+        assert_eq!(from_empty, got);
+        // 基準値の側は据え置き（v0.5.4〜v0.5.6 が入れていた版のまま）。
+        assert_eq!(
+            baseline.get("transformers").map(String::as_str),
+            Some("transformers<5")
+        );
+        assert_eq!(
+            baseline.get("huggingface_hub").map(String::as_str),
+            Some("huggingface_hub==0.27.0")
+        );
+        // モデルは項目 2 で変える。項目 1 の時点では基準値と一致する。
         assert_eq!(v054_baseline_models(), current_models());
+    }
+
+    /// **v0.5.7 の要件の入れ直しは、torch の index を使わない 1 回の pip で行う**（v0.5.6 項目 3c の段取り）。
+    ///
+    /// huggingface_hub と transformers と tokenizers は互いの版を縛り合うので、別々の pip に分けると
+    /// 途中の組み合わせで解決に失敗しうる（spike で確かめたのは 4 つを 1 回で入れた組み合わせ）。
+    #[test]
+    fn the_v057_requirements_go_in_one_pip_call() {
+        let outdated: Vec<String> = ["huggingface_hub", "pydub", "tokenizers", "transformers"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let plan = update_plan(&outdated);
+        assert!(plan.torch.is_empty(), "torch の index から入れるものは無い: {plan:?}");
+        let mut other = plan.other.clone();
+        other.sort();
+        assert_eq!(
+            other,
+            vec![
+                "huggingface_hub==1.33.0",
+                "pydub==0.25.1",
+                "tokenizers==0.23.2",
+                "transformers==5.17.0",
+            ]
+        );
+        assert!(plan.skipped.is_empty());
     }
 
     /// 一致している記録は信じ、**実物に聞かない**。ここが常に真になると、設定パネルを

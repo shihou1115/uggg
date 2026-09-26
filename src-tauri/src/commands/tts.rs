@@ -503,6 +503,23 @@ pub async fn irodori_assets_ready() -> bool {
     irodori_download::assets_ready(&root)
 }
 
+/// 「ランタイムをダウンロード」を押したときの行き先（v0.5.7 項目 1）。
+#[derive(Debug, PartialEq, Eq)]
+enum DownloadRoute {
+    /// まだ入っていない。全段を入れる。
+    FirstInstall,
+    /// もう入っている（`assets_ready`）。変わったものだけを 1 つのトランザクションで入れ直す。
+    Update,
+}
+
+fn download_route(present: bool) -> DownloadRoute {
+    if present {
+        DownloadRoute::Update
+    } else {
+        DownloadRoute::FirstInstall
+    }
+}
+
 /// Irodori 用 Python ランタイム + 共通依存 + 実モデルランタイム + HF モデル本体の初回 DL
 /// (architecture §8.2-8.3, M4c Phase C/G)。
 /// 進捗は `irodori-download` イベントで 1 行ずつ emit、完了時に `"__done__"`。
@@ -516,6 +533,8 @@ pub async fn irodori_assets_ready() -> bool {
 ///      dacvae / irodori-tts) を pip install (~数百MB) — 実モデル経路で必要 (Phase G)
 ///   6. HF モデル本体 (Aratako/Irodori-TTS-500M-v3 + VoiceDesign + DACVAE Codec) を取得 (2〜4GB) —
 ///      サイドカー起動 hot path から切り離すため、ここで先に DL しておく
+///
+/// **導入済み（`assets_ready`）なら上の段取りは行わず、`update_irodori_runtime` に渡す**（v0.5.7 項目 1）。
 #[tauri::command]
 pub async fn download_irodori_assets(
     agreed: bool,
@@ -526,6 +545,13 @@ pub async fn download_irodori_assets(
         return Err("利用規約への同意が必要です".to_string());
     }
     let asset_root = voice_ref::irodori_root().map_err(|e| format!("{e:#}"))?;
+    // **導入済みの環境では全段を入れ直さず、更新の経路へ振り向ける**（v0.5.7 項目 1、spec §6.0）。
+    // この経路は全段を `--upgrade` で入れ直して最後に今の値を記録するだけで、版の控えも全戻しも
+    // 合成のゲートも無い。導入済みの環境で押すと、依存の major 移行（transformers 4→5）が
+    // 失敗しても戻らないまま起きる。更新の経路は同じ移行を 1 つのトランザクションで行う。
+    if download_route(irodori_download::assets_ready(&asset_root)) == DownloadRoute::Update {
+        return update_irodori_runtime(app, state).await.map(|_| ());
+    }
     // 錠のファイルを置く前に作っておく（まっさらな端末ではまだ無い。反証レビュー #13）。
     std::fs::create_dir_all(&asset_root).map_err(|e| format!("資産ルート作成失敗: {e:#}"))?;
     // 更新と同時に走らせない（同じ site-packages を 2 経路が触る）。**もう 1 つの ugg とも**（v0.5.6 項目 3f）。
@@ -822,6 +848,45 @@ pub fn tts_params(settings: &Settings) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **導入済みの環境で「ランタイムをダウンロード」を押しても、全段は入れ直さない**（v0.5.7 項目 1）。
+    /// 全段の入れ直しには版の控えも全戻しも合成のゲートも無いので、依存の major 移行が失敗しても戻らない。
+    #[test]
+    fn an_installed_runtime_is_sent_to_the_update() {
+        assert_eq!(download_route(true), DownloadRoute::Update);
+        assert_eq!(download_route(false), DownloadRoute::FirstInstall);
+    }
+
+    /// 振り分けは**最初の入れる段より前**にあり、導入済みなら更新のコマンドへ渡す（配線を本文のテキストで固定する。
+    /// コマンドは AppHandle が要るので単体では呼べない）。
+    #[test]
+    fn the_download_command_routes_before_installing_anything() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let name = "pub async fn download_irodori_assets";
+        let body = &src[src.find(name).unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let routed = body
+            .find("download_route(irodori_download::assets_ready(")
+            .expect("導入済みかを見ていない");
+        let to_update = body
+            .find("return update_irodori_runtime(")
+            .expect("導入済みのとき更新のコマンドへ渡していない");
+        for step in [
+            "IrodoriBusyGuard::acquire_for(",
+            "prepare_to_replace_runtime(",
+            "ensure_python_embeddable(",
+            "install_common_requirements(",
+            "install_torch_cuda(",
+            "install_irodori_runtime(",
+        ] {
+            let at = body.find(step).unwrap_or_else(|| panic!("{step} が無い"));
+            assert!(routed < at && to_update < at, "{step} より後で振り分けている");
+        }
+    }
 
     /// 入れ替えを始められないときの説明は、**持ち主ごとに、することを分けて言う**（v0.5.6 項目 4）。
     /// ほかの ugg のものは「そちらを終了」、止められなかった孤児は「PC を再起動」。

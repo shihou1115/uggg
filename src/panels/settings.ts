@@ -691,6 +691,13 @@ async function onIrodoriUpdate(): Promise<void> {
 
 async function onIrodoriDownload(): Promise<void> {
   if (!inputs) return;
+  // **導入済みなら更新の経路へ**（v0.5.7 項目 1）。全段の入れ直しには版の控えも全戻しも合成の確認も無く、
+  // 依存の major 移行が失敗しても戻らない。確認の文言も、戻し方を説明している更新のほうを出す
+  // （バック側の `download_irodori_assets` も同じ振り分けをする）。
+  if (irodoriAssetsReady) {
+    await onIrodoriUpdate();
+    return;
+  }
   const ok = await uggConfirm(
     "Irodori-TTS (高品質モード) の Python ランタイム + PyTorch (CUDA 12.8) + " +
       "実モデル実行時ランタイム (irodori-tts / dacvae / silentcipher など) をダウンロードします。\n" +

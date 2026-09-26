@@ -236,6 +236,33 @@ describe("操作列: 更新が届いていないランタイムを開く", () =>
     expect(invoked.some((i) => i.cmd === "update_irodori_runtime")).toBe(true);
   });
 
+  it("導入済みで「ランタイムをダウンロード」を押すと、全段の入れ直しではなく更新になる", async () => {
+    // v0.5.7 項目 1。全段の入れ直しには版の控えも全戻しも合成の確認も無く、依存の major 移行
+    // （transformers 4→5）が失敗しても戻らない。導入済みなら更新（1 つのトランザクション）へ回す。
+    const settle = () => new Promise((r) => setTimeout(r, 0));
+    const called = (cmd: string) => invoked.some((i) => i.cmd === cmd);
+    const downloadBtn = () =>
+      document.getElementById("settings-irodori-download") as HTMLButtonElement;
+
+    irodoriStatus = status({ present: true, has_record: true, up_to_date: false, outdated: ["transformers"] });
+    await open();
+    downloadBtn().dispatchEvent(new Event("click"));
+    await settle();
+    expect(called("update_irodori_runtime"), "導入済みなら更新の経路へ").toBe(true);
+    expect(called("download_irodori_assets"), "全段の入れ直しはしない").toBe(false);
+
+    // 同じ待ち方で、未導入なら全段の導入が始まる = 上の false は「早すぎた」からではない
+    invoked.length = 0;
+    irodoriStatus = status({ present: false, up_to_date: false });
+    vi.resetModules();
+    loadIndexHtml();
+    await open();
+    downloadBtn().dispatchEvent(new Event("click"));
+    await settle();
+    expect(called("download_irodori_assets"), "未導入なら導入する").toBe(true);
+    expect(called("update_irodori_runtime")).toBe(false);
+  });
+
   it("確認で断ったら、入れ直しを始めない", async () => {
     // **「起きないこと」は待っても観測できない。** `vi.waitFor` に否定を渡すと
     // 1 回目の判定で通ってしまい、同意を無視する変異を素通りする
