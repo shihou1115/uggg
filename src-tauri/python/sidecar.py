@@ -99,25 +99,55 @@ SAMPLE_RATE = 22050  # モック wav のサンプルレート
 #
 # v0.5.6 項目 3a: Rust が渡す値は経路で違う。**取得（--download-only）はいまのビルドの値、
 # 起動（読み先）は導入記録から決めた値**で、更新が成功したときだけ記録がビルドに追いつく。
-# ここの既定値は v3（重みがある側）のままにしておく — 渡し忘れたときに重みの無い側へ倒れないように。
-MODEL_REPO_SYNTH = "Aratako/Irodori-TTS-500M-v3"
+# v0.5.7 項目 2: ここの既定値は Rust の `MODEL_PINS` と同じにする（契約テストが見張る）。v0.5.6 は
+# 「重みがある旧モデル（v3）に据え置く」としたが、乗り換えが成功すると旧モデルは消す（項目 10）ので、
+# 重みがあるのは新しいほうになる。Rust は常に 3 つとも渡すので、既定値が使われるのは渡し忘れた経路だけ。
+MODEL_REPO_SYNTH = "Aratako/Irodori-TTS-v4.1-Small"
 MODEL_REPO_VOICE_DESIGN = "Aratako/Irodori-TTS-500M-v2-VoiceDesign"
 MODEL_REPO_CODEC = "Aratako/Semantic-DACVAE-Japanese-32dim"
 # 取得する revision。`main` は「そのとき最新」なので、pip の `refs/heads/main` と
 # 同じく**上げても届かない / 黙って変わる**。Rust 側が固定値を渡せるようにしておく。
-MODEL_REVISION_SYNTH = "main"
+# コーデックも固定する（v0.5.7 項目 2）。`main` の間は repo ID で渡すので、上流が共有 HF キャッシュへ
+# 取りに行き、新規の人は最初の合成で約 0.43 GB を黙って取っていた（`_codec_location`）。
+MODEL_REVISION_SYNTH = "2b28324dc263ed5e6638b3cf3dd94c82ead07b4b"
 MODEL_REVISION_VOICE_DESIGN = "main"
-MODEL_REVISION_CODEC = "main"
+MODEL_REVISION_CODEC = "47376ee24834d7a05a48ebabfe3cde29b3c5e214"
 
-# 推論の精度。v0.5.6 では変えない（bf16 は v0.5.7 の乗り換えと一緒に入れる。spec §6.0）。
-MODEL_PRECISION = "fp32"
+# **モデルごとの値** (v0.5.7 項目 2・4、spec §6.0)。精度とサンプラーは、読み込むモデルで決める。
+# ここに無いモデル（v3・v2-VoiceDesign）は v0.5.6 の値のまま — アプリを v0.5.7 に上げて Irodori の
+# 更新をまだしていない間・更新に失敗して戻った間・VRAM 不足で保留した間は v3 で喋るので、そのとき
+# 音と速さを変えない（v3 の bf16 はユーザーが聴いていない。v3 の sway 8 は 2026-09-14 に許容）。
+# v4.1 の bf16 は 2026-09-26 にユーザーが聴いて許容（参照音声の生成では機械音声のクセが出るが許容範囲内）。
+V4_MODELS = frozenset({"Aratako/Irodori-TTS-v4.1-Small"})
 CODEC_PRECISION = "fp32"
 
+
+def model_precision(repo: str) -> str:
+    """合成モデルの精度。v4 系は bf16（VRAM が v3 より少ない。spec §6.0 の spike）、ほかは fp32。"""
+    return "bf16" if repo in V4_MODELS else "fp32"
+
+
 # 合成のサンプラー (spec §6.0 v0.5.6 項目 1)。
-# 通常合成は linear 40 → sway 8。参照音声の事前変換と合わせて約 3.6〜4.1 倍速（2026-09-14 の実測。
+# v3 の通常合成は linear 40 → sway 8。参照音声の事前変換と合わせて約 3.6〜4.1 倍速（2026-09-14 の実測。
 # 音はユーザーが自分の参照音声で聴いて許容と裁定）。`sway_coeff` は計測と同じ -1.0 のまま。
 SYNTH_NUM_STEPS = 8
 SYNTH_T_SCHEDULE = "sway"
+# v4 系の既定（v0.5.7 項目 4 の設定の既定値と同じ 16）。ステップ数ごとのサンプラーは測った組のまま
+# （8 は sway、16・40 は linear。spec §6.0 の spike）。
+V4_DEFAULT_STEPS = 16
+V4_STEP_SCHEDULES = {8: "sway", 16: "linear", 40: "linear"}
+
+
+# 合成モデル・参照音声の生成モデルのリポジトリから取るもの（v0.5.7 項目 2）。Rust の
+# `MODEL_FILES`（揃っているかの判定）と対。トークナイザを持たないリポジトリでは 2 つ目は何も当たらない。
+WEIGHT_FILE_PATTERNS = ("model.safetensors", "tokenizer/*")
+
+
+def synth_sampler(repo: str) -> tuple[int, str]:
+    """通常合成のステップ数とサンプラー。v4 系は既定の 16・linear、ほかは v0.5.6 の sway 8。"""
+    if repo in V4_MODELS:
+        return V4_DEFAULT_STEPS, V4_STEP_SCHEDULES[V4_DEFAULT_STEPS]
+    return SYNTH_NUM_STEPS, SYNTH_T_SCHEDULE
 # 参照音声の生成（VoiceDesign・no_ref）は据え置く。sway 8 を測ったのは参照音声つきの合成だけで、
 # 生成は一度きりなので速さより品質が効く。用途 2 つの値を分けるだけで、設定の仕組みは作らない。
 VOICE_DESIGN_NUM_STEPS = 40
@@ -263,7 +293,7 @@ def download_models(asset_dir: Path) -> None:
     が `[hf-download] ...` 行を pick して `irodori-download` イベントへ転送する。
     """
     try:
-        from huggingface_hub import hf_hub_download, snapshot_download  # type: ignore
+        from huggingface_hub import snapshot_download  # type: ignore
     except ImportError:
         sys.stderr.write(
             "[hf-download] huggingface_hub が見つかりません。Irodori 資産 DL を実行してください\n"
@@ -276,31 +306,39 @@ def download_models(asset_dir: Path) -> None:
     # `local_dir_use_symlinks` は渡さない（v0.5.6 項目 3c）。huggingface_hub 0.23 以降は非推奨で無視され
     # （警告の行を出すだけ）、1.x では引数ごと消えて TypeError になる。v0.5.7 には、新しい sidecar.py が
     # 更新前の依存のまま動く期間と、その逆の期間があるので、どちらの版でも通る形にしておく。
-    # 合成 / VoiceDesign 本体は upstream infer.py と同じく `model.safetensors` 1 ファイルでよい
-    # (config 情報は safetensors のメタデータに埋め込まれている)。
+    # 合成 / VoiceDesign 本体は upstream infer.py と同じく `model.safetensors` でよい
+    # (config 情報は safetensors のメタデータに埋め込まれている)。**v4 系はトークナイザも要る**
+    # （v0.5.7 項目 2）。上流はチェックポイントの隣の `tokenizer/` があればローカルで読み、無ければ
+    # 合成のときに `sbintuitions/modernbert-ja-310m` を黙って取りに行く。`tokenizer/` を持たない
+    # リポジトリ（v3・v2-VoiceDesign）では何も増えない。
     weight_repos = [
         (MODEL_REPO_SYNTH, MODEL_REVISION_SYNTH),
         (MODEL_REPO_VOICE_DESIGN, MODEL_REVISION_VOICE_DESIGN),
     ]
+    seen = set()
     for repo, revision in weight_repos:
+        # 合成と参照音声の生成が同じモデルなら 1 回だけ確かめる（v0.5.7 項目 3）。
+        if (repo, revision) in seen:
+            continue
+        seen.add((repo, revision))
         local_dir = target_root / model_dir_name(repo, revision)
         # **自前の「存在してサイズ > 0」判定をやめた** (v0.5.5 項目 3)。
         # 途中で切れた DL はサイズ > 0 のまま残るので、それでは完了と区別できない
-        # （v0.5.2 の 0 バイト残骸と同型）。`hf_hub_download` は etag を照合して
+        # （v0.5.2 の 0 バイト残骸と同型）。hub は etag を照合して
         # **一致していれば落とさない**ので、整合性の判断はそちらに委ねる。
         # 既に正しく入っている環境では通信はほぼ発生せず、再取得も起きない。
-        sys.stderr.write(f"[hf-download] {repo}@{revision}/model.safetensors を確認中…\n")
+        sys.stderr.write(f"[hf-download] {repo}@{revision} を確認中…\n")
         local_dir.mkdir(parents=True, exist_ok=True)
-        hf_hub_download(
+        snapshot_download(
             repo_id=repo,
-            filename="model.safetensors",
             revision=revision,
             local_dir=str(local_dir),
+            allow_patterns=list(WEIGHT_FILE_PATTERNS),
         )
         sys.stderr.write(f"[hf-download] {repo} ダウンロード完了\n")
 
-    # コーデック (DACVAE) は InferenceRuntime が repo_id 文字列でロードするので
-    # HF cache に snapshot しておけば codec_repo 経由で読まれる。
+    # コーデック (DACVAE)。revision を固定している間は、ここに取った `weights.pth` をパスで読む
+    # （`_codec_location`）。`main` の間は repo ID で渡し、上流が共有 HF キャッシュから読む。
     codec_dir = target_root / model_dir_name(MODEL_REPO_CODEC, MODEL_REVISION_CODEC)
     # コーデックも同じ理由で `snapshot_download` に判断を委ねる。
     sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} を確認中…\n")
@@ -392,7 +430,7 @@ class RealModelBackend:
                 checkpoint=str(ckpt),
                 model_device=device,
                 codec_repo=self._codec_location(),
-                model_precision=MODEL_PRECISION,
+                model_precision=model_precision(repo),
                 codec_device=device,
                 codec_precision=CODEC_PRECISION,
                 codec_deterministic_encode=True,
@@ -482,7 +520,8 @@ class RealModelBackend:
         ref_wav: Optional[str],
         ref_latent: Optional[str],
     ):
-        """通常合成（参照音声つき）のリクエスト。"""
+        """通常合成（参照音声つき）のリクエスト。ステップ数とサンプラーは読み込むモデルで決める。"""
+        steps, schedule = synth_sampler(MODEL_REPO_SYNTH)
         return self._make_request(
             text=text,
             caption=caption,
@@ -490,8 +529,8 @@ class RealModelBackend:
             ref_latent=ref_latent,
             no_ref=False,
             duration_scale=1.0,
-            num_steps=SYNTH_NUM_STEPS,
-            t_schedule_mode=SYNTH_T_SCHEDULE,
+            num_steps=steps,
+            t_schedule_mode=schedule,
         )
 
     def _reference_latent(self, runtime, voice_ref_path: Path) -> tuple[Optional[str], bool]:
@@ -516,7 +555,7 @@ class RealModelBackend:
             model_dir_name(MODEL_REPO_SYNTH, MODEL_REVISION_SYNTH)
             + "+"
             + model_dir_name(MODEL_REPO_CODEC, MODEL_REVISION_CODEC),
-            f"{MODEL_PRECISION}-{CODEC_PRECISION}",
+            f"{model_precision(MODEL_REPO_SYNTH)}-{CODEC_PRECISION}",
         )
         try:
             # 参照 wav のほうが新しければ作り直す（同じ名前のまま中身が変わった場合の保険）。
@@ -594,9 +633,12 @@ class RealModelBackend:
         # 所要時間を 1 行残す（spec §6.0 v0.5.6 項目 1 の確かめ方）。本文と caption は残さない。
         # 変換結果を作った回はその時間も入るので、そうと分かるように書く。
         reference = "wav" if latent is None else ("latent（今回作成）" if created else "latent")
+        # v0.5.7 項目 2: どのモデルと精度で喋ったかも残す（v3 で喋っている間と乗り換え後を見分ける）。
+        steps, schedule = synth_sampler(MODEL_REPO_SYNTH)
         _diag(
             f"[irodori] 合成 {(time.perf_counter() - started) * 1000:.0f} ms"
-            f"（{SYNTH_NUM_STEPS} ステップ・{SYNTH_T_SCHEDULE}・参照 {reference}）"
+            f"（{MODEL_REPO_SYNTH.rsplit('/', 1)[-1]}・{model_precision(MODEL_REPO_SYNTH)}・"
+            f"{steps} ステップ・{schedule}・参照 {reference}）"
         )
         return _audio_to_wav_bytes(result.audio, int(result.sample_rate))
 

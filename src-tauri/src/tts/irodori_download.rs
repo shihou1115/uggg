@@ -217,15 +217,75 @@ pub fn current_requirements() -> std::collections::BTreeMap<String, String> {
 /// `revision` が `main` なのは**現状の追認**であって固定ではない。pip の
 /// `refs/heads/main` と同じく「そのとき最新」なので、上げても届かないし黙って変わる。
 /// **この仕組みが入ったことで、固定値へ変えれば既存環境へ届くようになる。**
+///
+/// **v0.5.7 項目 2**: 合成を v3 から `Aratako/Irodori-TTS-v4.1-Small`（bf16。精度は `sidecar.py` が
+/// モデルで決める）へ。コーデックも revision を固定する（`main` の間は上流が共有 HF キャッシュから
+/// 読み、新規の人は最初の合成で約 0.43 GB を黙って取っていた）。
 const MODEL_PINS: &[(&str, &str, &str)] = &[
-    ("model_synth", "Aratako/Irodori-TTS-500M-v3", "main"),
+    (
+        "model_synth",
+        "Aratako/Irodori-TTS-v4.1-Small",
+        "2b28324dc263ed5e6638b3cf3dd94c82ead07b4b",
+    ),
     (
         "model_voice_design",
         "Aratako/Irodori-TTS-500M-v2-VoiceDesign",
         "main",
     ),
-    ("model_codec", "Aratako/Semantic-DACVAE-Japanese-32dim", "main"),
+    (
+        "model_codec",
+        "Aratako/Semantic-DACVAE-Japanese-32dim",
+        "47376ee24834d7a05a48ebabfe3cde29b3c5e214",
+    ),
 ];
+
+/// いまのビルドのモデルが**揃っている**と言えるファイル（`model\<置き場所>\` からの相対パス。v0.5.7 項目 2）。
+///
+/// v4.1 はトークナイザをチェックポイントの隣に置く（`sidecar.py` の `WEIGHT_FILE_PATTERNS` で取る）。
+/// 無ければ上流が合成のときに `sbintuitions/modernbert-ja-310m` を黙って取りに行く。**欠けていても
+/// 「未導入」にはしない**（`assets_ready` の意味は変えない — 変えると、更新前の人の設定が消えて更新ボタンも
+/// 隠れる。spec §6.0 の反証 1）。記録がいまのビルドのモデルを指しているのに欠けていれば、「更新が要る」に数える。
+const MODEL_FILES: &[(&str, &[&str])] = &[
+    (
+        "model_synth",
+        &["model.safetensors", "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json"],
+    ),
+    ("model_voice_design", &["model.safetensors"]),
+    ("model_codec", &["weights.pth"]),
+];
+
+/// モデルの置き場所の名前。**`sidecar.py` の `model_dir_name` と同じ規則**（契約テストが見張る）:
+/// `/` を `__` に、revision が `main` 以外なら `@revision` を付ける。
+fn model_dir_name(repo: &str, revision: &str) -> String {
+    let safe = repo.replace('/', "__");
+    if revision.is_empty() || revision == "main" {
+        safe
+    } else {
+        format!("{safe}@{revision}")
+    }
+}
+
+/// いまのビルドのモデルのうち、記録はそれを指しているのにファイルが欠けているものの名前。
+fn incomplete_models(
+    asset_root: &Path,
+    recorded_models: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let model_root = asset_root.join("model");
+    MODEL_PINS
+        .iter()
+        .filter(|(name, repo, rev)| recorded_models.get(*name) == Some(&format!("{repo}@{rev}")))
+        .filter(|(name, repo, rev)| {
+            let dir = model_root.join(model_dir_name(repo, rev));
+            let files = MODEL_FILES
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, files)| *files)
+                .unwrap_or(&[]);
+            files.iter().any(|f| !dir.join(f).is_file())
+        })
+        .map(|(name, _, _)| name.to_string())
+        .collect()
+}
 
 /// いまのビルドが要求している HF モデル一式（名前 → `repo@revision`）。
 pub fn current_models() -> std::collections::BTreeMap<String, String> {
@@ -682,6 +742,14 @@ fn outdated_list(
         &v054_baseline_models(),
         &current_models(),
     ));
+    // 記録はいまのモデルを指しているのにファイルが欠けているもの（v0.5.7 項目 2。トークナイザなど）。
+    // 欄が空の記録は基準値で読む（`outdated_section` と同じ）。
+    let effective_models = if recorded_models.is_empty() {
+        v054_baseline_models()
+    } else {
+        recorded_models.clone()
+    };
+    out.extend(incomplete_models(asset_root, &effective_models));
     out.sort();
     out.dedup();
     out.retain(|n| n != "python");
@@ -2977,7 +3045,8 @@ mod stamp_tests {
         let read = read.join(" ");
         assert!(read.contains("--model-synth-revision old111"), "{read}");
         let fetch = model_args_for_fetch().join(" ");
-        assert!(fetch.contains("--model-synth-revision main"), "{fetch}");
+        let synth_rev = MODEL_PINS.iter().find(|(n, _, _)| *n == "model_synth").unwrap().2;
+        assert!(fetch.contains(&format!("--model-synth-revision {synth_rev}")), "{fetch}");
         assert_ne!(read, fetch, "記録が古ければ読み先と取得先は違う");
     }
 
@@ -3095,6 +3164,7 @@ mod stamp_tests {
     #[test]
     fn stamp_round_trips() {
         let dir = tempfile::tempdir().unwrap();
+        place_current_model_files(dir.path());
         assert!(read_stamp(dir.path()).is_none(), "書く前は記録なし");
 
         let resolved = [("transformers", "4.57.6"), ("huggingface_hub", "0.36.2")]
@@ -3376,6 +3446,7 @@ mod stamp_tests {
     #[test]
     fn changing_a_named_requirement_makes_it_outdated() {
         let dir = tempfile::tempdir().unwrap();
+        place_current_model_files(dir.path());
         let pins = current_pins();
         let mut reqs = current_requirements();
         assert!(
@@ -3409,6 +3480,7 @@ mod stamp_tests {
     #[test]
     fn a_missing_record_does_not_accuse_requirements_or_models() {
         let dir = tempfile::tempdir().unwrap();
+        place_current_model_files(dir.path());
         let got = outdated_list(
             dir.path(),
             &Default::default(),
@@ -3470,6 +3542,7 @@ mod stamp_tests {
     #[test]
     fn an_old_record_gets_a_baseline_written_in() {
         let dir = tempfile::tempdir().unwrap();
+        place_current_model_files(dir.path());
         // v0.5.4 が書いた記録 = pins と resolved はあるが requirements / models が無い
         write_stamp_pins(
             dir.path(),
@@ -3501,6 +3574,98 @@ mod stamp_tests {
         expected.push("einops".to_string());
         expected.sort();
         assert_eq!(got, expected, "変えた 1 本だけ足される: {got:?}");
+    }
+
+    /// いまのビルドのモデルのファイルを置く（v0.5.7 項目 2）。記録がいまの値を指していても、
+    /// ファイルが無ければ「更新が要る」に数えるので、「全部一致なら空」を確かめるテストはこれを先に呼ぶ。
+    fn place_current_model_files(root: &Path) {
+        for (name, repo, rev) in MODEL_PINS {
+            let dir = root.join("model").join(model_dir_name(repo, rev));
+            let files = MODEL_FILES.iter().find(|(n, _)| n == name).expect("表に無い").1;
+            for f in files {
+                let path = dir.join(f);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"x").unwrap();
+            }
+        }
+    }
+
+    /// **記録はいまのモデルを指しているのにトークナイザが欠けていたら、「更新が要る」に数える**（v0.5.7 項目 2）。
+    /// ただし「未導入」にはしない — `assets_ready` はモデルを見ない（見ると更新前の人の設定が消え、
+    /// 更新ボタンも隠れる。spec §6.0 の反証 1）。
+    #[test]
+    fn a_missing_tokenizer_makes_the_model_outdated_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        place_current_model_files(dir.path());
+        let (_, repo, rev) = MODEL_PINS.iter().find(|(n, _, _)| *n == "model_synth").unwrap();
+        let synth = dir.path().join("model").join(model_dir_name(repo, rev));
+        std::fs::remove_file(synth.join("tokenizer").join("tokenizer_config.json")).unwrap();
+
+        let got = outdated_list(dir.path(), &current_pins(), &current_requirements(), &current_models());
+        assert_eq!(got, vec!["model_synth"], "欠けたモデルだけが対象: {got:?}");
+        assert!(!assets_ready(dir.path()), "前提: この一時フォルダには Python が無い");
+        // `assets_ready` の中身はモデルを見ない（本文のテキストで固定）
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body = &src[src.find("pub fn assets_ready(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            !body.contains("MODEL_FILES") && !body.contains("incomplete_models") && !body.contains("tokenizer"),
+            "assets_ready がモデルを見ている（「使えるか」と「最新か」を混ぜない）"
+        );
+    }
+
+    /// 記録が**古いモデル**を指しているときは、新しいモデルのファイルが無いのは当たり前なので、
+    /// 欠けを理由に数えない（古いことを理由に数える。二重に数えない）。
+    #[test]
+    fn an_old_model_in_the_record_is_not_blamed_for_missing_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = v054_baseline_models();
+        assert!(incomplete_models(dir.path(), &old).iter().all(|n| n == "model_voice_design"),
+            "古い値の欄は見ない（いまの値と同じ欄だけが残りうる）");
+        let got = outdated_list(dir.path(), &current_pins(), &current_requirements(), &old);
+        let mut expected = changed_since_baseline()
+            .into_iter()
+            .filter(|n| n.starts_with("model_"))
+            .collect::<Vec<_>>();
+        // いまの値と同じ欄（参照音声の生成）はファイルが無いので欠けとして数える
+        expected.push("model_voice_design".to_string());
+        expected.sort();
+        expected.dedup();
+        assert_eq!(got, expected);
+    }
+
+    /// 全部そろっていれば数えない。
+    #[test]
+    fn complete_current_models_are_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        place_current_model_files(dir.path());
+        assert!(incomplete_models(dir.path(), &current_models()).is_empty());
+    }
+
+    /// **置き場所の名前は `sidecar.py` の `model_dir_name` と同じ規則**（v0.5.7 項目 2。Rust で欠けを見る
+    /// ために写した。食い違うと、揃っているのに毎回「更新が要る」になるか、欠けを見逃す）。
+    #[test]
+    fn the_model_dir_name_matches_the_sidecar() {
+        assert_eq!(model_dir_name("Aratako/X", "main"), "Aratako__X");
+        assert_eq!(model_dir_name("Aratako/X", ""), "Aratako__X");
+        assert_eq!(model_dir_name("Aratako/X", "abc"), "Aratako__X@abc");
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"))
+            .unwrap();
+        for needle in [
+            "safe = repo.replace(\"/\", \"__\")",
+            "return f\"{safe}@{revision}\" if revision and revision != \"main\" else safe",
+            "WEIGHT_FILE_PATTERNS = (\"model.safetensors\", \"tokenizer/*\")",
+        ] {
+            assert!(src.contains(needle), "sidecar.py の規則が変わった: {needle}");
+        }
+        // 表の名前は MODEL_PINS と同じ組
+        let mut a: Vec<&str> = MODEL_PINS.iter().map(|(n, _, _)| *n).collect();
+        let mut b: Vec<&str> = MODEL_FILES.iter().map(|(n, _)| *n).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
     }
 
     /// このビルドが v0.5.4 の基準値から変えた要件とモデルの名前（並べ替え済み）。
@@ -3621,8 +3786,14 @@ mod stamp_tests {
             baseline.get("huggingface_hub").map(String::as_str),
             Some("huggingface_hub==0.27.0")
         );
-        // モデルは項目 2 で変える。項目 1 の時点では基準値と一致する。
-        assert_eq!(v054_baseline_models(), current_models());
+        // モデルは項目 2 で合成とコーデックを変えた（参照音声の生成は項目 3 で変える）。
+        let mut models = outdated_section(
+            &v054_baseline_models(),
+            &v054_baseline_models(),
+            &current_models(),
+        );
+        models.sort();
+        assert_eq!(models, vec!["model_codec", "model_synth"]);
     }
 
     /// **v0.5.7 の要件の入れ直しは、torch の index を使わない 1 回の pip で行う**（v0.5.6 項目 3c の段取り）。
@@ -3666,6 +3837,7 @@ mod stamp_tests {
     #[test]
     fn outdated_list_names_only_what_changed() {
         let dir = tempfile::tempdir().unwrap();
+        place_current_model_files(dir.path());
         let mut recorded = current_pins();
         assert!(
             outdated_list(dir.path(), &recorded, &current_requirements(), &current_models()).is_empty(),
@@ -3691,20 +3863,66 @@ mod stamp_tests {
             .join("sidecar.py");
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("sidecar.py を読めない {}: {e}", path.display()));
+        // **代入の行そのものを見る**（v0.5.7 の変異テストで発覚）。以前は「文字列がファイルのどこかに
+        // ある」だけを見ており、v4 系の一覧（`V4_MODELS`）に同じ名前を書いたら、既定値を v3 に戻しても通った。
         for (name, repo, rev) in MODEL_PINS {
+            let suffix = match *name {
+                "model_synth" => "SYNTH",
+                "model_voice_design" => "VOICE_DESIGN",
+                "model_codec" => "CODEC",
+                other => panic!("sidecar.py の定数の名前が分からない: {other}"),
+            };
+            let repo_line = format!("MODEL_REPO_{suffix} = \"{repo}\"");
             assert!(
-                src.contains(&format!("\"{repo}\"")),
-                "{name}: sidecar.py の既定値が Rust の正本と違う（{repo} が無い）"
+                src.lines().any(|l| l == repo_line),
+                "{name}: sidecar.py の既定値が Rust の正本と違う（{repo_line} が無い）"
             );
+            let rev_line = format!("MODEL_REVISION_{suffix} = \"{rev}\"");
             assert!(
-                src.contains(&format!("\"{rev}\"")),
-                "{name}: revision {rev} が sidecar.py に無い"
+                src.lines().any(|l| l == rev_line),
+                "{name}: sidecar.py の既定の revision が Rust の正本と違う（{rev_line} が無い）"
             );
         }
         assert!(
             src.contains("_apply_model_args"),
             "sidecar.py が Rust からの指定を受け取らなくなっている（正本が 2 つに割れる）"
         );
+    }
+
+    /// **合成モデルとコーデックの revision は固定値（40 桁の commit）**（v0.5.7 項目 2）。
+    /// `main` は「そのとき最新」なので、上げても届かないし黙って変わる。コーデックは `main` の間、
+    /// 上流が共有 HF キャッシュから読み、新規の人は最初の合成で約 0.43 GB を黙って取っていた。
+    #[test]
+    fn the_synth_and_codec_revisions_are_fixed_commits() {
+        for want in ["model_synth", "model_codec"] {
+            let (_, repo, rev) = MODEL_PINS.iter().find(|(n, _, _)| *n == want).unwrap();
+            assert!(
+                rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit()),
+                "{want} ({repo}) の revision が固定の commit ではない: {rev}"
+            );
+        }
+    }
+
+    /// **いまのビルドの合成モデルは `sidecar.py` の v4 系の一覧に入っていて、v3 は入っていない**（v0.5.7 項目 2）。
+    ///
+    /// 精度（bf16）とサンプラー（既定 16 ステップ）は `sidecar.py` が読み込むモデルで決める。`MODEL_PINS` だけ
+    /// 変えて一覧を直し忘れると、新しいモデルが fp32・sway 8 で動く。逆に v3 が入ると、更新前の人の v3 が
+    /// ユーザーの聴いていない bf16・16 ステップに変わる（spec §6.0 項目 2・4。v3 は v0.5.6 の値のまま）。
+    #[test]
+    fn the_current_synth_model_is_the_only_v4_model_and_v3_is_not() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
+        )
+        .unwrap();
+        let line = src
+            .lines()
+            .find(|l| l.starts_with("V4_MODELS = frozenset({"))
+            .expect("sidecar.py に V4_MODELS が無い");
+        let synth = MODEL_PINS.iter().find(|(n, _, _)| *n == "model_synth").unwrap().1;
+        assert!(line.contains(&format!("\"{synth}\"")), "いまの合成モデルが v4 系の一覧に無い: {line}");
+        let baseline_synth = v054_baseline_models()["model_synth"].clone();
+        let v3 = baseline_synth.split('@').next().unwrap();
+        assert!(!line.contains(&format!("\"{v3}\"")), "v3 が v4 系の一覧に入っている: {line}");
     }
 
     /// **モデルも更新の対象になる** (v0.5.5 項目 3)。
@@ -3716,6 +3934,7 @@ mod stamp_tests {
     #[test]
     fn changing_a_model_makes_it_outdated() {
         let dir = tempfile::tempdir().unwrap();
+        place_current_model_files(dir.path());
         let mut models = current_models();
         assert!(
             outdated_list(dir.path(), &current_pins(), &current_requirements(), &models).is_empty(),
