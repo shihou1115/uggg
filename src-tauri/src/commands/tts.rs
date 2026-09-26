@@ -580,6 +580,11 @@ pub async fn download_irodori_assets(
         irodori_download::install_common_requirements(&asset_root, &emit)
             .await
             .map_err(|e| format!("{e:#}"))?;
+        // 透かしの重みを先に取る（v0.5.7 項目 5）。huggingface_hub が入った後、pydub（透かしを効かせる）を
+        // 入れる前。失敗しても導入は止めない（透かしが無くても合成はできる）。
+        if let Err(err) = irodori_download::prefetch_watermark_weights(&asset_root, &emit) {
+            irodori_download::report_watermark_prefetch_failure(&err, &emit);
+        }
         irodori_download::install_torch_cuda(&asset_root, &emit)
             .await
             .map_err(|e| format!("{e:#}"))?;

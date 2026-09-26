@@ -1777,6 +1777,12 @@ where
         }
     };
 
+    // ⓪ 透かしの重みを先に取る（v0.5.7 項目 5）。名前付き要件（pydub を含む）より前に置く — 途中で全戻し
+    //    しても pydub は残るので、残ったときに合成で黙って取りに行かせない。失敗しても止めない。
+    if let Err(err) = prefetch_watermark_weights(asset_root, |l| on_line(l)) {
+        report_watermark_prefetch_failure(&err, |l| on_line(l));
+    }
+
     // ① 名前付き要件。torch 系を先に（その他の要件が新しい torch を前提にしていても、PyPI から
     //    取りに行かせないため）。
     if !plan.torch.is_empty() {
@@ -1948,8 +1954,9 @@ enum GateExit {
 /// 一発合成の結果（v0.5.6 項目 3b）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GateOutcome {
-    /// 合成できた（モデルの読み込みを含めた時間）。
-    Passed { ms: u64 },
+    /// 合成できた（モデルの読み込みを含めた時間）。`watermark` は透かしが効いていたか（v0.5.7 項目 5。
+    /// 古い `sidecar.py` は返さないので `None`。合否には使わない — 透かしが無くても合成はできる）。
+    Passed { ms: u64, watermark: Option<bool> },
     /// 参照音声が 1 つも無い（ユーザー裁定: 確かめられなかったとして更新は成立させる）。
     NoVoiceRef,
     /// torch から GPU が見えない。
@@ -1991,7 +1998,8 @@ fn classify_gate(
     let bytes = result.get("bytes").and_then(serde_json::Value::as_u64).unwrap_or(0);
     if ok && bytes > 0 && exit == GateExit::Code(Some(0)) {
         let ms = result.get("ms").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        return GateOutcome::Passed { ms };
+        let watermark = result.get("watermark").and_then(serde_json::Value::as_bool);
+        return GateOutcome::Passed { ms, watermark };
     }
     match result.get("kind").and_then(serde_json::Value::as_str) {
         Some("oom") => GateOutcome::OutOfMemory,
@@ -2027,9 +2035,16 @@ enum GateVerdict {
 /// なった**なら更新のせいとして戻す。元から使えない（または分からない）環境だけ飛ばす。
 fn gate_verdict(outcome: &GateOutcome, cuda_before: Option<bool>) -> GateVerdict {
     match outcome {
-        GateOutcome::Passed { ms } => GateVerdict::Pass(format!(
-            "合成できました（モデルの読み込みを含めて {:.1} 秒）",
-            *ms as f64 / 1000.0
+        GateOutcome::Passed { ms, watermark } => GateVerdict::Pass(format!(
+            "合成できました（モデルの読み込みを含めて {:.1} 秒{}）",
+            *ms as f64 / 1000.0,
+            // v0.5.7 項目 5: 効いていないことがまた見えなくならないように（v0.5.4 は一度も効いていないことに
+            // 実機検証で初めて気づいた）
+            match watermark {
+                Some(true) => "。透かし: 効いています",
+                Some(false) => "。透かし: 効いていません",
+                None => "",
+            }
         )),
         GateOutcome::NoVoiceRef => GateVerdict::Skip(
             "参照音声がまだ無いので、合成は確かめられませんでした（更新は済ませました）".to_string(),
@@ -2266,7 +2281,7 @@ where
     // 試しても「コードだけ新しくて重みが無い」を捕まえられない）。
     // 入れ直すものが無い呼び出し（前回の後始末だけ）では確かめない（何も変えていない）。
     let outcome = if plan.names.is_empty() {
-        GateOutcome::Passed { ms: 0 }
+        GateOutcome::Passed { ms: 0, watermark: None }
     } else {
         run_synth_gate(asset_root, &py_exe, &model_args_for_fetch(), |l| on_line(l))
     };
@@ -2315,6 +2330,42 @@ where
 /// マルチGBのモデル取得は本ステップで完了させておく。`--download-only` モードは uvicorn を
 /// 起動せず、download_models 完了で即終了する。stderr の `[hf-download] ...` 行は run_python
 /// が on_line に流すので、`download_irodori_assets` の `irodori-download` event に伝わる。
+/// 透かし（SilentCipher）の重みを、上流が読みに行く共有 HF キャッシュへ先に取る（v0.5.7 項目 5、spec §6.0）。
+///
+/// 取らないと、pydub が入った環境の**最初の合成で上流が黙って取りに行く**（約 68 MB）。更新の途中で全戻し
+/// しても pydub などの新しく入った配布は残る（消すほうが別の依存を壊しうる）ので、**更新の最初の段**で取る。
+/// **失敗しても導入・更新は止めない**（透かしが無くても合成はできる）。呼び出し側が理由を画面とログに出す。
+pub fn prefetch_watermark_weights<F>(asset_root: &Path, mut on_line: F) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    let py_exe = asset_root.join("python").join("python.exe");
+    let sidecar_py = asset_root.join("sidecar.py");
+    if !sidecar_py.is_file() {
+        return Err(anyhow!("sidecar.py が配置されていません: {}", sidecar_py.display()));
+    }
+    on_line("透かし（SilentCipher）の重みを取得しています…（約 68 MB）");
+    let asset_root_str = asset_root.to_string_lossy().into_owned();
+    let sidecar_py_str = sidecar_py.to_string_lossy().into_owned();
+    run_python(
+        &py_exe,
+        &[sidecar_py_str.as_str(), "--asset-dir", asset_root_str.as_str(), "--fetch-watermark"],
+        |l| on_line(l),
+    )
+}
+
+/// 透かしの重みの先取りに失敗したときに、止めずに理由を伝える（初回導入と更新で共通）。
+pub fn report_watermark_prefetch_failure<F>(err: &anyhow::Error, mut on_line: F)
+where
+    F: FnMut(&str),
+{
+    let msg = format!(
+        "透かしの重みを取得できませんでした（続けます。透かしは合成のときにもう一度取りに行きます）: {err:#}"
+    );
+    crate::ulog!("[irodori] {msg}");
+    on_line(&msg);
+}
+
 pub async fn install_irodori_models<F>(
     asset_root: &Path,
     sidecar_py: &Path,
@@ -4716,6 +4767,73 @@ mod update_tests {
         serde_json::from_str(text).unwrap()
     }
 
+    /// **合格の文面に透かしの状態を出す**（v0.5.7 項目 5）。効いていなくても合格は合格（透かしが無くても合成は
+    /// できる）。v0.5.4 は、一度も効いていないことに実機検証で初めて気づいた。
+    #[test]
+    fn the_gate_says_whether_the_watermark_works() {
+        let say = |w: Option<bool>| match gate_verdict(&GateOutcome::Passed { ms: 7900, watermark: w }, Some(true)) {
+            GateVerdict::Pass(m) => m,
+            other => panic!("合格にならない: {other:?}"),
+        };
+        assert!(say(Some(true)).contains("透かし: 効いています"), "{}", say(Some(true)));
+        assert!(say(Some(false)).contains("透かし: 効いていません"), "{}", say(Some(false)));
+        assert!(!say(None).contains("透かし"), "分からないときは言わない: {}", say(None));
+        assert!(say(Some(false)).contains("7.9 秒"));
+    }
+
+    /// **透かしの重みは更新の最初の段（名前付き要件より前）で取り、失敗しても止めない**（v0.5.7 項目 5）。
+    /// 途中で全戻ししても pydub は残るので、後ろに置くと残った pydub が合成のときに黙って取りに行かせる。
+    #[test]
+    fn the_watermark_weights_are_fetched_first_and_never_stop_the_update() {
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body = &src[src.find("async fn apply_update_plan<F>(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let fetch = body
+            .find("    if let Err(err) = prefetch_watermark_weights(asset_root, |l| on_line(l)) {\n        report_watermark_prefetch_failure(")
+            .expect("更新で透かしの重みを取っていない（または失敗で止まる形）");
+        for later in ["if !plan.torch.is_empty()", "if !plan.other.is_empty()", "for pkg in &plan.pins", "if plan.models"] {
+            let at = body.find(later).unwrap_or_else(|| panic!("{later} が無い"));
+            assert!(fetch < at, "透かしの重みを {later} より後で取っている");
+        }
+        // 初回導入: huggingface_hub を入れた後、pydub を含む追加の依存より前。失敗しても止めない
+        let cmd = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body = &cmd[cmd.find("pub async fn download_irodori_assets").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let common = body.find("install_common_requirements(").unwrap();
+        let fetch = body
+            .find("if let Err(err) = irodori_download::prefetch_watermark_weights(&asset_root, &emit) {\n            irodori_download::report_watermark_prefetch_failure(")
+            .expect("初回導入で透かしの重みを取っていない（または失敗で止まる形）");
+        let runtime = body.find("install_irodori_runtime(").unwrap();
+        assert!(common < fetch && fetch < runtime, "初回導入の順が違う");
+    }
+
+    /// **`sidecar.py` は透かしの重みを上流と同じ呼び方で取る**（v0.5.7 項目 5）。上流の `watermark.py` →
+    /// `silentcipher.get_model()` は `snapshot_download(repo_id="sony/silentcipher")`（revision も置き場所も
+    /// 指定しない）で取りに行く。違う形で取ると上流が見る場所に入らず、合成のときにまた取りに行く。
+    #[test]
+    fn the_sidecar_fetches_the_watermark_weights_the_way_upstream_reads_them() {
+        let py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"))
+            .unwrap();
+        for needle in [
+            "WATERMARK_REPO = \"sony/silentcipher\"",
+            "    snapshot_download(repo_id=WATERMARK_REPO)\n",
+            "        \"--fetch-watermark\",",
+            "    if args.fetch_watermark:",
+            "\"watermark\": backend.watermark_ready()",
+            "        _diag(f\"[irodori] 透かし: {said}\")",
+        ] {
+            assert!(py.contains(needle), "sidecar.py に無い: {needle}");
+        }
+        // 透かしの取得モードは HTTP を立てる前（--download-only と同じく）に分岐する
+        let fetch = py.find("    if args.fetch_watermark:").unwrap();
+        let download = py.find("    if args.download_only:").unwrap();
+        assert!(fetch < download);
+    }
+
     /// 子プロセスの終わり方と目印の行から、ゲートの結果を決める（v0.5.6 項目 3b）。
     #[test]
     fn the_gate_outcome_is_read_from_the_markers_and_the_exit() {
@@ -4723,8 +4841,18 @@ mod update_tests {
         let ok = json(r#"{"ok":true,"ms":41234,"bytes":90000}"#);
         assert_eq!(
             classify_gate(GateExit::Code(Some(0)), Some(&start), Some(&ok)),
-            GateOutcome::Passed { ms: 41234 }
+            GateOutcome::Passed { ms: 41234, watermark: None },
+            "透かしを返さない古い sidecar.py は「分からない」"
         );
+        // v0.5.7 項目 5: 透かしが効いていたかを読む（合否には使わない）
+        for (field, want) in [("true", Some(true)), ("false", Some(false)), ("null", None)] {
+            let r = json(&format!(r#"{{"ok":true,"ms":5,"bytes":9,"watermark":{field}}}"#));
+            assert_eq!(
+                classify_gate(GateExit::Code(Some(0)), Some(&start), Some(&r)),
+                GateOutcome::Passed { ms: 5, watermark: want },
+                "{field}"
+            );
+        }
         // 「ok」と言っても空の合成・0 以外の終了は合格にしない
         let empty = json(r#"{"ok":true,"ms":1,"bytes":0}"#);
         assert!(matches!(
@@ -4769,7 +4897,7 @@ mod update_tests {
         assert!(matches!(gate_verdict(&GateOutcome::NoGpu, Some(false)), GateVerdict::Skip(_)));
         assert!(matches!(gate_verdict(&GateOutcome::NoGpu, None), GateVerdict::Skip(_)));
         assert!(matches!(gate_verdict(&GateOutcome::NoVoiceRef, Some(true)), GateVerdict::Skip(_)));
-        assert!(matches!(gate_verdict(&GateOutcome::Passed { ms: 1 }, Some(true)), GateVerdict::Pass(_)));
+        assert!(matches!(gate_verdict(&GateOutcome::Passed { ms: 1, watermark: None }, Some(true)), GateVerdict::Pass(_)));
     }
 
     /// **VRAM 不足は「移行の失敗」と別の案内で戻す**（spec の裁定）。例外にならず落ちたときは、
@@ -4797,7 +4925,7 @@ mod update_tests {
     #[test]
     fn the_recheck_after_the_rollback_says_whose_fault_it_was() {
         let base = || anyhow!("更新したランタイムで合成できませんでした: X");
-        let caused = format!("{:#}", explain_after_recheck(base(), &GateOutcome::Passed { ms: 1 }));
+        let caused = format!("{:#}", explain_after_recheck(base(), &GateOutcome::Passed { ms: 1, watermark: None }));
         assert!(caused.contains("更新が原因"), "{caused}");
         let before = format!(
             "{:#}",

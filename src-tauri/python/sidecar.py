@@ -359,6 +359,37 @@ def download_models(asset_dir: Path) -> None:
     sys.stderr.write(f"[hf-download] {MODEL_REPO_CODEC} ダウンロード完了\n")
 
 
+# 透かし（SilentCipher）の重み（v0.5.7 項目 5）。上流の `irodori_tts/watermark.py` は、合成のランタイムを作るときに
+# `silentcipher.get_model()` を呼び、重みが手元に無ければ `snapshot_download(repo_id="sony/silentcipher")` で
+# **黙って取りに行く**（約 68 MB。共有 HF キャッシュへ。revision の指定なし）。更新の最初の段で同じ呼び方で先に取って、
+# 合成のときに取りに行かせない（途中で全戻しして pydub だけ残ったときも — spec §6.0 の反証 3）。
+WATERMARK_REPO = "sony/silentcipher"
+
+
+def fetch_watermark_weights() -> None:
+    """透かしの重みを、上流が読みに行く場所（共有 HF キャッシュ）へ先に取る。"""
+    from huggingface_hub import snapshot_download  # type: ignore
+
+    _show_download_progress()
+    sys.stderr.write(f"[hf-download] 透かしの重み（{WATERMARK_REPO}）を確認中…\n")
+    # 上流と**同じ呼び方**にする（repo だけ。revision も置き場所も指定しない）。違う形で取ると、
+    # 上流が見る場所に入らず、合成のときにまた取りに行く。
+    snapshot_download(repo_id=WATERMARK_REPO)
+    sys.stderr.write(f"[hf-download] 透かしの重み（{WATERMARK_REPO}）ダウンロード完了\n")
+
+
+def watermark_state(runtime) -> tuple[bool, str]:
+    """透かしが効いているかと、その説明（v0.5.7 項目 5）。効いていないことが見えなくならないように。"""
+    ready = bool(getattr(getattr(runtime, "watermarker", None), "ready", False))
+    if ready:
+        return True, "効いています"
+    try:
+        import silentcipher  # type: ignore  # noqa: F401
+    except Exception as exc:  # pydub が無い等（v0.5.6 まではこれで一度も効いていなかった）
+        return False, f"効いていません（{type(exc).__name__}: {exc}）"
+    return False, "効いていません（重みを読み込めませんでした）"
+
+
 class RealModelBackend:
     """実 Aratako/Irodori-TTS を用いた推論の薄いラッパ。
 
@@ -434,7 +465,7 @@ class RealModelBackend:
                 f"model.safetensors が見つかりません: {ckpt}. download_models を先に実行してください"
             )
         device = self._resolve_device()
-        return InferenceRuntime.from_key(
+        runtime = InferenceRuntime.from_key(
             RuntimeKey(
                 checkpoint=str(ckpt),
                 model_device=device,
@@ -448,11 +479,20 @@ class RealModelBackend:
                 compile_dynamic=False,
             )
         )
+        _, said = watermark_state(runtime)
+        _diag(f"[irodori] 透かし: {said}")
+        return runtime
 
     def _load_synth(self):
         if self._synth_runtime is None:
             self._synth_runtime = self._build_runtime(MODEL_REPO_SYNTH, MODEL_REVISION_SYNTH)
         return self._synth_runtime
+
+    def watermark_ready(self) -> Optional[bool]:
+        """読み込み済みの合成のランタイムで透かしが効いているか（まだ読み込んでいなければ None）。"""
+        if self._synth_runtime is None:
+            return None
+        return watermark_state(self._synth_runtime)[0]
 
     def _load_voice_design(self):
         # **合成と同じモデルなら、読み込み済みの合成のランタイムを使い回す**（v0.5.7 項目 3）。上流の
@@ -749,8 +789,9 @@ def synth_once(asset_dir: Path, voice_ref: Path) -> int:
         _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "no_gpu"})
         return SYNTH_ONCE_NO_GPU
     started = time.perf_counter()
+    backend = RealModelBackend(asset_dir)
     try:
-        wav = RealModelBackend(asset_dir).synthesize(SYNTH_ONCE_TEXT, voice_ref, 1.0, None)
+        wav = backend.synthesize(SYNTH_ONCE_TEXT, voice_ref, 1.0, None)
     except Exception as exc:
         if _is_out_of_memory(exc):
             _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "oom", "error": type(exc).__name__})
@@ -761,7 +802,8 @@ def synth_once(asset_dir: Path, voice_ref: Path) -> int:
         _report(SYNTH_ONCE_MARKER, {"ok": False, "kind": "other", "error": "合成結果が空でした"})
         return SYNTH_ONCE_FAILED
     ms = int((time.perf_counter() - started) * 1000)
-    _report(SYNTH_ONCE_MARKER, {"ok": True, "ms": ms, "bytes": len(wav)})
+    # v0.5.7 項目 5: 透かしが効いているかも返す（効いていなくても合成はできるので合否には使わない）。
+    _report(SYNTH_ONCE_MARKER, {"ok": True, "ms": ms, "bytes": len(wav), "watermark": backend.watermark_ready()})
     return SYNTH_ONCE_OK
 
 
@@ -966,6 +1008,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         " uvicorn は立てない。--voice-ref が必要",
     )
     parser.add_argument("--voice-ref", type=Path, default=None, help="--synth-once で使う参照 wav")
+    parser.add_argument(
+        "--fetch-watermark",
+        action="store_true",
+        help="透かしの重みを共有 HF キャッシュへ先に取って即終了する（v0.5.7 項目 5）。uvicorn は立てない",
+    )
     # **モデルの正本は Rust 側** (v0.5.5 項目 3)。渡されなければ上の既定値を使う。
     # ここをハードコードのままにすると、`sidecar.py` は毎起動で上書きされるのに
     # 重みは初回 DL でしか取らないため、ID を変えた瞬間に重みだけ無い状態になる。
@@ -982,6 +1029,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     logging.basicConfig(level=args.log_level.upper())
     asset_dir: Path = args.asset_dir
     asset_dir.mkdir(parents=True, exist_ok=True)
+
+    # --fetch-watermark モード（v0.5.7 項目 5）: 透かしの重みだけ取って即終了。更新の最初の段で呼ばれる。
+    if args.fetch_watermark:
+        try:
+            fetch_watermark_weights()
+        except Exception as exc:
+            sys.stderr.write(f"[hf-download] 透かしの重みの取得に失敗: {type(exc).__name__}: {exc}\n")
+            return 1
+        return 0
 
     # --download-only モード: HF モデルだけ DL して即終了。ready.json も書かない。
     # Rust 側 (irodori_download::install_irodori_models) が wait() で待つ。
