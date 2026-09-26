@@ -460,15 +460,30 @@ pub fn get_calendar_events(
     Ok(rows.into_iter().map(CalendarEvent::from).collect())
 }
 
-/// 全ソースを今すぐ再取得する（設定パネルの「いま取得」）。取得件数の合計を返す。
+/// `refresh_calendar` の戻り値（v0.5.7 項目 9 で件数だけから改めた）。
+#[derive(Debug, Clone, Serialize)]
+pub struct CalendarRefreshResult {
+    /// 取り込んだ予定の件数の合計。
+    pub total: usize,
+    /// 取れなかった取得元の呼び名（URL は出さない）。空なら全部取れた。
+    pub failed: Vec<String>,
+}
+
+/// 全ソースを今すぐ再取得する（設定パネルの「いま取得」）。
+///
+/// **取れなかった取得元も返す**（v0.5.7 項目 9 の掃討）。件数だけ返していたので、URL が失効した取得元が
+/// あっても画面は「0 件の予定を取り込みました」と成功の形で出ていた（背景の取得と同じ形）。
 #[tauri::command]
 pub async fn refresh_calendar(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
-) -> Result<usize, String> {
-    let total = crate::tasks::refresh_all_calendars(state.inner()).await;
+) -> Result<CalendarRefreshResult, String> {
+    let fetched = crate::tasks::refresh_all_calendars(state.inner()).await;
     let _ = app.emit("calendar-changed", ());
-    Ok(total)
+    Ok(CalendarRefreshResult {
+        total: fetched.total,
+        failed: fetched.failed_labels(),
+    })
 }
 
 /// ソースを 1 件追加する。index ベースの source_id がずれるため、

@@ -661,3 +661,6 @@ system_messages:
   irodori_update_available:
     - main: { text: "高品質モードに新しいのが来てるみたい！", pose: happy }
       sub: { text: "設定の「更新する」から入れられる。時間のあるときにどうぞ", pose: normal }
+  calendar_fetch_failed:
+    - main: { text: "カレンダーの予定が取れなくなってるみたい…", pose: troubled }
+      sub: { text: "このままだと予定の前に知らせられない。設定の「いま取得」でどれが取れないか見られる", pose: normal }

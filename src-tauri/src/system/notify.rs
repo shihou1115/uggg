@@ -62,6 +62,12 @@ pub enum NoticeKind {
     UpdateAvailable {
         version: String,
     },
+    /// **カレンダーの取得に失敗し始めた**（v0.5.7 項目 9、spec §4.6.4）。ICS の URL が失効すると、開始前の通知が
+    /// 静かに 1 件も来なくなっていた。取得元ごとに、失敗が続き始めたら 1 回（届いたときだけ済み）。
+    /// `sources` は取得元の呼び名（`CalendarSource::label`。**URL は入れない**）。
+    CalendarFetchFailed {
+        sources: Vec<String>,
+    },
     // M7: ReminderFired variant は削除した。リマインダー発火は
     // `system::deliver::deliver_event` + 辞書 events.reminder_fired 経路に一本化
     // (daily-support-design §3/§7.1)。
@@ -115,6 +121,7 @@ impl NoticeKind {
             NoticeKind::IrodoriDlComplete => "irodori_dl_complete",
             NoticeKind::IrodoriDlFailed { .. } => "irodori_dl_failed",
             NoticeKind::UpdateAvailable { .. } => "update_available",
+            NoticeKind::CalendarFetchFailed { .. } => "calendar_fetch_failed",
         }
     }
 
@@ -154,6 +161,10 @@ impl NoticeKind {
             NoticeKind::UpdateAvailable { version } => {
                 format!("ugg の新しいバージョン {version} が出ています")
             }
+            NoticeKind::CalendarFetchFailed { sources } => format!(
+                "カレンダーの予定を取れていません（{}）。設定の「いま取得」で確かめられます",
+                sources.join(" / ")
+            ),
         }
     }
 }
@@ -372,6 +383,7 @@ mod delivery_tests {
         };
         let dialogue = read("dialogue/mod.rs");
         let update = read("system/update.rs");
+        let tasks = read("tasks.rs");
         for (src, name, mark) in [
             (&dialogue, "pub(crate) async fn evaluate_cost_status", "mark_notified_this_month(&state.db, cost::KEY_WARNED_80)"),
             (&dialogue, "pub(crate) async fn announce_cost_limit_once", "mark_notified_this_month(&state.db, cost::KEY_LIMIT_NOTIFIED)"),
@@ -379,6 +391,8 @@ mod delivery_tests {
             (&update, "pub async fn check_update_once", "set_setting(&seen_key"),
             // v0.5.7 項目 7
             (&update, "pub async fn check_irodori_update_once", "set_setting(&seen_key"),
+            // v0.5.7 項目 9
+            (&tasks, "async fn announce_calendar_failures", "failures.mark_announced(&pending)"),
         ] {
             let body = body_of(src, name);
             let once = body
@@ -442,18 +456,34 @@ mod dict_key_contract {
             NoticeKind::IrodoriDlComplete,
             NoticeKind::IrodoriDlFailed { reason: "x".into() },
             NoticeKind::UpdateAvailable { version: "1.0".into() },
+            NoticeKind::CalendarFetchFailed { sources: vec!["calendar.example.com".into()] },
         ]
     }
 
-    /// サンプルが全変種を覆っていること（件数での歯止め）。
+    /// サンプルが全変種を覆っていること。**enum の定義と名前で突き合わせる**（v0.5.7 項目 9）。以前は
+    /// サンプルの件数を 16 と書いて比べていたので、変種を足してもサンプルに足し忘れると鳴らなかった
+    /// （`CalendarFetchFailed` を足したときに実際に鳴らなかった）。
     #[test]
     fn sample_covers_every_variant() {
-        let keys: BTreeSet<_> = all_kinds().iter().map(|k| k.dict_key()).collect();
-        assert_eq!(
-            keys.len(),
-            16,
-            "NoticeKind の変種を増やしたら all_kinds() にも足すこと（現在のキー: {keys:?}）"
-        );
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/system/notify.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let body = &src[src.find("pub enum NoticeKind {").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let declared: BTreeSet<String> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("    "))
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_uppercase()))
+            .map(|l| l.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap().to_string())
+            .collect();
+        let sampled: BTreeSet<String> = all_kinds()
+            .iter()
+            .map(|k| format!("{k:?}").split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap().to_string())
+            .collect();
+        assert!(declared.len() >= 12, "enum の変種を読めていない: {declared:?}");
+        assert_eq!(sampled, declared, "NoticeKind の変種を増やしたら all_kinds() にも足すこと");
     }
 
     /// **全変種の辞書キーが既定辞書の system_messages に存在すること。**

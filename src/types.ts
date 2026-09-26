@@ -203,6 +203,18 @@ export interface DndResult {
   errors: DndItemError[];
 }
 
+/// `refresh_calendar` の戻り値（v0.5.7 項目 9）。`failed` は取れなかった取得元の呼び名（URL は入らない）。
+export interface CalendarRefreshResult {
+  total: number;
+  failed: string[];
+}
+
+/// `export_data` の戻り値（v0.5.7 項目 9）。`failed_tables` が空なら全部読めた。
+export interface ExportResult {
+  path: string;
+  failed_tables: string[];
+}
+
 /// M5-E: clear_history の戻り値。
 export interface ClearResult {
   chat_cleared: boolean;

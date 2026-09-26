@@ -59,6 +59,21 @@ impl CalendarSource {
             CalendarSource::Url { url } => *url = fix(url),
         }
     }
+
+    /// 画面・告知・ログに出す呼び名（v0.5.7 項目 9）。**URL は出さない** — 公開していない予定表の
+    /// URL は、それを知っていれば誰でも読める合言葉を含む。URL はホスト名、ファイルはファイル名にする。
+    pub fn label(&self) -> String {
+        match self {
+            CalendarSource::File { path } => std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "ICS ファイル".to_string()),
+            CalendarSource::Url { url } => reqwest::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "URL の予定表".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

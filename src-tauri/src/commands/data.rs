@@ -23,8 +23,6 @@ pub fn get_chat_log(
         .map_err(|e| format!("{e:#}"))
 }
 
-/// M5-E: 会話ログ・API 使用履歴・(option で) 記憶 を JSON でダウンロードフォルダに書き出す。
-/// 戻り値: 書き出した絶対パス。
 /// 1 テーブル分の読み取り結果を「出せた / 出せなかった」に振り分ける (v0.5.3)。
 ///
 /// **破損 DB からの部分救出が目的**なので、失敗しても呼び出し側は続行する。
@@ -100,11 +98,46 @@ fn build_export_payload(db: &crate::db::Db, include_profile: bool, ts: u64) -> s
     })
 }
 
+/// `export_data` の戻り値（v0.5.7 項目 9 で `String` から改めた）。
+///
+/// 読めなかったテーブルはファイルの `failed_tables` にしか載っておらず、画面は「保存しました」
+/// だけだった。破損したら控えるよう案内している手段なので、**会話ログだけ落ちた控えを
+/// 「全部控えた」と信じて原本を捨てる**経路が残る。画面に出すために名前を返す。
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportResult {
+    /// 書き出した絶対パス。
+    pub path: String,
+    /// 読めなかったテーブルの名前（ファイルの `failed_tables` と同じ並び）。空なら全部読めた。
+    pub failed_tables: Vec<String>,
+}
+
+/// payload をファイルに書き、保存先と読めなかったテーブルを返す（保存先に依存させず検査するため切り出し）。
+fn write_export(payload: &serde_json::Value, dir: &std::path::Path, ts: u64) -> Result<ExportResult, String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("保存先の作成に失敗: {e}"))?;
+    let path = dir.join(format!("ugg-export-{ts}.json"));
+    let body = serde_json::to_string_pretty(payload)
+        .map_err(|e| format!("JSON 整形に失敗: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("書き出しに失敗: {e}"))?;
+    let failed_tables = payload["failed_tables"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| f["table"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ExportResult {
+        path: path.to_string_lossy().into_owned(),
+        failed_tables,
+    })
+}
+
 #[tauri::command]
 pub fn export_data(
     include_profile: bool,
     state: State<'_, Arc<AppState>>,
-) -> Result<String, String> {
+) -> Result<ExportResult, String> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -114,13 +147,7 @@ pub fn export_data(
     let dir = dirs::download_dir()
         .or_else(dirs::home_dir)
         .ok_or_else(|| "ダウンロードフォルダが解決できませんでした".to_string())?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("保存先の作成に失敗: {e}"))?;
-    let path = dir.join(format!("ugg-export-{ts}.json"));
-    let body = serde_json::to_string_pretty(&payload)
-        .map_err(|e| format!("JSON 整形に失敗: {e}"))?;
-    std::fs::write(&path, body).map_err(|e| format!("書き出しに失敗: {e}"))?;
-    Ok(path.to_string_lossy().into_owned())
+    write_export(&payload, &dir, ts)
 }
 
 /// M5-E: 履歴クリア。常に chat_log を全件削除、`include_profile=true` で user_profile も全削除。
@@ -255,6 +282,31 @@ mod export_tests {
             "読めるはずのリマインダーまで落ちている"
         );
         assert!(v["app_settings"].is_object());
+    }
+
+    /// **読めなかったテーブルを戻り値でも返す (v0.5.7 項目 9)。** ファイルの `failed_tables` に
+    /// しか載らないと、画面は「保存しました」だけになり、欠けた控えを全部だと信じて原本を捨てうる。
+    #[test]
+    fn the_export_result_names_the_tables_that_could_not_be_read() {
+        let (dir, db, path) = db_with_data();
+        drop_table(&path, "chat_log");
+        drop_table(&path, "todos");
+        let payload = build_export_payload(&db, true, 42);
+        let out = dir.path().join("out");
+
+        let res = write_export(&payload, &out, 42).unwrap();
+
+        assert_eq!(res.failed_tables, vec!["chat_log".to_string(), "todos".to_string()]);
+        let written = std::fs::read_to_string(&res.path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(v["failed_tables"], payload["failed_tables"], "ファイルと戻り値がずれている");
+        assert_eq!(v["reminders"].as_array().unwrap().len(), 1, "読めた分がファイルに無い");
+
+        // 健全なら空で返す（読めなかったものが無いことを画面が言える）。
+        let (dir2, db2, _p2) = db_with_data();
+        let healthy = write_export(&build_export_payload(&db2, true, 43), dir2.path(), 43).unwrap();
+        assert!(healthy.failed_tables.is_empty(), "{:?}", healthy.failed_tables);
+        assert!(std::path::Path::new(&healthy.path).is_file());
     }
 
     /// `include_profile=false` の null と、読み取り失敗の null を取り違えない。

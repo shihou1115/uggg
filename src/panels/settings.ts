@@ -7,11 +7,13 @@ import { previewWavBase64 } from "../tts/speaker";
 import { isWeatherReady } from "../weather/credit";
 import type {
   AssetEntry,
+  CalendarRefreshResult,
   CalendarSource,
   ClearResult,
   DailyWeather,
   DialogueMode,
   DndResult,
+  ExportResult,
   InterestTopic,
   IrodoriGpuInfo,
   IrodoriStatus,
@@ -895,15 +897,39 @@ function ensureAssetSelection(select: HTMLSelectElement, id: string): void {
 
 // === M5-E: データエクスポート / 履歴クリア =================================
 
+/// エクスポートのテーブル名を、取説の「データの管理」と同じ呼び方で出す。
+const EXPORT_TABLE_LABELS: Record<string, string> = {
+  chat_log: "会話履歴",
+  api_usage: "利用額の記録",
+  user_profile: "記憶",
+  reminders: "リマインダー",
+  reminder_log: "リマインダーの記録",
+  todos: "ToDo",
+  interest_topics: "興味分野",
+  voice_refs: "声の設定",
+  app_settings: "アプリの設定",
+};
+
 async function onDataExport(): Promise<void> {
   if (!inputs) return;
   inputs.dataExportBtn.disabled = true;
   showDataMessage("エクスポート中…", false);
   try {
-    const path = await invoke<string>("export_data", {
+    const res = await invoke<ExportResult>("export_data", {
       includeProfile: inputs.dataIncludeProfile.checked,
     });
-    showDataMessage(`保存しました: ${path}`, false);
+    // v0.5.7 項目 9: 読めなかったものを画面に出す。「保存しました」だけだと、欠けた控えを
+    // 全部だと信じて元のデータを捨てうる（破損したら控えるよう案内している手段なので）。
+    if (res.failed_tables.length > 0) {
+      const names = res.failed_tables.map((t) => EXPORT_TABLE_LABELS[t] ?? t).join("・");
+      showDataMessage(
+        `保存しました: ${res.path}（読み出せなかったもの: ${names}。` +
+          "このファイルには入っていません。元のデータは消さないでください）",
+        true,
+      );
+    } else {
+      showDataMessage(`保存しました: ${res.path}`, false);
+    }
   } catch (err) {
     showDataMessage(`エクスポート失敗: ${formatErr(err)}`, true);
   } finally {
@@ -1160,8 +1186,17 @@ async function onCalendarRefresh(): Promise<void> {
   inputs.calRefresh.disabled = true;
   showCalendarMessage("取得中…", false);
   try {
-    const n = await invoke<number>("refresh_calendar");
-    showCalendarMessage(`${n} 件の予定を取り込みました`, false);
+    const res = await invoke<CalendarRefreshResult>("refresh_calendar");
+    // v0.5.7 項目 9: 取れなかった取得元を出す（件数だけだと、失効した URL があっても成功に見えた）
+    if (res.failed.length > 0) {
+      showCalendarMessage(
+        `${res.total} 件の予定を取り込みました。取れなかったもの: ${res.failed.join("・")}` +
+          "（URL やファイルの場所が変わっていないか確かめてください）",
+        true,
+      );
+    } else {
+      showCalendarMessage(`${res.total} 件の予定を取り込みました`, false);
+    }
   } catch (err) {
     showCalendarMessage(`取得失敗: ${formatErr(err)}`, true);
   } finally {

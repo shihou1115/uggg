@@ -618,6 +618,44 @@ fn date_from_ts_local(ts: i64) -> NaiveDate {
         .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
 }
 
+/// **取得元ごとの失敗の続き**（v0.5.7 項目 9、spec §4.6.4）。値は「告知が届いたか」。
+///
+/// ICS の URL が失効すると、背景の取得は失敗をログに書くだけで、開始前の通知が**静かに 1 件も来なく
+/// なっていた**。失敗が続き始めたら 1 回告知し、成功したら戻す（次にまた失敗し始めたらまた告知する）。
+/// 取得は 30 分ごとなので、毎回の失敗で告知しない。届いたときだけ済みにする（v0.5.6 項目 6）。
+#[derive(Debug, Default)]
+pub struct FetchFailures(Vec<(CalendarSource, bool)>);
+
+impl FetchFailures {
+    /// 取得の結果を記録する。成功したら続きを切る。
+    pub fn record(&mut self, source: &CalendarSource, ok: bool) {
+        if ok {
+            self.0.retain(|(s, _)| s != source);
+        } else if !self.0.iter().any(|(s, _)| s == source) {
+            self.0.push((source.clone(), false));
+        }
+    }
+
+    /// いまの取得元に無いものを落とす（消した・書き直した取得元の失敗を告知しない）。
+    pub fn retain(&mut self, current: &[CalendarSource]) {
+        self.0.retain(|(s, _)| current.contains(s));
+    }
+
+    /// 失敗が続いていて、告知がまだ届いていない取得元。
+    pub fn unannounced(&self) -> Vec<CalendarSource> {
+        self.0.iter().filter(|(_, told)| !*told).map(|(s, _)| s.clone()).collect()
+    }
+
+    /// 告知が届いた取得元を済みにする。
+    pub fn mark_announced(&mut self, sources: &[CalendarSource]) {
+        for (s, told) in self.0.iter_mut() {
+            if sources.contains(s) {
+                *told = true;
+            }
+        }
+    }
+}
+
 /// 時刻付き予定の HH:MM ラベル（辞書 {time} 用、ローカル）。
 pub fn time_label(start_ts: i64, all_day: bool) -> String {
     if all_day {
@@ -796,5 +834,59 @@ mod tests {
     fn non_ics_body_is_rejected() {
         assert!(!looks_like_ics("<html><body>404 Not Found</body></html>"));
         assert!(looks_like_ics("BEGIN:VCALENDAR\nBEGIN:VEVENT\nEND:VEVENT\nEND:VCALENDAR"));
+    }
+
+    fn url(u: &str) -> CalendarSource {
+        CalendarSource::Url { url: u.to_string() }
+    }
+
+    /// **失敗が続き始めたら 1 回、成功したら戻す**（v0.5.7 項目 9）。取得元ごとに数える。
+    #[test]
+    fn a_fetch_failure_is_announced_once_per_streak_and_per_source() {
+        let a = url("https://calendar.example.com/a.ics");
+        let b = CalendarSource::File { path: "C:\\cal\\b.ics".to_string() };
+        let mut f = FetchFailures::default();
+
+        f.record(&a, false);
+        f.record(&b, true);
+        assert_eq!(f.unannounced(), vec![a.clone()], "失敗し始めた取得元だけ");
+
+        // 隠している間（届かなかった）は済みにしない → 次の機会にまた出す
+        assert_eq!(f.unannounced(), vec![a.clone()]);
+        f.mark_announced(&[a.clone()]);
+        assert!(f.unannounced().is_empty(), "届いたら済み");
+
+        f.record(&a, false);
+        assert!(f.unannounced().is_empty(), "続いている間は二度と出さない");
+
+        f.record(&a, true);
+        f.record(&a, false);
+        assert_eq!(f.unannounced(), vec![a.clone()], "成功を挟んで失敗し始めたら、また出す");
+
+        // 片方の告知が届いても、もう片方は残る
+        f.record(&b, false);
+        f.mark_announced(&[a.clone()]);
+        assert_eq!(f.unannounced(), vec![b.clone()]);
+    }
+
+    /// 消した・書き直した取得元の失敗は告知しない（直したのに古い失敗を告げない）。
+    #[test]
+    fn a_removed_source_is_not_announced() {
+        let old = url("https://calendar.example.com/old.ics");
+        let fixed = url("https://calendar.example.com/new.ics");
+        let mut f = FetchFailures::default();
+        f.record(&old, false);
+        f.retain(&[fixed.clone()]);
+        assert!(f.unannounced().is_empty());
+    }
+
+    /// 呼び名に URL を出さない（予定表の URL は合言葉を含む）。
+    #[test]
+    fn a_source_label_does_not_reveal_the_url() {
+        let secret = url("https://calendar.google.com/calendar/ical/me%40example.com/private-0123abcd/basic.ics");
+        assert_eq!(secret.label(), "calendar.google.com");
+        assert_eq!(url("not a url").label(), "URL の予定表");
+        let file = CalendarSource::File { path: "C:\\Users\\me\\予定.ics".to_string() };
+        assert_eq!(file.label(), "予定.ics");
     }
 }

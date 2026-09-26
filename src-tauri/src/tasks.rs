@@ -524,6 +524,7 @@ async fn follow_open_todos(
 /// 通知は `calendar_notify_min` 分前（終日は当日ローカル 8:00）に達したら
 /// `calendar_upcoming`（Notice、静音を越える）で 1 回だけ。到達で notified=1。
 /// カレンダーは既定オフ（ソース未設定なら何もしない）。取得失敗は既存キャッシュ維持。
+/// **v0.5.7 項目 9**: 取得元ごとに、失敗が続き始めたら 1 回告知する（`announce_calendar_failures`）。
 pub fn spawn_calendar_watcher(app: AppHandle, state: Arc<AppState>) {
     const CHECK_INTERVAL_SECS: u64 = 60;
     const FETCH_INTERVAL_SECS: i64 = 30 * 60;
@@ -533,20 +534,31 @@ pub fn spawn_calendar_watcher(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)).await;
         let mut last_fetch: i64 = 0;
+        // 取得元ごとの失敗の続き（v0.5.7 項目 9）。起動のたびに数え直す。
+        let mut failures = crate::system::calendar::FetchFailures::default();
         loop {
             // 他の Tier S watcher と同様、マスタスイッチ OFF 中は取得も通知もしない
             // (Notice は gate 段 3 を素通りするため、機能スイッチはここで見る。M10 reviewer 指摘)
-            let has_sources = {
+            let sources = {
                 let s = state.settings.lock().expect("settings poisoned");
-                s.daily_support_enabled && !s.calendar_sources.is_empty()
+                if s.daily_support_enabled {
+                    s.calendar_sources.clone()
+                } else {
+                    Vec::new()
+                }
             };
-            if has_sources {
+            if !sources.is_empty() {
+                // 消した・書き直した取得元の失敗は告知しない
+                failures.retain(&sources);
                 let now = Utc::now().timestamp();
                 // 定期取得（起動直後 + FETCH_INTERVAL ごと）
                 if now - last_fetch >= FETCH_INTERVAL_SECS {
-                    let n = fetch_all_calendars(&state, DISPLAY_DAYS).await;
+                    let fetched = fetch_all_calendars(&state, DISPLAY_DAYS).await;
                     last_fetch = now;
-                    if n > 0 {
+                    for (source, ok) in &fetched.outcomes {
+                        failures.record(source, *ok);
+                    }
+                    if fetched.total > 0 {
                         let _ = app.emit("calendar-changed", ());
                     }
                     // prune（前日より前の過去発生行）
@@ -555,6 +567,8 @@ pub fn spawn_calendar_watcher(app: AppHandle, state: Arc<AppState>) {
                         crate::ulog!("[calendar] prune failed: {err:#}");
                     }
                 }
+                // 取得の失敗の告知（毎 tick。隠している間は届かないので、見えたときに出る）
+                announce_calendar_failures(&app, &state, &mut failures).await;
                 // 開始前通知（毎 tick 判定）
                 notify_upcoming(&app, &state).await;
             }
@@ -563,30 +577,79 @@ pub fn spawn_calendar_watcher(app: AppHandle, state: Arc<AppState>) {
     });
 }
 
-/// 全ソースを取得して calendar_cache に反映する。取得件数の合計を返す。
+/// 全取得元の取得結果（v0.5.7 項目 9 で件数だけから改めた）。
+pub struct CalendarFetch {
+    /// 取り込んだ予定の件数の合計。
+    pub total: usize,
+    /// 取得元ごとの成否（設定の並び順）。
+    pub outcomes: Vec<(crate::state::CalendarSource, bool)>,
+}
+
+impl CalendarFetch {
+    /// 取れなかった取得元の呼び名（URL は出さない）。
+    pub fn failed_labels(&self) -> Vec<String> {
+        self.outcomes
+            .iter()
+            .filter(|(_, ok)| !*ok)
+            .map(|(s, _)| s.label())
+            .collect()
+    }
+}
+
+/// 全ソースを取得して calendar_cache に反映する。
 /// ソース失敗は個別にログして続行（1 ソースの障害で他を巻き込まない）。
-async fn fetch_all_calendars(state: &Arc<AppState>, display_days: i64) -> usize {
+async fn fetch_all_calendars(state: &Arc<AppState>, display_days: i64) -> CalendarFetch {
     let sources = state
         .settings
         .lock()
         .expect("settings poisoned")
         .calendar_sources
         .clone();
-    let mut total = 0;
+    let mut fetched = CalendarFetch { total: 0, outcomes: Vec::new() };
     for (idx, source) in sources.iter().enumerate() {
-        match crate::system::calendar::fetch_source_into_cache(state, idx as i64, source, display_days)
+        let ok = match crate::system::calendar::fetch_source_into_cache(state, idx as i64, source, display_days)
             .await
         {
-            Ok(n) => total += n,
-            Err(err) => crate::ulog!("[calendar] source {idx} fetch failed: {err:#}"),
-        }
+            Ok(n) => {
+                fetched.total += n;
+                true
+            }
+            Err(err) => {
+                crate::ulog!("[calendar] source {idx} fetch failed: {err:#}");
+                false
+            }
+        };
+        fetched.outcomes.push((source.clone(), ok));
     }
-    total
+    fetched
 }
 
 /// refresh_calendar コマンドの実体（表示窓は watcher と同じ 7 日）。
-pub async fn refresh_all_calendars(state: &Arc<AppState>) -> usize {
+pub async fn refresh_all_calendars(state: &Arc<AppState>) -> CalendarFetch {
     fetch_all_calendars(state, 7).await
+}
+
+/// **取得の失敗を告知する**（v0.5.7 項目 9、spec §4.6.4）。失敗が続き始めた取得元をまとめて 1 回。
+/// 届いたときだけ済みにする（v0.5.6 項目 6）ので、隠している間の失敗は見えたときに出る。
+async fn announce_calendar_failures(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    failures: &mut crate::system::calendar::FetchFailures,
+) {
+    let pending = failures.unannounced();
+    let labels: Vec<String> = pending.iter().map(|s| s.label()).collect();
+    crate::system::notify::once_reached(
+        pending.is_empty(),
+        || {
+            crate::system::notify::notify(
+                app,
+                state,
+                crate::system::notify::NoticeKind::CalendarFetchFailed { sources: labels },
+            )
+        },
+        || failures.mark_announced(&pending),
+    )
+    .await;
 }
 
 /// 開始前通知の対象を配達する。notify_at（時刻付き=start-notify_min、終日=当日 8:00）を
@@ -1206,6 +1269,41 @@ mod tests {
             watcher.contains("crate::system::update::check_irodori_update_once(&app, &state)"),
             "起動後の確認で Irodori の更新を見ていない"
         );
+    }
+
+    /// **カレンダーの取得の失敗を、取得元ごとに記録して告知する**（v0.5.7 項目 9）。AppHandle と取得先が要るので、
+    /// 配線を本文のテキストで固定する（監視・取得・「いま取得」のそれぞれ）。
+    #[test]
+    fn calendar_fetch_failures_are_recorded_announced_and_returned() {
+        use crate::state::CalendarSource;
+        let fetched = CalendarFetch {
+            total: 3,
+            outcomes: vec![
+                (CalendarSource::Url { url: "https://calendar.example.com/private-abc/basic.ics".into() }, false),
+                (CalendarSource::File { path: "C:\\cal\\home.ics".into() }, true),
+            ],
+        };
+        assert_eq!(fetched.failed_labels(), vec!["calendar.example.com".to_string()], "取れなかったものだけ、URL を出さずに");
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap().replace("\r\n", "\n");
+        let body_of = |src: &str, name: &str| -> String {
+            let rest = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+            rest[..rest.find("\n}\n").unwrap()].to_string()
+        };
+        let tasks = read("tasks.rs");
+        let watcher = body_of(&tasks, "pub fn spawn_calendar_watcher");
+        for wired in [
+            "failures.retain(&sources);",
+            "failures.record(source, *ok);",
+            "announce_calendar_failures(&app, &state, &mut failures).await;",
+        ] {
+            assert!(watcher.contains(wired), "監視が {wired} を通っていない");
+        }
+        let fetch = body_of(&tasks, "async fn fetch_all_calendars");
+        assert!(fetch.contains("fetched.outcomes.push((source.clone(), ok));"), "取得元ごとの成否を返していない");
+        let refresh = body_of(&read("commands/daily.rs"), "pub async fn refresh_calendar");
+        assert!(refresh.contains("failed: fetched.failed_labels(),"), "「いま取得」が取れなかったものを返していない");
     }
 
     #[test]
