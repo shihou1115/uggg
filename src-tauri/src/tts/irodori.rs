@@ -1191,7 +1191,7 @@ mod tests {
     fn step_choices_match_between_settings_sidecar_and_screen() {
         use crate::state::{Settings, IRODORI_STEP_CHOICES};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let py = std::fs::read_to_string(root.join("python").join("sidecar.py")).unwrap();
+        let py = std::fs::read_to_string(root.join("python").join("sidecar.py")).unwrap().replace("\r\n", "\n");
         let line = py
             .lines()
             .find(|l| l.starts_with("V4_STEP_SCHEDULES = {"))
@@ -1209,7 +1209,7 @@ mod tests {
             py.lines().any(|l| l == format!("V4_DEFAULT_STEPS = {default}")),
             "sidecar.py の既定のステップ数が設定の既定（{default}）と違う"
         );
-        let html = std::fs::read_to_string(root.join("..").join("index.html")).unwrap();
+        let html = std::fs::read_to_string(root.join("..").join("index.html")).unwrap().replace("\r\n", "\n");
         let select = &html[html.find("<select id=\"settings-irodori-steps\">").expect("画面に選択肢が無い")..];
         let select = &select[..select.find("</select>").unwrap()];
         let mut shown: Vec<u32> = select
@@ -1231,7 +1231,7 @@ mod tests {
         let py = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
         )
-        .unwrap();
+        .unwrap().replace("\r\n", "\n");
         let body = &py[py.find("def synth_sampler(repo: str, steps: Optional[int] = None)").expect("synth_sampler が無い")..];
         let body = &body[..body.find("\n\n\n").unwrap()];
         let v4 = body.find("    if repo in V4_MODELS:").expect("v4 系の分岐が無い");
@@ -1299,7 +1299,7 @@ mod tests {
         let py = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
         )
-        .unwrap();
+        .unwrap().replace("\r\n", "\n");
         assert!(
             py.contains("500, {\"kind\": synth_failure_kind(exc), \"message\": f\"Irodori 合成失敗: {exc}\"}"),
             "合成の失敗の応答に種類を入れていない"
@@ -1315,7 +1315,7 @@ mod tests {
         let rs = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori.rs"),
         )
-        .unwrap();
+        .unwrap().replace("\r\n", "\n");
         // **合成のメソッドの本文だけを見る**。このテスト自身が同じ文字列を持つので、ファイル全体で探すと
         // 本体を壊しても自分に当たって通る（v0.5.7 の変異テストで発覚）。
         let synth = &rs[rs.find("    pub async fn synthesize(").expect("synthesize が無い")..];

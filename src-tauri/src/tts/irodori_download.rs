@@ -2250,28 +2250,19 @@ fn probe_cuda(py_exe: &Path) -> Option<bool> {
     found
 }
 
-/// 古くなった分だけを入れ直す (v0.5.4 項目 3 / v0.5.6 項目 3c・3d、spec §6.0)。
-///
-/// **1 つのトランザクションにする。** 途中のどこで失敗しても、入れ替えたものを**全部**戻す
-/// （以前は、後の段で失敗すると、それより前に成功した分の退避＝唯一の旧版を戻さずに消していた。
-/// 名前付き要件には退避も復元も無かった）。記録（`installed.json`）は全部成功したときにだけ書く。
-///
-/// 1. 前回の更新が途中で止まっていれば、先に元へ戻す（`recover_interrupted_update`）
-/// 2. 入っている全配布の版を控える（控えを取れなければ何も変えずに止まる）
-/// 3. 計画の順に入れ直す（`update_plan` / `apply_update_plan`）
-/// 4. **1 回合成して確かめる**（`run_synth_gate` / `gate_verdict`。v0.5.6 項目 3b）
-/// 5. 失敗・不合格なら全部戻す（`roll_back_update`）。成功したら退避と控えを捨てて記録する
-///
-/// 戻り値は「入れ直せた名前」。呼び出し側はこれで記録を部分的に更新する。
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// **取得量の目安の正本**（v0.5.7 項目 8）。確認の文言（`settings.ts`）と取説（`manual.md`）は同じ文字列を書き、
 /// 契約テストが突き合わせる（以前は 3 か所で「約 2〜3 GB」「約 2〜4 GB」「合計 10 GB 前後」と食い違っていた）。
 /// 初回導入の取得（PyTorch 2.87 GB・v4.1-Small 3.07 GB・コーデック 0.43 GB・ほかの依存 約 0.25 GB・透かし 0.07 GB）。
+/// この 3 つは Rust の文言には使わず、画面と取説の正本として契約テストだけが読む（テストの外では未使用になる）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const FIRST_INSTALL_DOWNLOAD: &str = "約 7 GB";
 /// 初回導入のあとに使うディスク（Python と依存 約 5.4 GB・モデル 約 3.5 GB）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const FIRST_INSTALL_DISK: &str = "約 9 GB";
 /// AI モデルが変わる更新の取得（v4.1-Small 3.07 GB・コーデック 0.43 GB・透かし 0.07 GB・依存の差分）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MODEL_UPDATE_DOWNLOAD: &str = "約 3.6 GB";
 /// AI モデル本体の取得（v4.1-Small とコーデック）。
 pub(crate) const MODEL_DOWNLOAD: &str = "約 3.5 GB";
@@ -2348,6 +2339,19 @@ fn names_committed_on_hold(plan: &UpdatePlan) -> Vec<String> {
     plan.names.iter().filter(|n| !models.contains_key(*n)).cloned().collect()
 }
 
+/// 古くなった分だけを入れ直す (v0.5.4 項目 3 / v0.5.6 項目 3c・3d、spec §6.0)。
+///
+/// **1 つのトランザクションにする。** 途中のどこで失敗しても、入れ替えたものを**全部**戻す
+/// （以前は、後の段で失敗すると、それより前に成功した分の退避＝唯一の旧版を戻さずに消していた。
+/// 名前付き要件には退避も復元も無かった）。記録（`installed.json`）は全部成功したときにだけ書く。
+///
+/// 1. 前回の更新が途中で止まっていれば、先に元へ戻す（`recover_interrupted_update`）
+/// 2. 入っている全配布の版を控える（控えを取れなければ何も変えずに止まる）
+/// 3. 計画の順に入れ直す（`update_plan` / `apply_update_plan`）
+/// 4. **1 回合成して確かめる**（`run_synth_gate` / `gate_verdict`。v0.5.6 項目 3b）
+/// 5. 失敗・不合格なら全部戻す（`roll_back_update`）。成功したら退避と控えを捨てて記録する
+///
+/// 戻り値は「入れ直せた名前」。呼び出し側はこれで記録を部分的に更新する。
 pub async fn update_irodori_runtime<F>(
     asset_root: &Path,
     outdated: &[String],
@@ -3320,7 +3324,7 @@ mod stamp_tests {
         let src = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/sidecar.rs"),
         )
-        .expect("sidecar.rs を読めること");
+        .expect("sidecar.rs を読めること").replace("\r\n", "\n");
         assert!(
             src.contains("model_args_for_read(asset_root)"),
             "起動が読み先を使っていない"
@@ -3983,7 +3987,7 @@ mod stamp_tests {
         assert_eq!(model_dir_name("Aratako/X", ""), "Aratako__X");
         assert_eq!(model_dir_name("Aratako/X", "abc"), "Aratako__X@abc");
         let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"))
-            .unwrap();
+            .unwrap().replace("\r\n", "\n");
         for needle in [
             "safe = repo.replace(\"/\", \"__\")",
             "return f\"{safe}@{revision}\" if revision and revision != \"main\" else safe",
@@ -4244,10 +4248,9 @@ mod stamp_tests {
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
         )
-        .unwrap();
+        .unwrap().replace("\r\n", "\n");
         let body = &src[src.find("    def _load_voice_design(self):").expect("_load_voice_design が無い")..];
-        let body = &body[..body.find("
-    @staticmethod").unwrap()];
+        let body = &body[..body.find("\n    @staticmethod").unwrap()];
         let shared = body
             .find("if (MODEL_REPO_VOICE_DESIGN, MODEL_REVISION_VOICE_DESIGN) == (MODEL_REPO_SYNTH, MODEL_REVISION_SYNTH):")
             .expect("同じモデルかを見ていない");
@@ -4266,7 +4269,7 @@ mod stamp_tests {
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
         )
-        .unwrap();
+        .unwrap().replace("\r\n", "\n");
         let line = src
             .lines()
             .find(|l| l.starts_with("V4_MODELS = frozenset({"))
@@ -5038,9 +5041,9 @@ mod update_tests {
     #[test]
     fn download_sizes_agree_between_code_screen_and_manual() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let ts = std::fs::read_to_string(root.join("src/panels/settings.ts")).unwrap();
-        let manual = std::fs::read_to_string(root.join("docs/manual.md")).unwrap();
-        let html = std::fs::read_to_string(root.join("index.html")).unwrap();
+        let ts = std::fs::read_to_string(root.join("src/panels/settings.ts")).unwrap().replace("\r\n", "\n");
+        let manual = std::fs::read_to_string(root.join("docs/manual.md")).unwrap().replace("\r\n", "\n");
+        let html = std::fs::read_to_string(root.join("index.html")).unwrap().replace("\r\n", "\n");
         assert!(
             html.contains(&format!("ダウンロードには{FIRST_INSTALL_DOWNLOAD} の通信（入れたあとはディスクを{FIRST_INSTALL_DISK} 使います）")),
             "設定パネルの注記の数字が正本と違う"
@@ -5061,7 +5064,7 @@ mod update_tests {
         }
         let torch = &rs_install_torch_body();
         assert!(torch.contains("{TORCH_DOWNLOAD}"), "PyTorch の取得の文言に正本の数字を使っていない");
-        let rs = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs")).unwrap();
+        let rs = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs")).unwrap().replace("\r\n", "\n");
         let body = &rs[rs.find("pub async fn install_irodori_models<F>(").unwrap()..];
         assert!(body.contains("{MODEL_DOWNLOAD}"), "モデルの取得の進捗に正本の数字を使っていない");
     }
@@ -5243,7 +5246,7 @@ mod update_tests {
     #[test]
     fn the_sidecar_fetches_the_watermark_weights_the_way_upstream_reads_them() {
         let py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"))
-            .unwrap();
+            .unwrap().replace("\r\n", "\n");
         for needle in [
             "WATERMARK_REPO = \"sony/silentcipher\"",
             "    snapshot_download(repo_id=WATERMARK_REPO)\n",
@@ -5498,11 +5501,10 @@ mod update_tests {
         let src = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"),
         )
-        .unwrap();
+        .unwrap()
+        .replace("\r\n", "\n");
         let body = &src[src.find("pub async fn update_irodori_runtime").unwrap()..];
-        let body = &body[..body.find("
-}
-").unwrap()];
+        let body = &body[..body.find("\n}\n").unwrap()];
         let gate = body
             .find("run_synth_gate(asset_root, &py_exe, &model_args_for_fetch(), true,")
             .expect("ゲートが取得したいまのビルドの値で、生成も含めて試していない（v0.5.7 項目 6）");
@@ -5520,7 +5522,7 @@ mod update_tests {
     #[test]
     fn the_sidecar_synth_once_tries_the_voice_design_first() {
         let py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"))
-            .unwrap();
+            .unwrap().replace("\r\n", "\n");
         let body = &py[py.find("def synth_once(asset_dir: Path, voice_ref: Optional[Path], gate_dir: Optional[Path] = None) -> int:")
             .expect("synth_once が作業場所を受け取らない")..];
         let body = &body[..body.find("\n\n\ndef ").unwrap()];
@@ -5539,7 +5541,7 @@ mod update_tests {
     #[test]
     fn the_gate_matches_the_sidecar_synth_once_mode() {
         let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("python/sidecar.py"))
-            .expect("sidecar.py を読めること");
+            .expect("sidecar.py を読めること").replace("\r\n", "\n");
         assert!(src.contains(&format!("SYNTH_ONCE_START_MARKER = {SYNTH_ONCE_START_MARKER:?}")));
         assert!(src.contains(&format!("SYNTH_ONCE_MARKER = {SYNTH_ONCE_MARKER:?}")));
         assert!(src.contains(&format!("SYNTH_ONCE_OOM = {SYNTH_ONCE_OOM}")));
@@ -5560,12 +5562,11 @@ mod update_tests {
         let src = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
         )
-        .unwrap();
+        .unwrap()
+        .replace("\r\n", "\n");
         for name in ["pub async fn update_irodori_runtime", "pub async fn download_irodori_assets"] {
             let body = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
-            let body = &body[..body.find("
-}
-").unwrap()];
+            let body = &body[..body.find("\n}\n").unwrap()];
             let lock = body.find("IrodoriBusyGuard::acquire_for(").unwrap_or_else(|| panic!("{name}: プロセスをまたぐ錠を取っていない"));
             let mkdir = body.find("create_dir_all(").unwrap_or_else(|| panic!("{name}: フォルダを作っていない"));
             assert!(mkdir < lock, "{name}: 錠のファイルを置く前にフォルダを作ること");
