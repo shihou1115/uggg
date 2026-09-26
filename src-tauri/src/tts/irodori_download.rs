@@ -2324,12 +2324,6 @@ where
     Ok(plan.names)
 }
 
-/// 6) HF モデル本体を sidecar.py の `--download-only` モードで取得する (M4c Phase G)。
-///
-/// 通常のサイドカー起動経路 (`--no-download`) では DL を skip するように切り替えたため、
-/// マルチGBのモデル取得は本ステップで完了させておく。`--download-only` モードは uvicorn を
-/// 起動せず、download_models 完了で即終了する。stderr の `[hf-download] ...` 行は run_python
-/// が on_line に流すので、`download_irodori_assets` の `irodori-download` event に伝わる。
 /// 透かし（SilentCipher）の重みを、上流が読みに行く共有 HF キャッシュへ先に取る（v0.5.7 項目 5、spec §6.0）。
 ///
 /// 取らないと、pydub が入った環境の**最初の合成で上流が黙って取りに行く**（約 68 MB）。更新の途中で全戻し
@@ -2366,6 +2360,12 @@ where
     on_line(&msg);
 }
 
+/// 6) HF モデル本体を sidecar.py の `--download-only` モードで取得する (M4c Phase G)。
+///
+/// 通常のサイドカー起動経路 (`--no-download`) では DL を skip するように切り替えたため、
+/// マルチGBのモデル取得は本ステップで完了させておく。`--download-only` モードは uvicorn を
+/// 起動せず、download_models 完了で即終了する。stderr の `[hf-download] ...` 行は run_python
+/// が on_line に流すので、`download_irodori_assets` の `irodori-download` event に伝わる。
 pub async fn install_irodori_models<F>(
     asset_root: &Path,
     sidecar_py: &Path,
