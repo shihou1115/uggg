@@ -227,10 +227,13 @@ const MODEL_PINS: &[(&str, &str, &str)] = &[
         "Aratako/Irodori-TTS-v4.1-Small",
         "2b28324dc263ed5e6638b3cf3dd94c82ead07b4b",
     ),
+    // **参照音声の生成も同じ v4.1 で行う**（v0.5.7 項目 3）。欄は消さずに中身を合成と同じ値にする —
+    // 読み先の決定（`pick_models_to_read`）はビルドの名前しか回さないので、欄を消すと引数が渡らず
+    // `sidecar.py` の既定値が使われる。同じ値なら取得は 1 回で、サイドカーは合成のランタイムを使い回す。
     (
         "model_voice_design",
-        "Aratako/Irodori-TTS-500M-v2-VoiceDesign",
-        "main",
+        "Aratako/Irodori-TTS-v4.1-Small",
+        "2b28324dc263ed5e6638b3cf3dd94c82ead07b4b",
     ),
     (
         "model_codec",
@@ -250,7 +253,11 @@ const MODEL_FILES: &[(&str, &[&str])] = &[
         "model_synth",
         &["model.safetensors", "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json"],
     ),
-    ("model_voice_design", &["model.safetensors"]),
+    // 生成も同じ v4.1（caption のトークナイザも同じ `tokenizer/` を読む）
+    (
+        "model_voice_design",
+        &["model.safetensors", "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json"],
+    ),
     ("model_codec", &["weights.pth"]),
 ];
 
@@ -3602,7 +3609,14 @@ mod stamp_tests {
         std::fs::remove_file(synth.join("tokenizer").join("tokenizer_config.json")).unwrap();
 
         let got = outdated_list(dir.path(), &current_pins(), &current_requirements(), &current_models());
-        assert_eq!(got, vec!["model_synth"], "欠けたモデルだけが対象: {got:?}");
+        // 同じ置き場所を指す名前（項目 3 から、合成と参照音声の生成は同じ v4.1）がそろって対象になる
+        let expected: Vec<String> = MODEL_PINS
+            .iter()
+            .filter(|(_, r, v)| (*r, *v) == (*repo, *rev))
+            .map(|(n, _, _)| n.to_string())
+            .collect();
+        assert!(expected.contains(&"model_synth".to_string()));
+        assert_eq!(got, expected, "欠けたモデルだけが対象: {got:?}");
         assert!(!assets_ready(dir.path()), "前提: この一時フォルダには Python が無い");
         // `assets_ready` の中身はモデルを見ない（本文のテキストで固定）
         let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"))
@@ -3786,14 +3800,14 @@ mod stamp_tests {
             baseline.get("huggingface_hub").map(String::as_str),
             Some("huggingface_hub==0.27.0")
         );
-        // モデルは項目 2 で合成とコーデックを変えた（参照音声の生成は項目 3 で変える）。
+        // モデルは 3 つとも変えた（項目 2 で合成とコーデック、項目 3 で参照音声の生成）。
         let mut models = outdated_section(
             &v054_baseline_models(),
             &v054_baseline_models(),
             &current_models(),
         );
         models.sort();
-        assert_eq!(models, vec!["model_codec", "model_synth"]);
+        assert_eq!(models, vec!["model_codec", "model_synth", "model_voice_design"]);
     }
 
     /// **v0.5.7 の要件の入れ直しは、torch の index を使わない 1 回の pip で行う**（v0.5.6 項目 3c の段取り）。
@@ -3894,13 +3908,35 @@ mod stamp_tests {
     /// 上流が共有 HF キャッシュから読み、新規の人は最初の合成で約 0.43 GB を黙って取っていた。
     #[test]
     fn the_synth_and_codec_revisions_are_fixed_commits() {
-        for want in ["model_synth", "model_codec"] {
+        for want in ["model_synth", "model_voice_design", "model_codec"] {
             let (_, repo, rev) = MODEL_PINS.iter().find(|(n, _, _)| *n == want).unwrap();
             assert!(
                 rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit()),
                 "{want} ({repo}) の revision が固定の commit ではない: {rev}"
             );
         }
+    }
+
+    /// **参照音声の生成は合成と同じモデル（同じ値）で、サイドカーは合成のランタイムを使い回す**（v0.5.7 項目 3）。
+    /// 上流の `from_key` はキャッシュしないので、別々に作ると同じモデルを 2 つ読み込み VRAM を 2 倍使う。
+    /// `sidecar.py` は単体で動かせない（fastapi などが要る）ので、本文のテキストで固定する。
+    #[test]
+    fn voice_design_shares_the_synth_model_and_runtime() {
+        let get = |n: &str| MODEL_PINS.iter().find(|(name, _, _)| *name == n).map(|(_, r, v)| (*r, *v)).unwrap();
+        assert_eq!(get("model_voice_design"), get("model_synth"), "生成と合成は同じ repo@revision");
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
+        )
+        .unwrap();
+        let body = &src[src.find("    def _load_voice_design(self):").expect("_load_voice_design が無い")..];
+        let body = &body[..body.find("
+    @staticmethod").unwrap()];
+        let shared = body
+            .find("if (MODEL_REPO_VOICE_DESIGN, MODEL_REVISION_VOICE_DESIGN) == (MODEL_REPO_SYNTH, MODEL_REVISION_SYNTH):")
+            .expect("同じモデルかを見ていない");
+        let reuse = body.find("return self._load_synth()").expect("合成のランタイムを使い回していない");
+        let build = body.find("self._build_runtime(").expect("違うモデルのときの読み込みが無い");
+        assert!(shared < reuse && reuse < build, "同じなら使い回し、違うときだけ別に読む順になっていない");
     }
 
     /// **いまのビルドの合成モデルは `sidecar.py` の v4 系の一覧に入っていて、v3 は入っていない**（v0.5.7 項目 2）。

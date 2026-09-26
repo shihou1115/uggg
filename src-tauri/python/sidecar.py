@@ -103,14 +103,15 @@ SAMPLE_RATE = 22050  # モック wav のサンプルレート
 # 「重みがある旧モデル（v3）に据え置く」としたが、乗り換えが成功すると旧モデルは消す（項目 10）ので、
 # 重みがあるのは新しいほうになる。Rust は常に 3 つとも渡すので、既定値が使われるのは渡し忘れた経路だけ。
 MODEL_REPO_SYNTH = "Aratako/Irodori-TTS-v4.1-Small"
-MODEL_REPO_VOICE_DESIGN = "Aratako/Irodori-TTS-500M-v2-VoiceDesign"
+# 参照音声の生成も v4.1 で行う（v0.5.7 項目 3。v2-VoiceDesign の取得 2 GB と別モデルの読み込みをやめる）。
+MODEL_REPO_VOICE_DESIGN = "Aratako/Irodori-TTS-v4.1-Small"
 MODEL_REPO_CODEC = "Aratako/Semantic-DACVAE-Japanese-32dim"
 # 取得する revision。`main` は「そのとき最新」なので、pip の `refs/heads/main` と
 # 同じく**上げても届かない / 黙って変わる**。Rust 側が固定値を渡せるようにしておく。
 # コーデックも固定する（v0.5.7 項目 2）。`main` の間は repo ID で渡すので、上流が共有 HF キャッシュへ
 # 取りに行き、新規の人は最初の合成で約 0.43 GB を黙って取っていた（`_codec_location`）。
 MODEL_REVISION_SYNTH = "2b28324dc263ed5e6638b3cf3dd94c82ead07b4b"
-MODEL_REVISION_VOICE_DESIGN = "main"
+MODEL_REVISION_VOICE_DESIGN = "2b28324dc263ed5e6638b3cf3dd94c82ead07b4b"
 MODEL_REVISION_CODEC = "47376ee24834d7a05a48ebabfe3cde29b3c5e214"
 
 # **モデルごとの値** (v0.5.7 項目 2・4、spec §6.0)。精度とサンプラーは、読み込むモデルで決める。
@@ -446,6 +447,13 @@ class RealModelBackend:
         return self._synth_runtime
 
     def _load_voice_design(self):
+        # **合成と同じモデルなら、読み込み済みの合成のランタイムを使い回す**（v0.5.7 項目 3）。上流の
+        # `InferenceRuntime.from_key` はキャッシュしないので、別々に作ると同じモデルを 2 つ読み込み、
+        # VRAM を 2 倍使う。モデルが違うのは、記録が旧モデル（v3 と v2-VoiceDesign）を指している間だけ。
+        if (MODEL_REPO_VOICE_DESIGN, MODEL_REVISION_VOICE_DESIGN) == (MODEL_REPO_SYNTH, MODEL_REVISION_SYNTH):
+            if self._synth_runtime is None:
+                _diag("[irodori] 参照音声の生成は合成と同じモデルで行います（読み込みは 1 回）")
+            return self._load_synth()
         if self._voice_design_runtime is None:
             self._voice_design_runtime = self._build_runtime(
                 MODEL_REPO_VOICE_DESIGN, MODEL_REVISION_VOICE_DESIGN
