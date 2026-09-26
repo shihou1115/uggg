@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -896,8 +897,41 @@ def _audio_to_wav_bytes(audio, sample_rate: int) -> bytes:
 
 # --- FastAPI アプリ --------------------------------------------------------
 
+def is_peer_reset_on_close(context: dict) -> bool:
+    """ugg 側が接続を切ったあと、Windows の asyncio（Proactor）が接続を閉じる途中の `shutdown()` で出す
+    `ConnectionResetError` か (spec §6.0 v0.5.7 項目 11)。
+
+    合成は成功しているのに、`_ProactorBasePipeTransport._call_connection_lost` のトレースバックが 6 行ずつ
+    ugg.log に残っていた（2026-09-24 の実機で合成 6 回のうち 2 回。test-plan E-10）。**この 1 つの形だけ**を
+    落とす。同じ `ConnectionResetError` でも別の場所で出たもの、`_call_connection_lost` でも別の例外は残す。
+    """
+    if not isinstance(context.get("exception"), ConnectionResetError):
+        return False
+    callback = getattr(context.get("handle"), "_callback", None)
+    return getattr(callback, "__name__", None) == "_call_connection_lost"
+
+
+def quiet_peer_reset(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """asyncio の例外ハンドラ。接続切れの 1 つの形だけを落とし、ほかは既定のハンドラへ渡す（今までどおり残る）。"""
+    if is_peer_reset_on_close(context):
+        return
+    loop.default_exception_handler(context)
+
+
+@contextlib.asynccontextmanager
+async def _install_quiet_peer_reset(_app):
+    """uvicorn が作るイベントループに、上のハンドラを付ける（`on_event` は FastAPI で非推奨の警告を出すので使わない）。"""
+    asyncio.get_running_loop().set_exception_handler(quiet_peer_reset)
+    yield
+
+
 def build_app(asset_dir: Path, mock: bool, backend: Optional[RealModelBackend]) -> FastAPI:
-    app = FastAPI(title="ugg-irodori-sidecar", docs_url=None, redoc_url=None)
+    app = FastAPI(
+        title="ugg-irodori-sidecar",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=_install_quiet_peer_reset,
+    )
 
     @app.get("/health")
     async def health() -> JSONResponse:

@@ -1293,6 +1293,43 @@ mod tests {
         assert_eq!(health_ping_from(503, "not json"), HealthPing::Down);
     }
 
+    /// **サイドカーは接続切れの 1 つの形だけをログから落とす**（v0.5.7 項目 11）。ugg が接続を切ったあと、Windows の
+    /// asyncio（Proactor）が閉じる途中の `shutdown()` で出す `ConnectionResetError`（`_call_connection_lost`）だけ。
+    /// 別の場所の `ConnectionResetError` と、`_call_connection_lost` の別の例外は既定のハンドラへ渡して残す。
+    /// `sidecar.py` は単体で動かせない（fastapi などが要る）ので本文のテキストで固定する。振る舞いは実物の asyncio が
+    /// 作る context で確かめた（2026-09-27、コミットに記録）。
+    #[test]
+    fn the_sidecar_drops_only_the_connection_reset_on_close() {
+        let py = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let body_of = |start: &str| -> &str {
+            let rest = &py[py.find(start).unwrap_or_else(|| panic!("無い: {start}"))..];
+            &rest[..rest.find("\n\n\n").unwrap()]
+        };
+        let is_reset = body_of("def is_peer_reset_on_close(context: dict) -> bool:");
+        assert!(
+            is_reset.contains("if not isinstance(context.get(\"exception\"), ConnectionResetError):\n        return False"),
+            "ConnectionResetError 以外まで落としうる"
+        );
+        assert!(
+            is_reset.contains("return getattr(callback, \"__name__\", None) == \"_call_connection_lost\""),
+            "_call_connection_lost 以外の場所の ConnectionResetError まで落としうる"
+        );
+        let handler = body_of("def quiet_peer_reset(loop: asyncio.AbstractEventLoop, context: dict) -> None:");
+        let skip = handler.find("if is_peer_reset_on_close(context):\n        return").expect("落とす判定が無い");
+        let rest = handler.find("loop.default_exception_handler(context)").expect("ほかの例外を既定のハンドラへ渡していない");
+        assert!(skip < rest);
+        let install = body_of("async def _install_quiet_peer_reset(_app):");
+        assert!(install.contains("asyncio.get_running_loop().set_exception_handler(quiet_peer_reset)"));
+        let app = body_of("def build_app(asset_dir: Path, mock: bool, backend: Optional[RealModelBackend]) -> FastAPI:");
+        assert!(app.contains("lifespan=_install_quiet_peer_reset,"), "uvicorn のループにハンドラを付けていない");
+        // `on_event` は FastAPI で非推奨の警告を出す（__main__ から呼ぶと stderr に出て ugg.log に残る）
+        assert!(!py.contains(".on_event("), "on_event を使っている");
+    }
+
     /// **サイドカーの応答の形と、Rust の読み取りが噛み合う**（v0.5.7 項目 7。本文のテキストで固定する）。
     #[test]
     fn the_sidecar_speech_error_carries_the_kind_rust_reads() {
