@@ -686,6 +686,11 @@ class RealModelBackend:
         # 合成側 duration_scale は 1.0 固定。voicevox 経路 (voicevox_core も speed は未渡し、
         # フロントの playbackRate で補正) との挙動対称性を保つ。
         _ = speed
+        # **参照音声のファイルが無いことを「モデルが無い」と取り違えない**（v0.5.7 リリース前監査）。参照 wav のまま
+        # 上流へ渡すと、読み込みの `FileNotFoundError` が `synth_failure_kind` で `model_missing` になり、キャラが
+        # 「更新する」で直ると事実でない案内をする。先に確かめ、`FileNotFoundError` でない例外で返す（種類は other）。
+        if not voice_ref_path.is_file():
+            raise RuntimeError("参照音声のファイルが見つかりません。設定の「音声」で参照音声を作り直してください")
         runtime = self._load_synth()
         started = time.perf_counter()
         latent, created = self._reference_latent(runtime, voice_ref_path)

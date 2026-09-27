@@ -2000,6 +2000,11 @@ const GATE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 /// ゲートは合成と生成で同じランタイムを使い回すので、生成を足しても 2 つ分にはならない。
 const GATE_VRAM_SUSPECT_MB: u64 = 4096;
 
+/// **保留の目印**（v0.5.7 項目 6）。保留は `Err` で返すが失敗ではないので、画面はこの目印で見分けて「保留しました」と出す
+/// （リリース前監査。以前は「更新に失敗しました: …（保留）」と出ていた）。`settings.ts` の `IRODORI_HOLD_MARKER` と同じ
+/// 文字列にする（契約テストが突き合わせる）。
+const HOLD_MARKER: &str = "（保留）";
+
 /// ゲートの作業場所（参照音声の写しと、事前変換の結果が置かれる。終わったら消す）。
 const GATE_DIR: &str = ".update-gate";
 
@@ -2334,15 +2339,36 @@ pub(crate) const REQUIRED_FREE_FIRST_INSTALL: u64 = 11 * GIB;
 
 /// **更新に要るディスクの空き**（v0.5.7 項目 8、純関数）。更新が成功するまで旧モデルも残るが、既にディスクに
 /// あるので足さない。モデルが変わるなら約 3.6 GB の取得、PyTorch が変わるなら約 3 GB の取得に余裕を足す。
-fn required_free_for_update(plan: &UpdatePlan) -> u64 {
+///
+/// **重みがもう置き場所にあるなら、モデルの分は足さない**（`weights_present`。v0.5.7 リリース前監査）。VRAM 不足で
+/// 保留した次の「更新する」はモデルだけの計画になるが、v4.1 は取得済みで確かめだけを行う（spec §6.0 項目 6）。
+/// 以前は一律に 5 GiB を足し、何も取得しないのに空きが足りないと断っていた。
+fn required_free_for_update(plan: &UpdatePlan, weights_present: bool) -> u64 {
     let mut need = GIB;
     if !plan.torch.is_empty() {
         need += 4 * GIB;
     }
-    if plan.models {
+    if plan.models && !weights_present {
         need += 5 * GIB;
     }
     need
+}
+
+/// いまのビルドのモデルの**重み本体**（トークナイザを除く `MODEL_FILES`）が、全部もう置き場所にあるか。
+/// トークナイザは数 MB なので、欠けていても空きの見積もりには効かない。
+fn model_weights_present(asset_root: &Path) -> bool {
+    let model_root = asset_root.join("model");
+    MODEL_PINS.iter().all(|(name, repo, rev)| {
+        let dir = model_root.join(model_dir_name(repo, rev));
+        MODEL_FILES
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, files)| *files)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|f| !f.starts_with("tokenizer/"))
+            .all(|f| dir.join(f).is_file())
+    })
 }
 
 /// 空きが足りなければ理由（純関数）。空きが分からなければ止めない（分からないことを理由に断らない）。
@@ -2417,9 +2443,18 @@ fn old_model_dirs(
     let old: std::collections::BTreeSet<String> = before
         .values()
         .map(|v| model_dir_of(v))
+        .filter(|d| is_plain_dir_name(d))
         .filter(|d| !keep.contains(d))
         .collect();
     old.into_iter().collect()
+}
+
+/// `model\` の下のふつうのフォルダ名 1 つか（v0.5.7 リリース前監査）。**消す先を記録の値から作るので守りを置く**:
+/// 値が空なら名前も空になり `model\` そのもの、`..` なら `irodori\` ごとを `remove_dir_all` で消すことになる。
+/// 記録は ugg 自身が書くので起こりにくいが、起きたら全部のモデル（や実行環境）を失う。
+fn is_plain_dir_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None))
 }
 
 /// 旧モデルの片付けの結果。
@@ -2555,7 +2590,8 @@ where
         on_line(&format!("{name} は入れ直しの対象外です (skip)"));
     }
     // **空きを確かめてから始める**（v0.5.7 項目 8）。成功するまで旧モデルと新しいモデルが同時に残る。
-    if let Some(why) = lacking_free_space(required_free_for_update(&plan), free_bytes(asset_root)) {
+    let weights_present = model_weights_present(asset_root);
+    if let Some(why) = lacking_free_space(required_free_for_update(&plan, weights_present), free_bytes(asset_root)) {
         on_line(&why);
         return Err(anyhow!(why));
     }
@@ -2633,7 +2669,7 @@ where
             record_after_install(asset_root, &held, |l| on_line(l))
                 .context("パッケージの入れ替えは済みましたが、導入記録を書けませんでした")?;
             let message = format!(
-                "{why}。パッケージの入れ替えは済ませ、声はいままでのモデルのままにしています（保留）。\
+                "{why}。パッケージの入れ替えは済ませ、声はいままでのモデルのままにしています{HOLD_MARKER}。\
                  GPU を使うほかのアプリを止めて VRAM を空けてから、もう一度「更新する」を押してください\
                  （モデルは取得済みなので、取り直さずに確かめだけを行います）"
             );
@@ -5544,10 +5580,32 @@ mod update_tests {
     #[test]
     fn the_free_space_needed_follows_what_the_update_fetches() {
         let plan = |names: &[&str]| update_plan(&names.iter().map(|n| n.to_string()).collect::<Vec<_>>());
-        assert_eq!(required_free_for_update(&plan(&["transformers"])), GIB);
-        assert_eq!(required_free_for_update(&plan(&["model_synth"])), 6 * GIB);
-        assert_eq!(required_free_for_update(&plan(&["torch"])), 5 * GIB);
-        assert_eq!(required_free_for_update(&plan(&["torch", "model_synth"])), 10 * GIB);
+        assert_eq!(required_free_for_update(&plan(&["transformers"]), false), GIB);
+        assert_eq!(required_free_for_update(&plan(&["model_synth"]), false), 6 * GIB);
+        assert_eq!(required_free_for_update(&plan(&["torch"]), false), 5 * GIB);
+        assert_eq!(required_free_for_update(&plan(&["torch", "model_synth"]), false), 10 * GIB);
+        // **保留のあとの再試行**（v0.5.7 リリース前監査）: 重みは取得済みなので、確かめだけに空きを求めない
+        assert_eq!(required_free_for_update(&plan(&["model_synth"]), true), GIB);
+        assert_eq!(required_free_for_update(&plan(&["torch", "model_synth"]), true), 5 * GIB);
+    }
+
+    /// 重みが揃っているかは、いまのビルドの置き場所の重み本体で決める（トークナイザは見ない）。
+    #[test]
+    fn model_weights_presence_is_read_from_the_current_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!model_weights_present(dir.path()), "何も無ければ揃っていない");
+        for (name, repo, rev) in MODEL_PINS {
+            let at = dir.path().join("model").join(model_dir_name(repo, rev));
+            std::fs::create_dir_all(&at).unwrap();
+            let files = MODEL_FILES.iter().find(|(n, _)| n == name).unwrap().1;
+            for f in files.iter().filter(|f| !f.starts_with("tokenizer/")) {
+                std::fs::write(at.join(f), b"x").unwrap();
+            }
+        }
+        assert!(model_weights_present(dir.path()), "トークナイザが無くても重み本体が揃えば揃っている");
+        let (_, repo, rev) = MODEL_PINS.iter().find(|(n, _, _)| *n == "model_codec").unwrap();
+        std::fs::remove_file(dir.path().join("model").join(model_dir_name(repo, rev)).join("weights.pth")).unwrap();
+        assert!(!model_weights_present(dir.path()), "コーデックの重みが欠ければ揃っていない");
     }
 
     /// 空きが足りなければ要る量を伝えて止める。**空きが分からなければ止めない**（分からないことを理由に断らない）。
@@ -5572,8 +5630,12 @@ mod update_tests {
         let body = &src[src.find("pub async fn update_irodori_runtime<F>(").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
         let check = body
-            .find("lacking_free_space(required_free_for_update(&plan), free_bytes(asset_root))")
+            .find("lacking_free_space(required_free_for_update(&plan, weights_present), free_bytes(asset_root))")
             .expect("更新で空きを確かめていない");
+        assert!(
+            body.contains("let weights_present = model_weights_present(asset_root);"),
+            "重みが取得済みかを実物で見ていない（保留のあとの再試行が空きで断られる）"
+        );
         for later in ["import_report(&py_exe)", "write_versions_snapshot(", "apply_update_plan("] {
             let at = body.find(later).unwrap_or_else(|| panic!("{later} が無い"));
             assert!(check < at, "空きを {later} より後で確かめている");
@@ -5968,6 +6030,15 @@ mod update_tests {
         assert!(body.contains("remove_versions_snapshot(asset_root)"), "版の控えを片付けていない");
         assert!(body.contains("let held = names_committed_on_hold(&plan);"), "記録する名前を絞っていない");
         assert!(body.contains("record_after_install(asset_root, &held,"), "パッケージの分を記録していない");
+        // 保留の文面は目印を持ち、画面は同じ目印で「保留しました」と見分ける（v0.5.7 リリース前監査）
+        assert!(body.contains("のままにしています{HOLD_MARKER}。"), "保留の文面に目印が無い");
+        let ts = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/panels/settings.ts"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(
+            ts.contains(&format!("const IRODORI_HOLD_MARKER = \"{HOLD_MARKER}\";")),
+            "画面の保留の目印が Rust と違う"
+        );
     }
 
     /// 生成も確かめたかを読み、合格の文面に出す（v0.5.7 項目 6。項目 10 は、これが真のときだけ旧モデルを消す）。
@@ -6075,6 +6146,29 @@ mod update_tests {
             old_model_dirs(&half, &now),
             vec!["Aratako__Irodori-TTS-500M-v2-VoiceDesign".to_string(), "Aratako__Semantic-DACVAE-Japanese-32dim".to_string()]
         );
+    }
+
+    /// **記録の値が空や `..` でも、`model\` やその上を消さない**（v0.5.7 リリース前監査）。消す先を記録の値から作るので、
+    /// 空なら `model\` そのもの、`..` なら `irodori\` ごとが `remove_dir_all` に渡るところだった。実物のフォルダで確かめる。
+    #[test]
+    fn a_bad_record_value_never_removes_the_model_root_or_above() {
+        assert!(is_plain_dir_name("Aratako__Irodori-TTS-500M-v3"));
+        for bad in ["", ".", "..", "a/b", "a\\b", "../x", "C:\\x"] {
+            assert!(!is_plain_dir_name(bad), "{bad:?} をフォルダ名 1 つとして扱っている");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let now = current_models();
+        let kept = dir.path().join("model").join(model_dir_of(&now["model_synth"]));
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("model.safetensors"), b"x").unwrap();
+        for bad in ["", ".."] {
+            let before: std::collections::BTreeMap<String, String> =
+                [("model_synth".to_string(), bad.to_string())].into_iter().collect();
+            assert!(old_model_dirs(&before, &now).is_empty(), "{bad:?} を旧モデルに数えている");
+            let out = clean_up_old_models(dir.path(), &before, &now);
+            assert!(out.removed_models.is_empty(), "{bad:?}: {out:?}");
+            assert!(kept.join("model.safetensors").is_file(), "{bad:?} でいまのモデルが消えた");
+        }
     }
 
     /// **旧モデルの置き場所と、旧モデルのための参照音声の変換結果だけを消す**（v0.5.7 項目 10）。ugg が読んでいた

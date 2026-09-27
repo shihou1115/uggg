@@ -268,6 +268,8 @@ pub async fn download_voicevox_assets(
         return Err("利用規約への同意が必要です".to_string());
     }
     let asset_dir = crate::state::voicevox_asset_dir().map_err(|e| format!("{e:#}"))?;
+    // 始まりを残す（v0.5.7 リリース前監査。Irodori の導入・更新と同じ形。終わりは告知の `[notify]` の行に残る）
+    crate::ulog!("[voicevox] 資産の取得を始めます");
 
     // DL 前に既存 engine を破棄 (DLL を解放しないと上書きできない)。
     {
@@ -419,12 +421,19 @@ pub async fn update_irodori_runtime(
     // `current_pins()` を丸ごと対象にしたところ、入れ直せない `python` が混ざって
     // Err で止まり、この機能が対象にしている環境がちょうど 1 つも更新できなかった。
     let targets = status.outdated;
+    // **始まりと終わりを `ugg.log` に残す**（v0.5.7 リリース前監査）。進捗は画面にしか出ないので、更新が途中で
+    // 止まったこと（E-11 で dev の再起動により pip の途中で止まった）が、site-packages の日時からしか分からなかった。
+    // 始まりの行があって終わりの行が無ければ、途中で止まったと読める。
+    crate::ulog!("[irodori] 更新を始めます（対象: {}）", targets.join(" / "));
     // 記録の更新は `update_irodori_runtime` の中で行う。**ここに置いていたため
     // テストから到達できず**、「入れ直したのに `up_to_date` が false のまま」を
     // 自動で検出できなかった。
-    let updated = irodori_download::update_irodori_runtime(&root, &targets, &emit)
-        .await
-        .map_err(|e| format!("{e:#}"))?;
+    let result = irodori_download::update_irodori_runtime(&root, &targets, &emit).await;
+    match &result {
+        Ok(updated) => crate::ulog!("[irodori] 更新が終わりました（入れ直したもの: {}）", updated.join(" / ")),
+        Err(e) => crate::ulog!("[irodori] 更新が終わりませんでした: {e:#}"),
+    }
+    let updated = result.map_err(|e| format!("{e:#}"))?;
     let _ = app.emit("irodori-download", "__done__");
     Ok(updated)
 }
@@ -586,6 +595,8 @@ pub async fn download_irodori_assets(
     };
 
     let sidecar_py = asset_root.join("sidecar.py");
+    // 始まりを残す（v0.5.7 リリース前監査。終わりは下の告知が理由つきで `[notify]` の行に残す）
+    crate::ulog!("[irodori] ランタイムの導入を始めます");
     let result: Result<(), String> = async {
         // 更新と同じ入口の備え（v0.5.6 項目 3e）。**初回導入は自分のサイドカーを止めていなかった**
         // （更新の経路だけ止めていた）。Python が入っている環境で押し直すと、pip が掴まれた site-packages を触る。
@@ -909,6 +920,36 @@ mod tests {
     fn an_installed_runtime_is_sent_to_the_update() {
         assert_eq!(download_route(true), DownloadRoute::Update);
         assert_eq!(download_route(false), DownloadRoute::FirstInstall);
+    }
+
+    /// **環境を書き換える処理は、始まりを `ugg.log` に残す。更新は終わりも残す**（v0.5.7 リリース前監査）。進捗は画面に
+    /// しか出ないので、E-11 で更新が pip の途中で止まったことが site-packages の日時からしか分からなかった
+    /// （配線を本文のテキストで固定する。コマンドは AppHandle が要るので単体では呼べない）。
+    #[test]
+    fn rewrites_log_their_start_and_the_update_its_end() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let body_of = |name: &str| {
+            let body = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+            body[..body.find("\n}\n").unwrap()].to_string()
+        };
+        let upd = body_of("pub async fn update_irodori_runtime(");
+        let start = upd.find("crate::ulog!(\"[irodori] 更新を始めます（対象: {}）\"").expect("更新の始まりを残していない");
+        let call = upd
+            .find("irodori_download::update_irodori_runtime(&root, &targets, &emit).await;")
+            .expect("更新を呼んでいない");
+        let ok = upd.find("crate::ulog!(\"[irodori] 更新が終わりました").expect("成功の終わりを残していない");
+        let err = upd.find("crate::ulog!(\"[irodori] 更新が終わりませんでした").expect("失敗の終わりを残していない");
+        assert!(start < call && call < ok && call < err, "始まりと終わりの位置");
+        for (name, line) in [
+            ("pub async fn download_irodori_assets", "crate::ulog!(\"[irodori] ランタイムの導入を始めます\")"),
+            ("pub async fn download_voicevox_assets(", "crate::ulog!(\"[voicevox] 資産の取得を始めます\")"),
+        ] {
+            assert!(body_of(name).contains(line), "{name} が始まりを残していない");
+        }
     }
 
     /// 振り分けは**最初の入れる段より前**にあり、導入済みなら更新のコマンドへ渡す（配線を本文のテキストで固定する。

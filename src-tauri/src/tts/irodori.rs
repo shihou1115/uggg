@@ -1408,6 +1408,13 @@ mod tests {
             .find("    if isinstance(exc, FileNotFoundError):\n        return \"model_missing\"")
             .expect("モデルが無いのを見分けていない");
         assert!(oom < missing && body.contains("    return \"other\""));
+        // **参照音声のファイルが無いことを「モデルが無い」と取り違えない**（v0.5.7 リリース前監査）: 合成の入口で先に確かめ、
+        // FileNotFoundError でない例外で返す（上流の読み込みの FileNotFoundError まで行くと model_missing になる）
+        let synth_py = &py[py.find("    def synthesize(\n").expect("synthesize が無い")..];
+        let synth_py = &synth_py[..synth_py[1..].find("\n    def ").unwrap() + 1];
+        let check = synth_py.find("        if not voice_ref_path.is_file():\n            raise RuntimeError(").expect("参照音声のファイルを先に確かめていない");
+        let load = synth_py.find("        runtime = self._load_synth()").expect("ランタイムを読んでいない");
+        assert!(check < load, "モデルを読み込んでから参照音声を確かめている");
         // Rust の読み取りは同じ 3 つの文字列を知っている
         let rs = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori.rs"),

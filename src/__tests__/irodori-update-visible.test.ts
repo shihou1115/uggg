@@ -299,6 +299,46 @@ describe("操作列: 更新が届いていないランタイムを開く", () =>
     expect(packagesOnly).toContain("倫理条項");
   });
 
+  it("最新で「ランタイムをダウンロード」を押しても、「更新があります」と確認せず、何も始めない", async () => {
+    // v0.5.7 リリース前監査。導入済みのダウンロードは更新へ回すが、対象が無いのに「ランタイムに更新があります」と
+    // 確認を出すと、同意の本文が事実と違う。「最新」と出すのを観測点にして、確認も更新も起きていないことを示す。
+    const confirm = vi.mocked((await import("../confirm")).uggConfirm);
+    const progress = () => document.getElementById("settings-irodori-progress")!;
+    const downloadBtn = () =>
+      document.getElementById("settings-irodori-download") as HTMLButtonElement;
+    irodoriStatus = status({ present: true, has_record: true, up_to_date: true, outdated: [] });
+    await open();
+    confirm.mockClear();
+    downloadBtn().dispatchEvent(new Event("click"));
+    await vi.waitFor(() => expect(progress().textContent).toContain("最新の状態です"));
+    expect(confirm, "対象が無いのに更新の確認を出した").not.toHaveBeenCalled();
+    expect(invoked.some((i) => i.cmd === "update_irodori_runtime")).toBe(false);
+    expect(invoked.some((i) => i.cmd === "download_irodori_assets")).toBe(false);
+  });
+
+  it("VRAM 不足の保留は「失敗」と出さない", async () => {
+    // v0.5.7 リリース前監査。保留はバック側が Err で返すが、パッケージは入れ替え済みで声は旧モデルのまま。
+    // 「更新に失敗しました」と赤字で出すと、事実と違う（取説は「保留」と説明している）。
+    const progress = () => document.getElementById("settings-irodori-progress")!;
+    irodoriStatus = status({ present: true, has_record: true, up_to_date: false, outdated: ["model_synth"] });
+    await open();
+    onUpdate = () => {
+      throw "GPU のメモリ（VRAM）が足りず、合成で確かめられませんでした。…いままでのモデルのままにしています（保留）。…";
+    };
+    updateBtn().dispatchEvent(new Event("click"));
+    await vi.waitFor(() => expect(progress().textContent).toContain("更新を保留しました"));
+    expect(progress().textContent).not.toContain("失敗");
+    expect(progress().classList.contains("error"), "保留を赤字にしている").toBe(false);
+
+    // 同じ経路で、本当の失敗は失敗と出る（見分けが目印だけに頼っていることの確認）
+    onUpdate = () => {
+      throw "HF モデルの取得に失敗しました";
+    };
+    updateBtn().dispatchEvent(new Event("click"));
+    await vi.waitFor(() => expect(progress().textContent).toContain("更新に失敗しました"));
+    expect(progress().classList.contains("error")).toBe(true);
+  });
+
   it("確認で断ったら、入れ直しを始めない", async () => {
     // **「起きないこと」は待っても観測できない。** `vi.waitFor` に否定を渡すと
     // 1 回目の判定で通ってしまい、同意を無視する変異を素通りする

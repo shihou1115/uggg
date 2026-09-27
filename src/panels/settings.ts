@@ -160,6 +160,10 @@ const IRODORI_FIRST_DOWNLOAD = "約 7 GB";
 const IRODORI_FIRST_DISK = "約 9 GB";
 const IRODORI_MODEL_UPDATE_DOWNLOAD = "約 3.6 GB";
 
+/// **保留の目印**（v0.5.7 項目 6）。VRAM 不足の保留はバック側が `Err` で返すが、失敗ではない（パッケージは入れ替え済みで、
+/// 声は旧モデルのまま）。正本は Rust の `irodori_download.rs`（`HOLD_MARKER`）で、契約テストが突き合わせる。
+const IRODORI_HOLD_MARKER = "（保留）";
+
 /// **倫理条項の提示**（v0.5.7 項目 8、2026-09-25 ユーザー裁定: 提示だけ、同意は記録しない）。
 const IRODORI_ETHICS =
   "Irodori-TTS のモデルカードの倫理条項: 本人の明示的な同意なく、他人（声優・著名人・公人を含む）の声を" +
@@ -710,7 +714,13 @@ async function onIrodoriUpdate(): Promise<void> {
     // **「元の状態のまま」と一律に言わない。** 失敗したら入れ替えたものを全部戻す（v0.5.6 項目 3d）が、
     // 個別のパッケージは通信が要るので戻せないことがある。戻せたか・何が戻らなかったかは
     // バック側のメッセージが持っている。
-    showIrodoriProgress(`更新に失敗しました: ${formatErr(err)}`, true);
+    const message = formatErr(err);
+    // **保留は失敗と出さない**（v0.5.7 リリース前監査）。VRAM を空けてもう一度押せば、確かめだけで終わる。
+    if (message.includes(IRODORI_HOLD_MARKER)) {
+      showIrodoriProgress(`更新を保留しました: ${message}`, false);
+    } else {
+      showIrodoriProgress(`更新に失敗しました: ${message}`, true);
+    }
   } finally {
     unlisten();
     inputs.irodoriUpdateBtn.disabled = false;
@@ -725,6 +735,12 @@ async function onIrodoriDownload(): Promise<void> {
   // 依存の major 移行が失敗しても戻らない。確認の文言も、戻し方を説明している更新のほうを出す
   // （バック側の `download_irodori_assets` も同じ振り分けをする）。
   if (irodoriAssetsReady) {
+    // **最新なら「更新があります」と確認しない**（v0.5.7 リリース前監査）。導入済みのダウンロードは更新へ回すが、
+    // 対象が無いのに更新の確認を出すと、同意の本文が事実と違う（v0.5.4 の監査と同じ型）。
+    if (irodoriOutdated.length === 0) {
+      showIrodoriProgress("最新の状態です（入れ直すものはありません）", false);
+      return;
+    }
     await onIrodoriUpdate();
     return;
   }
