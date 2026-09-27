@@ -3096,6 +3096,18 @@ fn human_size(bytes: f64) -> String {
 impl HfProgress {
     /// 取得の進捗の行なら `Some`（中身は出す文言。今回は出さないなら `None`）。進捗でなければ `None`。
     fn describe(&mut self, line: &str) -> Option<Option<String>> {
+        // `snapshot_download`（sidecar のモデルと透かしの取得）は、ファイルごとの行ではなく**全体をまとめた 2 本**を出す
+        // （E-11 の実機検証で判明。ファイルごとの形だけを読んでいたので、実機では生の棒グラフが並んでいた）。
+        // ファイルごとの形へ読み替えて、同じ処理に通す
+        let aggregated;
+        let line = match aggregate_as_per_file(line) {
+            Some(AggregateLine::Progress(l)) => {
+                aggregated = l;
+                aggregated.as_str()
+            }
+            Some(AggregateLine::Finished) => return Some(None),
+            None => line,
+        };
         let (name, rest) = line.split_once(": ")?;
         let name = name.trim();
         if name.is_empty() || name.contains(char::is_whitespace) {
@@ -3104,8 +3116,8 @@ impl HfProgress {
         if let Some(r) = rest.strip_prefix("reconstructing file:") {
             let (pct, sizes) = split_percent_and_sizes(r)?;
             let (done, total) = sizes.split_once(" / ")?;
-            // 末尾にカーソルを上へ戻す並び（`\x1b[A`）や空白が付くので、最初のまとまりだけを読む
-            let total = total.split_whitespace().next()?;
+            // 末尾にカーソルを上へ戻す並び（`\x1b[A`）や空白、速度（`, 21.9MB/s`）が付くので、最初のまとまりだけを読む
+            let total = total.split_whitespace().next()?.trim_end_matches(',');
             let (done, total) = (parse_progress_size(done)?, parse_progress_size(total)?);
             self.has_percent.insert(name.to_string());
             return Some(self.percent_line(name, pct, done, total));
@@ -3149,6 +3161,37 @@ impl HfProgress {
         self.shown_percent.insert(name.to_string(), pct);
         Some(format!("  取得中 {name} {} / {}（{pct}%）", human_size(done), human_size(total)))
     }
+}
+
+/// `snapshot_download` のまとめた進捗の行を、どう扱うか。
+#[derive(Debug, PartialEq, Eq)]
+enum AggregateLine {
+    /// ファイルごとの形へ読み替えた行（名前は `AGGREGATE_NAME`）。
+    Progress(String),
+    /// 取得の終わりの行（`Download complete` / `Reconstruction complete`）。棒グラフが付くので出さない。
+    Finished,
+}
+
+/// まとめた進捗を画面に出すときの名前（repo の中のどのファイルかは行に無い）。
+const AGGREGATE_NAME: &str = "モデル";
+
+/// hub 1.33 の `snapshot_download` のまとめた 2 本（`_snapshot_download.py` の `desc`）を、ファイルごとの形へ読み替える。
+///
+/// - 受信: `Downloading bytes: ███| 1.38GB, 21.9MB/s`（量と速度だけ）→ `モデル: downloading bytes: …`
+/// - 組み立て: `Reconstructing (incomplete total...):  45%|███| 1.38GB / 3.06GB, 21.9MB/s`（全体と割合）→
+///   `モデル: reconstructing file: …`。全体は取得するファイルが分かるたびに増える（desc の「incomplete total」）
+fn aggregate_as_per_file(line: &str) -> Option<AggregateLine> {
+    let line = line.trim_start();
+    if line.starts_with("Download complete:") || line.starts_with("Reconstruction complete:") {
+        return Some(AggregateLine::Finished);
+    }
+    if let Some(r) = line.strip_prefix("Downloading bytes:") {
+        return Some(AggregateLine::Progress(format!("{AGGREGATE_NAME}: downloading bytes:{r}")));
+    }
+    let r = line
+        .strip_prefix("Reconstructing (incomplete total...):")
+        .or_else(|| line.strip_prefix("Reconstructing:"))?;
+    Some(AggregateLine::Progress(format!("{AGGREGATE_NAME}: reconstructing file:{r}")))
 }
 
 /// 「`  40%|███   |  1.2GB / 3.06GB   …`」→ (40, 「1.2GB / 3.06GB   …」)。
@@ -5543,6 +5586,42 @@ mod update_tests {
         let check = body.find("check_free_space_for_first_install(&asset_root)").expect("初回導入で空きを確かめていない");
         let python = body.find("ensure_python_embeddable(").unwrap();
         assert!(check < python, "Python を置いてから空きを確かめている");
+    }
+
+    /// **`snapshot_download` のまとめた 2 本も直す**（v0.5.7 の実機検証 E-11 の 8b）。sidecar のモデルと透かしの取得は
+    /// `snapshot_download` で、hub 1.33 はファイルごとの行を出さず、全体をまとめた受信（`Downloading bytes`）と
+    /// 組み立て（`Reconstructing (incomplete total...)`）の 2 本だけを出す。ファイルごとの形しか読んでいなかったので、
+    /// 実機では `Downloading bytes: ██████| 1.38GB, 21.9MB/s` がそのまま画面に並んでいた。書式は hub 1.33 の
+    /// `XET_TRANSFER_BAR_FORMAT` / `XET_BYTES_BAR_FORMAT`（組み立ての行は末尾に速度が付く）。
+    #[test]
+    fn aggregated_snapshot_progress_is_turned_into_readable_lines() {
+        let mut hf = HfProgress::default();
+        // 組み立ての行が来る前の受信は、量だけ出す
+        assert_eq!(
+            hf.describe("Downloading bytes: ███       |  552MB, 14.5MB/s  "),
+            Some(Some("  取得中 モデル 552 MB（14.5MB/s）".to_string()))
+        );
+        // 組み立ての行（全体と割合。末尾に速度）が出たら、それを優先する
+        assert_eq!(
+            hf.describe("Reconstructing (incomplete total...):  45%|████▌     | 1.38GB / 3.06GB, 21.9MB/s  \x1b[A"),
+            Some(Some("  取得中 モデル 1.38 GB / 3.06 GB（45%）".to_string()))
+        );
+        assert_eq!(hf.describe("Downloading bytes: ██████    | 1.40GB, 22.0MB/s  "), Some(None), "割合の行があれば受信は出さない");
+        assert_eq!(
+            hf.describe("Reconstructing (incomplete total...):  45%|████▌     | 1.39GB / 3.06GB, 21.9MB/s"),
+            Some(None),
+            "割合が変わらなければ出さない"
+        );
+        assert_eq!(
+            hf.describe("Reconstructing (incomplete total...):  46%|████▌     | 1.41GB / 3.06GB, 21.9MB/s"),
+            Some(Some("  取得中 モデル 1.41 GB / 3.06 GB（46%）".to_string()))
+        );
+        // 終わりの行（棒グラフ付き）は出さない
+        assert_eq!(hf.describe("Download complete: ██████████| 3.06GB, 21.0MB/s"), Some(None));
+        assert_eq!(hf.describe("Reconstruction complete: 100%|██████████| 3.06GB / 3.06GB, 21.0MB/s"), Some(None));
+        // 普通の行はそのまま流す（進捗ではない）
+        assert_eq!(hf.describe("Downloading the model files"), None);
+        assert_eq!(hf.describe("Warning: You are sending unauthenticated requests to the HF Hub."), None);
     }
 
     /// **huggingface_hub の取得の進捗を、画面向けに直す**（v0.5.7 項目 8）。行は spike（hub 1.33・hf-xet）で実際に出たもの。

@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.52）
+# ugg アーキテクチャ設計書（architecture.md v2.53）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1238,7 +1238,11 @@ raw テキストフォールバックに委ねる。
   `--progress-bar raw`（pip 24.1 以降。入っている版を見てから付ける）を渡し、`Progress N of M` の行を
   「取得中 N / M MB（P%）」へ直して割合が変わったときだけ流す。**★v0.5.7 hub 1.33（hf-xet）の行も直す**（`HfProgress`）:
   「reconstructing file」（全体と割合）を優先して「取得中 <ファイル> 1.26 GB / 3.06 GB（41%）」、割合の行が無いファイルは
-  「downloading bytes」を 50 MB ごと、小さなファイルはいつもの tqdm。行末のカーソル移動を読み飛ばす。`sidecar.py` は `--download-only` の
+  「downloading bytes」を 50 MB ごと、小さなファイルはいつもの tqdm。行末のカーソル移動を読み飛ばす。
+  **sidecar の取得（`snapshot_download`）はファイルごとの行を出さず、全体をまとめた 2 本**（`Downloading bytes` /
+  `Reconstructing (incomplete total...)`、組み立ての行は末尾に速度）を出すので、名前を「モデル」としてファイルごとの形へ
+  読み替えて同じ処理に通し、終わりの行（`Download complete` / `Reconstruction complete`）は出さない（★E-11 の実機検証で判明。
+  ファイルごとの形しか読んでいなかったので、実機では生の棒グラフが並んでいた）。`sidecar.py` は `--download-only` の
   取得の間だけ hub の判定（`is_tqdm_disabled`）を「自動なら出す」に差し替える
 - 失敗したときは**理由**（pip の `ERROR:` の行・例外の行）をエラーに添え、直前の 20 行を `ugg.log`
   （`[irodori:python]`）に残す。進捗の上書きの行は残さない
@@ -1906,3 +1910,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-27 | v2.50 | **v0.5.7 項目 10 の実装に伴う改訂**。`update_irodori_runtime` の行に旧モデルの片付け（入れ替える前に読み先を控え、合成と生成の両方を確かめて記録を書いたあとにだけ消す。対象と消さない場合）を、リスク表の「更新の途中で失敗する」に同じ条件を足した。契約は変わらない。 |
 | 2026-09-27 | v2.51 | **v0.5.7 項目 11 の実装に伴う改訂**。リスク表の文字コードの行に、接続切れのログだけを落とす asyncio の例外ハンドラ（lifespan で付ける）を足した。契約は変わらない。 |
 | 2026-09-27 | v2.52 | **v0.5.7 受け入れ条件の試験の経路**。§8.3 に `sidecar.py --acceptance` を足した（ugg からは呼ばない。seed を固定するのはこの経路だけ）。契約は変わらない。 |
+| 2026-09-27 | v2.53 | **E-11 の実機検証で見つけた 2 件**。§ Irodori の取得の進捗: sidecar の `snapshot_download` が出すまとめた 2 本（`Downloading bytes` / `Reconstructing (incomplete total...)`）も読み替えるようにした（実機では生の棒グラフが並んでいた）。中断した更新の後始末は pip の一時退避（`~` 始まりの dist-info）を入っている版として数えず、全部戻せたら片付ける（`2e09255`。本文の契約は変わらないので節の追記なし）。 |
