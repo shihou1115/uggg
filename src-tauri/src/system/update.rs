@@ -52,9 +52,15 @@ pub async fn check_update_once(app: &AppHandle, state: &Arc<AppState>) -> Result
     }
 
     let seen_key = format!("update_notice_seen:{}", feed.latest);
+    let done = matches!(state.db.get_setting(&seen_key), Ok(Some(_)));
+    // **告知済みで出さなかったことも 1 行残す**（v0.5.7 の実機検証 E-11 の 7a。出ないときに「対象が無い」のか
+    // 「告知済み」なのかがログから分からなかった）。確かめるのは起動の 30 秒後と 24 時間ごとだけ。
+    if done {
+        crate::ulog!("[update] 新しい版 {} があります（告知済みなので出しません）", feed.latest);
+    }
     // 同じ版は二度告知しない。**済みにするのは届いたときだけ**（v0.5.6 項目 6）
     notify::once_reached(
-        matches!(state.db.get_setting(&seen_key), Ok(Some(_))),
+        done,
         || {
             notify::notify(
                 app,
@@ -88,11 +94,20 @@ pub async fn check_irodori_update_once(app: &AppHandle, state: &Arc<AppState>) -
     .await
     .map_err(|e| anyhow!("Irodori の更新の確認が中断しました: {e}"))?;
     let Some(targets) = targets else {
+        crate::ulog!("[update] Irodori のランタイムの更新の告知: 対象なし（未導入・更新中・最新のどれか）");
         return Ok(());
     };
     let seen_key = irodori_update_seen_key(&targets);
+    let done = matches!(state.db.get_setting(&seen_key), Ok(Some(_)));
+    // **告知済みで出さなかったことも 1 行残す**（v0.5.7 の実機検証 E-11 の 7a で、出ない理由がログから分からなかった）
+    if done {
+        crate::ulog!(
+            "[update] Irodori のランタイムに更新があります（{}。この組は告知済みなので出しません）",
+            targets.join(" / ")
+        );
+    }
     notify::once_reached(
-        matches!(state.db.get_setting(&seen_key), Ok(Some(_))),
+        done,
         || {
             notify::notify(
                 app,
@@ -155,6 +170,31 @@ fn is_newer(latest: (u32, u32, u32), current: (u32, u32, u32)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **告知しなかった理由もログに残す**（v0.5.7 の実機検証 E-11 の 7a）。対象が無いときと、告知済みで出さないとき。
+    /// 告知済みかどうかは 1 回だけ読み、その同じ値を `once_reached` に渡す（読み直すとログと判断が食い違いうる）。
+    #[test]
+    fn a_skipped_update_notice_leaves_its_reason_in_the_log() {
+        let src = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/system/update.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body_of = |name: &str| -> String {
+            let rest = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+            rest[..rest.find("\n}\n").unwrap()].to_string()
+        };
+        for (name, logged) in [
+            ("pub async fn check_update_once", "（告知済みなので出しません）"),
+            ("pub async fn check_irodori_update_once", "この組は告知済みなので出しません"),
+        ] {
+            let body = body_of(name);
+            let done = body.find("let done = matches!(state.db.get_setting(&seen_key), Ok(Some(_)));").expect(name);
+            let log = body.find(logged).unwrap_or_else(|| panic!("{name}: 告知済みで出さないことをログに残していない"));
+            let once = body.find("notify::once_reached(\n        done,").unwrap_or_else(|| panic!("{name}: 読んだ値を渡していない"));
+            assert!(done < log && log < once, "{name}: 順序");
+            assert_eq!(body.matches("get_setting(&seen_key)").count(), 1, "{name}: 告知済みを 2 回読んでいる");
+        }
+        assert!(body_of("pub async fn check_irodori_update_once").contains("対象なし（未導入・更新中・最新のどれか）"));
+    }
 
     /// **導入済みで、更新の錠が空いていて、対象があるときだけ告知する**（v0.5.7 項目 7）。錠が握られている・
     /// 未導入のときは**対象を確かめること自体をしない**（`status()` は記録に書き足し、python.exe を起動しうる）。
