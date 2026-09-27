@@ -1,4 +1,4 @@
-# ugg テスト計画（test-plan.md v1.58）
+# ugg テスト計画（test-plan.md v1.59）
 
 **フェーズ**: 本開発 Phase 3 確定版
 **作成日**: 2026-06-18
@@ -533,7 +533,7 @@ spec.md の §4 機能仕様の構造に従う。各項目に **○/×/該当な
         **ugg を終了して**（VRAM を空ける）PowerShell で流す。`<参照音声>` は `refs\` の中の、いま使っている `main_*.wav`:
         ```powershell
         $r = "$env:APPDATA\ugg\irodori"
-        & "$r\python\python.exe" "$r\sidecar.py" --asset-dir $r --acceptance "$env:USERPROFILE\Desktop\ugg-acceptance" --voice-ref "$r\refs\<参照音声>.wav"
+        & "$r\python\python.exe" "$r\sidecar.py" --asset-dir $r --acceptance "$([Environment]::GetFolderPath('Desktop'))\ugg-acceptance" --voice-ref "$r\refs\<参照音声>.wav"
         ```
         終了コード 0。`acceptance.json` の `caption.differs` と `caption.control_identical` が true（**S4' を兼ねる**）、
         `emoji.unknown` が空、`watermark.on.found` が true で `watermark.off.found` が false
@@ -1146,3 +1146,4 @@ CI（GitHub Actions など）は**置いていない**（v0.4.1 で見送り）�
 | 2026-09-27 | v1.56 | **E-11 の段階 1・2 の実機結果を §5.9 に記録**。段階 2 の前に、中断した更新の後始末が pip の一時退避を「入っている版」と読んで v3 を import できなくする欠陥を見つけて直した（`2e09255`）。実施の順の段階 2 に「更新が途中で止まっていたら先に戻す」と「更新の最中にソースを編集しない」を足し、1a の期待値に `model_*` を足した。 |
 | 2026-09-27 | v1.57 | **8b の期待値を実物の形に直した**（E-11 の段階 3 で、sidecar の `snapshot_download` が出すまとめた行を変換が読めず、生の棒グラフが並んだ。修正後の形は「取得中 モデル N GB / M GB（N%）」）。 |
 | 2026-09-27 | v1.58 | **E-11 の段階 3〜5 の実機結果を §5.9 に記録**。段階 3（保留）はこの端末では再現できず実機未確認（WDDM が待機中の LM Studio の VRAM を追い出すので OOM にならない）。段階 4 PASS、8b は FAIL → 修正（`24133de`）、段階 5 は A1 を含めて PASS（A2・A3・任意項目は未実施）。2a は長い文と、ローカル LLM の生成中に合成が大きく遅れることを記録した。 |
+| 2026-09-27 | v1.59 | **A1 の出力先をデスクトップの実体から引く書き方に直した**（`$env:USERPROFILE\Desktop` は、デスクトップを OneDrive へ移した環境では画面に出ない場所で、道具がそのフォルダごと新しく作っていた。開発機で実際に起きた）。 |
