@@ -1397,15 +1397,59 @@ fn normalize_dist_name(name: &str) -> String {
     out
 }
 
+/// pip が入れ替えの途中で止まったときに残す一時退避か（名前が `~` で始まる）。
+///
+/// pip は古い版を `~ransformers` / `~ransformers-4.57.6.dist-info` のように先頭を `~` に変えた名前へ移してから
+/// 新しい版を入れ、済んだら消す。**途中でプロセスごと止まると残り**、`importlib.metadata.distributions()` は
+/// これも `Name: transformers` の配布として返す（v0.5.7 の実機検証 E-11 で、dev の再起動で中断した更新が残した）。
+fn is_pip_stash(name: &str) -> bool {
+    name.starts_with('~')
+}
+
 /// `ALL_VERSIONS_MARKER` の行から、全配布の版（名前は正規化済み）を取り出す。
+///
+/// 行は `[名前, 版, dist-info のディレクトリ名]` の並び。**pip の一時退避（`is_pip_stash`）は数えない。**
+/// 数えると、入れ替えの途中で止まった配布が同じ名前で 2 つ並び、名前で畳んだときに一時退避の古い版が
+/// 残りうる — 実際に「transformers は控えと同じ 4.57.6」と読み、5.17.0 のコードを残したまま依存だけ
+/// 旧版へ戻して、v3 が import できなくなった（E-11）。
 fn parse_all_versions_line(line: &str) -> Option<std::collections::BTreeMap<String, String>> {
     let json = line.trim().strip_prefix(ALL_VERSIONS_MARKER)?;
-    let raw: std::collections::BTreeMap<String, String> = serde_json::from_str(json).ok()?;
+    let raw: Vec<(String, String, String)> = serde_json::from_str(json).ok()?;
     Some(
         raw.into_iter()
-            .map(|(name, version)| (normalize_dist_name(&name), version))
+            .filter(|(_, _, dir)| !is_pip_stash(dir))
+            .map(|(name, version, _)| (normalize_dist_name(&name), version))
             .collect(),
     )
+}
+
+/// site-packages に残った pip の一時退避（`is_pip_stash`）を消し、消した名前を返す。
+///
+/// **控えの版へ全部戻せたあとにだけ呼ぶ**（`recover_interrupted_update`）。戻したあとの一時退避は古い版の抜け殻で、
+/// 使われないのに pip が呼ばれるたびに `Ignoring invalid distribution` と警告し、ディスクを百 MB 単位で塞ぐ。
+fn remove_pip_stash(site: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(site) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_pip_stash(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let gone = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match gone {
+            Ok(()) => removed.push(name),
+            Err(err) => crate::ulog!("[irodori] pip の一時退避を消せませんでした（残します）: {}: {err}", path.display()),
+        }
+    }
+    removed.sort();
+    removed
 }
 
 /// いま入っている**全部の**配布の版を聞く（v0.5.6 項目 3d の控え）。
@@ -1419,11 +1463,11 @@ where
 {
     let script = format!(
         "import json,importlib.metadata as m
-out={{}}
+out=[]
 for d in m.distributions():
     n=d.metadata.get('Name')
-    if n: out[n]=d.version
-print({marker:?}+json.dumps(out,sort_keys=True))",
+    if n: out.append([n,d.version,getattr(getattr(d,'_path',None),'name','')])
+print({marker:?}+json.dumps(out))",
         marker = ALL_VERSIONS_MARKER,
     );
     let mut found = None;
@@ -1684,6 +1728,12 @@ where
                 left.join(" / "),
                 versions_snapshot_path(asset_root).display()
             ));
+        }
+        // 前回の更新が pip の入れ替えの途中で止まっていれば、pip の一時退避が残っている（E-11）。全部戻せたので抜け殻
+        let stash = remove_pip_stash(&site);
+        if !stash.is_empty() {
+            on_line(&format!("止まった pip が残した一時退避を片付けました: {}", stash.join(", ")));
+            crate::ulog!("[irodori] 止まった pip が残した一時退避を片付けました: {}", stash.join(", "));
         }
         remove_versions_snapshot(asset_root);
         on_line("戻しました");
@@ -4845,6 +4895,50 @@ mod update_tests {
         say("[harness] PASS".to_string());
     }
 
+    /// **実機検証用**（test-plan E-11 の段階 2 の前）。更新が**プロセスごと中断して**版の控え（`update-versions.json`）が
+    /// 残った実環境で、次の更新の冒頭の後始末（`recover_interrupted_update`）が**控えの版へ全部戻し**、控えを片付け、
+    /// v3 で喋れることを確かめる（v0.5.6 項目 3d。E-11 の実施中に dev の再起動で更新が中断し、transformers 5 が入ったまま
+    /// 記録は旧のままの環境ができた）。**実環境を書き換え、通信が要る。** ugg を終了してから走らせる。
+    ///
+    /// ```powershell
+    /// $env:UGG_IRODORI_REAL_ROOT = "$env:APPDATA\ugg\irodori"
+    /// cargo test -- --ignored --nocapture irodori_interrupted_update_recovers_on_a_real_runtime
+    /// ```
+    #[tokio::test]
+    #[ignore = "実環境を書き換える（通信が要る）。UGG_IRODORI_REAL_ROOT を指定して明示的に実行する"]
+    async fn irodori_interrupted_update_recovers_on_a_real_runtime() {
+        let root = real_root();
+        let py = root.join("python").join("python.exe");
+        let live = crate::tts::sidecar::live_sidecars(&root, &reqwest::Client::new()).await;
+        assert!(live.is_empty(), "ugg を終了してから走らせること（生きているサイドカー: {} 件）", live.len());
+        let _busy = IrodoriBusyGuard::acquire_for(&root).expect("更新の錠を取れること（ugg を終了してから）");
+        crate::tts::sidecar::install_sidecar_script(Path::new(env!("CARGO_MANIFEST_DIR")), &root)
+            .expect("sidecar.py を置けること");
+
+        let snapshot = read_versions_snapshot(&root).expect("前提: 中断した更新の版の控えが残っていること");
+        let now = query_all_versions(&py, |l| println!("  | {l}")).expect("版を読めること");
+        let differ = versions_to_restore(&snapshot, &now);
+        println!("[before] 控えと違う配布={differ:?} 控えに無い配布={:?}", added_since(&snapshot, &now));
+        assert!(!differ.is_empty(), "前提: 中断した更新で入れ替わった配布があること");
+        let stamp_before = std::fs::read(root.join(STAMP_FILE)).ok();
+        let read_before = model_args_for_read(&root).0;
+
+        recover_interrupted_update(&root, &py, |l| println!("  | {l}")).expect("後始末が成功すること");
+
+        let after = query_all_versions(&py, |l| println!("  | {l}")).expect("版を読めること");
+        let left = versions_to_restore(&snapshot, &after);
+        println!("[after] transformers={:?} 戻っていないもの={left:?}", after.get("transformers"));
+        assert!(left.is_empty(), "控えの版へ戻っていない: {left:?}");
+        assert!(read_versions_snapshot(&root).is_none(), "戻したら版の控えを片付けること");
+        assert_eq!(std::fs::read(root.join(STAMP_FILE)).ok(), stamp_before, "記録を書き換えないこと");
+        assert_eq!(model_args_for_read(&root).0, read_before, "読み先を変えないこと");
+
+        let outcome = run_synth_gate(&root, &py, &read_before, false, |l| println!("  | {l}"));
+        println!("[v3] {outcome:?}");
+        assert!(matches!(outcome, GateOutcome::Passed { .. }), "戻したあと v3 で合成できること: {outcome:?}");
+        println!("[harness] PASS");
+    }
+
     /// **実機検証用**（v0.5.6 項目 3d、test-plan E-10 の 4）。名前付きの配布を**控えの版へ戻せる**ことを、
     /// 実物の pip で確かめる。**実環境を書き換え、通信が要る。** ugg を終了してから走らせる。
     ///
@@ -5039,7 +5133,10 @@ mod update_tests {
     /// 全配布の版の行を読む（名前は正規化する）。無関係な行は拾わない。
     #[test]
     fn the_all_versions_line_is_parsed_with_normalized_names() {
-        let line = format!("{ALL_VERSIONS_MARKER}{{\"Huggingface_Hub\":\"0.36.2\",\"torch\":\"2.10.0+cu128\"}}");
+        let line = format!(
+            "{ALL_VERSIONS_MARKER}[[\"Huggingface_Hub\",\"0.36.2\",\"huggingface_hub-0.36.2.dist-info\"],\
+             [\"torch\",\"2.10.0+cu128\",\"torch-2.10.0+cu128.dist-info\"]]"
+        );
         let got = parse_all_versions_line(&line).expect("読めること");
         assert_eq!(got.get("huggingface-hub").map(String::as_str), Some("0.36.2"));
         assert_eq!(got.get("torch").map(String::as_str), Some("2.10.0+cu128"));
@@ -5228,9 +5325,10 @@ mod update_tests {
     #[tokio::test]
     async fn a_leftover_version_snapshot_is_not_dropped_silently() {
         let dir = tempfile::tempdir().unwrap();
-        make_site(dir.path());
+        let site = make_site(dir.path());
         std::fs::write(dir.path().join("python").join("python.exe"), b"x").unwrap();
         write_versions_snapshot(dir.path(), &map(&[("transformers", "4.57.6")])).unwrap();
+        put_pkg(&site, "~ransformers", "4.57.6", "old");
 
         let err = update_irodori_runtime(dir.path(), &[], |_| {})
             .await
@@ -5240,6 +5338,68 @@ mod update_tests {
             read_versions_snapshot(dir.path()).is_some(),
             "控えを残す（次の更新でもう一度戻す）"
         );
+        assert!(site.join("~ransformers").is_dir(), "戻せていないうちは pip の一時退避を消さない");
+    }
+
+    /// **pip の一時退避（`~` で始まる dist-info）は、入っている版として数えない**（v0.5.7 の実機検証 E-11）。
+    /// 入れ替えの途中で止まった pip は `~ransformers-4.57.6.dist-info` を残し、`distributions()` はこれも
+    /// `transformers` として返す。名前で畳むと並び次第で古い版が残り、5.17.0 が入っているのに「4.57.6 のまま」と
+    /// 読んで戻さなかった。どちらの並びでも、本物の dist-info の版だけを読む。
+    #[test]
+    fn a_pip_stash_is_not_counted_as_installed() {
+        for (first, second) in [
+            ("[\"transformers\",\"5.17.0\",\"transformers-5.17.0.dist-info\"]", "[\"transformers\",\"4.57.6\",\"~ransformers-4.57.6.dist-info\"]"),
+            ("[\"transformers\",\"4.57.6\",\"~ransformers-4.57.6.dist-info\"]", "[\"transformers\",\"5.17.0\",\"transformers-5.17.0.dist-info\"]"),
+        ] {
+            let line = format!("{ALL_VERSIONS_MARKER}[{first},{second}]");
+            let got = parse_all_versions_line(&line).expect("読めること");
+            assert_eq!(got.get("transformers").map(String::as_str), Some("5.17.0"), "{line}");
+            let before = map(&[("transformers", "4.57.6")]);
+            assert_eq!(
+                versions_to_restore(&before, &got),
+                vec![("transformers".to_string(), "4.57.6".to_string())],
+                "控えの版へ戻す対象に入る"
+            );
+        }
+        // 一時退避しか無い（新しい版の dist-info が書かれる前に止まった）なら、入っていないと読む → 戻す対象になる
+        let only_stash =
+            format!("{ALL_VERSIONS_MARKER}[[\"transformers\",\"4.57.6\",\"~ransformers-4.57.6.dist-info\"]]");
+        assert!(parse_all_versions_line(&only_stash).unwrap().get("transformers").is_none());
+    }
+
+    /// 後始末は、**控えの版へ全部戻せたと確かめたあと**、控えを捨てる前に pip の一時退避を片付ける
+    /// （成功の経路は python が要るので、配線を本文のテキストで固定する。戻せなかったときに残すことは
+    /// `a_leftover_version_snapshot_is_not_dropped_silently` が振る舞いで見る）。
+    #[test]
+    fn the_recovery_removes_pip_stashes_only_after_everything_is_restored() {
+        let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tts/irodori_download.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let body = &src[src.find("fn recover_interrupted_update<F>(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let returned = body.find("if !left.is_empty() {").expect("戻せなかったら止まる");
+        let stash = body.find("let stash = remove_pip_stash(&site);").expect("一時退避を片付けていない");
+        let dropped = body.find("remove_versions_snapshot(asset_root);").expect("控えを捨てる");
+        assert!(returned < stash && stash < dropped, "戻せたと確かめたあと、控えを捨てる前に片付ける");
+        assert_eq!(body.matches("remove_pip_stash(").count(), 1);
+    }
+
+    /// **pip の一時退避だけを消す**（v0.5.7 の実機検証 E-11）。本物のパッケージと dist-info、`~` を途中に含む名前は残す。
+    #[test]
+    fn only_pip_stashes_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = make_site(dir.path());
+        put_pkg(&site, "transformers", "5.17.0", "new");
+        put_pkg(&site, "~ransformers", "4.57.6", "old");
+        std::fs::write(site.join("~stray.pth"), b"").unwrap();
+        std::fs::create_dir_all(site.join("a~b")).unwrap();
+
+        let removed = remove_pip_stash(&site);
+        assert_eq!(removed, vec!["~ransformers", "~ransformers-4.57.6.dist-info", "~stray.pth"]);
+        assert!(site.join("transformers").is_dir());
+        assert!(site.join("transformers-5.17.0.dist-info").is_dir());
+        assert!(site.join("a~b").is_dir(), "先頭が `~` でないものは消さない");
+        assert!(remove_pip_stash(&site).is_empty(), "2 回目は何もしない");
     }
 
     /// **後の段で失敗しても、前の段で入れ替えた分まで戻す**（v0.5.6 項目 3d。spec §6.0 の土台の欠落 ①）。
