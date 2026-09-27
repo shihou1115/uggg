@@ -367,8 +367,17 @@ fn v054_baseline_models() -> std::collections::BTreeMap<String, String> {
 /// キャラは「GPU 環境が整っていない」と事実でない説明をする）。**取得はいまのビルド、読みは記録**で、
 /// **更新が成功したときだけ記録がいまのビルドに追いつく**。
 pub fn model_args_for_fetch() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(args) = FETCH_ARGS_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return args;
+    }
     model_args_from(&current_models())
 }
+
+/// **テストのビルドだけにある差し込み口**（v0.5.7 の受け入れ条件 (b)、test-plan E-11 の A5）。取得先を差し替えて、
+/// 実物の更新を「入れ替えたあと、モデルの取得で落ちる」経路へ通す。出荷物には入らない。
+#[cfg(test)]
+static FETCH_ARGS_FOR_TEST: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
 /// **読みに行く先**（記録から決める。v0.5.6 項目 3a の決定表）。サイドカーの起動で使う。
 /// 引数の並びと、**どこから決めたか**（ログに残す）を返す。
@@ -4703,6 +4712,137 @@ mod update_tests {
             "重みが無ければ不合格として戻す側に倒れること: {failed:?}"
         );
         assert!(!root.join(GATE_DIR).exists(), "作業場所を残さない");
+    }
+
+    /// **実機検証用**（v0.5.7 の受け入れ条件 (b)、test-plan E-11 の A5）。v0.5.6 の実環境で、**途中で失敗した更新が
+    /// transformers 5 → 4 まで全部戻り、v3 で喋れる**ことを確かめる。**実環境を書き換え、通信が要る**（入れ替えと戻しで
+    /// pip が数百 MB を取る）。**ugg を終了してから**走らせる（生きているサイドカーが残っていれば始めない）。
+    ///
+    /// 失敗は、取得するモデルの revision を存在しないものに差し替えて起こす（テストのビルドだけの差し込み口）。
+    /// 本物の `update_irodori_runtime` が、透かしの重みの先取り → 名前付き要件 → 固定 URL と入れ替えたあと、
+    /// モデルの取得で落ちて全部戻す。v3 のモデルは消えない（片付けはゲートが両方通ったあとだけ）。
+    ///
+    /// ```powershell
+    /// $env:UGG_IRODORI_REAL_ROOT = "$env:APPDATA\ugg\irodori"
+    /// cargo test -- --ignored --nocapture irodori_failed_update_rolls_back_on_a_real_runtime
+    /// ```
+    #[tokio::test]
+    #[ignore = "実環境を書き換える（通信が要る）。UGG_IRODORI_REAL_ROOT を指定して明示的に実行する"]
+    async fn irodori_failed_update_rolls_back_on_a_real_runtime() {
+        let root = real_root();
+        let py = root.join("python").join("python.exe");
+        let log_path = std::env::temp_dir().join("ugg-e11-rollback.log");
+        let _ = std::fs::write(&log_path, "");
+        let log = log_path.clone();
+        let say = move |line: String| {
+            use std::io::Write;
+            println!("{line}");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+                let _ = writeln!(f, "{line}");
+            }
+        };
+        say(format!(
+            "[harness] E-11 (b) 途中で失敗した更新の全戻し / {} / log={}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            log_path.display()
+        ));
+        let live = crate::tts::sidecar::live_sidecars(&root, &reqwest::Client::new()).await;
+        assert!(live.is_empty(), "ugg を終了してから走らせること（生きているサイドカー: {} 件）", live.len());
+        let _busy = IrodoriBusyGuard::acquire_for(&root).expect("更新の錠を取れること（ugg を終了してから）");
+        crate::tts::sidecar::install_sidecar_script(Path::new(env!("CARGO_MANIFEST_DIR")), &root)
+            .expect("sidecar.py を置けること");
+
+        let before = status(&root);
+        say(format!("[before] outdated={:?}", before.outdated));
+        assert!(before.present, "前提: 使える状態であること");
+        for name in ["transformers", "model_synth"] {
+            assert!(before.outdated.iter().any(|n| n == name), "前提: v0.5.6 の環境であること（{name} が対象に無い）");
+        }
+        let versions_before = query_all_versions(&py, |l| say(format!("  | {l}"))).expect("版を控えられること");
+        let transformers_before = versions_before.get("transformers").cloned();
+        say(format!("[before] transformers={transformers_before:?} 配布 {} 件", versions_before.len()));
+        assert!(
+            transformers_before.as_deref().is_some_and(|v| v.starts_with("4.")),
+            "前提: transformers 4 の環境であること"
+        );
+        let stamp_before = std::fs::read(root.join(STAMP_FILE)).ok();
+        let read_before = model_args_for_read(&root).0;
+        let pinned_before: Vec<String> =
+            ["irodori_tts", "dacvae", "silentcipher"].iter().map(|p| describe_package(&site_of(&root), p)).collect();
+        let models_dir = |name: &str| root.join("model").join(name);
+        let v3 = model_dir_of(&v054_baseline_models()["model_synth"]);
+        assert!(models_dir(&v3).is_dir(), "前提: v3 のモデルがあること: {v3}");
+
+        // 取得先を存在しない revision にする（名前付き要件と固定 URL を入れ替えたあと、モデルの取得で落ちる）
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                *FETCH_ARGS_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        let _reset = Reset;
+        let mut bogus = model_args_from(&current_models());
+        let at = bogus.iter().position(|a| a == "--model-synth-revision").expect("revision の引数がある");
+        bogus[at + 1] = "ugg-no-such-revision".to_string();
+        *FETCH_ARGS_FOR_TEST.lock().unwrap() = Some(bogus);
+
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = lines.clone();
+        let say2 = say.clone();
+        let result = update_irodori_runtime(&root, &before.outdated, move |l| {
+            seen.lock().unwrap().push(l.to_string());
+            say2(format!("  | {l}"));
+        })
+        .await;
+        drop(_reset);
+        say(format!("[result] {:?}", result.as_ref().map_err(|e| format!("{e:#}"))));
+        // 取得の前に sidecar.py が作る、存在しない revision の置き場所（このテストが作ったもの）だけを片付ける
+        let synth_repo = current_models()["model_synth"].rsplit_once('@').map(|(r, _)| r.to_string()).unwrap();
+        let junk = models_dir(&model_dir_name(&synth_repo, "ugg-no-such-revision"));
+        if junk.is_dir() {
+            let _ = std::fs::remove_dir_all(&junk);
+            say(format!("[cleanup] テストが作った置き場所を消しました: {}", junk.display()));
+        }
+        assert!(result.is_err(), "取得で落ちて失敗として返ること");
+        let lines = lines.lock().unwrap().clone();
+        let prefetch = lines.iter().position(|l| l.contains("透かし（SilentCipher）の重みを取得しています"));
+        let named = lines.iter().position(|l| l.contains("transformers"));
+        say(format!("[progress] 透かしの先取り={prefetch:?} 名前付き要件={named:?}"));
+        assert!(prefetch.is_some(), "透かしの重みを最初の段で取っていない");
+
+        // 全部戻った
+        let versions_after = query_all_versions(&py, |l| say(format!("  | {l}"))).expect("版を読めること");
+        let not_restored = versions_to_restore(&versions_before, &versions_after);
+        say(format!("[after] transformers={:?} 戻っていないもの={not_restored:?}", versions_after.get("transformers")));
+        assert!(not_restored.is_empty(), "控えの版へ戻っていない: {not_restored:?}");
+        assert_eq!(versions_after.get("transformers").cloned(), transformers_before, "transformers 4 まで戻ること");
+        let added: Vec<&String> = versions_after.keys().filter(|k| !versions_before.contains_key(*k)).collect();
+        say(format!("[after] 新しく入って残った配布={added:?}"));
+        let pinned_after: Vec<String> =
+            ["irodori_tts", "dacvae", "silentcipher"].iter().map(|p| describe_package(&site_of(&root), p)).collect();
+        assert_eq!(pinned_after, pinned_before, "固定 URL の 3 本が戻ること");
+        assert_eq!(std::fs::read(root.join(STAMP_FILE)).ok(), stamp_before, "記録を書き換えないこと");
+        assert!(!root.join(UPDATE_BACKUP_DIR).exists(), "退避を残さないこと");
+        assert!(!versions_snapshot_path(&root).exists(), "版の控えを残さないこと");
+        assert_eq!(model_args_for_read(&root).0, read_before, "読み先が v3 のままであること");
+        assert!(models_dir(&v3).is_dir(), "v3 のモデルを消さないこと");
+
+        // 透かしの重みは先取りで共有キャッシュにある（v3 の合成で黙って取りに行かない）
+        let hub = std::env::var_os("HF_HUB_CACHE")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HF_HOME").map(|h| PathBuf::from(h).join("hub")))
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default()).join(".cache/huggingface/hub")
+            });
+        let weights = hub.join("models--sony--silentcipher").join("snapshots");
+        say(format!("[after] 透かしの重み: {} ({})", weights.display(), weights.is_dir()));
+        assert!(weights.is_dir(), "透かしの重みが共有キャッシュに無い（合成のときに黙って取りに行く）");
+
+        // v3 で喋れる
+        let outcome = run_synth_gate(&root, &py, &read_before, false, |l| say(format!("  | {l}")));
+        say(format!("[v3] {outcome:?} → {:?}", gate_verdict(&outcome, None)));
+        assert!(matches!(outcome, GateOutcome::Passed { .. }), "戻したあと v3 で合成できること: {outcome:?}");
+        say("[harness] PASS".to_string());
     }
 
     /// **実機検証用**（v0.5.6 項目 3d、test-plan E-10 の 4）。名前付きの配布を**控えの版へ戻せる**ことを、
