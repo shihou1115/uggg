@@ -393,6 +393,27 @@ def watermark_state(runtime) -> tuple[bool, str]:
     return False, "効いていません（重みを読み込めませんでした）"
 
 
+def avoid_cudnn_attention_plans() -> str:
+    """上流の注意機構から cuDNN を外し、その説明を返す（v0.5.7 の実機検証 E-11 の 2a）。
+
+    上流 `89f9d8fb` の `irodori_tts/attention.py` は、マスク付きの SDPA を
+    `sdpa_kernel([CUDNN_ATTENTION, EFFICIENT_ATTENTION, MATH], set_priority=True)` で呼び、cuDNN を最優先に
+    固定している（全体の `torch.backends.cuda.enable_cudnn_sdp(False)` では外せない）。cuDNN は**初めての入力の形
+    ごとに実行計画を組み立てる**ので、長さが毎回違う ugg の台詞では 1 文ごとに約 700 ms 上乗せされていた
+    （RTX 5080・16 ステップで 1115〜1290 ms。同じ文の 2 回目は 443〜481 ms）。EFFICIENT を先頭にすると初回も
+    444〜491 ms で、定常の速さは変わらない（どちらも近似の無い計算）。上流にこの指定が無い版では何もしない。
+    """
+    try:
+        import irodori_tts.attention as attention  # type: ignore
+        from torch.nn.attention import SDPBackend  # type: ignore
+    except Exception:
+        return "上流の既定のまま（irodori_tts.attention が無い版）"
+    if not hasattr(attention, "_SDPA_PRIORITY"):
+        return "上流の既定のまま（優先順の指定が無い版）"
+    attention._SDPA_PRIORITY = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+    return "cuDNN を使わない（EFFICIENT → MATH）"
+
+
 class RealModelBackend:
     """実 Aratako/Irodori-TTS を用いた推論の薄いラッパ。
 
@@ -468,6 +489,7 @@ class RealModelBackend:
                 f"model.safetensors が見つかりません: {ckpt}. download_models を先に実行してください"
             )
         device = self._resolve_device()
+        _diag(f"[irodori] 注意機構: {avoid_cudnn_attention_plans()}")
         runtime = InferenceRuntime.from_key(
             RuntimeKey(
                 checkpoint=str(ckpt),

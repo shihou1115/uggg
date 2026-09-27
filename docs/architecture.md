@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.53）
+# ugg アーキテクチャ設計書（architecture.md v2.54）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1218,6 +1218,12 @@ raw テキストフォールバックに委ねる。
   取得は `model.safetensors` と `tokenizer/*`（`WEIGHT_FILE_PATTERNS`）を `snapshot_download` で、同じ repo@revision は
   1 回だけ。**精度とサンプラーは `sidecar.py` が読み込むモデルで決める**（`V4_MODELS`: v4.1 は bf16・16 ステップ linear、
   それ以外の v3・v2-VoiceDesign は fp32・sway 8）。生成と合成が同じ repo@revision なら、生成は合成のランタイムを使い回す
+- **★v0.5.7 上流の注意機構から cuDNN を外す**（E-11 の実機検証で判明）: 上流 `89f9d8fb` の `irodori_tts/attention.py` は
+  マスク付きの SDPA を `sdpa_kernel([CUDNN, EFFICIENT, MATH], set_priority=True)` で呼び、cuDNN を最優先に固定している
+  （全体の `enable_cudnn_sdp(False)` では外せない）。cuDNN は初めての入力の形ごとに実行計画を組み立てるので、長さが毎回違う
+  台詞では 1 文ごとに約 700 ms 上乗せされた（torch.profiler で `_scaled_dot_product_cudnn_attention` が +678 ms）。
+  `sidecar.py` はランタイムを作る前に `_SDPA_PRIORITY` を EFFICIENT → MATH に差し替え（`avoid_cudnn_attention_plans`）、
+  結果を `[irodori] 注意機構: …` の 1 行に残す。上流に指定が無い版では何もしない。定常の速さは変わらない（どちらも厳密な計算）
 - **★v0.5.7 揃っているかの判定**: 記録がいまのビルドのモデルを指しているのに、`MODEL_FILES` のファイル（v4.1 は
   トークナイザ 2 本を含む）が欠けていれば `outdated` に数える。**`present`（`irodori_assets_ready`）の意味は変えない**
   （モデルを見ると、更新前の人の設定が消え更新ボタンも隠れる — §4.7 の注記と同じ理由）。置き場所の名前は
@@ -1911,3 +1917,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-27 | v2.51 | **v0.5.7 項目 11 の実装に伴う改訂**。リスク表の文字コードの行に、接続切れのログだけを落とす asyncio の例外ハンドラ（lifespan で付ける）を足した。契約は変わらない。 |
 | 2026-09-27 | v2.52 | **v0.5.7 受け入れ条件の試験の経路**。§8.3 に `sidecar.py --acceptance` を足した（ugg からは呼ばない。seed を固定するのはこの経路だけ）。契約は変わらない。 |
 | 2026-09-27 | v2.53 | **E-11 の実機検証で見つけた 2 件**。§ Irodori の取得の進捗: sidecar の `snapshot_download` が出すまとめた 2 本（`Downloading bytes` / `Reconstructing (incomplete total...)`）も読み替えるようにした（実機では生の棒グラフが並んでいた）。中断した更新の後始末は pip の一時退避（`~` 始まりの dist-info）を入っている版として数えず、全部戻せたら片付ける（`2e09255`。本文の契約は変わらないので節の追記なし）。 |
+| 2026-09-27 | v2.54 | **上流の注意機構から cuDNN を外す**（E-11 の実機検証で判明）。上流 `89f9d8fb` が cuDNN を最優先に固定し、初めての長さの文ごとに実行計画の組み立てで約 700 ms 上乗せされていた。`sidecar.py` がランタイムを作る前に優先順を EFFICIENT → MATH へ差し替え、結果を 1 行残す。 |

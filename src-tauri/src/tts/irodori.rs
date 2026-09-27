@@ -1185,6 +1185,34 @@ mod tests {
         assert!(json.contains("\"num_steps\":16"), "ステップ数を送る（v0.5.7 項目 4）: {json}");
     }
 
+    /// **上流の注意機構から cuDNN を外す**（v0.5.7 の実機検証 E-11 の 2a）。上流 `89f9d8fb` の `attention.py` は
+    /// cuDNN を最優先に固定しており、初めての長さの文ごとに実行計画の組み立てで約 700 ms かかっていた（毎回長さが
+    /// 違う台詞ではほぼ毎回）。ランタイムを作る前に優先順を差し替え、どうなったかを 1 行残す（配線を本文のテキストで
+    /// 固定する。関数の本文を切り出して探す — 全体を探すとドキュメントの説明に当たる）。
+    #[test]
+    fn the_sidecar_keeps_cudnn_out_of_the_upstream_attention() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let py = std::fs::read_to_string(root.join("python").join("sidecar.py")).unwrap().replace("\r\n", "\n");
+        let avoid = &py[py.find("def avoid_cudnn_attention_plans() -> str:").expect("差し替えの関数が無い")..];
+        let avoid = &avoid[..avoid.find("\n\n\n").unwrap()];
+        let assign = avoid
+            .lines()
+            .find(|l| l.trim_start().starts_with("attention._SDPA_PRIORITY ="))
+            .expect("優先順を差し替えていない");
+        assert!(assign.contains("SDPBackend.EFFICIENT_ATTENTION"), "{assign}");
+        assert!(!assign.contains("CUDNN"), "差し替えた優先順に cuDNN が残っている: {assign}");
+        assert!(avoid.contains("if not hasattr(attention, \"_SDPA_PRIORITY\"):"), "指定が無い版で壊れる");
+
+        let build = &py[py.find("    def _build_runtime(self, repo: str, revision: str):").expect("_build_runtime が無い")..];
+        let build = &build[..build[1..].find("\n    def ").unwrap() + 1];
+        let patched = build
+            .find("_diag(f\"[irodori] 注意機構: {avoid_cudnn_attention_plans()}\")")
+            .expect("ランタイムを作るときに差し替えていない（またはログに残していない）");
+        // docstring にも「InferenceRuntime.from_key(RuntimeKey(...)) と同じ構成」とあるので、代入の行で探す
+        let created = build.find("runtime = InferenceRuntime.from_key(").expect("ランタイムを作っていない");
+        assert!(patched < created, "ランタイムを作ったあとに差し替えている");
+    }
+
     /// **合成のステップ数の選択肢と既定値は、設定・`sidecar.py`・画面で同じ組**（v0.5.7 項目 4）。
     /// 食い違うと、画面で選んだ値をサイドカーが知らずに既定の 16 へ倒す（黙って効かない）。
     #[test]
