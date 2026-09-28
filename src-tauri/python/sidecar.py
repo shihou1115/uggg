@@ -381,6 +381,59 @@ def fetch_watermark_weights() -> None:
     sys.stderr.write(f"[hf-download] 透かしの重み（{WATERMARK_REPO}）ダウンロード完了\n")
 
 
+# 上流が読む透かしの重み（`silentcipher.get_model(model_type="44.1k")` が snapshot の中のこの 4 つを読む）。
+WATERMARK_WEIGHT_DIR = "44_1_khz/73999_iteration"
+WATERMARK_WEIGHT_FILES = ("hparams.yaml", "enc_c.ckpt", "dec_c.ckpt", "dec_m_0.ckpt")
+
+
+def hf_hub_cache_dir() -> Path:
+    """共有 HF キャッシュの場所。huggingface_hub の `constants` と同じ規則で、**hub を import せずに**決める
+    （hub は import した時点で `HF_HUB_OFFLINE` を読むので、決める前に import できない）。"""
+    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if os.environ.get(name):
+            return Path(os.path.expanduser(os.environ[name]))
+    home = os.environ.get("HF_HOME") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "huggingface"
+    )
+    return Path(os.path.expanduser(home)) / "hub"
+
+
+def watermark_weights_present(cache_dir: Path) -> bool:
+    """透かしの重みが共有 HF キャッシュに揃っているか（`refs/main` が指す snapshot に 4 つとも、空でなく）。
+
+    hub は取得し終えたファイルだけを snapshot に置くので、途中で切れた取得はここに現れない。
+    """
+    repo = cache_dir / ("models--" + WATERMARK_REPO.replace("/", "--"))
+    try:
+        sha = (repo / "refs" / "main").read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not sha:
+        return False
+    weights = repo / "snapshots" / sha / WATERMARK_WEIGHT_DIR
+    try:
+        return all((weights / name).stat().st_size > 0 for name in WATERMARK_WEIGHT_FILES)
+    except OSError:
+        return False
+
+
+def stay_off_the_hub() -> str:
+    """合成・参照音声の生成をするプロセスを、Hub へ問い合わせない形にする。説明の 1 行を返す（v0.5.8 項目 2）。
+
+    上流は合成のランタイムを作るたびに、透かしの重みを `snapshot_download(repo_id=...)` で解決する（重みが手元に
+    あっても `main` の版を Hub に聞く）。**誰も操作していないのに、サイドカーが起きるたびに外へ出る通信**で、
+    通信が詰まる環境では読み込みが 9 → 30 秒になっていた（2026-09-28 の実測）。`HF_HUB_OFFLINE` は
+    **上書きする**（`setdefault` にしない）。hub を import する前に呼ぶこと。
+
+    **透かしの重みが揃っていないときは立てない**（spec §6.0 の反証 R1）。先取りは失敗しても導入・更新を止めない
+    設計で、失敗の文言は「合成のときにもう一度取りに行きます」。立てると、その回復が消えて透かしが二度と効かない。
+    """
+    if watermark_weights_present(hf_hub_cache_dir()):
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        return "Hub へは問い合わせません"
+    return "透かしの重みが手元に揃っていないので、Hub への問い合わせを許します（合成のときに上流が取り直します）"
+
+
 def watermark_state(runtime) -> tuple[bool, str]:
     """透かしが効いているかと、その説明（v0.5.7 項目 5）。効いていないことが見えなくならないように。"""
     ready = bool(getattr(getattr(runtime, "watermarker", None), "ready", False))
@@ -780,13 +833,32 @@ def synth_failure_kind(exc: BaseException) -> str:
     """合成の失敗の種類（v0.5.7 項目 7。Rust の `SynthFailure` と同じ組）。
 
     Rust はこれでキャラの説明を言い分ける（以前は理由によらず「GPU 環境が整っていない」と言った）。
-    モデルの重み・トークナイザが無いときは `FileNotFoundError`（`_build_runtime` と上流の読み込み）。
+    モデルの重みが無いときは `_build_runtime` が `FileNotFoundError` を投げる。**Hub へ問い合わせずに読むと
+    （v0.5.8 項目 2）、キャッシュに無いものは別の例外で届く** — transformers は `OSError`（「couldn't find them in
+    the cached files」）、hub は `LocalEntryNotFoundError`（`FileNotFoundError` の派生）や `OfflineModeIsEnabled`。
+    どれも「揃っていない」（設定の「更新する」で直る）なので、原因を連ねた先まで見て同じ組にする。
     """
     if _is_out_of_memory(exc):
         return "oom"
-    if isinstance(exc, FileNotFoundError):
+    if _is_missing_locally(exc):
         return "model_missing"
     return "other"
+
+
+def _is_missing_locally(exc: BaseException) -> bool:
+    """手元に無いものを読もうとして失敗したか（例外の原因を連ねた先まで見る）。"""
+    seen = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, FileNotFoundError):
+            return True
+        if type(cur).__name__ in ("LocalEntryNotFoundError", "OfflineModeIsEnabled"):
+            return True
+        if isinstance(cur, OSError) and "cached files" in str(cur):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 # --- 更新の成否を確かめる一発合成 (spec §6.0 v0.5.6 項目 3b) -----------------
@@ -1364,6 +1436,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
         sys.stderr.write("[hf-download] モデル DL 完了\n")
         return 0
+
+    # ここから下は合成・参照音声の生成をするモード。**Hub へは問い合わせない**（v0.5.8 項目 2）。取得と更新の段
+    # （上の 2 つ）だけが通信する。例外は `--no-download` 無しでサーバーとして起動したとき（手で起動したときだけ。
+    # ugg は必ず `--no-download` を渡す）で、その中で取得が走るので立てない。hub を import する前に決める。
+    serves_with_download = (
+        args.acceptance is None and not args.synth_once and not args.mock and not args.no_download
+    )
+    if serves_with_download:
+        _diag("[irodori] Hub: 取得を含む起動なので、問い合わせを許します")
+    else:
+        _diag(f"[irodori] Hub: {stay_off_the_hub()}")
 
     # --acceptance モード（v0.5.7 の受け入れ条件）: 試験の経路だけ。HTTP は立てない。
     if args.acceptance is not None:

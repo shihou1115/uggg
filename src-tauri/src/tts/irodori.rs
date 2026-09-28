@@ -659,7 +659,8 @@ pub enum TtsError {
 /// サイドカーが返す合成の失敗の種類（v0.5.7 項目 7。`sidecar.py` の `synth_failure_kind` と同じ組）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SynthFailure {
-    /// モデルの重み・トークナイザが無い（`FileNotFoundError`）。更新が要る。
+    /// モデルの重み・トークナイザ・コーデックが手元に無い（`FileNotFoundError` か、Hub へ問い合わせずに読んで
+    /// キャッシュに無かった。v0.5.8 項目 2）。更新が要る。
     ModelMissing,
     /// GPU のメモリが足りない。
     OutOfMemory,
@@ -1395,6 +1396,43 @@ mod tests {
         assert!(py[acceptance..].starts_with("    if args.acceptance is not None:\n        if args.voice_ref is None:"));
     }
 
+    /// **合成・参照音声の生成をするプロセスは Hub へ問い合わせない。取得と更新の段は塞がない**（v0.5.8 項目 2）。
+    /// `main` の本文を切り出して、順序を固定する: 取得の 2 モード（`--fetch-watermark` / `--download-only`）→
+    /// 通信を塞ぐ判断 → 合成をするモード（`--acceptance` / `--synth-once` / サーバー）。
+    #[test]
+    fn the_synth_processes_stay_off_the_hub_but_fetching_does_not() {
+        let py = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let main = &py[py.find("def main(argv: Optional[list[str]] = None) -> int:").expect("main が無い")..];
+        let at = |needle: &str| main.find(needle).unwrap_or_else(|| panic!("main に無い: {needle}"));
+        let fetch = at("    if args.fetch_watermark:");
+        let download = at("    if args.download_only:");
+        let decide = at("        _diag(f\"[irodori] Hub: {stay_off_the_hub()}\")");
+        let acceptance = at("    if args.acceptance is not None:");
+        let once = at("    if args.synth_once:");
+        let serve = at("    port = args.port if args.port and args.port > 0 else pick_free_port(args.host)");
+        assert!(fetch < decide && download < decide, "取得の段より前に通信を塞いでいる");
+        assert!(decide < acceptance && decide < once && decide < serve, "合成をするモードのあとで塞いでいる");
+        // `--no-download` 無しのサーバー（中で取得が走る）だけは塞がない
+        assert!(main.contains(
+            "    serves_with_download = (\n        args.acceptance is None and not args.synth_once and not args.mock and not args.no_download\n    )"
+        ));
+        // 立て方: **上書き**で、**透かしの重みが揃っているときだけ**（反証 R1: 揃っていなければ上流が取り直せるように）
+        let stay = &py[py.find("def stay_off_the_hub() -> str:").expect("stay_off_the_hub が無い")..];
+        let stay = &stay[..stay.find("\n\n\n").unwrap()];
+        let guard = stay.find("    if watermark_weights_present(hf_hub_cache_dir()):").expect("重みを見ていない");
+        let set = stay.find("        os.environ[\"HF_HUB_OFFLINE\"] = \"1\"").expect("上書きで立てていない");
+        assert!(guard < set);
+        // docstring の「`setdefault` にしない」に当たらないよう、コードの形で探す
+        assert!(!stay.contains("os.environ.setdefault"));
+        // hub をファイルの頭で import しない（import した時点で環境変数を読むので、決める前に読まれる）
+        let head = &py[..py.find("\ndef ").unwrap()];
+        assert!(!head.contains("huggingface_hub") && !head.contains("import transformers"));
+    }
+
     /// **サイドカーの応答の形と、Rust の読み取りが噛み合う**（v0.5.7 項目 7。本文のテキストで固定する）。
     #[test]
     fn the_sidecar_speech_error_carries_the_kind_rust_reads() {
@@ -1410,9 +1448,21 @@ mod tests {
         let body = &body[..body.find("\n\n\n").unwrap()];
         let oom = body.find("    if _is_out_of_memory(exc):\n        return \"oom\"").expect("VRAM 不足を見分けていない");
         let missing = body
-            .find("    if isinstance(exc, FileNotFoundError):\n        return \"model_missing\"")
+            .find("    if _is_missing_locally(exc):\n        return \"model_missing\"")
             .expect("モデルが無いのを見分けていない");
         assert!(oom < missing && body.contains("    return \"other\""));
+        // **Hub へ問い合わせずに読むと、無いものは FileNotFoundError 以外でも届く**（v0.5.8 項目 2）。
+        // 原因を連ねた先まで、3 つの形を見る
+        let local = &py[py.find("def _is_missing_locally(exc: BaseException) -> bool:").expect("_is_missing_locally が無い")..];
+        let local = &local[..local.find("\n\n\n").unwrap()];
+        for needle in [
+            "isinstance(cur, FileNotFoundError)",
+            "(\"LocalEntryNotFoundError\", \"OfflineModeIsEnabled\")",
+            "isinstance(cur, OSError) and \"cached files\" in str(cur)",
+            "cur = cur.__cause__ or cur.__context__",
+        ] {
+            assert!(local.contains(needle), "見ていない: {needle}");
+        }
         // **参照音声のファイルが無いことを「モデルが無い」と取り違えない**（v0.5.7 リリース前監査）: 合成の入口で先に確かめ、
         // FileNotFoundError でない例外で返す（上流の読み込みの FileNotFoundError まで行くと model_missing になる）
         let synth_py = &py[py.find("    def synthesize(\n").expect("synthesize が無い")..];
