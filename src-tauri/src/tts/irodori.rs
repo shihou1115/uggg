@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use thiserror::Error;
 
+use crate::system::log::StripUrl;
 use crate::tts::sidecar::{self, SidecarHandle};
 
 fn now_secs() -> i64 {
@@ -534,6 +535,7 @@ impl IrodoriClient {
             .json(&body)
             .send()
             .await
+            .strip_url()
             .map_err(|e| TtsError::Http(format!("{e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -552,6 +554,7 @@ impl IrodoriClient {
         let bytes = resp
             .bytes()
             .await
+            .strip_url()
             .map_err(|e| TtsError::Http(format!("body 受信失敗: {e}")))?;
         Ok(bytes.to_vec())
     }
@@ -579,6 +582,7 @@ impl IrodoriClient {
             .json(&body)
             .send()
             .await
+            .strip_url()
             .map_err(|e| TtsError::Http(format!("{e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -591,6 +595,7 @@ impl IrodoriClient {
         let r: VoiceRefResponse = resp
             .json()
             .await
+            .strip_url()
             .map_err(|e| TtsError::Http(format!("voice_ref レスポンス解析失敗: {e}")))?;
         Ok(PathBuf::from(r.path))
     }

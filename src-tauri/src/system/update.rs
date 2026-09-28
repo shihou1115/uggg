@@ -16,6 +16,7 @@ use serde::Deserialize;
 use tauri::AppHandle;
 
 use crate::state::AppState;
+use crate::system::log::{url_for_log, StripUrl};
 use crate::system::notify::{self, NoticeKind};
 
 /// 自バージョン (CARGO_PKG_VERSION) と feed の `latest` を比較。
@@ -35,11 +36,15 @@ pub async fn check_update_once(app: &AppHandle, state: &Arc<AppState>) -> Result
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .with_context(|| format!("update feed 取得: {url}"))?
+        .strip_url()
+        // フィードの URL はユーザーの設定。ホストまでしか書かない（spec §5、v0.5.8 項目 1）
+        .with_context(|| format!("update feed 取得: {}", url_for_log(&url)))?
         .error_for_status()
-        .with_context(|| format!("update feed status: {url}"))?
+        .strip_url()
+        .with_context(|| format!("update feed status: {}", url_for_log(&url)))?
         .json()
         .await
+        .strip_url()
         .with_context(|| "update feed の JSON 解析に失敗")?;
 
     let current = parse_version(env!("CARGO_PKG_VERSION"))

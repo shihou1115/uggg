@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
+use crate::system::log::{url_for_log, StripUrl};
 
 /// 定期取得の間隔 (daily watcher の 60 秒 tick 内で判定、§3.3)。
 pub const WEATHER_FETCH_INTERVAL_SECS: i64 = 3 * 3600;
@@ -244,15 +245,20 @@ pub async fn fetch_forecast(latitude: f64, longitude: f64) -> Result<WeatherCach
         .timeout(Duration::from_secs(15))
         .build()
         .context("HTTP クライアント構築失敗")?;
+    // URL はホストまでしか書かない（spec §5、v0.5.8 項目 1）。クエリに座標が入る。
+    let host = url_for_log(&url);
     let body = client
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("天気予報の取得に失敗: {url}"))?
+        .strip_url()
+        .with_context(|| format!("天気予報の取得に失敗: {host}"))?
         .error_for_status()
-        .with_context(|| format!("天気予報の取得が HTTP エラー: {url}"))?
+        .strip_url()
+        .with_context(|| format!("天気予報の取得が HTTP エラー: {host}"))?
         .text()
         .await
+        .strip_url()
         .context("天気予報の応答取得に失敗")?;
     let daily = parse_forecast_body(&body)?;
     Ok(WeatherCache {

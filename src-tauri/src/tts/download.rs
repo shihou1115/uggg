@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::system::log::StripUrl;
 use crate::tts::child_process::{self, Ended, Stream};
 
 /// 無進捗とみなすまでの時間（v0.5.6 項目 2）。出力・読み書き・CPU のどれも無い時間で数える
@@ -65,9 +66,11 @@ pub async fn ensure_downloader(asset_dir: &Path) -> Result<PathBuf, String> {
         .send()
         .await
         .and_then(|r| r.error_for_status())
+        .strip_url()
         .map_err(|e| format!("ダウンローダ取得に失敗: {e}"))?
         .bytes()
         .await
+        .strip_url()
         .map_err(|e| format!("ダウンローダ受信に失敗: {e}"))?;
     std::fs::write(&path, &bytes).map_err(|e| format!("ダウンローダ保存に失敗: {e}"))?;
     Ok(path)

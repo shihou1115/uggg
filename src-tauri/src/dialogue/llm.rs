@@ -8,6 +8,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::system::log::{url_for_log, StripUrl};
+
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Clone)]
@@ -110,7 +112,9 @@ impl LlmClient {
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("LLM へ接続できませんでした: {url}"))?;
+            .strip_url()
+            // 接続先はユーザーの設定。ホストまでしか書かない（spec §5、v0.5.8 項目 1）
+            .with_context(|| format!("LLM へ接続できませんでした: {}", url_for_log(&url)))?;
         let status = resp.status();
         if !status.is_success() {
             // ボディは診断に要る（`insufficient_quota` などはここにしか出ない）が、
@@ -122,6 +126,7 @@ impl LlmClient {
         let parsed = resp
             .json::<ChatResponse>()
             .await
+            .strip_url()
             .context("LLM 応答 JSON のパースに失敗")?;
         Ok(parsed)
     }
@@ -244,5 +249,25 @@ mod tests {
     fn pricing_unknown_model_returns_zero() {
         let cost = estimate_cost_usd("local-llama", 9999, 9999);
         assert_eq!(cost, 0.0);
+    }
+
+    /// **接続先はホストまでしか失敗の文に入れない**（spec §5、v0.5.8 項目 1）。接続先はユーザーの設定で、
+    /// パスに合言葉を含むものもありうる。接続・状態コード・本文の読み取りの 3 通りで確かめる。
+    #[tokio::test]
+    async fn a_failed_chat_does_not_write_the_endpoint_path() {
+        use crate::system::log::http_fixture;
+        for failure in http_fixture::ALL {
+            let client = LlmClient {
+                http: http_fixture::client(),
+                base_url: format!("{}/SECRET-path/v1?key=SECRET", http_fixture::base_url(failure)),
+                api_key: None,
+            };
+            let err = client
+                .chat("m", vec![ChatMessage::user("hi")])
+                .await
+                .expect_err(&format!("{failure:?} で失敗しなかった"));
+            let text = format!("{err:#}");
+            assert!(!text.contains("SECRET"), "{failure:?}: 接続先のパスが残っている: {text}");
+        }
     }
 }

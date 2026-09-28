@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Timelike};
 
 use crate::state::{AppState, CalendarSource};
+use crate::system::log::{url_for_log, StripUrl};
 use crate::tools::reminder::local_to_utc_ts;
 
 /// 終日予定の通知基準時刻（ローカル 8:00。§2.5 / 時間帯マッピングの「朝」と共有）。
@@ -518,6 +519,22 @@ fn collect_recurrence_overrides(
 
 // ===== 取得 + DB 反映 =====
 
+/// ICS を URL から取る。**失敗の文に URL はホストまでしか入れない**（spec §5、v0.5.8 項目 1）。
+/// 公開していない予定表の URL はパスやクエリに合言葉を含み、失敗の文は `ugg.log` に残る
+/// （ログは履歴クリアの対象外）。reqwest のエラー文にも URL が付くので外す。
+async fn fetch_ics(client: &reqwest::Client, url: &str) -> Result<String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .strip_url()
+        .with_context(|| format!("ICS 取得失敗: {}", url_for_log(url)))?
+        .error_for_status()
+        .strip_url()
+        .with_context(|| format!("ICS 取得が HTTP エラー: {}", url_for_log(url)))?;
+    resp.text().await.strip_url().context("ICS 本文の取得失敗")
+}
+
 /// 1 ソースを取得して calendar_cache へ反映する（watcher / refresh_calendar が呼ぶ）。
 /// File は読込、Url は HTTP GET（15 秒タイムアウト、topics.rs と同水準）。
 /// **取得失敗・非 ICS 応答は Err で早期 return し既存キャッシュを維持する**
@@ -539,14 +556,7 @@ pub async fn fetch_source_into_cache(
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .context("HTTP クライアント構築失敗")?;
-            let resp = client
-                .get(url)
-                .send()
-                .await
-                .with_context(|| format!("ICS 取得失敗: {url}"))?
-                .error_for_status()
-                .with_context(|| format!("ICS 取得が HTTP エラー: {url}"))?;
-            resp.text().await.context("ICS 本文の取得失敗")?
+            fetch_ics(&client, url).await?
         }
     };
     if !looks_like_ics(&raw) {
@@ -670,6 +680,23 @@ pub fn time_label(start_ts: i64, all_day: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **失敗の文に ICS の URL の合言葉を入れない**（spec §5、v0.5.8 項目 1）。公開していない予定表の URL は
+    /// パスやクエリに合言葉を含み、失敗の文は `ugg.log` に残る。接続・状態コード・本文の読み取りの 3 通りとも。
+    #[tokio::test]
+    async fn a_failed_ics_fetch_keeps_only_the_host() {
+        use crate::system::log::http_fixture;
+        for failure in http_fixture::ALL {
+            let base = http_fixture::base_url(failure);
+            let url = format!("{base}/calendar/ical/me/private-SECRET/basic.ics?token=SECRET");
+            let err = fetch_ics(&http_fixture::client(), &url)
+                .await
+                .expect_err(&format!("{failure:?} で失敗しなかった"));
+            let text = format!("{err:#}");
+            assert!(!text.contains("SECRET"), "{failure:?}: 合言葉が残っている: {text}");
+            assert!(!text.contains("/calendar/"), "{failure:?}: パスが残っている: {text}");
+        }
+    }
 
     fn local_ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
         local_to_utc_ts(

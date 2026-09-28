@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use crate::system::log::StripUrl;
 use crate::tts::child_process::{self, Ended, Line, Stream};
 
 use anyhow::{anyhow, Context, Result};
@@ -2846,10 +2847,14 @@ async fn download_to(url: &str, dest: &Path) -> Result<()> {
         .get(url)
         .send()
         .await
+        .strip_url()
+        // 取得先は出荷物に固定した公開の URL なので、文脈には残す（版の証跡。spec §5 の規則の対象外）。
+        // reqwest のエラー文からは一律に外す（二重に出さない）
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
+        .strip_url()
         .with_context(|| format!("status {url}"))?;
-    let bytes = resp.bytes().await.with_context(|| format!("read body {url}"))?;
+    let bytes = resp.bytes().await.strip_url().with_context(|| format!("read body {url}"))?;
     let mut f = std::fs::File::create(dest)
         .with_context(|| format!("create {}", dest.display()))?;
     f.write_all(&bytes)

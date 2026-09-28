@@ -17,6 +17,7 @@ use crate::db::{
 };
 use crate::state::{AppState, CalendarSource};
 use crate::system::deliver;
+use crate::system::log::StripUrl;
 use crate::system::governance::{self, Priority, SpeechCategory};
 use crate::system::weather::{self, DailyWeather};
 use crate::tools::{reminder, todo};
@@ -750,15 +751,19 @@ pub async fn search_location(query: String) -> Result<Vec<LocationHit>, String> 
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("HTTP クライアント構築に失敗しました: {e}"))?;
+    // 画面へ返す文にも URL（クエリに入力した地名）を入れない（spec §5、v0.5.8 項目 1）
     let body = client
         .get(&url)
         .send()
         .await
+        .strip_url()
         .map_err(|e| format!("地名検索に失敗しました: {e}"))?
         .error_for_status()
+        .strip_url()
         .map_err(|e| format!("地名検索が HTTP エラーになりました: {e}"))?
         .text()
         .await
+        .strip_url()
         .map_err(|e| format!("地名検索の応答取得に失敗しました: {e}"))?;
     parse_geocoding_response(&body)
 }

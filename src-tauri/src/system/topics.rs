@@ -17,6 +17,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
 use crate::state::AppState;
+use crate::system::log::{url_for_log, StripUrl};
 
 /// 暗い見出しのキーワード (架空語含む、含めば除外)。
 /// メンテはここを更新するだけ。多言語化は将来課題。
@@ -42,17 +43,22 @@ pub fn build_google_news_rss_url(query: &str) -> String {
 /// 1 トピックぶんの RSS を取得 → パース → 暗い見出しを除外 → 上位 N 件返す。
 pub async fn fetch_topic(query: &str, limit: usize) -> Result<Vec<RssItem>> {
     let url = build_google_news_rss_url(query);
+    // URL はホストまでしか書かない（spec §5、v0.5.8 項目 1）。クエリの `q=` は検索語＝ユーザーの関心事。
+    let host = url_for_log(&url);
     let body = reqwest::Client::new()
         .get(&url)
         .timeout(Duration::from_secs(15))
         .send()
         .await
-        .with_context(|| format!("rss get {url}"))?
+        .strip_url()
+        .with_context(|| format!("RSS の取得に失敗: {host}"))?
         .error_for_status()
-        .with_context(|| format!("rss status {url}"))?
+        .strip_url()
+        .with_context(|| format!("RSS の取得が HTTP エラー: {host}"))?
         .text()
         .await
-        .with_context(|| format!("rss text {url}"))?;
+        .strip_url()
+        .with_context(|| format!("RSS の本文の取得に失敗: {host}"))?;
     let items = parse_rss_items(&body)?;
     Ok(filter_and_take(items, limit))
 }
@@ -65,7 +71,7 @@ pub async fn fetch_all_into_cache(state: &Arc<AppState>) -> Result<()> {
         return Ok(());
     }
     let now = chrono::Utc::now().timestamp();
-    for topic in &topics {
+    for (i, topic) in topics.iter().enumerate() {
         match fetch_topic(topic, 5).await {
             Ok(items) => {
                 for it in items {
@@ -73,7 +79,8 @@ pub async fn fetch_all_into_cache(state: &Arc<AppState>) -> Result<()> {
                 }
             }
             Err(err) => {
-                crate::ulog!("[topics] '{topic}' の RSS 取得失敗: {err:#}");
+                // 検索語そのものは書かない（ユーザーの関心事。spec §5、v0.5.8 項目 1）。何件目かだけ。
+                crate::ulog!("[topics] {} 件目の検索語の RSS 取得失敗: {err:#}", i + 1);
             }
         }
     }
@@ -181,6 +188,27 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **検索語そのものをログに書かない**（spec §5、v0.5.8 項目 1）。検索語はユーザーの関心事で、ログは
+    /// 履歴クリアの対象外。URL の `q=` を外しても、同じ行に検索語を書けば同じこと。
+    /// テキストの契約: `fetch_all_into_cache` の本文を切り出し、`ulog!` の書式に検索語の変数が入っていない。
+    #[test]
+    fn a_failed_topic_is_logged_without_its_words() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/system/topics.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let start = src.find("pub async fn fetch_all_into_cache(").expect("関数が見つからない");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("関数の終わりが見つからない")];
+        let logs: Vec<&str> = body.lines().filter(|l| l.contains("ulog!")).collect();
+        assert!(!logs.is_empty(), "失敗のログの行が見つからない（テストが空振りしている）");
+        for line in logs {
+            assert!(!line.contains("{topic"), "検索語をログに書いている: {line}");
+            assert!(!line.contains("topic)"), "検索語をログに書いている: {line}");
+        }
+    }
 
     #[test]
     fn dark_keyword_filters_obvious_cases() {
