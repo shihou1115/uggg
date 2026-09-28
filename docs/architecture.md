@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.57）
+# ugg アーキテクチャ設計書（architecture.md v2.58）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1933,3 +1933,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-27 | v2.55 | **v0.5.7 リリース前監査の指摘への対応**。空き容量はモデルの重み本体が無いときだけモデルの分を足す（保留のあとの再試行が断られていた）／更新・初回導入・VOICEVOX の取得の始まり（更新は終わりも）を `ugg.log` に残す／保留は目印 `（保留）` で見分けて失敗と出さず、最新ならダウンロードで確認を出さない／旧モデルの片付けはふつうのフォルダ名 1 つだけを対象にする／参照音声のファイルが無いのを「モデルが無い」と取り違えない。**コマンド・イベント・設定の契約は変わらない。** |
 | 2026-09-28 | v2.56 | **v0.5.8 項目 1（ログに URL を残さない）**。`system/log.rs` に `url_for_log`（ユーザー由来の URL をスキームとホスト（とポート）までに縮める）と `StripUrl` トレイト（`Result<T, reqwest::Error>` の `strip_url()` で `without_url()` を当てる）を置き、reqwest の失敗しうる呼び出しすべてに当てた（カレンダー・時事ネタ・天気・LLM・更新通知・地名検索・VOICEVOX と Irodori の取得・サイドカーへの合成と参照音声の要求）。カレンダーは取得を `fetch_ics` に切り出した。時事ネタの失敗のログから検索語を外した。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
 | 2026-09-28 | v2.57 | **v0.5.8 項目 2（合成のたびの Hub への問い合わせをやめる）**。`sidecar.py` に `hf_hub_cache_dir`（hub を import せずに共有キャッシュの場所を決める）・`watermark_weights_present`・`stay_off_the_hub`（重みが揃っていれば `HF_HUB_OFFLINE=1` を上書き）を足し、`main` で取得の 2 モード（`--fetch-watermark` / `--download-only`）のあと、合成をするモード（`--acceptance` / `--synth-once` / サーバー）の前に呼ぶ。`--no-download` 無しのサーバー（手で起動したときだけ）は塞がない。`synth_failure_kind` は `_is_missing_locally` で例外の原因を連ねた先まで見る（`FileNotFoundError`・`LocalEntryNotFoundError`・`OfflineModeIsEnabled`・「cached files」の `OSError`）。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
+| 2026-09-28 | v2.58 | **v0.5.8 項目 3（ゲートの子プロセスの終わり方）**。`sidecar.py` の `_exit_now` を足し、`main` の `--synth-once` と `--acceptance` の分岐は結果を書いたあとこれで抜ける（CUDA を使ったあとのインタプリタの後片付けで落ちて、`classify_gate` が `ok` の結果を終了コードで失敗にするのを防ぐ）。`classify_gate` は変えない。**Tauri コマンド・イベント・DB スキーマの変更なし。** |

@@ -6107,8 +6107,32 @@ mod update_tests {
         assert!(design < fallback && fallback < synth, "生成 → 生成した声の代用 → 合成の順になっていない");
         assert!(body.contains("\"voice_design\": voice_design,"), "結果に生成の欄を返していない");
         assert!(body.contains("\"stage\": \"voice_design\""), "生成の失敗を見分けられない");
-        assert!(py.contains("        return synth_once(asset_dir, args.voice_ref, args.gate_dir)"), "作業場所を渡していない");
+        assert!(py.contains("        _exit_now(synth_once(asset_dir, args.voice_ref, args.gate_dir))"), "作業場所を渡していない");
         assert!(py.contains("        \"--gate-dir\","), "--gate-dir の引数が無い");
+    }
+
+    /// **確認用の子プロセスは、結果を書いたら後片付けを通さずに抜ける**（v0.5.8 項目 3）。CUDA を使ったあとの
+    /// 通常の終了で落ちると終了コードが 0 でなくなり、`classify_gate` は結果の行が `ok` でも失敗として戻す。
+    /// `main` の本文を切り出して、CUDA を使う 2 つのモードが `_exit_now` を通ることを固定する。**終了コードを見る
+    /// 条件は外さない**（結果の行を書く前に落ちたものは失敗として届く）ことも併せて見る。
+    #[test]
+    fn the_gate_child_exits_without_the_teardown_once_it_has_reported() {
+        let py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("python").join("sidecar.py"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let exit = &py[py.find("def _exit_now(code: int) -> None:").expect("_exit_now が無い")..];
+        let exit = &exit[..exit.find("\n\n\n").unwrap()];
+        let flush = exit.find("            stream.flush()").expect("flush していない");
+        let hard = exit.find("    os._exit(code)").expect("os._exit で抜けていない");
+        assert!(flush < hard, "flush の前に抜けている");
+        assert!(exit.contains("for stream in (sys.stdout, sys.stderr):"), "stdout と stderr の両方を flush していない");
+        let main = &py[py.find("def main(argv: Optional[list[str]] = None) -> int:").expect("main が無い")..];
+        assert!(main.contains("        _exit_now(synth_once(asset_dir, args.voice_ref, args.gate_dir))"), "--synth-once");
+        assert!(main.contains("        _exit_now(acceptance_check(asset_dir, args.voice_ref, args.acceptance))"), "--acceptance");
+        // 終了コードを見る条件はそのまま（ok でも 0 でなければ合格にしない）
+        let ok = json(r#"{"ok":true,"ms":1,"bytes":10}"#);
+        assert!(matches!(classify_gate(GateExit::Code(Some(0)), None, Some(&ok)), GateOutcome::Passed { .. }));
+        assert!(!matches!(classify_gate(GateExit::Code(Some(1)), None, Some(&ok)), GateOutcome::Passed { .. }));
     }
 
     /// **`sidecar.py` の一発合成と噛み合っていること**（目印の文字列・終了コード・分岐の位置）。

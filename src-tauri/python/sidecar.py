@@ -882,6 +882,22 @@ def _report(marker: str, payload: dict) -> None:
     sys.stdout.flush()
 
 
+def _exit_now(code: int) -> None:
+    """結果を書き終えたプロセスを、**後片付けを通さずに**終わらせる（v0.5.8 項目 3）。
+
+    CUDA を使ったあとの通常の終了（インタプリタの後片付け・ネイティブのスレッドの終了）で落ちると、終了コードが 0 で
+    なくなり、確かめた成功が失敗として扱われる（`classify_gate` は結果の行が `ok` でも終了コードを見る）。結果は
+    もう書いてあるので、stdout / stderr を flush してから `os._exit` で抜ける。後片付けで固まって締め切りまで
+    待たされることも避けられる。**結果の行を書く前に落ちたものは、いまどおり失敗として届く。**
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
 def synth_once(asset_dir: Path, voice_ref: Optional[Path], gate_dir: Optional[Path] = None) -> int:
     """更新の成否を確かめるため、1 回だけ合成する (spec §6.0 v0.5.6 項目 3b)。
 
@@ -1453,7 +1469,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.voice_ref is None:
             sys.stderr.write("sidecar.py: --acceptance には --voice-ref が必要です\n")
             return 2
-        return acceptance_check(asset_dir, args.voice_ref, args.acceptance)
+        # 結果（acceptance.json と標準出力）を書いたら後片付けを通さずに抜ける（v0.5.8 項目 3）
+        _exit_now(acceptance_check(asset_dir, args.voice_ref, args.acceptance))
 
     # --synth-once モード（v0.5.6 項目 3b）: 1 回だけ合成して即終了。--download-only と同じく、
     # ポート確保と --ready-file の必須チェックより前に置く（HTTP は立てない）。モデルは取りに行かない
@@ -1462,7 +1479,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.voice_ref is None and args.gate_dir is None:
             sys.stderr.write("sidecar.py: --synth-once には --voice-ref か --gate-dir が必要です\n")
             return SYNTH_ONCE_FAILED
-        return synth_once(asset_dir, args.voice_ref, args.gate_dir)
+        # 結果の行を書いたら後片付けを通さずに抜ける（v0.5.8 項目 3。後片付けで落ちて、確かめた成功を捨てない）
+        _exit_now(synth_once(asset_dir, args.voice_ref, args.gate_dir))
 
     port = args.port if args.port and args.port > 0 else pick_free_port(args.host)
     LOG.info("sidecar binding to %s:%d (mock=%s)", args.host, port, args.mock)
