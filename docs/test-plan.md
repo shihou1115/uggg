@@ -1,4 +1,4 @@
-# ugg テスト計画（test-plan.md v1.65）
+# ugg テスト計画（test-plan.md v1.66）
 
 **フェーズ**: 本開発 Phase 3 確定版
 **作成日**: 2026-06-18
@@ -556,6 +556,30 @@ spec.md の §4 機能仕様の構造に従う。各項目に **○/×/該当な
         最後に `[harness] PASS`。証跡は `%TEMP%\ugg-e11-rollback.log`
   - 自動テストで固定済み: 絵文字の並びが `IRODORI_EMOJIS` と同じ・seed を固定するのはこの経路だけ（HTTP の要求・設定に無い）。
         判定の流れは身代わりの runtime で 6 通り確かめた（2026-09-27）
+
+- [ ] **E-12 持ち越しを片付ける（spec §6.0／v0.5.8）** — 自動テストで届かない範囲だけを、**インストール版**で通す。
+  ugg の起動と `ugg.log` の読み取りはユーザーの端末かエクスプローラーから（CLAUDE.md の規律）。
+
+  **1. ログに URL を残さない（項目 1）**
+  - [ ] 1a: 設定のカレンダーに、合言葉を入れた届かない URL（例: `https://example.com/private-TESTSECRET/basic.ics?token=TESTSECRET`）を
+        足して「いま取得」を押す。`ugg.log` の `[calendar]` の行に `TESTSECRET` と `/private-` が無く、`https://example.com`
+        までが出る。**終わったら取得元を消す**
+  - 自動テストで固定済み: 3 通りの失敗（接続・404・本文の途中切断）で、カレンダーと LLM の失敗の文に合言葉が出ない／
+        src 全体の reqwest の失敗しうる呼び出しに `strip_url()` が付く（テキストの契約）／時事ネタの失敗のログに検索語が無い
+
+  **2. 合成のたびに Hub へ問い合わせない（項目 2）・3. 確認用の子プロセスの終わり方（項目 3）**
+  - [ ] 2a: ugg を終了し、記録サーバーを起動してから（`python src-tauri\target\realcheck\hub_recorder.py <記録ファイル>`。
+        `127.0.0.1:18089` で待ち受け、受けた要求を 1 行ずつ書いて 503 を返す）、realcheck の `step-hubonce_installed.cmd` を
+        エクスプローラーから起動する（インストール版が置いた `%APPDATA%\ugg\irodori\sidecar.py` を `--synth-once` で 3 回動かす）。
+        `logs\hubonce_installed.log` で:
+        - record: `Hub: Hub へは問い合わせません`・`透かし: 効いています`・exit=0・`UGG_SYNTH_ONCE {"ok": true` の行がある
+        - blackhole: record と同じ行で、所要時間が record と同程度（v0.5.7 までは約 20 秒長かった）
+        - nocache: `Hub: 透かしの重みが手元に揃っていないので、Hub への問い合わせを許します`・`透かし: 効いていません`・exit=0
+        - 記録ファイルの要求は nocache の回の `GET /api/models/sony/silentcipher/revision/main` の 1 本だけ
+  - [ ] 2b: インストール版で高品質モードで 1 回喋らせる。`ugg.log` に `[irodori:py] [irodori] Hub: Hub へは問い合わせません` があり、
+        その起動の `Fetching 13 files` の行が無い
+  - 自動テストで固定済み: `main` の順序（取得の 2 モード → 塞ぐ判断 → 合成をするモード）と立て方（上書き・重みの確かめ）／
+        `_exit_now` の形と 2 つの分岐／通信なしで足りないときの例外 3 形が `model_missing`（hub 1.33 / transformers 5.17 の実物で確認）
 
 ### 5.6 F. 天気・定例会話（§4.7）
 
@@ -1173,3 +1197,4 @@ CI（GitHub Actions など）は**置いていない**（v0.4.1 で見送り）�
 | 2026-09-27 | v1.63 | **v0.5.7 リリース前監査の指摘への対応に伴うテスト**（Rust 3 本と既存 3 本の強化・フロントの操作列 2 本。変異 10 通りすべて捕捉）。6c（保留）を試すときは、表示が「更新を保留しました」（赤字でない）になり、VRAM を空けた再試行が空き容量で断られないことも見る。 |
 | 2026-09-28 | v1.64 | **E-11 の A3（インストール版の速さ）を §5.9 に記録**（471 / 502 / 509 ms、±20% 内）。 |
 | 2026-09-28 | v1.65 | **v0.5.7 タグ後の docs 整理（tidy-docs）**。§5.9 E-11 の見出しと 2e の「A3 で兼ねる」を、リリース前に行った結果（A2・A3 PASS）へ直した。 |
+| 2026-09-28 | v1.66 | **v0.5.8 の確認項目 E-12 を足した**（1a: 合言葉入りの ICS の URL を失敗させて `ugg.log` にホストまでしか出ない／2a: realcheck の `hubonce_installed` 手順でインストール版の `sidecar.py --synth-once` を 3 条件で動かす — Hub への要求 0 本・パケットを捨てても遅れない・透かしの重みが無ければ問い合わせを許す・3 回とも終了コード 0／2b: 高品質モードの起動に `Fetching 13 files` が無い）。項目 3 は 2a で兼ねる。 |
