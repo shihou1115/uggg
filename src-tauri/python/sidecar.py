@@ -389,13 +389,17 @@ WATERMARK_WEIGHT_FILES = ("hparams.yaml", "enc_c.ckpt", "dec_c.ckpt", "dec_m_0.c
 def hf_hub_cache_dir() -> Path:
     """共有 HF キャッシュの場所。huggingface_hub の `constants` と同じ規則で、**hub を import せずに**決める
     （hub は import した時点で `HF_HUB_OFFLINE` を読むので、決める前に import できない）。"""
+    # hub と同じく `~` と `%VAR%` を展開する（`HF_HOME=%LOCALAPPDATA%\hf` のような書き方）
+    def expand(value: str) -> str:
+        return os.path.expandvars(os.path.expanduser(value))
+
     for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
         if os.environ.get(name):
-            return Path(os.path.expanduser(os.environ[name]))
+            return Path(expand(os.environ[name]))
     home = os.environ.get("HF_HOME") or os.path.join(
         os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "huggingface"
     )
-    return Path(os.path.expanduser(home)) / "hub"
+    return Path(expand(home)) / "hub"
 
 
 def watermark_weights_present(cache_dir: Path) -> bool:
@@ -846,7 +850,13 @@ def synth_failure_kind(exc: BaseException) -> str:
 
 
 def _is_missing_locally(exc: BaseException) -> bool:
-    """手元に無いものを読もうとして失敗したか（例外の原因を連ねた先まで見る）。"""
+    """手元に無いものを読もうとして失敗したか（`raise … from …` で包んだ原因まで見る）。
+
+    **`__context__`（処理の最中に別の理由で出た例外）はたどらない**（v0.5.8 のリリース前監査）。たどると、
+    キャッシュに無いことを処理している間に CUDA などの別の理由で落ちたものまで「揃っていない」になり、キャラが
+    「更新する」で直ると事実でない案内をする。hub 1.33 / transformers 5.17 の実物では、3 つの形とも包まれずに
+    直接届いた（2026-09-28）。
+    """
     seen = set()
     cur: Optional[BaseException] = exc
     while cur is not None and id(cur) not in seen:
@@ -857,7 +867,7 @@ def _is_missing_locally(exc: BaseException) -> bool:
             return True
         if isinstance(cur, OSError) and "cached files" in str(cur):
             return True
-        cur = cur.__cause__ or cur.__context__
+        cur = cur.__cause__
     return False
 
 

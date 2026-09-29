@@ -349,6 +349,7 @@ impl IrodoriClient {
             .timeout(Duration::from_secs(3))
             .send()
             .await
+            .strip_url()
         {
             Ok(resp) if resp.status().is_success() => HealthPing::Ok,
             Ok(resp) => {
@@ -1459,10 +1460,13 @@ mod tests {
             "isinstance(cur, FileNotFoundError)",
             "(\"LocalEntryNotFoundError\", \"OfflineModeIsEnabled\")",
             "isinstance(cur, OSError) and \"cached files\" in str(cur)",
-            "cur = cur.__cause__ or cur.__context__",
+            "        cur = cur.__cause__\n",
         ] {
             assert!(local.contains(needle), "見ていない: {needle}");
         }
+        // `__context__`（処理の最中に別の理由で出た例外）はたどらない（v0.5.8 のリリース前監査）。
+        // docstring の語に当たらないよう、コードの形で探す
+        assert!(!local.contains("cur.__context__"), "処理中の別の例外まで「揃っていない」にしている");
         // **参照音声のファイルが無いことを「モデルが無い」と取り違えない**（v0.5.7 リリース前監査）: 合成の入口で先に確かめ、
         // FileNotFoundError でない例外で返す（上流の読み込みの FileNotFoundError まで行くと model_missing になる）
         let synth_py = &py[py.find("    def synthesize(\n").expect("synthesize が無い")..];

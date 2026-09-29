@@ -221,15 +221,16 @@ mod tests {
 
     /// **全経路がこの規則を通る**（v0.5.8 項目 1。テキストの契約）。reqwest の失敗しうる呼び出し
     /// （`.send()` / `error_for_status()` / `.text()` / `.json()` / `.bytes()`）のすぐ後ろには、
-    /// `.strip_url()` か、エラーを捨てる形（`.unwrap_or_default()` / `match … {` / 文の終わり /
+    /// `.strip_url()` か、エラーを捨てる形（`.unwrap_or_default()` / 文の終わり /
     /// `and_then` の閉じ括弧）しか来ない。取得先のホストが固定の経路（時事ネタ・天気・地名検索）は
-    /// 通信なしでは失敗を作れないので、ここで固定する。**テスト自身の文字列に当たらないよう、各ファイルの
-    /// `#[cfg(test)]` より前だけを読む。**
+    /// 通信なしでは失敗を作れないので、ここで固定する。**テスト自身の文字列に当たらないよう、テストの塊
+    /// （`#[cfg(test)]` の直後が `mod`）だけを除いて読む。**
     #[test]
     fn every_reqwest_call_strips_its_url() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut checked = 0;
         let mut bad = Vec::new();
+        let mut scanned = String::new();
         let mut stack = vec![src];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).unwrap().flatten() {
@@ -241,14 +242,16 @@ mod tests {
                 if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                     continue;
                 }
-                let body = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
-                let body = body.split("#[cfg(test)]").next().unwrap_or("");
+                let body = without_test_modules(&std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n"));
+                scanned.push_str(&body);
+                let body = body.as_str();
                 for (start, end) in fallible_reqwest_calls(body) {
                     let rest: String = body[end..].split_whitespace().collect::<Vec<_>>().join("");
                     // 行コメントを挟む書き方（`.strip_url()\n// …\n.with_context`）はそのままでよい
                     let ok = rest.starts_with(".strip_url()")
                         || rest.starts_with(".unwrap_or_default()")
-                        || rest.starts_with('{')
+                        // `match … .await {` は許さない（arm の中でエラーを文にしても見えないので、match で受ける
+                        // ものも `.strip_url()` を通す。v0.5.8 のリリース前監査の変異で残った）
                         || rest.starts_with(';')
                         || rest.starts_with(").strip_url()")
                         // `.send().await.and_then(|r| r.error_for_status()).strip_url()`（まとめて外す）
@@ -262,7 +265,53 @@ mod tests {
             }
         }
         assert!(checked >= 20, "走査が空振りしている（{checked} 件）");
+        // **関数の途中やファイルの頭にある `#[cfg(test)]` で走査を打ち切らない**（v0.5.8 のリリース前監査。以前は
+        // 最初の `#[cfg(test)]` より前だけを読み、irodori_download.rs の 371 行目以降と sidecar.rs の 45 行目以降が
+        // 見えていなかった）。ファイルの後ろのほうにある本番の取得が、走査に入っていることを確かめる
+        for needle in ["async fn download_to(", "async fn request_shutdown(", "async fn identify_sidecar("] {
+            assert!(scanned.contains(needle), "走査に入っていない: {needle}");
+        }
+        assert!(!scanned.contains("fn every_reqwest_call_strips_its_url"), "テスト自身を走査している");
         assert!(bad.is_empty(), "URL を外していない reqwest の呼び出し:\n{}", bad.join("\n"));
+    }
+
+    /// テストの塊（`#[cfg(test)]` の直後が `mod` のもの）だけを、閉じ括弧の行まで空行に置き換える。
+    /// **それ以外の `#[cfg(test)]`（関数の途中の分岐・テスト用の impl）では切らない。** 行番号は保つ。
+    fn without_test_modules(body: &str) -> String {
+        let lines: Vec<&str> = body.lines().collect();
+        let mut out = Vec::with_capacity(lines.len());
+        let mut i = 0;
+        while i < lines.len() {
+            let is_mod = lines[i].trim() == "#[cfg(test)]"
+                && lines.get(i + 1).map_or(false, |next| {
+                    let next = next.trim_start();
+                    next.starts_with("mod ") || next.starts_with("pub mod ") || next.starts_with("pub(crate) mod ")
+                });
+            if !is_mod {
+                out.push(lines[i]);
+                i += 1;
+                continue;
+            }
+            // 塊は列 0 の `}` で閉じる
+            while i < lines.len() {
+                let closes = lines[i] == "}";
+                out.push("");
+                i += 1;
+                if closes {
+                    break;
+                }
+            }
+        }
+        out.join("\n")
+    }
+
+    #[test]
+    fn only_test_modules_are_cut_out() {
+        let body = "fn a() {\n    #[cfg(test)]\n    x.send().await.strip_url();\n}\n#[cfg(test)]\nimpl H {}\n#[cfg(test)]\nmod tests {\n    fn t() { y.send().await; }\n}\nfn b() { z.send().await.strip_url(); }\n";
+        let kept = without_test_modules(body);
+        assert!(kept.contains("x.send()") && kept.contains("impl H") && kept.contains("z.send()"), "{kept}");
+        assert!(!kept.contains("y.send()"), "{kept}");
+        assert_eq!(kept.lines().count(), body.lines().count(), "行番号がずれる");
     }
 
     /// reqwest の失敗しうる呼び出しの位置（始まりと、`.await` まで含めた終わり）。

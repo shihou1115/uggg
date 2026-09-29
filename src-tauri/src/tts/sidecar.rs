@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
+use crate::system::log::StripUrl;
 use crate::tts::irodori_download;
 
 /// 起動済みサイドカーの参照。drop しても子プロセスは生き続けるので、明示的に
@@ -480,13 +481,13 @@ async fn identify_sidecar(client: &reqwest::Client, port: u16, timeout: Duration
         Reach::Connected => {}
     }
     let url = format!("http://127.0.0.1:{port}/health");
-    let resp = match client.get(&url).timeout(timeout).send().await {
+    let resp = match client.get(&url).timeout(timeout).send().await.strip_url() {
         Ok(resp) => resp,
         Err(err) if err.is_timeout() => return Probe::Unanswered,
         Err(_) => return Probe::NotOurs,
     };
     // **status は見ない**（GPU 不在で 503 を返す）。本文の形だけで判断する。
-    match resp.json::<serde_json::Value>().await {
+    match resp.json::<serde_json::Value>().await.strip_url() {
         Ok(body) if looks_like_our_sidecar(&body) => Probe::Ours,
         Ok(_) => Probe::NotOurs,
         Err(err) if err.is_timeout() => Probe::Unanswered,
@@ -719,7 +720,7 @@ const STOP_CONFIRM: Duration = Duration::from_secs(8);
 /// **`looks_like_our_sidecar` で自分のものだと確かめてから呼ぶこと。**
 async fn request_shutdown(port: u16, http: &reqwest::Client) -> bool {
     let url = format!("http://127.0.0.1:{port}/shutdown");
-    match http.post(&url).timeout(Duration::from_secs(2)).send().await {
+    match http.post(&url).timeout(Duration::from_secs(2)).send().await.strip_url() {
         Ok(resp) if resp.status().is_success() => {}
         _ => return false,
     }
