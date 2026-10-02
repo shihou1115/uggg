@@ -789,6 +789,9 @@ pub struct AppState {
 pub struct TtsState {
     pub voicevox: Mutex<Option<crate::tts::voicevox::VoicevoxEngine>>,
     pub irodori: crate::tts::irodori::IrodoriClient,
+    /// 声の告知（参照音声が無い slot の VOICEVOX 代用・声を決めていないゴーストの案内）の 1 回だけの取り合い
+    /// （v0.6.0 項目 2・3）。鍵は告知ごとに付ける（`commands::tts`）。永続化しない（再起動したら取り直す）。
+    pub voice_notices: crate::system::notify::OnceGate,
 }
 
 impl Default for TtsState {
@@ -796,6 +799,7 @@ impl Default for TtsState {
         Self {
             voicevox: Mutex::new(None),
             irodori: crate::tts::irodori::IrodoriClient::new(),
+            voice_notices: crate::system::notify::OnceGate::default(),
         }
     }
 }

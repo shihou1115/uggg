@@ -1,14 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type { SlotName, TalkSpeed } from "../types";
+import { noteSynthesized } from "./credit";
 import { attachMouth, stopMouth } from "./mouth";
+import type { SynthesizedVoice } from "./types";
 
 /// TTS スピーカー: テキストを WAV (base64) として取得し、Web Audio で再生する。
 /// **全 slot 直列の単一キュー**: main/sub を問わず enqueue 順に 1 つずつ再生し、
 /// 音声が重なることは構造的にない (掛け合いで main 再生中に sub が話し始めない)。
 /// 再生中に次アイテムの合成を先行させる (先読み 1) ため、話者交代の無音は最小。
 /// interrupt() でキュー破棄 + 再生停止。失敗 (TTS 無効 / 資産未 DL / 合成エラー) は
-/// 黙殺 (フロントは声なしで継続)。
+/// 黙殺 (フロントは声なしで継続)。**参照音声が無い slot は失敗にならない**（Rust が VOICEVOX で合成して
+/// 返す。v0.6.0 項目 3）ので、ここへ来る失敗は「VOICEVOX も使えない」場合だけ。
 ///
 /// テキスト読み上げツール (panels/reader.ts) は専用の再生ループを持ち、この
 /// キューとは独立 (仕様: ユーザー起点のチャット応答と読み上げの同時発声は許容)。
@@ -85,7 +88,10 @@ function dequeueAndSynth(): SynthEntry | null {
 
 async function synthOne(item: QueueItem): Promise<string | null> {
   try {
-    return await invoke<string>("synthesize_voice", { text: item.text, slot: item.slot });
+    const voice = await invoke<SynthesizedVoice>("synthesize_voice", { text: item.text, slot: item.slot });
+    // どのエンジンで鳴らしたかをクレジットへ（高品質モードのフォールバックで VOICEVOX が鳴るとき出す）
+    noteSynthesized(item.slot, voice.engine);
+    return voice.wav;
   } catch (err) {
     console.warn("[tts] synth failed", err);
     return null;

@@ -17,18 +17,37 @@ use crate::system::secrets;
 use crate::tts::irodori::TtsError;
 use crate::tts::{download, gpu, irodori_download, preprocess, voice_ref, voicevox};
 
-/// Irodori 経路の合成エラーを「明示エラー (return)」と「voicevox にフォールバック」に振り分ける。
-/// VoiceRefMissing は user setup の問題 (参照音声未生成) なので fallback せず、それ以外
-/// (SidecarStart / Http / NotImplemented) は voicevox 経路で再合成を試みる (architecture §8.6)。
+/// 合成で選べるエンジンの名前（`synthesize_voice` の戻りの `engine`。設定の `tts_engine` と同じ綴り）。
+const ENGINE_VOICEVOX: &str = "voicevox_core";
+const ENGINE_IRODORI: &str = "irodori";
+
+/// `synthesize_voice` の戻り。**どのエンジンで鳴らしたか**をフロントへ伝える（v0.6.0 項目 2、spec §6.0）。
+/// VOICEVOX のクレジット（規約上の常時表示）は、設定のエンジンではなく**実際に VOICEVOX で鳴らしたか**で
+/// 出すため（高品質モードでもフォールバックで VOICEVOX が鳴る間は出す）。
+/// 契約: `wav` = base64 の WAV、`engine` = `"voicevox_core"`（VOICEVOX で鳴らした）か `"irodori"`。
+#[derive(Debug, Clone, Serialize)]
+pub struct SynthesizedVoice {
+    pub wav: String,
+    pub engine: &'static str,
+}
+
+/// Irodori 経路の合成エラーを VOICEVOX へ回すときの種類に振り分ける（**エラーで返すものは無い**。無言にしない）。
+/// VoiceRefMissing は故障ではなく「その slot の参照音声がまだ無い」ので、VOICEVOX で喋って 1 回だけ伝える
+/// （`irodori_unavailable` は言わない・その 5 分の待ちも共有しない。v0.6.0 項目 3）。
+/// それ以外 (SidecarStart / Http / NotImplemented ほか) は故障として VOICEVOX 経路で再合成し、
+/// `irodori_unavailable` 系を言う (architecture §8.6)。
+///
+/// **参照音声のプレビュー（`voice_ref_preview`）はここを通らない**（`synthesize_irodori` を直接呼び、エラーのまま
+/// 返す。作ったばかりの声を聴く道具なので、代わりの声で鳴らさない）。
 #[derive(Debug, PartialEq)]
 pub(crate) enum FallbackAction {
-    ReturnError,
+    FallbackForMissingRef,
     FallbackToVoicevox,
 }
 
 pub(crate) fn decide_fallback(err: &TtsError) -> FallbackAction {
     match err {
-        TtsError::VoiceRefMissing(_) => FallbackAction::ReturnError,
+        TtsError::VoiceRefMissing(_) => FallbackAction::FallbackForMissingRef,
         TtsError::NotImplemented
         | TtsError::SidecarStart(_)
         | TtsError::Http(_)
@@ -49,6 +68,8 @@ pub(crate) fn unavailable_kind(err: &TtsError) -> UnavailableKind {
         | TtsError::SidecarStart(_)
         | TtsError::Http(_)
         | TtsError::NotImplemented
+        // 参照音声が無いときはここへ来ない（`FallbackForMissingRef` は `IrodoriVoiceRefMissing` を言う）。
+        // match の網羅のために置いてある
         | TtsError::VoiceRefMissing(_) => UnavailableKind::Other,
     }
 }
@@ -84,6 +105,11 @@ pub fn list_voices(state: State<'_, Arc<AppState>>) -> Result<Vec<VoiceOption>, 
 /// Irodori 経路で **`VoiceRefMissing` 以外**のエラー (サイドカー起動失敗 / HTTP 失敗 / 501 等) が
 /// 出たら `notify(IrodoriUnavailable)` を発火 + voicevox_core で再合成して可能なら音声を返す。
 /// voicevox も使えない場合は元の irodori エラーを返す (architecture.md §8.6 / §13.4)。
+///
+/// **`VoiceRefMissing`（読み込み中のゴーストにその slot の参照音声が無い）は VOICEVOX で喋り**、
+/// ゴースト × slot ごとに 1 回だけ `IrodoriVoiceRefMissing` を告げる（v0.6.0 項目 3。以前は無言だった）。
+/// VOICEVOX で鳴らしたときは、声を決めていないゴーストに 1 回だけ案内する（`GhostVoiceUnset`）。
+/// 戻りの `engine` は実際に鳴らしたエンジン（クレジットの表示に使う）。
 #[tauri::command]
 pub async fn synthesize_voice(
     text: String,
@@ -91,7 +117,7 @@ pub async fn synthesize_voice(
     caption: Option<String>,
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
-) -> Result<String, String> {
+) -> Result<SynthesizedVoice, String> {
     let settings = state.settings.lock().expect("settings poisoned").clone();
     if !settings.tts_enabled {
         return Err("TTS は無効化されています".to_string());
@@ -103,18 +129,30 @@ pub async fn synthesize_voice(
     let caption = caption.filter(|c| !c.is_empty());
     let state_arc = state.inner().clone();
 
-    let wav = match settings.tts_engine.as_str() {
-        "voicevox_core" | "" => {
-            synthesize_voicevox(state_arc.clone(), &settings, &slot, &text).await?
-        }
+    let (wav, engine) = match settings.tts_engine.as_str() {
+        "voicevox_core" | "" => (
+            synthesize_voicevox(state_arc.clone(), &settings, &slot, &text).await?,
+            ENGINE_VOICEVOX,
+        ),
         "irodori" => {
             let irodori_result =
                 synthesize_irodori(state_arc.clone(), &slot, &text, caption.clone(), Some(app.clone()))
                     .await;
             match irodori_result {
-                Ok(wav) => wav,
+                Ok(wav) => (wav, ENGINE_IRODORI),
                 Err(err) => match decide_fallback(&err) {
-                    FallbackAction::ReturnError => return Err(format!("{err}")),
+                    // 参照音声が無い slot: VOICEVOX（読み込み中のゴーストの話者）で喋り、1 回だけ伝える。
+                    // **`irodori_unavailable` を言わず、その 5 分の待ち（`should_notify_unavailable`）も使わない** —
+                    // 故障ではないので事実と違う理由を言わない。
+                    FallbackAction::FallbackForMissingRef => {
+                        let wav = synthesize_voicevox(state_arc.clone(), &settings, &slot, &text)
+                            .await
+                            .map_err(|voicevox_err| {
+                                format!("{err} (voicevox で代わりに喋ることも失敗: {voicevox_err})")
+                            })?;
+                        announce_voice_ref_missing_once(&app, &state_arc, &slot).await;
+                        (wav, ENGINE_VOICEVOX)
+                    }
                     FallbackAction::FallbackToVoicevox => {
                         let reason = format!("{err}");
                         // **理由は毎回ログへ残す** (v0.5.5 項目 1、2026-09-13 実機で発覚)。
@@ -146,7 +184,7 @@ pub async fn synthesize_voice(
                                     )
                                     .await;
                                 }
-                                wav
+                                (wav, ENGINE_VOICEVOX)
                             }
                             Err(voicevox_err) => {
                                 // 両方失敗: notify はキャラ発話を呼ぶ → やはり両方失敗するだけなので skip。
@@ -163,7 +201,91 @@ pub async fn synthesize_voice(
         other => return Err(format!("未知の TTS エンジン: {other}")),
     };
 
-    Ok(base64::engine::general_purpose::STANDARD.encode(wav))
+    // VOICEVOX で鳴らしたら（フォールバックを含む）、声を決めていないゴーストへ 1 回だけ案内する。
+    if engine == ENGINE_VOICEVOX {
+        announce_ghost_voice_unset_once(&app, &state_arc).await;
+    }
+
+    Ok(SynthesizedVoice {
+        wav: base64::engine::general_purpose::STANDARD.encode(wav),
+        engine,
+    })
+}
+
+/// 参照音声が無い slot を VOICEVOX で話したことの告知（**ゴースト × slot、プロセスで 1 回**。v0.6.0 項目 3）。
+/// 取り合いは原子的（main と sub を並べて合成しても 2 回出ない）、済みは**届いたときだけ**。告知の台詞自体の
+/// 合成も `synthesize_voice` に戻ってくるが、取り合いの鍵が同じなので重ならない。
+/// 読み込み中のゴーストが無ければ（辞書も無く、何も言えない）出さない。
+pub(crate) async fn announce_voice_ref_missing_once(app: &AppHandle, state: &Arc<AppState>, slot: &str) {
+    let Some(ghost_id) = state.loaded_ghost_id() else {
+        return;
+    };
+    notify::once_reached_claimed(
+        &state.tts.voice_notices,
+        &voice_ref_missing_key(&ghost_id, slot),
+        false,
+        || notify::notify(app, state, NoticeKind::IrodoriVoiceRefMissing),
+        || {},
+    )
+    .await;
+}
+
+/// 参照音声の告知の取り合いの鍵（ゴースト × slot）。
+fn voice_ref_missing_key(ghost_id: &str, slot: &str) -> String {
+    format!("voice_ref_missing:{ghost_id}:{slot}")
+}
+
+/// 声を決めていないゴーストが VOICEVOX で喋ったことの案内（**ゴーストごとに 1 回、届いたときだけ済み**。
+/// v0.6.0 項目 2）。済みは `app_settings` の `ghost_voice_hint_seen:<ghost_id>`（再起動しても出ない）。
+pub(crate) async fn announce_ghost_voice_unset_once(app: &AppHandle, state: &Arc<AppState>) {
+    let Some(ghost_id) = state.loaded_ghost_id() else {
+        return;
+    };
+    let settings = state.settings.lock().expect("settings poisoned").clone();
+    ghost_voice_unset_once(
+        &state.db,
+        &state.tts.voice_notices,
+        &settings,
+        &ghost_id,
+        || notify::notify(app, state, NoticeKind::GhostVoiceUnset),
+    )
+    .await;
+}
+
+/// `announce_ghost_voice_unset_once` の中身（`show` を差し替えられる。AppHandle 無しで流れをテストするため）。
+async fn ghost_voice_unset_once<Fut>(
+    db: &crate::db::Db,
+    gate: &notify::OnceGate,
+    settings: &Settings,
+    ghost_id: &str,
+    show: impl FnOnce() -> Fut,
+) -> Option<notify::NoticeOutcome>
+where
+    Fut: std::future::Future<Output = notify::NoticeOutcome>,
+{
+    let seen_key = ghost_voice_hint_key(ghost_id);
+    let seen = matches!(db.get_setting(&seen_key), Ok(Some(_)));
+    notify::once_reached_claimed(
+        gate,
+        &format!("ghost_voice_unset:{ghost_id}"),
+        !ghost_voice_hint_due(settings, ghost_id, seen),
+        show,
+        || {
+            let _ = db.set_setting(&seen_key, "1");
+        },
+    )
+    .await
+}
+
+/// 案内済みの記録の鍵（`update_notice_seen:<version>` と同じ作り）。
+fn ghost_voice_hint_key(ghost_id: &str) -> String {
+    format!("ghost_voice_hint_seen:{ghost_id}")
+}
+
+/// 案内が要るか（純粋部分）。**そのゴーストの行が `tts_speakers_by_ghost` に無く**（声を決めていない）、
+/// まだ案内していないとき。移行で行が埋まった既存のゴースト（`from_persisted`）や、声を決めたゴーストには出さない。
+fn ghost_voice_hint_due(settings: &Settings, ghost_id: &str, seen: bool) -> bool {
+    !seen && !settings.tts_speakers_by_ghost.contains_key(ghost_id)
 }
 
 async fn synthesize_voicevox(
@@ -1085,10 +1207,204 @@ mod tests {
         }
     }
 
+    /// **参照音声が無い slot は、通常の合成では VOICEVOX へ回り（無言にしない）、プレビューはエラーのまま**
+    /// （v0.6.0 項目 3）。プレビューは作ったばかりの声を聴く道具で、代わりの声で鳴らすと誤解させる。
     #[test]
-    fn decide_fallback_voice_ref_missing_returns_error() {
+    fn a_missing_voice_ref_goes_to_voicevox_but_the_preview_stays_an_error() {
         let err = TtsError::VoiceRefMissing("main".into());
-        assert_eq!(decide_fallback(&err), FallbackAction::ReturnError);
+        assert_eq!(decide_fallback(&err), FallbackAction::FallbackForMissingRef);
+        // 故障（サイドカー・HTTP ほか）の VOICEVOX 代用とは別の扱い（告知が違う）
+        assert_ne!(
+            decide_fallback(&err),
+            decide_fallback(&TtsError::SidecarStart("x".into()))
+        );
+
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let body_of = |name: &str| {
+            let body = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+            body[..body.find("\n}\n").unwrap()].to_string()
+        };
+        // プレビューは Irodori の合成をそのまま呼んでエラーで返す（フォールバックの判定も VOICEVOX も通らない）
+        let preview = body_of("pub async fn voice_ref_preview(");
+        assert!(preview.contains("synthesize_irodori("), "プレビューが Irodori の合成を呼んでいない");
+        assert!(
+            preview.contains(".map_err(|e| format!(\"{e}\"))?"),
+            "プレビューが合成のエラーをエラーのまま返していない"
+        );
+        for banned in ["decide_fallback", "synthesize_voicevox", "FallbackAction", "announce_"] {
+            assert!(!preview.contains(banned), "プレビューが {banned} を通っている（代わりの声で鳴らさない）");
+        }
+        // 通常の合成は VoiceRefMissing の枝で VOICEVOX を呼んで告げる。irodori_unavailable の経路（5 分の待ち・
+        // IrodoriUnavailable）は共有しない
+        let synth = body_of("pub async fn synthesize_voice(");
+        let from = synth
+            .find("FallbackAction::FallbackForMissingRef =>")
+            .expect("VoiceRefMissing の枝が無い");
+        let to = synth
+            .find("FallbackAction::FallbackToVoicevox =>")
+            .expect("故障の枝が無い");
+        assert!(from < to, "枝の並びが想定と違う");
+        let missing = &synth[from..to];
+        assert!(missing.contains("synthesize_voicevox("), "VOICEVOX で喋っていない");
+        assert!(missing.contains("announce_voice_ref_missing_once("), "1 回だけ伝えていない");
+        for banned in ["should_notify_unavailable", "IrodoriUnavailable", "unavailable_kind"] {
+            assert!(!missing.contains(banned), "参照音声が無いだけなのに {banned} を通っている");
+        }
+        assert!(!synth.contains("ReturnError"), "エラーで返す枝が残っている");
+        // 戻りの engine は実際に鳴らしたもの（クレジットの根拠）。VOICEVOX で鳴らした枝は VOICEVOX、Irodori は Irodori
+        assert!(missing.contains("(wav, ENGINE_VOICEVOX)"), "代用で鳴らしたのに VOICEVOX と返していない");
+        assert!(!missing.contains("ENGINE_IRODORI"));
+        let failure = &synth[to..];
+        assert!(failure.contains("(wav, ENGINE_VOICEVOX)"), "故障の代用が VOICEVOX と返していない");
+        assert!(!failure.contains("ENGINE_IRODORI"));
+        assert!(synth.contains("Ok(wav) => (wav, ENGINE_IRODORI)"), "Irodori で鳴らしたのに Irodori と返していない");
+        assert!(synth.contains("            ENGINE_VOICEVOX,\n        ),"), "VOICEVOX 設定の合成が VOICEVOX と返していない");
+    }
+
+    /// **参照音声の告知は、ゴースト × slot の鍵で取り合い、届いたときだけ済みにする**（v0.6.0 項目 3）。
+    /// 実物は `once_reached_claimed` が行う（振る舞いは notify.rs のテストで固定）。ここは配線。
+    #[test]
+    fn the_voice_ref_notice_is_claimed_per_ghost_and_slot() {
+        assert_ne!(voice_ref_missing_key("a", "main"), voice_ref_missing_key("a", "sub"));
+        assert_ne!(voice_ref_missing_key("a", "main"), voice_ref_missing_key("b", "main"));
+        assert_eq!(voice_ref_missing_key("a", "main"), voice_ref_missing_key("a", "main"));
+
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let body_of = |name: &str| {
+            let body = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+            body[..body.find("\n}\n").unwrap()].to_string()
+        };
+        let body = body_of("pub(crate) async fn announce_voice_ref_missing_once(");
+        let claimed = body.find("once_reached_claimed(").expect("取り合いを通していない");
+        let shown = body
+            .find("NoticeKind::IrodoriVoiceRefMissing")
+            .expect("参照音声の告知を出していない");
+        assert!(claimed < shown, "取る前に告知を出している");
+        assert!(body.contains("voice_ref_missing_key(&ghost_id, slot)"), "ゴースト × slot の鍵を使っていない");
+        assert!(body.contains("state.loaded_ghost_id()"), "読み込み中のゴーストで引いていない");
+        assert!(!body.contains("settings.ghost_id"), "設定の ghost_id で引いている");
+        // 取る側の中で 5 分の待ちには触らない
+        assert!(!body.contains("should_notify_unavailable"), "5 分の待ちを共有している");
+    }
+
+    /// **声を決めていないゴーストの案内**（v0.6.0 項目 2）。行が無いときだけ・ゴーストごとに 1 回・
+    /// 届いたときだけ済み（`app_settings` に記録）。実物の DB で流す。
+    #[tokio::test]
+    async fn the_unset_voice_hint_is_once_per_ghost_and_only_when_reached() {
+        use crate::db::Db;
+        use crate::state::GhostSpeakers;
+        use crate::system::notify::{NoticeOutcome, OnceGate};
+
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        let gate = OnceGate::default();
+        let mut settings = Settings::default();
+        settings.tts_speakers_by_ghost.clear();
+        let shown = std::cell::Cell::new(0);
+        let tell = |outcome: NoticeOutcome| {
+            shown.set(shown.get() + 1);
+            async move { outcome }
+        };
+
+        // 隠している間（保留）は済みにしない。記録も gate も残さず、次の機会にまた出る
+        let held = ghost_voice_unset_once(&db, &gate, &settings, "g1", || tell(NoticeOutcome::Held)).await;
+        assert_eq!(held, Some(NoticeOutcome::Held));
+        assert_eq!(db.get_setting(&ghost_voice_hint_key("g1")).unwrap(), None, "保留で済みにした");
+        // 失敗も同じ
+        let failed = ghost_voice_unset_once(&db, &gate, &settings, "g1", || tell(NoticeOutcome::Failed)).await;
+        assert_eq!(failed, Some(NoticeOutcome::Failed));
+        assert_eq!(db.get_setting(&ghost_voice_hint_key("g1")).unwrap(), None, "失敗で済みにした");
+
+        // 届いたら出て、app_settings に記録する
+        let reached = ghost_voice_unset_once(&db, &gate, &settings, "g1", || tell(NoticeOutcome::Shown)).await;
+        assert_eq!(reached, Some(NoticeOutcome::Shown));
+        assert_eq!(
+            db.get_setting(&ghost_voice_hint_key("g1")).unwrap().as_deref(),
+            Some("1"),
+            "届いたのに記録していない"
+        );
+        // 済みなら出さない
+        let again = ghost_voice_unset_once(&db, &gate, &settings, "g1", || tell(NoticeOutcome::Shown)).await;
+        assert_eq!(again, None);
+        // 再起動（gate が空）しても、記録があれば出ない
+        let after_restart =
+            ghost_voice_unset_once(&db, &OnceGate::default(), &settings, "g1", || tell(NoticeOutcome::Shown)).await;
+        assert_eq!(after_restart, None, "再起動すると出る");
+        assert_eq!(shown.get(), 3, "出した回数（保留・失敗・届いたの 3 回だけ。済みと再起動後は出さない）");
+
+        // ゴーストごと: 別のゴーストにはまた出る
+        let other = ghost_voice_unset_once(&db, &gate, &settings, "g2", || tell(NoticeOutcome::Shown)).await;
+        assert_eq!(other, Some(NoticeOutcome::Shown));
+
+        // 声を決めたゴースト（行がある）には出ない。記録もしない
+        settings
+            .tts_speakers_by_ghost
+            .insert("g3".into(), GhostSpeakers { main: 5, sub: 6 });
+        let decided = ghost_voice_unset_once(&db, &gate, &settings, "g3", || tell(NoticeOutcome::Shown)).await;
+        assert_eq!(decided, None);
+        assert_eq!(db.get_setting(&ghost_voice_hint_key("g3")).unwrap(), None);
+    }
+
+    /// **案内の判定は、行・記録のどちらかがあれば出さない**（純粋部分）。移行で行が埋まる既存のゴースト
+    /// （`from_persisted`）には出ない。
+    #[test]
+    fn the_hint_is_due_only_without_a_row_and_a_record() {
+        use crate::state::GhostSpeakers;
+        let mut s = Settings::default();
+        s.tts_speakers_by_ghost.clear();
+        assert!(ghost_voice_hint_due(&s, "a", false));
+        assert!(!ghost_voice_hint_due(&s, "a", true), "記録があるのに出す");
+        s.tts_speakers_by_ghost.insert("a".into(), GhostSpeakers { main: 2, sub: 3 });
+        assert!(!ghost_voice_hint_due(&s, "a", false), "行があるのに出す");
+        assert!(ghost_voice_hint_due(&s, "b", false), "別のゴーストの行で引いている");
+        // 旧版の設定を読んだ（`from_persisted` が現在のゴーストの行を埋める）既存のゴーストには出ない
+        let raw = serde_json::to_string(&Settings::default()).unwrap();
+        let migrated = Settings::from_persisted(&raw).unwrap();
+        assert!(!ghost_voice_hint_due(&migrated, &migrated.ghost_id, false), "移行で行が埋まるゴーストに出す");
+    }
+
+    /// **配線: VOICEVOX で鳴らしたら案内を試みる**（フォールバックを含む。全経路が `engine` の判定 1 か所を通る）。
+    /// 案内は告知を出す関数に取り合いと記録を任せ、済みの記録は `once_reached_claimed` の後ろ（届いたとき）にある。
+    #[test]
+    fn the_unset_voice_hint_is_wired_after_voicevox_speaks_and_marked_after_reaching() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let body_of = |name: &str| {
+            let body = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+            body[..body.find("\n}\n").unwrap()].to_string()
+        };
+        let synth = body_of("pub async fn synthesize_voice(");
+        let judged = synth.find("if engine == ENGINE_VOICEVOX {").expect("鳴らしたエンジンで案内を判定していない");
+        let announced = synth.find("announce_ghost_voice_unset_once(").expect("案内を呼んでいない");
+        let returned = synth.find("Ok(SynthesizedVoice {").expect("戻りが無い");
+        assert!(judged < announced && announced < returned);
+        assert_eq!(
+            synth.matches("announce_ghost_voice_unset_once(").count(),
+            1,
+            "案内の呼び出しが経路ごとに散っている"
+        );
+        // 告知を出す側（AppHandle が要る）は NoticeKind::GhostVoiceUnset を出す
+        let announce = body_of("pub(crate) async fn announce_ghost_voice_unset_once(");
+        assert!(announce.contains("NoticeKind::GhostVoiceUnset"));
+        assert!(announce.contains("state.loaded_ghost_id()"), "読み込み中のゴーストで引いていない");
+        // 記録は届いたかを見る関数（once_reached_claimed）の mark の中だけ
+        let core = body_of("async fn ghost_voice_unset_once<Fut>(");
+        let claimed = core.find("once_reached_claimed(").expect("取り合いを通していない");
+        let marked = core.find("set_setting(&seen_key").expect("記録していない");
+        assert!(claimed < marked, "届いたかを見る前に済みにしている");
+        assert_eq!(core.matches("set_setting(").count(), 1);
+        assert!(!announce.contains("set_setting("), "出す側が記録を直接書いている");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.60）
+# ugg アーキテクチャ設計書（architecture.md v2.61）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -264,6 +264,7 @@ CREATE TABLE app_settings (
 - ★M11 天気: `weather_cache`（WeatherCache を JSON。専用テーブルを持たず app_settings に保存。「解除」= 空文字で消去、§4.7.2）, `weather_rain_date`（降雨の一言の 1 日 1 回 dedup。`*_date` 系と同型）
 - ★M12 定例会話: `regular_morning_date` / `regular_evening_date`（朝・夜の定例会話の 1 日 1 回 dedup、`*_date` 系と同型）
 - ★v0.5 コスト告知: `cost_warned_80_month` / `cost_limit_notified_month`（値は当月タグ `YYYY-MM`。非永続の AtomicBool では再起動で消え、**月が替わっても戻らない**ため翌月の警告が鳴らなかった。spec §4.2.7「次月リセットで復帰。」）
+- ★v0.6.0 声の案内: `ghost_voice_hint_seen:<ghost_id>`（"1"。`GhostVoiceUnset` を届けたゴースト。`update_notice_seen:<version>` と同じ作り）
 - ★M13 表示モニタ: `monitor_pref`（ユーザーが選んだモニタ = `{name, x, y}` の JSON。**`window_pos`（前回位置）とは別物**で、選択があるときは `window_pos` を参照しない。空文字 = 選択なし）
 
 #### `chat_log`
@@ -657,7 +658,7 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `synthesize_voice` | `text: String, slot: "main"\|"sub", caption: String\|null（省略可）` | `String` | WAV を base64 で返す（slot 基準、エンジン振り分けはバックエンド）。★ `caption` は Irodori 実モデルのみ使用（他経路は無視、空文字は None 正規化。script-reader-spec.md §3.3）。**v3 本体では効いていない**（§7.1。v0.5.7 の差し替えで閉じる予定で、効くことは差し替え時に検証する） |
+| `synthesize_voice` | `text: String, slot: "main"\|"sub", caption: String\|null（省略可）` | `SynthesizedVoice { wav: String, engine: "voicevox_core"\|"irodori" }`（★v0.6.0 で `String` から改めた） | WAV を base64 で返す（slot 基準、エンジン振り分けはバックエンド）。**★v0.6.0 `engine` は実際に鳴らしたエンジン**（フォールバックを含む）。フロントは VOICEVOX で鳴らした slot の話者でクレジットを出す（`src/tts/credit.ts` の `creditSlots` / `noteSynthesized`。spec §4.5.1 の常時表示・VVM 規約）。★ `caption` は Irodori 実モデルのみ使用（他経路は無視、空文字は None 正規化。script-reader-spec.md §3.3）。**v3 本体では効いていない**（§7.1。v0.5.7 の差し替えで閉じる予定で、効くことは差し替え時に検証する） |
 | `list_voices` | なし | `VoiceOption[]` | 現在エンジンの声一覧 |
 | `voicevox_assets_ready` | なし | `bool` | 資産有無 |
 | `download_voicevox_assets` | `agreed: bool, gh_token: String\|null` | `()` | 規約同意必須、進捗は `voicevox-download` イベント |
@@ -1414,7 +1415,13 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 //   shutdown → 20 分は ensure_sidecar_running が即 SidecarStart を返す → 理由を ugg.log へ（通知のゲートより前）
 //   → notify(IrodoriUnavailable)（synthesize_voice と共有の 5 分クールダウン）
 // 合成の失敗（VoiceRefMissing 以外）は synthesize_voice が理由を ugg.log へ残して voicevox_core で再合成し、
-//   成功したときだけ notify(IrodoriUnavailable)（commands::tts::decide_fallback）
+//   成功したときだけ notify(IrodoriUnavailable)（commands::tts::decide_fallback → FallbackToVoicevox）
+// ★v0.6.0 VoiceRefMissing（読み込み中のゴーストに参照音声が無い slot）は FallbackForMissingRef: そのゴーストの話者で
+//   voicevox_core 合成し、notify(IrodoriVoiceRefMissing) を「ゴースト × slot・プロセス内 1 回」出す（OnceGate で原子的に
+//   取り、once_reached_claimed で届いたときだけ済み）。IrodoriUnavailable も 5 分のクールダウンも通らない。
+//   voice_ref_preview は decide_fallback を通らずエラーのまま（作った声を聴く道具なので代わりの声で鳴らさない）
+// ★v0.6.0 VOICEVOX で鳴らした全経路の最後に notify(GhostVoiceUnset)（読み込み中のゴーストに tts_speakers_by_ghost の
+//   行が無いとき、ゴーストごとに 1 回。届いたときだけ app_settings `ghost_voice_hint_seen:<ghost_id>` に記録）
 // ★v0.5.7 理由の種類（commands::tts::unavailable_kind / tasks::health_unavailable_kind）:
 //   TtsError::Updating → 更新中 / TtsError::Synth{ModelMissing} → モデルが無い / Synth{OutOfMemory} → VRAM /
 //   ヘルスの 503 + status: no_gpu（HealthPing::NoGpu）→ GPU が無い / それ以外 → その他
@@ -1965,3 +1972,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-28 | v2.58 | **v0.5.8 項目 3（ゲートの子プロセスの終わり方）**。`sidecar.py` の `_exit_now` を足し、`main` の `--synth-once` と `--acceptance` の分岐は結果を書いたあとこれで抜ける（CUDA を使ったあとのインタプリタの後片付けで落ちて、`classify_gate` が `ok` の結果を終了コードで失敗にするのを防ぐ）。`classify_gate` は変えない。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
 | 2026-09-29 | v2.59 | **v0.5.8 リリース前監査への対応**。`system/log.rs` の走査のテストはテストの塊（`#[cfg(test)]` の直後が `mod`）だけを除く。`tts/sidecar.rs` の `identify_sidecar`（send・json）と `request_shutdown`、`tts/irodori.rs` の `health_ping` も match の手前で `strip_url()` を通す。`sidecar.py` の `_is_missing_locally` は `__cause__` だけをたどり、`hf_hub_cache_dir` は `%VAR%` を展開する。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
 | 2026-10-03 | v2.60 | **v0.6.0 項目 2・4（声と会話の履歴をゴーストごとに）**。schema v10: `ghost_voice_refs` を新設し、`chat_log.ghost_id` を追加（**既存のテーブルは作り直さない** — 旧版へ戻せるように。`voice_refs` は残し新版は読み書きしない）。移行のゴーストは `Settings::from_persisted`（起動時の読み込みと共有する唯一の解釈）。`Settings.tts_speakers_by_ghost`、`BootPayload.default_speakers`、`voice_ref_*` の対象を読み込み中のゴーストへ、export `ugg-export-v4`。フロントは `mountSettingsPanel(loadedGhost)`・`src/tts/ghost-voice.ts`（`speakersFor`）。**新規コマンド・イベントなし。** |
+| 2026-10-03 | v2.61 | **v0.6.0 項目 3（参照音声が無いときに無言にしない）と項目 2 の残り**。`synthesize_voice` の戻りを `SynthesizedVoice { wav, engine }` に（実際に鳴らしたエンジン。クレジットを VOICEVOX で鳴らした slot の話者で出すため。新規コマンド・イベントなし）。`decide_fallback` は `FallbackForMissingRef` / `FallbackToVoicevox`。`NoticeKind::IrodoriVoiceRefMissing`（`irodori_voice_ref_missing`、ゴースト × slot・プロセス内 1 回）と `NoticeKind::GhostVoiceUnset`（`ghost_voice_unset`、ゴーストごとに 1 回・`ghost_voice_hint_seen:<ghost_id>`）。`OnceGate`（鍵ごとの原子的な取り合い）と `once_reached_claimed`（取り合い＋届いたときだけ済み）を `system/notify.rs` に。 |

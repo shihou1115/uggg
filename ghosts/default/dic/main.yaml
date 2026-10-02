@@ -658,6 +658,21 @@ system_messages:
   irodori_vram:
     - main: { text: "GPU のメモリがいっぱいみたい…いつもの声で話すね", pose: troubled }
       sub: { text: "VRAM が足りない。ほかに GPU を使っているアプリを止めれば戻る", pose: normal }
+  # v0.6.0 項目 3: 参照音声がまだ無い slot は VOICEVOX で話す（ゴースト × slot ごとに 1 回）。
+  # 故障ではないので irodori_unavailable とは別のキー（「高品質モードが使えない」とは言わない）。
+  irodori_voice_ref_missing:
+    - main: { text: "高品質モードのあたしたちの声は、まだ作ってないんだ。いつもの声で話すね", pose: normal }
+      sub: { text: "参照音声がまだ無い。設定の「音声」で作れるから、それまでは VOICEVOX だ", pose: normal }
+    - main: { text: "あたしたちの高品質モードの声はこれから。今はいつもの声で話すよ", pose: happy }
+      sub: { text: "作るなら設定の「音声」からだ。できるまでは VOICEVOX で代用する", pose: normal }
+    - main: { text: "高品質の声がまだ無いから、いつもの声でお話するね。設定の「音声」で作れるよ", pose: normal }
+      sub: { text: "声は作るまで無いままだ。今は VOICEVOX で話している", pose: normal }
+  # v0.6.0 項目 2: 声を決めていないゴーストが VOICEVOX で初めて喋るとき、ゴーストごとに 1 回だけ。
+  ghost_voice_unset:
+    - main: { text: "ちなみに、あたしたちの声は設定の「音声」で変えられるよ", pose: happy }
+      sub: { text: "いまは初期の声のままだ。好きな話者に替えてかまわない", pose: normal }
+    - main: { text: "声は設定の「音声」で選び直せるよ。気分で替えてみてね", pose: normal }
+      sub: { text: "話者はボクらそれぞれに決められる。設定を見てみろ", pose: normal }
   irodori_update_available:
     - main: { text: "高品質モードに新しいのが来てるみたい！", pose: happy }
       sub: { text: "設定の「更新する」から入れられる。時間のあるときにどうぞ", pose: normal }

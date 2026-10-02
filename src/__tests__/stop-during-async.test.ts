@@ -105,7 +105,7 @@ describe("操作列: 合成 → デコード中に停止", () => {
     const speaker = createSpeaker();
 
     // 1. 合成は成功して WAV が返る
-    invokeMock.mockResolvedValue("AAAA");
+    invokeMock.mockResolvedValue({ wav: "AAAA", engine: "voicevox_core" });
     const spoken = speaker.speak("main", "こんにちは");
     await settle();
     expect(pendingDecode, "デコード待ちに入っていること").not.toBeNull();
@@ -129,7 +129,7 @@ describe("操作列: 合成 → デコード中に停止", () => {
     setTtsParams({ enabled: true, speed: 1, volume: 1 });
     const speaker = createSpeaker();
 
-    invokeMock.mockResolvedValue("AAAA");
+    invokeMock.mockResolvedValue({ wav: "AAAA", engine: "voicevox_core" });
     const spoken = speaker.speak("main", "こんにちは");
     await settle();
     pendingDecode!.resolve({});
@@ -146,7 +146,7 @@ describe("操作列: 合成 → デコード中に停止", () => {
     setTtsParams({ enabled: true, speed: 1, volume: 0 });
     const speaker = createSpeaker();
 
-    invokeMock.mockResolvedValue("AAAA");
+    invokeMock.mockResolvedValue({ wav: "AAAA", engine: "voicevox_core" });
     const spoken = speaker.speak("main", "こんにちは");
     await settle();
     pendingDecode!.resolve({});

@@ -9,6 +9,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+import { noteSynthesized } from "../tts/credit";
+import type { SynthesizedVoice } from "../tts/types";
 import type { ReadingChunk, Settings, VoiceRef, VoiceSlot } from "../types";
 
 interface Inputs {
@@ -142,10 +144,16 @@ export async function startReading(path: string): Promise<void> {
     if (chunk.caption !== null) {
       args.caption = chunk.caption;
     }
-    return invoke<string>("synthesize_voice", args).catch((err) => {
-      console.warn("[reader] chunk synth failed", err);
-      return null;
-    });
+    return invoke<SynthesizedVoice>("synthesize_voice", args)
+      .then((voice) => {
+        // VOICEVOX で鳴らしたらクレジットを出す（高品質モードのフォールバック中も。規約上の常時表示）
+        noteSynthesized(chunk.slot, voice.engine);
+        return voice.wav;
+      })
+      .catch((err) => {
+        console.warn("[reader] chunk synth failed", err);
+        return null;
+      });
   };
 
   let skipped = 0;
