@@ -38,9 +38,12 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 const settle = () => new Promise((r) => setTimeout(r, 0));
 
+/// 読み込み中のゴースト（boot payload 相当。v0.6.0 項目 2）。設定の `ghost_id` とは別物。
+const loadedGhost = { id: "mimi", name: "ミミとクロ", defaultSpeakers: { main: 2, sub: 3 } };
+
 async function click(buttonId: string) {
   const panel = await import("../panels/settings");
-  await panel.mountSettingsPanel();
+  await panel.mountSettingsPanel(loadedGhost);
   document.getElementById(buttonId)!.dispatchEvent(new Event("click"));
   await settle();
 }

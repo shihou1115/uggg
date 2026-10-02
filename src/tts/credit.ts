@@ -8,6 +8,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+import type { GhostSpeakers } from "../types";
 import type { VoiceOption } from "./types";
 
 interface CreditState {
@@ -28,11 +29,11 @@ export function mountCredit(): void {
 /// Irodori-TTS のモデル（MIT）には音声へのクレジット表示の定めが無い。ただし**モデルカードの倫理条項**（本人の
 /// 同意なく他人の声をクローン・なりすましに使わない／人を欺く目的で使わない）があり、ugg は取得と更新の確認と
 /// 取説で提示する（v0.5.7 項目 8、spec §6.0）。以前は「規約上の帰属表示義務がない」と言い切っていた。
+/// `speakers` は**読み込み中のゴーストの話者**（`speakersFor`。v0.6.0 項目 2）。設定の単一の話者ではない。
 export async function refreshCredit(
   enabled: boolean,
   engine: string,
-  speakerMain: number,
-  speakerSub: number,
+  speakers: GhostSpeakers,
 ): Promise<void> {
   if (!state) return;
   if (!enabled || engine !== "voicevox_core") {
@@ -43,7 +44,7 @@ export async function refreshCredit(
   try {
     const voices = await invoke<VoiceOption[]>("list_voices");
     state.voices = voices;
-    const text = formatCreditText(voices, speakerMain, speakerSub);
+    const text = formatCreditText(voices, speakers.main, speakers.sub);
     state.el.textContent = text;
     state.el.classList.add("visible");
   } catch (err) {

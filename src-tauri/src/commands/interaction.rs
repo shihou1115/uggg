@@ -68,23 +68,24 @@ fn prompt_from_dictionary(
     target: &str,
     pick: impl Fn(&crate::ghost::dict::Dictionary, &str) -> Option<SpeechTurn>,
 ) -> Option<SpeechTurn> {
-    let turn = {
+    let (turn, ghost_id) = {
         let guard = state.ghost.lock().expect("ghost poisoned");
         let bundle = guard.as_ref().ok()?;
         if target == "sub" && !bundle.sub_available() {
             return None;
         }
-        pick(&bundle.dictionary, target)
-    }?;
+        (pick(&bundle.dictionary, target)?, bundle.ghost.id.clone())
+    };
     let role = if target == "sub" {
         ChatRole::Sub
     } else {
         ChatRole::Main
     };
     let now = chrono::Utc::now().timestamp();
+    // 読み込み中のゴーストを記録する (v0.6.0 項目 4)
     let _ = state
         .db
-        .append_chat(now, "low", role, &turn.text, turn.pose.as_deref());
+        .append_chat(now, "low", role, &turn.text, turn.pose.as_deref(), Some(ghost_id.as_str()));
     crate::presence::idle::reset(state);
     Some(turn)
 }

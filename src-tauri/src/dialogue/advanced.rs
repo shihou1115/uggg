@@ -86,13 +86,16 @@ async fn parse_and_record(
     let now = Utc::now().timestamp();
     // chat_log: user → main → sub の順で記録。掛け合いパターン3/4 では 3ターン目
     // (extra) を話者と同じロール (パターン3=Main / パターン4=Sub) で追記するため最大 4 行。
-    db.append_chat(now, "advanced", ChatRole::User, user_text, None)?;
+    // どのゴーストとの会話かを残す (v0.6.0 項目 4)。読み込み中のゴースト = この応答を作った bundle。
+    let ghost_id = Some(bundle.ghost.id.as_str());
+    db.append_chat(now, "advanced", ChatRole::User, user_text, None, ghost_id)?;
     db.append_chat(
         now,
         "advanced",
         ChatRole::Main,
         &line.main.text,
         line.main.pose.as_deref(),
+        ghost_id,
     )?;
     if let Some(sub) = &line.sub {
         db.append_chat(
@@ -101,12 +104,13 @@ async fn parse_and_record(
             ChatRole::Sub,
             &sub.text,
             sub.pose.as_deref(),
+            ghost_id,
         )?;
     }
     // 3ターン目 (パターン3=main の再発話 / パターン4=sub の再発話) も同じ話者役として記録する。
     if let Some(extra) = &extra {
         let role = if pattern == 3 { ChatRole::Main } else { ChatRole::Sub };
-        db.append_chat(now, "advanced", role, &extra.text, extra.pose.as_deref())?;
+        db.append_chat(now, "advanced", role, &extra.text, extra.pose.as_deref(), ghost_id)?;
     }
     // api_usage: 0 トークンでも 1 行残しておく (回数監視)
     db.append_api_usage(&ApiUsageRow {
@@ -431,7 +435,9 @@ fn load_recent_history(
 
     // 1 往復は最大 4 行 (user + main + sub + extra)。多めに取って後段で捨てる。
     let limit = (max_pairs.saturating_mul(4) + 4) as u32;
-    let mut rows = db.list_recent_chat_log_in_mode("advanced", limit)?; // 新しい順
+    // **読み込み中のゴーストの行だけ** (v0.6.0 項目 4。SQL 側で絞る)。前のゴーストの台詞が、新しいキャラの
+    // 名前 (下の main_name / sub_name) を付けて LLM に渡るのを防ぐ。
+    let mut rows = db.list_recent_chat_log_in_mode("advanced", &bundle.ghost.id, limit)?; // 新しい順
     rows.reverse(); // 時系列順へ
 
     let main_name = bundle.ghost.characters.main.name.as_str();
@@ -715,14 +721,67 @@ mod tests {
         db
     }
 
+    /// `make_bundle` のゴーストの id。履歴の注入は読み込み中のゴーストの行だけを使う (v0.6.0 項目 4)。
+    const GHOST: &str = "default";
+
     fn say(db: &Db, ts: i64, role: ChatRole, text: &str) {
-        db.append_chat(ts, "advanced", role, text, None).unwrap();
+        db.append_chat(ts, "advanced", role, text, None, Some(GHOST)).unwrap();
     }
 
     /// バック起点の発話 (独り言・リマインダー / カレンダー通知・状況発話)。
     /// `persist_and_speak` は例外なく mode="low" で記録する。
     fn say_back_origin(db: &Db, ts: i64, text: &str) {
-        db.append_chat(ts, "low", ChatRole::Main, text, None).unwrap();
+        db.append_chat(ts, "low", ChatRole::Main, text, None, Some(GHOST)).unwrap();
+    }
+
+    /// **切り替えたあと、前のゴーストとの会話を LLM に渡さない** (v0.6.0 項目 4)。
+    /// 渡すと、前のゴーストの台詞が新しいキャラの名前を付けて最大 8 往復ぶん入る。
+    #[test]
+    fn another_ghosts_conversation_is_not_injected() {
+        let db = hist_db();
+        let old = |ts, role, text: &str| {
+            db.append_chat(ts, "advanced", role, text, None, Some("previous_ghost")).unwrap()
+        };
+        old(1, ChatRole::User, "前の子に話しかけた");
+        old(2, ChatRole::Main, "前の子の返事");
+        // 持ち主が分からない行 (読み込み中のゴーストが無いときの記録・旧版へ戻して書かれた行) も渡さない
+        db.append_chat(3, "advanced", ChatRole::Main, "持ち主不明", None, None).unwrap();
+        say(&db, 4, ChatRole::User, "いまの子に話しかけた");
+        say(&db, 5, ChatRole::Main, "いまの子の返事");
+
+        let msgs = load_recent_history(&db, &make_bundle(true), 8).unwrap();
+        let joined = msgs.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join(" / ");
+        assert!(!joined.contains("前の子"), "前のゴーストの台詞が渡っている: {joined}");
+        assert!(!joined.contains("持ち主不明"), "持ち主不明の行が渡っている: {joined}");
+        assert_eq!(msgs.len(), 2, "いまのゴーストの 1 往復だけ: {msgs:?}");
+
+        // 切り替え: 読み込み中のゴーストが変われば、見える行も入れ替わる (往復する)
+        let mut previous = make_bundle(true);
+        previous.ghost.id = "previous_ghost".into();
+        let msgs = load_recent_history(&db, &previous, 8).unwrap();
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert!(msgs[0].content.contains("前の子に話しかけた"), "{msgs:?}");
+    }
+
+    /// **記録から注入まで通しで**: 応答を記録すると読み込み中のゴーストの行になり、別のゴーストに切り替えた
+    /// bundle には注入されない (記録側が ghost_id を書き忘れると、注入側の絞り込みは全部を落として履歴が空になる)。
+    #[test]
+    fn a_recorded_reply_belongs_to_the_loaded_ghost() {
+        let db = hist_db();
+        let bundle = make_bundle(true);
+        let response: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"おかえり!"}}]}"#,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(parse_and_record(response, &bundle, &db, &Settings::default(), "ただいま", 1))
+            .unwrap();
+
+        let same = load_recent_history(&db, &bundle, 8).unwrap();
+        assert_eq!(same.len(), 2, "記録した会話が同じゴーストの履歴に出ない: {same:?}");
+        let mut other = make_bundle(true);
+        other.ghost.id = "other".into();
+        assert!(load_recent_history(&db, &other, 8).unwrap().is_empty(), "別のゴーストへ渡っている");
     }
 
     /// **独り言・通知は LLM へ渡さない** (spec §3.3 / §4.6.4、リリース前監査で検出)。

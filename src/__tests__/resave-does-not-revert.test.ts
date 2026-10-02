@@ -25,6 +25,12 @@ const invoked: { cmd: string; args: unknown }[] = [];
 let currentSettings: Settings;
 /// `set_settings` の応答を作る。既定は「渡されたものをそのまま保存」。
 let saveResponder: (next: Settings) => Settings;
+/// VOICEVOX の資産が入っているか（話者の select が埋まるか）。声の操作列テストだけ true にする。
+let voicevoxReady = false;
+/// 読み込み中のゴースト（boot payload 相当。v0.6.0 項目 2）。設定の `ghost_id` とは別物 —
+/// 切り替えて再起動するまでは食い違う。
+let loadedGhost = { id: "mimi", name: "ミミとクロ", defaultSpeakers: { main: 2, sub: 3 } };
+const VOICES = [1, 2, 3, 6, 7, 8, 9].map((id) => ({ id, name: `声${id}` }));
 
 // `restoreMocks: true` なので `vi.fn().mockResolvedValue(...)` は 1 本目のテストで
 // 実装ごと消える（2 本目以降 undefined が返り、`unlisten()` が落ちる）。
@@ -58,9 +64,12 @@ vi.mock("@tauri-apps/api/core", () => ({
           { id: "default", name: "既定シェル" },
           { id: "poko_shell", name: "ポコのシェル" },
         ];
+      case "voicevox_assets_ready":
+        return voicevoxReady;
+      case "list_voices":
+        return VOICES;
       case "has_api_key":
       case "has_github_token":
-      case "voicevox_assets_ready":
       case "irodori_assets_ready":
         return false;
       case "get_cost_status":
@@ -112,8 +121,10 @@ function baseSettings(): Settings {
     pomodoro_rounds: 4,
     tts_enabled: false,
     tts_engine: "voicevox_core",
+    // 旧版の単一の話者（移行の読み出し元。新版は書き換えない）
     tts_speaker_main: 1,
     tts_speaker_sub: 2,
+    tts_speakers_by_ghost: { mimi: { main: 1, sub: 2 }, poko: { main: 6, sub: 7 } },
     tts_speed: 1,
     tts_volume: 1,
     tts_irodori_use_real_model: false,
@@ -160,6 +171,8 @@ describe("操作列: ゴーストを切り替えて保存 → もう一度保存
     invoked.length = 0;
     currentSettings = baseSettings();
     saveResponder = (next) => next;
+    voicevoxReady = false;
+    loadedGhost = { id: "mimi", name: "ミミとクロ", defaultSpeakers: { main: 2, sub: 3 } };
     loadIndexHtml();
     vi.resetModules();
   });
@@ -168,7 +181,7 @@ describe("操作列: ゴーストを切り替えて保存 → もう一度保存
     // v0.5.7 項目 4。読み込み（保存済みの 40 を出す）と保存（選び直した 8 を送る）の両方を見る。
     // 片方だけだと「画面の値を無視して元の値を送る」壊れ方を捕まえられない（元の値も 40 なので）。
     const panel = await import("../panels/settings");
-    await panel.mountSettingsPanel();
+    await panel.mountSettingsPanel(loadedGhost);
     await panel.openSettingsPanel();
 
     const steps = document.getElementById("settings-irodori-steps") as HTMLSelectElement;
@@ -182,7 +195,7 @@ describe("操作列: ゴーストを切り替えて保存 → もう一度保存
 
   it("default_shell の追従が、2 回目の保存で取り消されない", async () => {
     const panel = await import("../panels/settings");
-    await panel.mountSettingsPanel();
+    await panel.mountSettingsPanel(loadedGhost);
     await panel.openSettingsPanel();
 
     const ghostSelect = document.getElementById("settings-ghost-id") as HTMLSelectElement;
@@ -222,7 +235,7 @@ describe("操作列: ゴーストを切り替えて保存 → もう一度保存
 
   it("ユーザーが同じ操作でシェルも明示的に選んだら、そちらが優先される", async () => {
     const panel = await import("../panels/settings");
-    await panel.mountSettingsPanel();
+    await panel.mountSettingsPanel(loadedGhost);
     await panel.openSettingsPanel();
 
     const ghostSelect = document.getElementById("settings-ghost-id") as HTMLSelectElement;
@@ -234,5 +247,114 @@ describe("操作列: ゴーストを切り替えて保存 → もう一度保存
 
     expect(savedPayloads()[0].shell_id).toBe("default");
     expect(savedPayloads()[0].ghost_id).toBe("poko");
+  });
+});
+
+/// 操作列テスト（v0.6.0 項目 2）: 声はゴーストごと。保存のたびにフォーム全体から設定を組み立てるので、
+/// **読み込み中のゴースト以外の行や map 全体が巻き戻らない**ことを、保存を 2 回流して確かめる。
+///
+/// 単機能テスト（「話者を選ぶと保存される」）では捕まらない: 壊れ方は「選んだゴーストの行は正しく書けるが、
+/// ほかのゴーストの行を落とす / 旧版の単一の話者を書き換える / 声を決めていないゴーストに行を勝手に作る」。
+describe("操作列: 声をゴーストごとに保存する", () => {
+  const speakerMain = () => document.getElementById("settings-tts-speaker-main") as HTMLSelectElement;
+  const speakerSub = () => document.getElementById("settings-tts-speaker-sub") as HTMLSelectElement;
+  const voiceNote = () => document.getElementById("settings-voice-ghost-note") as HTMLElement;
+  const save = async (count: number) => {
+    document.getElementById("settings-save")!.dispatchEvent(new Event("click"));
+    await vi.waitFor(() => expect(savedPayloads()).toHaveLength(count));
+  };
+
+  beforeEach(() => {
+    invoked.length = 0;
+    currentSettings = baseSettings();
+    saveResponder = (next) => next;
+    voicevoxReady = true;
+    loadedGhost = { id: "mimi", name: "ミミとクロ", defaultSpeakers: { main: 2, sub: 3 } };
+    loadIndexHtml();
+    vi.resetModules();
+  });
+
+  async function open() {
+    const panel = await import("../panels/settings");
+    await panel.mountSettingsPanel(loadedGhost);
+    await panel.openSettingsPanel();
+    return panel;
+  }
+
+  it("読み込み中のゴーストの行を出し、そこだけを書く。ほかのゴーストの行と旧版の話者は動かさない", async () => {
+    await open();
+    expect(speakerMain().value, "読み込み中のゴーストの話者を出す").toBe("1");
+    expect(speakerSub().value).toBe("2");
+
+    speakerMain().value = "9";
+    await save(1);
+    const first = savedPayloads()[0];
+    expect(first.tts_speakers_by_ghost.mimi, "選んだ値で、読み込み中のゴーストの行だけが変わる").toEqual({
+      main: 9,
+      sub: 2,
+    });
+    expect(first.tts_speakers_by_ghost.poko, "ほかのゴーストの行は巻き戻らない").toEqual({
+      main: 6,
+      sub: 7,
+    });
+    expect(
+      [first.tts_speaker_main, first.tts_speaker_sub],
+      "旧版の単一の話者は書き換えない（旧版へ戻したとき移行前の話者で喋る）",
+    ).toEqual([1, 2]);
+
+    // 2 回目: 何も触らずもう一度保存しても、フォームが古い値を送り返して巻き戻さない
+    await save(2);
+    const second = savedPayloads()[1];
+    expect(second.tts_speakers_by_ghost.mimi).toEqual({ main: 9, sub: 2 });
+    expect(second.tts_speakers_by_ghost.poko).toEqual({ main: 6, sub: 7 });
+  });
+
+  it("ゴーストの選択を変えて保存すると、声の変更は読み込み中のゴースト（旧ゴースト）に入り、注記が出る", async () => {
+    await open();
+    expect(voiceNote().classList.contains("force-hide"), "選択が読み込み中と同じなら注記は出さない").toBe(true);
+
+    const ghostSelect = document.getElementById("settings-ghost-id") as HTMLSelectElement;
+    ghostSelect.value = "poko";
+    ghostSelect.dispatchEvent(new Event("change"));
+    expect(voiceNote().classList.contains("force-hide")).toBe(false);
+    expect(voiceNote().textContent).toBe("再起動まで ミミとクロ の声を編集します");
+
+    speakerSub().value = "8";
+    await save(1);
+    const saved = savedPayloads()[0];
+    expect(saved.ghost_id).toBe("poko");
+    expect(saved.tts_speakers_by_ghost.mimi, "変更は読み込み中の旧ゴーストに入る").toEqual({ main: 1, sub: 8 });
+    expect(saved.tts_speakers_by_ghost.poko, "切り替え先の行は触らない").toEqual({ main: 6, sub: 7 });
+
+    // 再保存しても、旧ゴーストの行が切り替え先の値で上書きされない
+    await save(2);
+    expect(savedPayloads()[1].tts_speakers_by_ghost.mimi).toEqual({ main: 1, sub: 8 });
+    expect(savedPayloads()[1].tts_speakers_by_ghost.poko).toEqual({ main: 6, sub: 7 });
+  });
+
+  it("声を決めていないゴーストは、アプリの既定の話者を出し、関係ない設定の保存で行を作らない", async () => {
+    loadedGhost = { id: "newcomer", name: "新入り", defaultSpeakers: { main: 2, sub: 3 } };
+    currentSettings = { ...baseSettings(), ghost_id: "newcomer" };
+    await open();
+    expect(speakerMain().value, "行が無いゴーストは boot payload の既定（直書きではない）").toBe("2");
+    expect(speakerSub().value).toBe("3");
+
+    const volume = document.getElementById("settings-tts-volume") as HTMLInputElement;
+    volume.value = "1.5";
+    await save(1);
+    const saved = savedPayloads()[0];
+    expect(saved.tts_volume).toBe(1.5);
+    expect(Object.keys(saved.tts_speakers_by_ghost).sort(), "声を決めていないのに行を作らない").toEqual([
+      "mimi",
+      "poko",
+    ]);
+
+    // 話者を選べば、そのゴーストの行ができる（ほかの行はそのまま）
+    speakerMain().value = "8";
+    await save(2);
+    const second = savedPayloads()[1];
+    expect(second.tts_speakers_by_ghost.newcomer).toEqual({ main: 8, sub: 3 });
+    expect(second.tts_speakers_by_ghost.mimi).toEqual({ main: 1, sub: 2 });
+    expect(second.tts_speakers_by_ghost.poko).toEqual({ main: 6, sub: 7 });
   });
 });

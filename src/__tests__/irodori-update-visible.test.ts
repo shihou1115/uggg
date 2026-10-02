@@ -84,6 +84,9 @@ vi.mock("@tauri-apps/api/core", () => ({
   }),
 }));
 
+/// 読み込み中のゴースト（boot payload 相当。v0.6.0 項目 2）。設定の `ghost_id` とは別物。
+const loadedGhost = { id: "mimi", name: "ミミとクロ", defaultSpeakers: { main: 2, sub: 3 } };
+
 function baseSettings(): Settings {
   return {
     mode: "low",
@@ -106,6 +109,7 @@ function baseSettings(): Settings {
     tts_engine: "irodori",
     tts_speaker_main: 1,
     tts_speaker_sub: 2,
+    tts_speakers_by_ghost: {},
     tts_speed: 1,
     tts_volume: 1,
     // **更新が届いていないだけのユーザー**は、実モデルを使う設定のまま
@@ -164,7 +168,7 @@ const savedRealModelValues = () =>
 
 async function open() {
   const panel = await import("../panels/settings");
-  await panel.mountSettingsPanel();
+  await panel.mountSettingsPanel(loadedGhost);
   await panel.openSettingsPanel();
   return panel;
 }

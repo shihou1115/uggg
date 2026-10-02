@@ -294,7 +294,8 @@
             </label>
           </section>
           <section class="panel-section" data-page="voice">
-            <h3>音声</h3>
+            <h3 id="settings-voice-heading">音声</h3>
+            <p class="panel-hint force-hide" id="settings-voice-ghost-note"></p>
             <label class="row checkbox-row">
               <input type="checkbox" id="settings-tts-enabled" />
               <span>声で話す (TTS 有効化)</span>
@@ -348,7 +349,7 @@
             <p id="settings-tts-progress" class="panel-message" hidden></p>
           </section>
           <section class="panel-section" data-page="voice" id="settings-irodori-section">
-            <h3>音声 (Irodori-TTS / 高品質モード)</h3>
+            <h3 id="settings-irodori-heading">音声 (Irodori-TTS / 高品質モード)</h3>
             <div class="row">
               <span>GPU 検出</span>
               <span id="settings-irodori-gpu-state" class="key-state">未確認</span>

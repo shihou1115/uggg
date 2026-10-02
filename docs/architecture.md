@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.59）
+# ugg アーキテクチャ設計書（architecture.md v2.60）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -247,7 +247,8 @@ src/
 | `reminder_log` | ★M7 リマインダー発火・確認履歴 | 〜500（prune） | 完了/未完了管理・通知履歴・再通知判断 |
 | `todos` | ★M8 ToDo・日課 | 〜数百 | 3 バケット・2 段階優先度・日課復活 |
 | `calendar_cache` | ★M10 ICS 予定の発生インスタンス | 〜数百 | (source_id,uid,start_ts) 複合キー・near-term 展開 |
-| `voice_refs` | ★ Irodori 参照音声メタ | 最大 2（slot 1件ずつ） | クローン合成の元音声 |
+| `voice_refs` | ★ Irodori 参照音声メタ | 最大 2（slot 1件ずつ） | **★v0.6.0 から新版は読み書きしない**（旧版へ戻したとき用に残す。移行で `ghost_voice_refs` へ写す） |
+| `ghost_voice_refs` | ★v0.6.0 Irodori 参照音声メタ（ゴーストごと） | ゴースト数 × 2 | クローン合成の元音声。一意は `(ghost_id, slot)` |
 
 ### 2.2 各テーブル詳細
 
@@ -273,10 +274,15 @@ CREATE TABLE chat_log (
     mode TEXT NOT NULL,          -- "low" | "advanced"
     role TEXT NOT NULL,          -- "user" | "main" | "sub"
     text TEXT NOT NULL,
-    pose TEXT                    -- main/sub のときのみ
+    pose TEXT,                   -- main/sub のときのみ
+    ghost_id TEXT                -- ★v0.6.0 (schema v10、ALTER で追加) 記録したときの読み込み中のゴースト
 );
 CREATE INDEX idx_chat_log_ts ON chat_log(ts);
 ```
+- **★v0.6.0 `ghost_id`**: 新しい行には読み込み中のゴースト（`AppState::loaded_ghost_id()` か、握っている bundle の id）を
+  書く。移行で既存の行は「移行のゴースト」（下の `ghost_voice_refs` と同じ出どころ）で埋める。advanced の履歴の注入
+  （`list_recent_chat_log_in_mode(mode, ghost_id, limit)`）は一致する行だけを SQL で返し、NULL の行は返さない。
+  列が無い（破損 DB で移行が走らなかった）ときは、`append_chat` は列なしで追記して記録を止めず、注入は空
 - **1 応答あたりの行数**: 通常は user → main → sub の 3 行。**掛け合いパターン3/4（§10.4）では3ターン目を話者と同じロール（パターン3=main / パターン4=sub）で追記するため最大 4 行**になり、同一 ts・同一 role の行が 2 行並ぶ（スキーマは不変。role に新値は増やさない）
 
 #### `user_profile`（★ origin 拡張、source_keywords 追加）
@@ -312,6 +318,27 @@ CREATE TABLE voice_refs (
     UNIQUE(slot)                 -- MVP は slot ごと最新1件のみ
 );
 ```
+
+#### `ghost_voice_refs`（★v0.6.0、schema v10）
+```sql
+CREATE TABLE ghost_voice_refs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ghost_id TEXT NOT NULL,      -- 声の持ち主のゴースト
+    slot TEXT NOT NULL,          -- "main" | "sub"
+    caption TEXT NOT NULL,
+    file_path TEXT NOT NULL,     -- 絶対パス。wav の名前と置き場所は voice_refs と同じ（<slot>_<ts>.wav）
+    created_ts INTEGER NOT NULL,
+    UNIQUE(ghost_id, slot)
+);
+```
+- **`voice_refs` は作り直さず・消さず・書き換えない**（旧版へ戻したとき、旧版の `ON CONFLICT(slot)` が成り立つように）。
+  移行で `voice_refs` の全行を「移行のゴースト」の行として写し、以後の新版はこのテーブルだけを読み書きする
+- **移行のゴースト** = `app_settings."settings"` を `Settings::from_persisted`（起動時の `load_persisted_settings` と同じ
+  唯一の解釈）で読んだ `ghost_id`。読めなければ `"default"`。SQL の `json_extract` は使わない（壊れた JSON で移行が
+  失敗すると、健全な DB でも起動しない）
+- 引き当ては**読み込み中のゴースト**（`AppState::loaded_ghost_id()`）。テーブルが無い（破損 DB で移行が走らなかった）
+  ときは get = None・list = 空・delete = 何もしない（SQL エラーを `irodori_unavailable` に化けさせない）。export だけは
+  読めなかったことを `failed_tables` に出す
 
 #### `reminders`（★M7 v6 拡張）+ `reminder_log`（★M7 新設）
 
@@ -570,7 +597,7 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `get_boot_payload` | なし | `BootPayload` | キャラ画像（data URL）、settings、`char_positions`（保存済みキャラ X 位置。無ければ null）等 |
+| `get_boot_payload` | なし | `BootPayload` | キャラ画像（data URL）、settings、`char_positions`（保存済みキャラ X 位置。無ければ null）等。**★v0.6.0 `default_speakers: GhostSpeakers`**（声を決めていないゴーストの話者 = アプリの既定。フロントの直書き 2 / 3 をやめた） |
 | `frontend_ready` | なし | `()` | boot 完了通知。起動挨拶（first_boot or boot）+ 更新チェック起動 |
 | `quit_app` | なし | `()` | 右クリックメニュー「終了」。**★v0.5.6 トレイの「終了」と同じ `lifecycle::quit_with_farewell` を通る**（見えていれば終了前の確認かあいさつ → 位置の保存 → サイドカー停止 → exit。隠しているときはすぐ）。終了の処理を始めたら戻る（exit を待たない） |
 | `hide_window` | なし | `()` | メインウインドウを hide（トレイから再表示） |
@@ -580,7 +607,7 @@ pub struct GhostBundle {
 
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `set_settings` | `settings: Settings` | `Settings` | 値の clamp（display_scale, tts_speed/volume 等）+ 永続化 + 後処理。**clamp 後の確定値を返す**（フロントはこれを保存済み値として反映） |
+| `set_settings` | `settings: Settings` | `Settings` | 値の clamp（display_scale, tts_speed/volume 等）+ 永続化 + 後処理。**clamp 後の確定値を返す**（フロントはこれを保存済み値として反映）。**★v0.6.0 `Settings.tts_speakers_by_ghost: { [ghost_id]: { main, sub } }`**（既定は空）。`tts_speaker_main/sub` は移行の読み出し元で、新版は書き換えない。フロントは読み込み中のゴーストの行だけを書き、ほかの行と map 全体を巻き戻さない。保存された JSON の解釈は `Settings::from_persisted` が唯一（起動時の読み込みと DB の移行が共有。map が空なら `ghost_id` の行を旧欄で埋める） |
 | `get_settings` | なし | `Settings` | |
 | `set_api_key` | `provider, key: String` | `()` | keyring 保存 |
 | `has_api_key` | `provider: String` | `bool` | |
@@ -620,7 +647,7 @@ pub struct GhostBundle {
 |---|---|---|---|
 | `get_chat_log` | `limit: u32` | `LogEntry[]` | 新しい順 |
 | `clear_history` | `include_profile: bool` | `ClearResult` | |
-| `export_data` | `include_profile: bool` | `{ path: string, failed_tables: string[] }`（★v0.5.7 で `String` から改めた） | 保存パスと読めなかったテーブルの名前を返し、画面が読めなかったものを出す（`write_export`）。**★v0.5.1: キャッシュ 3 つ（`calendar_cache` / `topics_cache` / `monologue_cache`）を除く全 9 テーブル**（schema `ugg-export-v2`）。除外したことは payload の `omitted_caches` に明記。**★v0.5.3: 部分救出**。`build_export_payload` へ切り出し、テーブルごとに `rescue()` で「出せた / 出せなかった」を振り分ける。失敗しても打ち切らず、`failed_tables` に名前と理由を残して値は `null`。schema `ugg-export-v3` |
+| `export_data` | `include_profile: bool` | `{ path: string, failed_tables: string[] }`（★v0.5.7 で `String` から改めた） | 保存パスと読めなかったテーブルの名前を返し、画面が読めなかったものを出す（`write_export`）。**★v0.5.1: キャッシュ 3 つ（`calendar_cache` / `topics_cache` / `monologue_cache`）を除く全 9 テーブル**（schema `ugg-export-v2`）。除外したことは payload の `omitted_caches` に明記。**★v0.5.3: 部分救出**。`build_export_payload` へ切り出し、テーブルごとに `rescue()` で「出せた / 出せなかった」を振り分ける。失敗しても打ち切らず、`failed_tables` に名前と理由を残して値は `null`。schema `ugg-export-v3`。**★v0.6.0 `ghost_voice_refs`（ghost_id 付き）を足し、schema `ugg-export-v4`**（`voice_refs` も従来どおり出す） |
 | `check_update_now` | なし | `()` | 設定パネル「いますぐチェック」。`update_feed_url` 未設定なら Err、結果は notify 経由で発話 |
 | `get_db_health` | なし | `DbIntegrity` | **★v0.5.1**（spec §4.5.5）。起動時 `PRAGMA quick_check` の結果と、破損時に作った退避先（原本コピー / `VACUUM INTO` 救出コピー）を返す。**正常時は何も検知せず退避コピーも作らない。破損しても DB は作り直さず起動も止めない**（データを取り出せる状態を優先）。**保全は破損 1 件につき 1 回**（既存の退避があれば作り直さずそのパスを返す。毎起動コピーは、まさに対象ユーザーのディスクを食い潰す）。原本コピーは `-wal` / `-shm` も同じ規則で運ぶ（本体だけだと未チェックポイント分が抜ける）。**★v0.5.2: 破損時は `migrate()` の失敗を伝播させない**（`AppState::initialize`。健全な DB での失敗は従来どおり致命）。`VACUUM INTO` 失敗時の 0 バイト残骸は削除する。**★v0.5.3: 整合性検査を pragma より前に実行**し、pragma 失敗は健全時のみ致命。既存の退避・救出コピーは `is_usable_preserved` で妥当性（空でない / 救出コピーは `quick_check` 通過）を確認してから採用する |
 
@@ -646,6 +673,8 @@ pub struct GhostBundle {
 | `voice_ref_list` | なし | `VoiceRef[]` | ★ |
 | `voice_ref_delete` | `slot: String` | `VoiceRef[]` | ★ 削除後の一覧を返す |
 | `voice_ref_preview` | `slot: String, text: String` | `String` | ★ 既存参照音声でプレビュー（WAV base64） |
+
+**★v0.6.0 `voice_ref_*` の 4 つは引数を変えず、対象を「読み込み中のゴースト」（`AppState::loaded_ghost_id()`）の `ghost_voice_refs` に変えた**（契約の意味の変更）。読み込み中のゴーストが無いときは list = 空、generate / delete = Err。通常の合成（`synthesize_voice`）の参照音声と VOICEVOX の話者も同じゴーストで引く（設定の `ghost_id` では引かない — 切り替えて再起動するまでの間に先に変わるため）。
 | `reader_load_text` | `path: String` | `ReadingChunk[]` | ★ テキスト読み上げ: 拡張子で分岐（.txt=プレーン読み / .md=台本形式。script-reader-spec.md）。演出メタ付きチャンク配列を返す（spec §4.5.8） |
 | `set_reading_active` | `active: bool` | `()` | テキスト読み上げ: 読み上げ中フラグ（撫で抑制等に使用） |
 
@@ -1935,3 +1964,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-28 | v2.57 | **v0.5.8 項目 2（合成のたびの Hub への問い合わせをやめる）**。`sidecar.py` に `hf_hub_cache_dir`（hub を import せずに共有キャッシュの場所を決める）・`watermark_weights_present`・`stay_off_the_hub`（重みが揃っていれば `HF_HUB_OFFLINE=1` を上書き）を足し、`main` で取得の 2 モード（`--fetch-watermark` / `--download-only`）のあと、合成をするモード（`--acceptance` / `--synth-once` / サーバー）の前に呼ぶ。`--no-download` 無しのサーバー（手で起動したときだけ）は塞がない。`synth_failure_kind` は `_is_missing_locally` で例外の原因を連ねた先まで見る（`FileNotFoundError`・`LocalEntryNotFoundError`・`OfflineModeIsEnabled`・「cached files」の `OSError`）。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
 | 2026-09-28 | v2.58 | **v0.5.8 項目 3（ゲートの子プロセスの終わり方）**。`sidecar.py` の `_exit_now` を足し、`main` の `--synth-once` と `--acceptance` の分岐は結果を書いたあとこれで抜ける（CUDA を使ったあとのインタプリタの後片付けで落ちて、`classify_gate` が `ok` の結果を終了コードで失敗にするのを防ぐ）。`classify_gate` は変えない。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
 | 2026-09-29 | v2.59 | **v0.5.8 リリース前監査への対応**。`system/log.rs` の走査のテストはテストの塊（`#[cfg(test)]` の直後が `mod`）だけを除く。`tts/sidecar.rs` の `identify_sidecar`（send・json）と `request_shutdown`、`tts/irodori.rs` の `health_ping` も match の手前で `strip_url()` を通す。`sidecar.py` の `_is_missing_locally` は `__cause__` だけをたどり、`hf_hub_cache_dir` は `%VAR%` を展開する。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
+| 2026-10-03 | v2.60 | **v0.6.0 項目 2・4（声と会話の履歴をゴーストごとに）**。schema v10: `ghost_voice_refs` を新設し、`chat_log.ghost_id` を追加（**既存のテーブルは作り直さない** — 旧版へ戻せるように。`voice_refs` は残し新版は読み書きしない）。移行のゴーストは `Settings::from_persisted`（起動時の読み込みと共有する唯一の解釈）。`Settings.tts_speakers_by_ghost`、`BootPayload.default_speakers`、`voice_ref_*` の対象を読み込み中のゴーストへ、export `ugg-export-v4`。フロントは `mountSettingsPanel(loadedGhost)`・`src/tts/ghost-voice.ts`（`speakersFor`）。**新規コマンド・イベントなし。** |

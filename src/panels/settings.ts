@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 
 import { openChatLog } from "./chatlog";
 import { uggConfirm } from "../confirm";
+import { speakersFor, type LoadedGhost } from "../tts/ghost-voice";
 import { previewWavBase64 } from "../tts/speaker";
 import { isWeatherReady } from "../weather/credit";
 import type {
@@ -14,6 +15,7 @@ import type {
   DialogueMode,
   DndResult,
   ExportResult,
+  GhostSpeakers,
   InterestTopic,
   IrodoriGpuInfo,
   IrodoriStatus,
@@ -50,6 +52,10 @@ interface Inputs {
   ttsEngine: HTMLSelectElement;
   ttsSpeakerMain: HTMLSelectElement;
   ttsSpeakerSub: HTMLSelectElement;
+  /// 音声欄の見出しと注記（読み込み中のゴーストの名前を出す。v0.6.0 項目 2）
+  voiceHeading: HTMLElement;
+  irodoriHeading: HTMLElement;
+  voiceGhostNote: HTMLElement;
   ttsSpeed: HTMLInputElement;
   ttsVolume: HTMLInputElement;
   ttsAssetsState: HTMLElement;
@@ -146,6 +152,9 @@ interface Inputs {
 
 let inputs: Inputs | null = null;
 let current: Settings | null = null;
+/// **読み込み中のゴースト**（boot payload の ghost id・名前・既定の話者。v0.6.0 項目 2）。声の欄はこのゴーストの
+/// 声を編集する。設定の `ghost_id`（ゴーストの select）とは別物 — 切り替えて再起動するまでの間は食い違う。
+let loadedGhost: LoadedGhost | null = null;
 let onSaved: ((s: Settings) => void) | null = null;
 // Irodori 資産が導入済みか。未導入のうちは、エンジンが voicevox でも Irodori セクション
 // (ランタイム DL 導線) を表示し続ける必要がある (クリーンインストールでの詰み防止)。
@@ -170,8 +179,10 @@ const IRODORI_ETHICS =
   "クローンしたり、なりすましに使ったりしないこと。人を欺く目的のディープフェイクや偽情報に使わないこと" +
   "（出典: huggingface.co/Aratako/Irodori-TTS-v4.1-Small）。";
 
-export async function mountSettingsPanel(): Promise<void> {
+export async function mountSettingsPanel(loaded: LoadedGhost): Promise<void> {
+  loadedGhost = loaded;
   inputs = collectInputs();
+  updateVoiceGhostNote();
   buildWeekdayToggles(inputs.regularMorningDays);
   buildWeekdayToggles(inputs.regularEveningDays);
   attachHandlers(inputs);
@@ -303,6 +314,9 @@ function collectInputs(): Inputs {
     ttsEngine: byId<HTMLSelectElement>("settings-tts-engine"),
     ttsSpeakerMain: byId<HTMLSelectElement>("settings-tts-speaker-main"),
     ttsSpeakerSub: byId<HTMLSelectElement>("settings-tts-speaker-sub"),
+    voiceHeading: byId("settings-voice-heading"),
+    irodoriHeading: byId("settings-irodori-heading"),
+    voiceGhostNote: byId("settings-voice-ghost-note"),
     ttsSpeed: byId<HTMLInputElement>("settings-tts-speed"),
     ttsVolume: byId<HTMLInputElement>("settings-tts-volume"),
     ttsAssetsState: byId("settings-tts-assets-state"),
@@ -404,6 +418,8 @@ function attachHandlers(i: Inputs): void {
     void refreshKeyState(i.provider.value);
   });
   i.ttsEngine.addEventListener("change", () => updateVoiceEngineVisibility(i.ttsEngine.value));
+  // ゴーストの選択が読み込み中と違うあいだ、音声欄に「再起動まで…」を出す（選んだ瞬間に更新）
+  i.ghostId.addEventListener("change", () => updateVoiceGhostNote());
   i.ttsDownloadBtn.addEventListener("click", () => void onTtsDownload());
   i.ghTokenDeleteBtn.addEventListener("click", () => void onDeleteGhToken());
   i.irodoriDownloadBtn.addEventListener("click", () => void onIrodoriDownload());
@@ -450,8 +466,10 @@ async function refreshTtsState(): Promise<void> {
     if (ready) {
       // 話者一覧を取得して select に流し込む
       const voices = await invoke<Array<{ id: number; name: string }>>("list_voices");
-      const currentMain = inputs.ttsSpeakerMain.value || (current?.tts_speaker_main ?? 2).toString();
-      const currentSub = inputs.ttsSpeakerSub.value || (current?.tts_speaker_sub ?? 3).toString();
+      // 既定の話者は boot payload の値（直書きしない）。読み込み中のゴーストの行 → 無ければアプリの既定
+      const speakers = speakersOfLoadedGhost(current);
+      const currentMain = inputs.ttsSpeakerMain.value || String(speakers.main);
+      const currentSub = inputs.ttsSpeakerSub.value || String(speakers.sub);
       fillSpeakerSelect(inputs.ttsSpeakerMain, voices, currentMain);
       fillSpeakerSelect(inputs.ttsSpeakerSub, voices, currentSub);
     }
@@ -874,6 +892,7 @@ async function refreshAssetLists(s: Settings): Promise<void> {
     ]);
     fillAssetSelect(inputs.ghostId, ghosts, s.ghost_id);
     fillAssetSelect(inputs.shellId, shells, s.shell_id);
+    updateVoiceGhostNote();
   } catch (err) {
     console.warn("[assets] list_ghosts/list_shells failed", err);
   }
@@ -923,6 +942,7 @@ const EXPORT_TABLE_LABELS: Record<string, string> = {
   todos: "ToDo",
   interest_topics: "興味分野",
   voice_refs: "声の設定",
+  ghost_voice_refs: "ゴーストごとの声の設定",
   app_settings: "アプリの設定",
 };
 
@@ -1550,12 +1570,35 @@ function applySettingsToForm(s: Settings): void {
   inputs.ttsSpeed.value = String(s.tts_speed);
   inputs.ttsVolume.value = String(s.tts_volume);
   // 話者 select は資産 DL 済みのときだけ list_voices で埋められる。値は文字列で保持。
-  ensureSpeakerSelection(inputs.ttsSpeakerMain, s.tts_speaker_main);
-  ensureSpeakerSelection(inputs.ttsSpeakerSub, s.tts_speaker_sub);
+  // **読み込み中のゴーストの声**を出す（設定の単一の話者 `tts_speaker_main/sub` は移行の読み出し元で、読まない）
+  const speakers = speakersOfLoadedGhost(s);
+  ensureSpeakerSelection(inputs.ttsSpeakerMain, speakers.main);
+  ensureSpeakerSelection(inputs.ttsSpeakerSub, speakers.sub);
   // ゴースト/シェルも「保存済みの値」をフォームへ戻す対象に含める (v0.5.3)。
   // 一覧の中身は refreshAssetLists が別途埋める。ここは選択値だけを追従させる。
   ensureAssetSelection(inputs.ghostId, s.ghost_id);
   ensureAssetSelection(inputs.shellId, s.shell_id);
+  updateVoiceGhostNote();
+}
+
+/// 読み込み中のゴーストの話者（`speakersFor`）。まだ受け取っていなければ呼べない（起動の組み立て誤り）。
+function speakersOfLoadedGhost(s: Settings | null): GhostSpeakers {
+  if (!loadedGhost) throw new Error("設定パネルが読み込み中のゴーストを受け取っていません");
+  if (!s) return loadedGhost.defaultSpeakers;
+  return speakersFor(s, loadedGhost);
+}
+
+/// 音声欄の見出しにゴースト名を出し、**ゴーストの選択が読み込み中と違うとき**は「再起動まで <読み込み中のゴースト名>
+/// の声を編集します」と出す（v0.6.0 項目 2）。同じ保存でゴーストを切り替えつつ話者を変えても、変更は読み込み中の
+/// ゴースト（旧ゴースト）に入る — 声は再起動で読み込むまで切り替わらない。
+function updateVoiceGhostNote(): void {
+  if (!inputs || !loadedGhost) return;
+  inputs.voiceHeading.textContent = `音声（${loadedGhost.name} の声）`;
+  inputs.irodoriHeading.textContent = `音声 (Irodori-TTS / 高品質モード)（${loadedGhost.name} の声）`;
+  const selected = inputs.ghostId.value;
+  const differs = selected !== "" && selected !== loadedGhost.id;
+  inputs.voiceGhostNote.textContent = `再起動まで ${loadedGhost.name} の声を編集します`;
+  inputs.voiceGhostNote.classList.toggle("force-hide", !differs);
 }
 
 /// 話者 select に id が無ければ「#<id> (未取得)」項目を作って current を保つ。
@@ -1590,6 +1633,26 @@ async function refreshKeyState(provider: string): Promise<void> {
   }
 }
 
+/// 保存する `tts_speakers_by_ghost`。**読み込み中のゴーストの行だけを書き、ほかのゴーストの行は `current` のまま残す**
+/// （保存のたびにフォーム全体から組み立てるので、map ごと作り直すとほかのゴーストの声が巻き戻る）。
+/// 行が無いゴースト（声を決めていない）は、選んだ値が既定から変わったときだけ行を作る — 関係ない設定の保存で
+/// 「声を決めた」ことにしない。
+function speakersToSave(cur: Settings): Settings["tts_speakers_by_ghost"] {
+  if (!inputs) return cur.tts_speakers_by_ghost;
+  const loaded = loadedGhost;
+  if (!loaded) throw new Error("設定パネルが読み込み中のゴーストを受け取っていません");
+  const resolved = speakersFor(cur, loaded);
+  const chosen: GhostSpeakers = {
+    main: Number(inputs.ttsSpeakerMain.value) || resolved.main,
+    sub: Number(inputs.ttsSpeakerSub.value) || resolved.sub,
+  };
+  const hasRow = Object.prototype.hasOwnProperty.call(cur.tts_speakers_by_ghost, loaded.id);
+  if (!hasRow && chosen.main === resolved.main && chosen.sub === resolved.sub) {
+    return cur.tts_speakers_by_ghost;
+  }
+  return { ...cur.tts_speakers_by_ghost, [loaded.id]: chosen };
+}
+
 async function onSave(): Promise<void> {
   if (!inputs || !current) return;
   hideMessage();
@@ -1611,8 +1674,9 @@ async function onSave(): Promise<void> {
     pomodoro_rounds: Number(inputs.pomoRounds.value) || current.pomodoro_rounds,
     tts_enabled: inputs.ttsEnabled.checked,
     tts_engine: inputs.ttsEngine.value || current.tts_engine,
-    tts_speaker_main: Number(inputs.ttsSpeakerMain.value) || current.tts_speaker_main,
-    tts_speaker_sub: Number(inputs.ttsSpeakerSub.value) || current.tts_speaker_sub,
+    // tts_speaker_main/sub は移行の読み出し元なので書き換えない（`...current` のまま。旧版へ戻したとき
+    // 移行前の話者で喋る）。話者は `tts_speakers_by_ghost` の読み込み中のゴーストの行だけを書く。
+    tts_speakers_by_ghost: speakersToSave(current),
     tts_speed: Number(inputs.ttsSpeed.value) || current.tts_speed,
     tts_volume: Number(inputs.ttsVolume.value) || current.tts_volume,
     tts_irodori_use_real_model: inputs.irodoriUseRealModel.checked,

@@ -4,7 +4,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::ghost::manifest::{build_shell_character, ShellCharacter};
-use crate::state::{AppState, Settings};
+use crate::state::{AppState, GhostSpeakers, Settings};
 
 #[derive(Debug, Serialize)]
 pub struct BootCharacters {
@@ -31,6 +31,9 @@ pub struct BootPayload {
     pub onboarded: bool,
     /// 保存済みキャラ X 位置 (spec §4.1.6)。未保存は None → フロントが既定配置。
     pub char_positions: crate::commands::window::CharPositions,
+    /// アプリの既定の話者（声を決めていないゴーストが使う。v0.6.0 項目 2）。フロントが 2 / 3 を直書きしない
+    /// ための正本 — 合成側の既定（`Settings::speakers_for`）と同じ値。
+    pub default_speakers: GhostSpeakers,
 }
 
 #[tauri::command]
@@ -80,6 +83,8 @@ fn build_payload(state: &AppState) -> anyhow::Result<BootPayload> {
 
     let onboarded = crate::commands::onboarding::is_onboarded(&state.db);
     let char_positions = crate::commands::window::load_char_positions(&state.db);
+    // 行が無いゴースト（None）の話者 = アプリの既定。合成と同じ関数から取る
+    let default_speakers = settings.speakers_for(None);
 
     Ok(BootPayload {
         settings,
@@ -94,5 +99,6 @@ fn build_payload(state: &AppState) -> anyhow::Result<BootPayload> {
         pose_names,
         onboarded,
         char_positions,
+        default_speakers,
     })
 }

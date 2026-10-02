@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
@@ -76,6 +77,16 @@ impl CalendarSource {
     }
 }
 
+/// 1 つのゴーストの VOICEVOX 話者（main / sub の style ID）。
+/// 片方しか無い行（手で書き換えた設定など）でも全設定の読み込みを失敗させないよう、各フィールドに既定を付ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GhostSpeakers {
+    #[serde(default = "default_tts_speaker_main")]
+    pub main: u32,
+    #[serde(default = "default_tts_speaker_sub")]
+    pub sub: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub mode: DialogueMode,
@@ -125,12 +136,18 @@ pub struct Settings {
     /// TTS エンジン種別 (現状 "voicevox_core" のみ。M4c で "irodori" を追加予定)。
     #[serde(default = "default_tts_engine")]
     pub tts_engine: String,
-    /// メインキャラの話者(style)ID。
+    /// メインキャラの話者(style)ID。**v0.6.0 から移行の読み出し元**（以後は書き換えない。
+    /// 旧版へ戻したとき、移行前の話者で喋るため）。喋るときの話者は `tts_speakers_by_ghost`。
     #[serde(default = "default_tts_speaker_main")]
     pub tts_speaker_main: u32,
-    /// サブキャラの話者(style)ID。
+    /// サブキャラの話者(style)ID。移行の読み出し元（`tts_speaker_main` と同じ）。
     #[serde(default = "default_tts_speaker_sub")]
     pub tts_speaker_sub: u32,
+    /// VOICEVOX の話者をゴーストごとに（v0.6.0 項目 2、spec §6.0）。ゴースト ID → `{ main, sub }`。
+    /// **付け忘れると旧 JSON の読み込みが失敗して全設定が既定に戻る**ので、既定（空）を必ず付ける。
+    /// 引くのは**読み込み中のゴースト**（`settings.ghost_id` ではない。[`Settings::speakers_for`]）。
+    #[serde(default)]
+    pub tts_speakers_by_ghost: BTreeMap<String, GhostSpeakers>,
     /// 話速 (voicevox の speedScale 相当。0.5〜2.0 clamp)。
     #[serde(default = "default_tts_speed")]
     pub tts_speed: f64,
@@ -266,6 +283,96 @@ fn default_regular_days() -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== 声をゴーストごとに (v0.6.0 項目 2) =====
+
+    /// 旧版（`tts_speakers_by_ghost` が無い）の設定の JSON。
+    fn legacy_json(mutate: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("tts_speakers_by_ghost");
+        mutate(&mut v);
+        v.to_string()
+    }
+
+    /// **旧 JSON が読めて、`ghost_id` の行が旧版の話者で埋まる。** 付け忘れた既定があると、旧 JSON の読み込みが
+    /// 失敗して全設定が既定に戻って見える。
+    #[test]
+    fn a_legacy_json_loads_and_fills_the_current_ghosts_row() {
+        let raw = legacy_json(|v| {
+            v["ghost_id"] = serde_json::json!("mimi");
+            v["tts_speaker_main"] = serde_json::json!(5);
+            v["tts_speaker_sub"] = serde_json::json!(6);
+            v["display_scale"] = serde_json::json!(1.5);
+        });
+        let s = Settings::from_persisted(&raw).expect("旧 JSON が読めない");
+        assert_eq!(s.display_scale, 1.5, "ほかの設定が既定に戻っている");
+        assert_eq!(s.tts_speakers_by_ghost.len(), 1);
+        assert_eq!(s.tts_speakers_by_ghost["mimi"], GhostSpeakers { main: 5, sub: 6 });
+        // 旧版の欄は残る（旧版へ戻したとき、移行前の話者で喋る）
+        assert_eq!((s.tts_speaker_main, s.tts_speaker_sub), (5, 6));
+    }
+
+    /// すでに行がある設定では、**足りないゴーストの行を作らない**（声を決めていないゴースト = アプリの既定）。
+    #[test]
+    fn existing_rows_are_kept_and_no_row_is_invented() {
+        let raw = legacy_json(|v| {
+            v["ghost_id"] = serde_json::json!("b");
+            v["tts_speaker_main"] = serde_json::json!(5);
+            v["tts_speakers_by_ghost"] = serde_json::json!({ "a": { "main": 7, "sub": 8 } });
+        });
+        let s = Settings::from_persisted(&raw).unwrap();
+        assert_eq!(s.tts_speakers_by_ghost.len(), 1);
+        assert_eq!(s.tts_speakers_by_ghost["a"], GhostSpeakers { main: 7, sub: 8 });
+    }
+
+    /// 片方しか無い行でも、全設定の読み込みを失敗させない（欠けた側はアプリの既定）。
+    #[test]
+    fn a_partial_ghost_row_does_not_break_loading() {
+        let raw = legacy_json(|v| {
+            v["display_scale"] = serde_json::json!(1.5);
+            v["tts_speakers_by_ghost"] = serde_json::json!({ "a": { "main": 9 } });
+        });
+        let s = Settings::from_persisted(&raw).expect("片方だけの行で全設定が読めなくなった");
+        assert_eq!(s.display_scale, 1.5);
+        assert_eq!(s.tts_speakers_by_ghost["a"], GhostSpeakers { main: 9, sub: default_tts_speaker_sub() });
+    }
+
+    /// 読めない JSON は None（呼び出し側が既定へ倒す）。読めるものは `clamp` を通す（起動時の読み込みと同じ）。
+    #[test]
+    fn from_persisted_rejects_broken_json_and_clamps() {
+        assert!(Settings::from_persisted("{ not json").is_none());
+        assert!(Settings::from_persisted("").is_none());
+        assert!(Settings::from_persisted(r#"{"ghost_id":"x"}"#).is_none(), "必須の欄が無い");
+        let raw = legacy_json(|v| v["display_scale"] = serde_json::json!(9.0));
+        assert_eq!(Settings::from_persisted(&raw).unwrap().display_scale, 2.0);
+    }
+
+    /// **喋る話者は読み込み中のゴーストの行 → 無ければアプリの既定**。設定の `ghost_id`（切り替え直後〜再起動前は
+    /// 読み込み中と別物）では引かない。
+    #[test]
+    fn the_speakers_come_from_the_loaded_ghost_then_the_app_default() {
+        let mut s = Settings::default();
+        s.ghost_id = "next".into(); // 切り替えて再起動を待っている
+        s.tts_speakers_by_ghost.insert("loaded".into(), GhostSpeakers { main: 10, sub: 11 });
+        s.tts_speakers_by_ghost.insert("next".into(), GhostSpeakers { main: 20, sub: 21 });
+        s.tts_speaker_main = 30; // 移行の読み出し元は合成で使わない
+        s.tts_speaker_sub = 31;
+
+        assert_eq!(s.speakers_for(Some("loaded")), GhostSpeakers { main: 10, sub: 11 });
+        let app_default = GhostSpeakers { main: default_tts_speaker_main(), sub: default_tts_speaker_sub() };
+        assert_eq!((app_default.main, app_default.sub), (2, 3));
+        assert_eq!(s.speakers_for(Some("never_set")), app_default, "行が無いゴースト");
+        assert_eq!(s.speakers_for(None), app_default, "読み込めているゴーストが無い");
+    }
+
+    #[test]
+    fn a_saved_map_roundtrips_through_the_persisted_form() {
+        let mut s = Settings::default();
+        s.tts_speakers_by_ghost.insert("a".into(), GhostSpeakers { main: 1, sub: 4 });
+        s.tts_speakers_by_ghost.insert("b".into(), GhostSpeakers { main: 8, sub: 9 });
+        let back = Settings::from_persisted(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.tts_speakers_by_ghost, s.tts_speakers_by_ghost);
+    }
 
     #[test]
     fn clamp_normalizes_quoted_calendar_paths() {
@@ -415,11 +522,12 @@ fn default_tts_engine() -> String {
     "voicevox_core".to_string()
 }
 
-fn default_tts_speaker_main() -> u32 {
+/// アプリの既定の話者（声を決めていないゴーストはこれで喋る。boot payload でフロントへも渡す）。
+pub(crate) fn default_tts_speaker_main() -> u32 {
     2
 }
 
-fn default_tts_speaker_sub() -> u32 {
+pub(crate) fn default_tts_speaker_sub() -> u32 {
     3
 }
 
@@ -463,6 +571,7 @@ impl Default for Settings {
             tts_engine: default_tts_engine(),
             tts_speaker_main: default_tts_speaker_main(),
             tts_speaker_sub: default_tts_speaker_sub(),
+            tts_speakers_by_ghost: BTreeMap::new(),
             tts_speed: default_tts_speed(),
             tts_volume: default_tts_volume(),
             tts_irodori_use_real_model: false,
@@ -604,6 +713,45 @@ impl Settings {
         self.weather_longitude = self.weather_longitude.and_then(|v| {
             v.is_finite().then(|| round_coord(v.clamp(-180.0, 180.0)))
         });
+    }
+
+    /// 永続化された JSON を `Settings` として読む**唯一の解釈**（serde で全体をパース → `clamp`）。読めなければ None。
+    ///
+    /// 起動時の読み込み（`load_persisted_settings`）と DB の移行（schema v10 が「移行のゴースト」を
+    /// 決める。`Db::migrate`）の両方がこれを使う（v0.6.0 項目 2）。**別々に読まない** — たとえば移行だけ
+    /// SQL の `json_extract` で読むと、serde が拒む JSON から SQL だけが `ghost_id` を読めてしまい、
+    /// 声が実行時のゴーストとずれる（逆に壊れた JSON で移行が失敗すれば、健全な DB でも起動しない）。
+    ///
+    /// **旧版の話者の移行もここで行う**: `tts_speakers_by_ghost` が空なら、`ghost_id` の行を
+    /// `tts_speaker_main/sub` で埋める。読み込みの経路がここ 1 つなので、読む側（起動・移行）によらず
+    /// 同じ結果になる。`tts_speaker_main/sub` は以後書き換えないので、新版が最初に保存するまでの
+    /// 読み込みでも、保存したあとの読み込み（map が空でない）でも、声は移行前のまま保たれる。
+    pub fn from_persisted(raw: &str) -> Option<Settings> {
+        let mut s = serde_json::from_str::<Settings>(raw).ok()?;
+        s.clamp();
+        if s.tts_speakers_by_ghost.is_empty() {
+            s.tts_speakers_by_ghost.insert(
+                s.ghost_id.clone(),
+                GhostSpeakers {
+                    main: s.tts_speaker_main,
+                    sub: s.tts_speaker_sub,
+                },
+            );
+        }
+        Some(s)
+    }
+
+    /// 喋る VOICEVOX の話者（v0.6.0 項目 2）。**読み込み中のゴースト**（`state.ghost` の id）の行、無ければアプリの
+    /// 既定（2 / 3）。`self.ghost_id` では引かない — ゴーストを切り替えると再起動より先に変わるので、
+    /// 旧ゴーストが新ゴーストの声で喋ってしまう（独り言の在庫と同じ扱い）。
+    pub fn speakers_for(&self, loaded_ghost_id: Option<&str>) -> GhostSpeakers {
+        loaded_ghost_id
+            .and_then(|id| self.tts_speakers_by_ghost.get(id))
+            .copied()
+            .unwrap_or(GhostSpeakers {
+                main: default_tts_speaker_main(),
+                sub: default_tts_speaker_sub(),
+            })
     }
 
     /// 天気機能が実際に使える状態か (有効化 + 座標設定済み、regular-talk-design §6)。
@@ -786,6 +934,13 @@ pub struct DecodedMask {
 }
 
 impl AppState {
+    /// 読み込み中のゴーストの id（読み込みに失敗していれば None）。声・チャットログの `ghost_id` の鍵は
+    /// **これ**で、`settings.ghost_id` ではない（切替直後〜再起動前は別物）。ロックは複製だけで外す。
+    pub fn loaded_ghost_id(&self) -> Option<String> {
+        let guard = self.ghost.lock().expect("ghost poisoned");
+        guard.as_ref().ok().map(|b| b.ghost.id.clone())
+    }
+
     pub fn initialize(app: &AppHandle) -> Result<Self> {
         let data_dir = resolve_app_data_dir()?;
         std::fs::create_dir_all(&data_dir)

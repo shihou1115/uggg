@@ -172,9 +172,13 @@ async fn synthesize_voicevox(
     slot: &str,
     text: &str,
 ) -> Result<Vec<u8>, String> {
+    // 話者は**読み込み中のゴースト**の行、無ければアプリの既定（v0.6.0 項目 2）。設定の ghost_id では引かない
+    // （切り替えた直後〜再起動前は読み込み中のゴーストと別物で、旧ゴーストが新ゴーストの声で喋ってしまう）。
+    // 旧版の単一の話者設定は移行の読み出し元で、ここでは読まない。
+    let speakers = settings.speakers_for(state.loaded_ghost_id().as_deref());
     let style_id = match slot {
-        "main" => settings.tts_speaker_main,
-        "sub" => settings.tts_speaker_sub,
+        "main" => speakers.main,
+        "sub" => speakers.sub,
         other => return Err(format!("未知の slot: {other}")),
     };
     let text_owned = text.to_string();
@@ -209,11 +213,16 @@ async fn synthesize_irodori(
         .map_err(|e| TtsError::SidecarStart(format!("{e:#}")))?;
 
     // 参照音声を DB から取得 (slot 未登録なら VoiceRefMissing で明示エラー)。
-    let voice_ref_row = state
-        .db
-        .get_voice_ref(slot)
-        .map_err(|e| TtsError::Http(format!("voice_refs lookup: {e:#}")))?
-        .ok_or_else(|| TtsError::VoiceRefMissing(slot.to_string()))?;
+    // **読み込み中のゴースト**の行を引く（v0.6.0 項目 2。設定の ghost_id ではない）。
+    // 読み込み中のゴーストが無い・テーブルが無い（破損 DB で移行が走らなかった）ときは「参照音声なし」。
+    let voice_ref_row = match state.loaded_ghost_id() {
+        Some(ghost_id) => state
+            .db
+            .get_ghost_voice_ref(&ghost_id, slot)
+            .map_err(|e| TtsError::Http(format!("ghost_voice_refs lookup: {e:#}")))?,
+        None => None,
+    }
+    .ok_or_else(|| TtsError::VoiceRefMissing(slot.to_string()))?;
 
     // 漢字→かな前処理 (voicevox の OpenJtalk を流用) は spec §4.5.1 で Irodori 経路には必須。
     // voicevox 資産が未 DL 等で前処理ができない場合は warning ログを出して raw text を渡す。
@@ -334,7 +343,7 @@ pub struct GpuInfo {
     pub reason: Option<String>,
 }
 
-/// `voice_refs` 行をフロントへ返す形 (file_path は外に出さない)。
+/// `ghost_voice_refs` 行をフロントへ返す形 (file_path は外に出さない)。
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceRef {
     pub slot: String,
@@ -657,14 +666,26 @@ pub async fn download_irodori_assets(
     result
 }
 
-/// 登録済みの参照音声一覧 (slot/caption/created_ts のみ、ファイルパスは隠す)。
+/// 参照音声を扱うゴースト = **読み込み中のゴースト**（v0.6.0 項目 2。引数は変えず、対象だけがゴーストごとになった）。
+/// 読み込めていなければ、生成・削除はできない。
+fn voice_ref_ghost(state: &AppState) -> Result<String, String> {
+    state.loaded_ghost_id().ok_or_else(|| "ゴーストが読み込まれていないため、参照音声を扱えません".to_string())
+}
+
+/// 読み込み中のゴーストの参照音声一覧 (slot/caption/created_ts のみ、ファイルパスは隠す)。
 #[tauri::command]
 pub fn voice_ref_list(state: State<'_, Arc<AppState>>) -> Result<Vec<VoiceRef>, String> {
-    let rows = state.db.list_voice_refs().map_err(|e| format!("{e:#}"))?;
+    let Some(ghost_id) = state.loaded_ghost_id() else {
+        return Ok(Vec::new());
+    };
+    let rows = state
+        .db
+        .list_ghost_voice_refs(&ghost_id)
+        .map_err(|e| format!("{e:#}"))?;
     Ok(rows.into_iter().map(VoiceRef::from).collect())
 }
 
-/// 指定 slot の参照音声を削除 (DB 行 + .wav ファイル両方)。
+/// 読み込み中のゴーストの指定 slot の参照音声を削除 (DB 行 + .wav ファイル両方)。
 #[tauri::command]
 pub fn voice_ref_delete(
     slot: String,
@@ -673,7 +694,12 @@ pub fn voice_ref_delete(
     if !matches!(slot.as_str(), "main" | "sub") {
         return Err(format!("未知の slot: {slot}"));
     }
-    if let Some(row) = state.db.get_voice_ref(&slot).map_err(|e| format!("{e:#}"))? {
+    let ghost_id = voice_ref_ghost(&state)?;
+    if let Some(row) = state
+        .db
+        .get_ghost_voice_ref(&ghost_id, &slot)
+        .map_err(|e| format!("{e:#}"))?
+    {
         let path = std::path::PathBuf::from(&row.file_path);
         if let Err(err) = voice_ref::delete_file(&path) {
             // ファイル削除失敗でも DB 行は削除する (パスがずれている場合の救済)。
@@ -682,13 +708,13 @@ pub fn voice_ref_delete(
     }
     state
         .db
-        .delete_voice_ref(&slot)
+        .delete_ghost_voice_ref(&ghost_id, &slot)
         .map_err(|e| format!("{e:#}"))?;
     voice_ref_list(state)
 }
 
 /// 参照音声の新規生成 (キャプション → Irodori サイドカーで .wav 生成 → DB upsert)。
-/// 同じ slot に既存があれば置き換え (UNIQUE(slot))、古い wav は削除する。
+/// 読み込み中のゴーストの同じ slot に既存があれば置き換え (UNIQUE(ghost_id, slot))、古い wav は削除する。
 #[tauri::command]
 pub async fn voice_ref_generate(
     slot: String,
@@ -704,11 +730,14 @@ pub async fn voice_ref_generate(
         return Err("キャプションが空です".to_string());
     }
 
+    let ghost_id = voice_ref_ghost(&state)?;
     let asset_root = voice_ref::irodori_root().map_err(|e| format!("{e:#}"))?;
     let refs_dir = voice_ref::refs_dir().map_err(|e| format!("{e:#}"))?;
 
     // 新規 ID は (現時刻秒) を使い <slot>_<id>.wav とする (DB が後で id を発番するが
-    // ファイル名先決→DB upsert の順で、UNIQUE(slot) で 1 行を更新する)。
+    // ファイル名先決→DB upsert の順で、UNIQUE(ghost_id, slot) で 1 行を更新する)。
+    // wav の名前と場所はゴーストごとにしない（v0.6.0。既存の行は絶対パスで指し、更新の確かめは
+    // 名前の先頭 main_ / sub_ で材料の順位を決めるので、変える利点が無い）。
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -717,7 +746,10 @@ pub async fn voice_ref_generate(
         .map_err(|e| format!("{e:#}"))?;
 
     // 既存ファイルがあれば事前削除 (上書きで構わないが、別 ID への切替時に残骸が残らないよう保険)。
-    let previous = state.db.get_voice_ref(&slot).map_err(|e| format!("{e:#}"))?;
+    let previous = state
+        .db
+        .get_ghost_voice_ref(&ghost_id, &slot)
+        .map_err(|e| format!("{e:#}"))?;
 
     let use_real = state
         .settings
@@ -736,7 +768,7 @@ pub async fn voice_ref_generate(
     // DB upsert
     state
         .db
-        .upsert_voice_ref(&slot, &caption_trimmed, &out_path.to_string_lossy(), ts)
+        .upsert_ghost_voice_ref(&ghost_id, &slot, &caption_trimmed, &out_path.to_string_lossy(), ts)
         .map_err(|e| format!("{e:#}"))?;
 
     // 古いファイル削除 (新パスと一致する場合は触らない)
@@ -1001,6 +1033,56 @@ mod tests {
 
         let msg = why_the_runtime_cannot_be_replaced(&[another, orphan]);
         assert!(msg.contains("50001") && msg.contains("50002"), "両方を言う: {msg}");
+    }
+
+    /// **声はゴーストごと、引くのは読み込み中のゴースト**（v0.6.0 項目 2）。`settings.ghost_id` は切り替えて再起動する
+    /// までの間に先に変わるので、それで引くと旧ゴーストが新ゴーストの声で喋る。VOICEVOX の話者も参照音声も同じ
+    /// （配線を本文のテキストで固定する。コマンドは AppHandle / State が要るので単体では呼べない）。
+    #[test]
+    fn the_voice_is_looked_up_by_the_loaded_ghost() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let body_of = |name: &str| {
+            let body = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+            body[..body.find("\n}\n").unwrap()].to_string()
+        };
+        let voicevox = body_of("async fn synthesize_voicevox(");
+        assert!(
+            voicevox.contains("settings.speakers_for(state.loaded_ghost_id().as_deref())"),
+            "話者を読み込み中のゴーストの行から引いていない"
+        );
+        assert!(
+            !voicevox.contains("tts_speaker_main") && !voicevox.contains("tts_speaker_sub"),
+            "移行の読み出し元（tts_speaker_main/sub）を合成で読んでいる"
+        );
+        for (name, lookup) in [
+            ("async fn synthesize_irodori(", "state.loaded_ghost_id()"),
+            ("fn voice_ref_ghost(", "state.loaded_ghost_id()"),
+            ("pub fn voice_ref_list(", "state.loaded_ghost_id()"),
+            ("pub fn voice_ref_delete(", "voice_ref_ghost(&state)"),
+            ("pub async fn voice_ref_generate(", "voice_ref_ghost(&state)"),
+        ] {
+            let body = body_of(name);
+            assert!(body.contains(lookup), "{name} が読み込み中のゴーストを引いていない");
+        }
+        for name in [
+            "async fn synthesize_voicevox(",
+            "async fn synthesize_irodori(",
+            "pub fn voice_ref_list(",
+            "pub fn voice_ref_delete(",
+            "pub async fn voice_ref_generate(",
+        ] {
+            let body = body_of(name);
+            assert!(!body.contains("settings.ghost_id"), "{name} が settings.ghost_id で引いている");
+            // 旧テーブル `voice_refs` は新版が読み書きしない（export だけが読む）
+            assert!(
+                !body.contains("get_voice_ref(") && !body.contains("upsert_voice_ref(") && !body.contains("delete_voice_ref("),
+                "{name} が旧 voice_refs を触っている"
+            );
+        }
     }
 
     #[test]

@@ -96,12 +96,58 @@ pub fn load_persisted_settings(db: &crate::db::Db, current: Settings) -> Setting
         Ok(Some(v)) => v,
         _ => return current,
     };
-    match serde_json::from_str::<Settings>(&stored) {
-        Ok(mut s) => {
-            s.clamp();
-            s
+    // 読み方は `Settings::from_persisted` が唯一の解釈（DB の移行 schema v10 もこれで `ghost_id` を読む）。
+    Settings::from_persisted(&stored).unwrap_or(current)
+}
+
+#[cfg(test)]
+mod persisted_settings_tests {
+    use super::*;
+    use crate::db::Db;
+
+    fn db_with_settings(raw: Option<&str>) -> Db {
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        db.migrate().unwrap();
+        if let Some(raw) = raw {
+            db.set_setting(SETTINGS_KEY, raw).unwrap();
         }
-        Err(_) => current,
+        db
+    }
+
+    /// **旧版の設定の JSON（`tts_speakers_by_ghost` が無い）を新版が読め、話者は移行前のまま残る**（v0.6.0 項目 2）。
+    /// 全設定が既定に戻って見える事故（既定の付け忘れ）を、起動時の読み込みの経路そのもので見張る。
+    #[test]
+    fn a_legacy_settings_json_loads_at_startup_with_its_speakers_kept() {
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("tts_speakers_by_ghost");
+        v["ghost_id"] = serde_json::json!("mimi");
+        v["tts_speaker_main"] = serde_json::json!(5);
+        v["tts_speaker_sub"] = serde_json::json!(6);
+        v["display_scale"] = serde_json::json!(1.5);
+        let db = db_with_settings(Some(&v.to_string()));
+
+        let loaded = load_persisted_settings(&db, Settings::default());
+        assert_eq!(loaded.display_scale, 1.5, "旧 JSON の読み込みが失敗して既定に戻っている");
+        assert_eq!(loaded.ghost_id, "mimi");
+        let s = loaded.speakers_for(Some("mimi"));
+        assert_eq!((s.main, s.sub), (5, 6), "更新前の話者がそのゴーストに残らない");
+        assert_eq!(
+            loaded.speakers_for(Some("another")),
+            loaded.speakers_for(None),
+            "声を決めていないゴーストはアプリの既定"
+        );
+    }
+
+    /// 読めない JSON・無い設定は引数の既定をそのまま返す（従来どおり）。
+    #[test]
+    fn unreadable_or_missing_settings_fall_back_to_the_given_default() {
+        let mut current = Settings::default();
+        current.display_scale = 1.25;
+        for raw in [None, Some("{ not json"), Some(r#"{"ghost_id":"x"}"#)] {
+            let loaded = load_persisted_settings(&db_with_settings(raw), current.clone());
+            assert_eq!(loaded.display_scale, 1.25, "{raw:?}");
+            assert_eq!(loaded.ghost_id, "default", "{raw:?}");
+        }
     }
 }
 

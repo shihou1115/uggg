@@ -72,11 +72,13 @@ fn build_export_payload(db: &crate::db::Db, include_profile: bool, ts: u64) -> s
     let todos = rescue("todos", db.list_todos(None), &mut failed);
     let interests = rescue("interest_topics", db.list_interests(), &mut failed);
     let voice_refs = rescue("voice_refs", db.list_voice_refs(), &mut failed);
+    // v0.6.0: 参照音声はゴーストごと。旧テーブル voice_refs も従来どおり出す（旧版へ戻した場合の控え）
+    let ghost_voice_refs = rescue("ghost_voice_refs", db.list_all_ghost_voice_refs(), &mut failed);
     let app_settings = rescue("app_settings", db.list_all_settings(), &mut failed)
         .map(|v| v.into_iter().collect::<std::collections::BTreeMap<_, _>>());
 
     json!({
-        "schema": "ugg-export-v3",
+        "schema": "ugg-export-v4",
         "exported_at": ts,
         "include_profile": include_profile,
         // 再生成できるキャッシュ (calendar_cache / topics_cache / monologue_cache) は
@@ -94,6 +96,7 @@ fn build_export_payload(db: &crate::db::Db, include_profile: bool, ts: u64) -> s
         "todos": todos,
         "interest_topics": interests,
         "voice_refs": voice_refs,
+        "ghost_voice_refs": ghost_voice_refs,
         "app_settings": app_settings,
     })
 }
@@ -226,6 +229,8 @@ mod export_tests {
         db.migrate().unwrap();
         db.insert_reminder(1_800_000_000, "牛乳を買う", 1_700_000_000)
             .unwrap();
+        db.upsert_ghost_voice_ref("mimi", "main", "M", "C:/refs/main_1.wav", 1)
+            .unwrap();
         (dir, db, path)
     }
 
@@ -240,7 +245,7 @@ mod export_tests {
     fn healthy_db_exports_everything_and_reports_no_failure() {
         let (_dir, db, _path) = db_with_data();
         let v = build_export_payload(&db, true, 42);
-        assert_eq!(v["schema"], "ugg-export-v3");
+        assert_eq!(v["schema"], "ugg-export-v4");
         assert_eq!(v["exported_at"], 42);
         assert_eq!(
             v["failed_tables"].as_array().unwrap().len(),
@@ -251,6 +256,11 @@ mod export_tests {
         assert!(v["reminders"].is_array());
         assert_eq!(v["reminders"].as_array().unwrap().len(), 1);
         assert!(v["chat_log"].is_array());
+        // v0.6.0: ゴーストごとの参照音声（ghost_id つき）と、旧 voice_refs の両方を出す
+        let gvr = v["ghost_voice_refs"].as_array().expect("ghost_voice_refs が出ていない");
+        assert_eq!(gvr.len(), 1);
+        assert_eq!(gvr[0]["ghost_id"], "mimi");
+        assert!(v["voice_refs"].is_array());
     }
 
     /// **1 テーブルが読めなくても、読めた分は出す (v0.5.3)。**

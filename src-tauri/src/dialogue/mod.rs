@@ -59,13 +59,25 @@ pub struct DialogueResponse {
 pub fn persist_and_speak(app: &AppHandle, state: &Arc<AppState>, resp: &DialogueResponse) -> bool {
     use tauri::Emitter;
     let now = Utc::now().timestamp();
-    let _ = state
-        .db
-        .append_chat(now, resp.mode, ChatRole::Main, &resp.main.text, resp.main.pose.as_deref());
+    // 読み込み中のゴーストを記録する (v0.6.0 項目 4)。
+    let ghost_id = state.loaded_ghost_id();
+    let _ = state.db.append_chat(
+        now,
+        resp.mode,
+        ChatRole::Main,
+        &resp.main.text,
+        resp.main.pose.as_deref(),
+        ghost_id.as_deref(),
+    );
     if let Some(sub) = &resp.sub {
-        let _ = state
-            .db
-            .append_chat(now, resp.mode, ChatRole::Sub, &sub.text, sub.pose.as_deref());
+        let _ = state.db.append_chat(
+            now,
+            resp.mode,
+            ChatRole::Sub,
+            &sub.text,
+            sub.pose.as_deref(),
+            ghost_id.as_deref(),
+        );
     }
     if let Err(err) = app.emit("dialogue", resp) {
         crate::ulog!("[persist_and_speak] dialogue emit failed: {err}");
@@ -105,10 +117,13 @@ fn handle_reminder_request(
     let now = Utc::now().timestamp();
     let now_local = chrono::Local::now().naive_local();
     let confirm_text = format_confirmation(&parsed.schedule, now_local, &body);
-    let _ = state.db.append_chat(now, "low", ChatRole::User, user_text, None);
+    let ghost_id = state.loaded_ghost_id();
     let _ = state
         .db
-        .append_chat(now, "low", ChatRole::Main, &confirm_text, None);
+        .append_chat(now, "low", ChatRole::User, user_text, None, ghost_id.as_deref());
+    let _ = state
+        .db
+        .append_chat(now, "low", ChatRole::Main, &confirm_text, None, ghost_id.as_deref());
     Ok(DialogueResponse {
         kind: "reply",
         mode: "low",
@@ -558,13 +573,16 @@ fn fallback_low(
         .collect();
     let resp = low::reply(&bundle.dictionary, user_text, &profile, sub_available);
     let now = Utc::now().timestamp();
-    let _ = state.db.append_chat(now, "low", ChatRole::User, user_text, None);
+    // bundle を握っている (ghost ロックを持ったまま) ので `loaded_ghost_id()` は呼ばず、その id を使う。
+    let ghost_id = Some(bundle.ghost.id.as_str());
+    let _ = state.db.append_chat(now, "low", ChatRole::User, user_text, None, ghost_id);
     let _ = state.db.append_chat(
         now,
         "low",
         ChatRole::Main,
         &resp.main.text,
         resp.main.pose.as_deref(),
+        ghost_id,
     );
     if let Some(sub) = &resp.sub {
         let _ = state.db.append_chat(
@@ -573,6 +591,7 @@ fn fallback_low(
             ChatRole::Sub,
             &sub.text,
             sub.pose.as_deref(),
+            ghost_id,
         );
     }
     Ok(resp)

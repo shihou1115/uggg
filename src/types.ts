@@ -32,6 +32,12 @@ export interface MonitorList {
 export type BalloonSlot = "main" | "sub" | "extra";
 export type TalkSpeed = "slow" | "normal" | "fast" | "instant";
 
+/// VOICEVOX の話者（style ID）の組。ゴーストごとに持つ（v0.6.0 項目 2。Rust の `GhostSpeakers`）。
+export interface GhostSpeakers {
+  main: number;
+  sub: number;
+}
+
 export interface Settings {
   mode: DialogueMode;
   ghost_id: string;
@@ -51,8 +57,13 @@ export interface Settings {
   pomodoro_rounds: number;
   tts_enabled: boolean;
   tts_engine: string;
+  /// **v0.6.0 から移行の読み出し元**。フロントは書き換えない（旧版へ戻したとき移行前の話者で喋るため）。
+  /// 喋る話者・編集する話者は `tts_speakers_by_ghost`（読み込み中のゴーストの行）。
   tts_speaker_main: number;
   tts_speaker_sub: number;
+  /// ゴースト ID → 話者。行が無いゴーストはアプリの既定（`BootPayload.default_speakers`）。
+  /// **保存のたびにフォーム全体から組み立てるので、読み込み中のゴースト以外の行を落とさないこと。**
+  tts_speakers_by_ghost: Record<string, GhostSpeakers>;
   tts_speed: number;
   tts_volume: number;
   tts_irodori_use_real_model: boolean;
@@ -296,6 +307,8 @@ export interface BootPayload {
   pose_names: string[];
   onboarded: boolean;
   char_positions: CharPositions;
+  /// アプリの既定の話者（声を決めていないゴーストが使う。Rust が正本で、フロントは 2 / 3 を直書きしない）。
+  default_speakers: GhostSpeakers;
 }
 
 /// M5-G: チャットログ 1 件 (バックエンド `Db::list_recent_chat_log` の戻り値)。

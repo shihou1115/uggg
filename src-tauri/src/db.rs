@@ -264,9 +264,9 @@ pub struct ChatLogRow {
     pub pose: Option<String>,
 }
 
-/// Irodori 参照音声 1 件分のメタ (architecture §2.2 voice_refs)。
+/// Irodori 参照音声 1 件分のメタ (architecture §2.2 voice_refs / ghost_voice_refs)。
 /// `file_path` は `%APPDATA%\ugg\irodori\refs\<slot>_<id>.wav` を指す。
-/// MVP では `UNIQUE(slot)` で各 slot 最新 1 件のみ保持する。
+/// 各 slot 最新 1 件のみ保持する（v0.6.0 から**ゴーストごと**: `UNIQUE(ghost_id, slot)`）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct VoiceRefRow {
     pub id: i64,
@@ -274,6 +274,51 @@ pub struct VoiceRefRow {
     pub caption: String,
     pub file_path: String,
     pub created_ts: i64,
+}
+
+/// `ghost_voice_refs` 1 行（export 用。ゴーストごとの行を全部出すので `ghost_id` を持つ）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GhostVoiceRefRow {
+    pub id: i64,
+    pub ghost_id: String,
+    pub slot: String,
+    pub caption: String,
+    pub file_path: String,
+    pub created_ts: i64,
+}
+
+/// テーブル・列が無いことを示すエラーか。破損 DB で移行（schema v10）が走らなかったとき、
+/// `ghost_voice_refs` / `chat_log.ghost_id` が無いまま動き続ける経路の判定に使う（spec §4.5.5・§6.0）。
+fn is_missing_schema(err: &rusqlite::Error) -> bool {
+    // 文を組み立てる段（prepare）の失敗は、位置が分かるものだけ `SqlInputError` で返る
+    // （no such column / has no column named）。no such table は `SqliteFailure`。両方を見る。
+    let msg = match err {
+        rusqlite::Error::SqliteFailure(_, Some(msg)) => msg,
+        rusqlite::Error::SqlInputError { msg, .. } => msg,
+        _ => return false,
+    };
+    msg.starts_with("no such table")
+        || msg.starts_with("no such column")
+        || msg.contains("has no column named")
+}
+
+/// 移行（schema v10）が既存の声と履歴を帰属させる「移行のゴースト」。
+/// **`load_persisted_settings` と同じ解釈**（`Settings::from_persisted`）で設定の JSON を読んだ `ghost_id`、
+/// 読めなければ `default`。**移行を止めない**（SQL の `json_extract` で読むと、壊れた JSON で移行が失敗して
+/// 健全な DB でも起動しない — v0.5.2 と同じ型。逆に serde が拒む JSON から SQL だけが読めると、
+/// 声が実行時のゴーストとずれる）。
+fn migration_ghost_id(conn: &Connection) -> String {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key = 'settings'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|raw| crate::state::Settings::from_persisted(&raw))
+    .map(|s| s.ghost_id)
+    .unwrap_or_else(|| "default".to_string())
 }
 
 impl Db {
@@ -535,19 +580,77 @@ impl Db {
             .context("migrate to schema v9")?;
         }
 
+        if current < 10 {
+            // v0.6.0: 声と履歴をゴーストごとに (spec §6.0 項目 2・4)。
+            // **既存のテーブルは作り直さず、消さず、書き換えない** — 旧版へ戻したとき旧版が使えるように
+            // (`voice_refs` を作り直すと、旧版の `ON CONFLICT(slot)` が毎回失敗する)。足すだけ:
+            //   - ghost_voice_refs: 参照音声をゴーストごとに。`voice_refs` は残し、新版は以後これだけを読み書きする
+            //   - chat_log.ghost_id: 履歴の注入を読み込み中のゴーストの行に絞るため。既存の行は移行のゴーストで埋める
+            let ghost_id = migration_ghost_id(&tx);
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS ghost_voice_refs (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ghost_id   TEXT    NOT NULL,
+                    slot       TEXT    NOT NULL,
+                    caption    TEXT    NOT NULL,
+                    file_path  TEXT    NOT NULL,
+                    created_ts INTEGER NOT NULL,
+                    UNIQUE(ghost_id, slot)
+                );
+                ALTER TABLE chat_log ADD COLUMN ghost_id TEXT;",
+            )
+            .context("migrate to schema v10 (create ghost_voice_refs / add chat_log.ghost_id)")?;
+            tx.execute(
+                "INSERT OR IGNORE INTO ghost_voice_refs (ghost_id, slot, caption, file_path, created_ts)
+                 SELECT ?1, slot, caption, file_path, created_ts FROM voice_refs",
+                params![ghost_id],
+            )
+            .context("migrate to schema v10 (copy voice_refs)")?;
+            tx.execute(
+                "UPDATE chat_log SET ghost_id = ?1 WHERE ghost_id IS NULL",
+                params![ghost_id],
+            )
+            .context("migrate to schema v10 (fill chat_log.ghost_id)")?;
+            tx.execute_batch(
+                "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_schema_version', '10');",
+            )
+            .context("migrate to schema v10")?;
+        }
+
         tx.commit().context("commit migration tx")?;
         Ok(())
     }
 
     // ===== chat_log =====
 
-    pub fn append_chat(&self, ts: i64, mode: &str, role: ChatRole, text: &str, pose: Option<&str>) -> Result<()> {
+    /// `ghost_id` は**読み込み中のゴースト**（`AppState::loaded_ghost_id` / bundle の id。v0.6.0 項目 4）。
+    /// 読み込み中のゴーストが無ければ None（NULL）— 履歴の注入には使われない。
+    pub fn append_chat(
+        &self,
+        ts: i64,
+        mode: &str,
+        role: ChatRole,
+        text: &str,
+        pose: Option<&str>,
+        ghost_id: Option<&str>,
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("db poisoned");
-        conn.execute(
-            "INSERT INTO chat_log (ts, mode, role, text, pose) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![ts, mode, role.as_str(), text, pose],
-        )
-        .context("append_chat")?;
+        let res = conn.execute(
+            "INSERT INTO chat_log (ts, mode, role, text, pose, ghost_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![ts, mode, role.as_str(), text, pose, ghost_id],
+        );
+        match res {
+            Ok(_) => {}
+            // 破損 DB で移行が走らなかった (列が無い) ときも、会話の記録は止めない (spec §4.5.5)。
+            Err(err) if is_missing_schema(&err) => {
+                conn.execute(
+                    "INSERT INTO chat_log (ts, mode, role, text, pose) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![ts, mode, role.as_str(), text, pose],
+                )
+                .context("append_chat (ghost_id 列なし)")?;
+            }
+            Err(err) => return Err(err).context("append_chat"),
+        }
         Ok(())
     }
 
@@ -602,17 +705,29 @@ impl Db {
     ///
     /// **SQL 側で絞る。** 取ってから絞ると、独り言だけが続いた静かな夜を挟むだけで
     /// 会話行が LIMIT の窓から押し出される。
-    pub fn list_recent_chat_log_in_mode(&self, mode: &str, limit: u32) -> Result<Vec<ChatLogRow>> {
+    ///
+    /// **`ghost_id`（読み込み中のゴースト）の行だけを返す**（v0.6.0 項目 4）。絞らないと、切り替えたあと
+    /// 前のゴーストの台詞が新しいキャラの名前を付けて最大 8 往復ぶん LLM に渡る。`ghost_id` が NULL の行
+    /// （読み込み中のゴーストが無いとき・旧版へ戻して書かれた行）は誰の台詞か分からないので渡さない。
+    /// 列が無い（破損 DB で移行が走らなかった）ときは履歴なしとして扱う。
+    pub fn list_recent_chat_log_in_mode(
+        &self,
+        mode: &str,
+        ghost_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChatLogRow>> {
         let conn = self.conn.lock().expect("db poisoned");
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, ts, mode, role, text, pose FROM chat_log
-                 WHERE mode = ?1
-                 ORDER BY id DESC LIMIT ?2",
-            )
-            .context("prepare list_recent_chat_log_in_mode")?;
+        let mut stmt = match conn.prepare(
+            "SELECT id, ts, mode, role, text, pose FROM chat_log
+             WHERE mode = ?1 AND ghost_id = ?2
+             ORDER BY id DESC LIMIT ?3",
+        ) {
+            Ok(s) => s,
+            Err(err) if is_missing_schema(&err) => return Ok(Vec::new()),
+            Err(err) => return Err(err).context("prepare list_recent_chat_log_in_mode"),
+        };
         let rows = stmt
-            .query_map(params![mode, limit as i64], |row| {
+            .query_map(params![mode, ghost_id, limit as i64], |row| {
                 let role_str: String = row.get(3)?;
                 let role = match role_str.as_str() {
                     "user" => ChatRole::User,
@@ -1632,14 +1747,20 @@ impl Db {
         Ok(n as u64)
     }
 
-    // ===== voice_refs (M4c) =====
+    // ===== ghost_voice_refs (v0.6.0 項目 2。M4c の voice_refs の後継) =====
+    //
+    // 新版が読み書きするのはこちらだけ。`voice_refs` は旧版へ戻したとき旧版が使えるように残してあるだけで、
+    // 移行（`migrate` の v10）が写した後は export (`list_voice_refs`) 以外から触らない。
+    //
+    // テーブルが無い（破損 DB で移行が走らなかった）ときは「参照音声なし」として扱い、SQL エラーにしない
+    // （エラーのままだと合成の失敗として `irodori_unavailable` に化ける）。
 
-    /// `slot` ("main" | "sub") に紐づく参照音声を 1 件 upsert する。
+    /// `ghost_id` の `slot` ("main" | "sub") に紐づく参照音声を 1 件 upsert する。
     /// 既存行があれば file_path / caption / created_ts を上書きし、id は維持される。
-    /// Phase D の `voice_ref_generate` コマンドが呼ぶ。
-    #[allow(dead_code)]
-    pub fn upsert_voice_ref(
+    /// `voice_ref_generate` コマンドが呼ぶ。
+    pub fn upsert_ghost_voice_ref(
         &self,
+        ghost_id: &str,
         slot: &str,
         caption: &str,
         file_path: &str,
@@ -1647,31 +1768,32 @@ impl Db {
     ) -> Result<i64> {
         let conn = self.conn.lock().expect("db poisoned");
         conn.execute(
-            "INSERT INTO voice_refs (slot, caption, file_path, created_ts)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(slot) DO UPDATE SET
+            "INSERT INTO ghost_voice_refs (ghost_id, slot, caption, file_path, created_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(ghost_id, slot) DO UPDATE SET
                  caption    = excluded.caption,
                  file_path  = excluded.file_path,
                  created_ts = excluded.created_ts",
-            params![slot, caption, file_path, ts],
+            params![ghost_id, slot, caption, file_path, ts],
         )
-        .context("upsert_voice_ref")?;
+        .context("upsert_ghost_voice_ref")?;
         let id: i64 = conn
             .query_row(
-                "SELECT id FROM voice_refs WHERE slot = ?1",
-                params![slot],
+                "SELECT id FROM ghost_voice_refs WHERE ghost_id = ?1 AND slot = ?2",
+                params![ghost_id, slot],
                 |row| row.get(0),
             )
-            .context("read voice_refs.id after upsert")?;
+            .context("read ghost_voice_refs.id after upsert")?;
         Ok(id)
     }
 
-    pub fn get_voice_ref(&self, slot: &str) -> Result<Option<VoiceRefRow>> {
+    pub fn get_ghost_voice_ref(&self, ghost_id: &str, slot: &str) -> Result<Option<VoiceRefRow>> {
         let conn = self.conn.lock().expect("db poisoned");
-        let row = conn
+        let res = conn
             .query_row(
-                "SELECT id, slot, caption, file_path, created_ts FROM voice_refs WHERE slot = ?1",
-                params![slot],
+                "SELECT id, slot, caption, file_path, created_ts FROM ghost_voice_refs
+                 WHERE ghost_id = ?1 AND slot = ?2",
+                params![ghost_id, slot],
                 |row| {
                     Ok(VoiceRefRow {
                         id: row.get(0)?,
@@ -1682,9 +1804,12 @@ impl Db {
                     })
                 },
             )
-            .optional()
-            .context("get_voice_ref")?;
-        Ok(row)
+            .optional();
+        match res {
+            Ok(row) => Ok(row),
+            Err(err) if is_missing_schema(&err) => Ok(None),
+            Err(err) => Err(err).context("get_ghost_voice_ref"),
+        }
     }
 
     /// `app_settings` の全キー。エクスポート（データの持ち出し・DB 退避）専用。
@@ -1735,6 +1860,7 @@ impl Db {
         Ok(out)
     }
 
+    /// 旧テーブル `voice_refs` の全行。**export 専用**（新版は読み書きしない。v0.6.0）。
     pub fn list_voice_refs(&self) -> Result<Vec<VoiceRefRow>> {
         let conn = self.conn.lock().expect("db poisoned");
         let mut stmt = conn
@@ -1760,11 +1886,75 @@ impl Db {
         Ok(out)
     }
 
-    pub fn delete_voice_ref(&self, slot: &str) -> Result<()> {
+    /// `ghost_id` の参照音声の一覧（slot 順）。テーブルが無ければ空。
+    pub fn list_ghost_voice_refs(&self, ghost_id: &str) -> Result<Vec<VoiceRefRow>> {
         let conn = self.conn.lock().expect("db poisoned");
-        conn.execute("DELETE FROM voice_refs WHERE slot = ?1", params![slot])
-            .context("delete_voice_ref")?;
-        Ok(())
+        let mut stmt = match conn.prepare(
+            "SELECT id, slot, caption, file_path, created_ts FROM ghost_voice_refs
+             WHERE ghost_id = ?1 ORDER BY slot ASC",
+        ) {
+            Ok(s) => s,
+            Err(err) if is_missing_schema(&err) => return Ok(Vec::new()),
+            Err(err) => return Err(err).context("prepare list_ghost_voice_refs"),
+        };
+        let rows = stmt
+            .query_map(params![ghost_id], |row| {
+                Ok(VoiceRefRow {
+                    id: row.get(0)?,
+                    slot: row.get(1)?,
+                    caption: row.get(2)?,
+                    file_path: row.get(3)?,
+                    created_ts: row.get(4)?,
+                })
+            })
+            .context("query_map list_ghost_voice_refs")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("row list_ghost_voice_refs")?);
+        }
+        Ok(out)
+    }
+
+    /// `ghost_voice_refs` の全ゴースト分。**export 専用**。テーブルが無ければ Err
+    /// （`failed_tables` に載る。export は「読めなかった」を正直に報告するのが役目）。
+    pub fn list_all_ghost_voice_refs(&self) -> Result<Vec<GhostVoiceRefRow>> {
+        let conn = self.conn.lock().expect("db poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, ghost_id, slot, caption, file_path, created_ts FROM ghost_voice_refs
+                 ORDER BY ghost_id ASC, slot ASC",
+            )
+            .context("prepare list_all_ghost_voice_refs")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(GhostVoiceRefRow {
+                    id: row.get(0)?,
+                    ghost_id: row.get(1)?,
+                    slot: row.get(2)?,
+                    caption: row.get(3)?,
+                    file_path: row.get(4)?,
+                    created_ts: row.get(5)?,
+                })
+            })
+            .context("query_map list_all_ghost_voice_refs")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("row list_all_ghost_voice_refs")?);
+        }
+        Ok(out)
+    }
+
+    /// テーブルが無ければ何もしない（消す行が無い）。
+    pub fn delete_ghost_voice_ref(&self, ghost_id: &str, slot: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db poisoned");
+        match conn.execute(
+            "DELETE FROM ghost_voice_refs WHERE ghost_id = ?1 AND slot = ?2",
+            params![ghost_id, slot],
+        ) {
+            Ok(_) => Ok(()),
+            Err(err) if is_missing_schema(&err) => Ok(()),
+            Err(err) => Err(err).context("delete_ghost_voice_ref"),
+        }
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -2261,24 +2451,29 @@ mod tests {
     }
 
     #[test]
-    fn migration_is_idempotent_at_v9() {
-        // 既存 DB への再 migrate で v9 が壊れない (テーブルもデータも残る)。
+    fn migration_is_idempotent_at_v10() {
+        // 既存 DB への再 migrate で v10 が壊れない (テーブルもデータも残る)。
         let db = make_db();
         push_plain(&db, "default", "残るはず");
+        db.upsert_ghost_voice_ref("default", "main", "M", "C:/refs/main_1.wav", 1).unwrap();
+        db.append_chat(1, "advanced", ChatRole::User, "残るはず", None, Some("default")).unwrap();
         db.migrate().expect("re-migrate");
+        db.migrate().expect("re-migrate again");
         assert_eq!(db.count_monologue_cache("default", NOW).unwrap(), 1);
+        assert_eq!(db.list_ghost_voice_refs("default").unwrap().len(), 1);
+        assert_eq!(db.list_recent_chat_log_in_mode("advanced", "default", 10).unwrap().len(), 1);
         let version = db.get_setting("db_schema_version").unwrap();
-        assert_eq!(version.as_deref(), Some("9"));
+        assert_eq!(version.as_deref(), Some("10"));
     }
 
     #[test]
-    fn voice_refs_upsert_and_get() {
+    fn ghost_voice_refs_upsert_and_get() {
         let db = make_db();
         // 初回 insert
         let id1 = db
-            .upsert_voice_ref("main", "明るい女性の声", "C:/refs/main_1.wav", 100)
+            .upsert_ghost_voice_ref("default", "main", "明るい女性の声", "C:/refs/main_1.wav", 100)
             .expect("upsert");
-        let row = db.get_voice_ref("main").expect("get").expect("some");
+        let row = db.get_ghost_voice_ref("default", "main").expect("get").expect("some");
         assert_eq!(row.id, id1);
         assert_eq!(row.caption, "明るい女性の声");
         assert_eq!(row.file_path, "C:/refs/main_1.wav");
@@ -2286,13 +2481,212 @@ mod tests {
 
         // 再生成 (UPSERT): id は維持され caption/path/ts が上書き
         let id2 = db
-            .upsert_voice_ref("main", "落ち着いた女性の声", "C:/refs/main_2.wav", 200)
+            .upsert_ghost_voice_ref("default", "main", "落ち着いた女性の声", "C:/refs/main_2.wav", 200)
             .expect("upsert again");
         assert_eq!(id1, id2);
-        let row2 = db.get_voice_ref("main").expect("get").expect("some");
+        let row2 = db.get_ghost_voice_ref("default", "main").expect("get").expect("some");
         assert_eq!(row2.caption, "落ち着いた女性の声");
         assert_eq!(row2.file_path, "C:/refs/main_2.wav");
         assert_eq!(row2.created_ts, 200);
+    }
+
+    /// **参照音声はゴーストごとに別の行**（v0.6.0 項目 2）。同じ slot でも、別のゴーストの行を上書きも削除もしない。
+    #[test]
+    fn ghost_voice_refs_are_kept_per_ghost() {
+        let db = make_db();
+        db.upsert_ghost_voice_ref("mimi", "main", "ミミ", "C:/refs/main_1.wav", 1).unwrap();
+        db.upsert_ghost_voice_ref("other", "main", "別の子", "C:/refs/main_2.wav", 2).unwrap();
+
+        assert_eq!(db.get_ghost_voice_ref("mimi", "main").unwrap().unwrap().caption, "ミミ");
+        assert_eq!(db.get_ghost_voice_ref("other", "main").unwrap().unwrap().caption, "別の子");
+        assert!(db.get_ghost_voice_ref("third", "main").unwrap().is_none(), "行が無いゴーストは None");
+
+        // other を作り直しても mimi は変わらない
+        db.upsert_ghost_voice_ref("other", "main", "別の子 2", "C:/refs/main_3.wav", 3).unwrap();
+        assert_eq!(db.get_ghost_voice_ref("mimi", "main").unwrap().unwrap().file_path, "C:/refs/main_1.wav");
+
+        // other の削除は mimi を消さない。一覧も自分のゴーストだけ
+        db.delete_ghost_voice_ref("other", "main").unwrap();
+        assert!(db.get_ghost_voice_ref("other", "main").unwrap().is_none());
+        assert_eq!(db.list_ghost_voice_refs("mimi").unwrap().len(), 1);
+        assert!(db.list_ghost_voice_refs("other").unwrap().is_empty());
+    }
+
+    /// **`ghost_voice_refs` が無い（破損 DB で移行が走らなかった）ときは「行なし」**。SQL エラーにしない
+    /// （エラーのままだと合成の失敗として `irodori_unavailable` に化ける。spec §6.0 項目 2）。
+    #[test]
+    fn missing_ghost_voice_refs_table_reads_as_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        let db = Db::open(&path).unwrap();
+        db.migrate().unwrap();
+        {
+            let other = Connection::open(&path).unwrap();
+            other.execute("DROP TABLE ghost_voice_refs", []).unwrap();
+        }
+        assert!(db.get_ghost_voice_ref("default", "main").unwrap().is_none());
+        assert!(db.list_ghost_voice_refs("default").unwrap().is_empty());
+        db.delete_ghost_voice_ref("default", "main").expect("消す行が無いだけ");
+        // 書けないものを書けたことにはしない（生成は失敗として見える）
+        assert!(db.upsert_ghost_voice_ref("default", "main", "c", "p", 1).is_err());
+        // export は「読めなかった」を正直に報告する（failed_tables に載る）
+        assert!(db.list_all_ghost_voice_refs().is_err());
+    }
+
+    /// 破損 DB で移行が走らず `chat_log.ghost_id` が無くても、会話の記録は止めず、履歴の注入は「履歴なし」になる。
+    #[test]
+    fn chat_log_without_the_ghost_id_column_still_records_and_reads_as_no_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("companion.db");
+        let db = Db::open(&path).unwrap();
+        db.migrate().unwrap();
+        {
+            let other = Connection::open(&path).unwrap();
+            other.execute("ALTER TABLE chat_log DROP COLUMN ghost_id", []).unwrap();
+        }
+        db.append_chat(1, "advanced", ChatRole::User, "こんにちは", None, Some("default"))
+            .expect("列が無くても記録は止めない");
+        assert_eq!(db.list_recent_chat_log(10).unwrap().len(), 1, "記録は残っている");
+        assert!(db.list_recent_chat_log_in_mode("advanced", "default", 10).unwrap().is_empty());
+    }
+
+    /// **履歴は読み込み中のゴーストの行だけ**（v0.6.0 項目 4）。mode の絞り込みも保つ。NULL の行は誰のか分からないので渡さない。
+    #[test]
+    fn history_rows_are_limited_to_the_given_ghost() {
+        let db = make_db();
+        db.append_chat(1, "advanced", ChatRole::User, "ミミへ", None, Some("mimi")).unwrap();
+        db.append_chat(2, "advanced", ChatRole::Main, "ミミの返事", None, Some("mimi")).unwrap();
+        db.append_chat(3, "advanced", ChatRole::User, "別の子へ", None, Some("other")).unwrap();
+        db.append_chat(4, "advanced", ChatRole::Main, "誰のか不明", None, None).unwrap();
+        db.append_chat(5, "low", ChatRole::Main, "ミミの独り言", None, Some("mimi")).unwrap();
+
+        let texts = |ghost: &str| -> Vec<String> {
+            db.list_recent_chat_log_in_mode("advanced", ghost, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.text)
+                .collect()
+        };
+        assert_eq!(texts("mimi"), ["ミミの返事", "ミミへ"], "新しい順。他のゴースト・NULL・low は入らない");
+        assert_eq!(texts("other"), ["別の子へ"]);
+        assert!(texts("nobody").is_empty());
+        // チャットログ画面と export の読み出しは従来どおり全ゴーストの全行
+        assert_eq!(db.list_recent_chat_log(10).unwrap().len(), 5);
+    }
+
+    // ===== schema v9 → v10 (v0.6.0 項目 2・4) =====
+
+    /// v9 のまま止まっている DB（更新前の実機の形）を作る。新版の `migrate` で作り、v10 で足したものを
+    /// 取り除いて版を戻す。`voice_refs` と `chat_log` に更新前の行を入れる。
+    fn make_v9_db(dir: &std::path::Path, settings_json: Option<&str>) -> std::path::PathBuf {
+        let path = dir.join("companion.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.migrate().unwrap();
+        }
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch(
+            "DROP TABLE ghost_voice_refs;
+             ALTER TABLE chat_log DROP COLUMN ghost_id;
+             UPDATE app_settings SET value = '9' WHERE key = 'db_schema_version';
+             INSERT INTO voice_refs (slot, caption, file_path, created_ts) VALUES ('main', 'M', 'C:/refs/main_1.wav', 10);
+             INSERT INTO voice_refs (slot, caption, file_path, created_ts) VALUES ('sub', 'S', 'C:/refs/sub_1.wav', 20);
+             INSERT INTO chat_log (ts, mode, role, text, pose) VALUES (1, 'advanced', 'user', '更新前の発言', NULL);
+             INSERT INTO chat_log (ts, mode, role, text, pose) VALUES (2, 'advanced', 'main', '更新前の返事', NULL);",
+        )
+        .unwrap();
+        if let Some(json) = settings_json {
+            c.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('settings', ?1)",
+                params![json],
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    /// 旧版（`tts_speakers_by_ghost` が無い）の設定の JSON。`mutate` で好きに壊せる。
+    fn legacy_settings_json(ghost_id: &str, mutate: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut v = serde_json::to_value(crate::state::Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("tts_speakers_by_ghost");
+        v["ghost_id"] = serde_json::json!(ghost_id);
+        mutate(&mut v);
+        v.to_string()
+    }
+
+    /// **更新前の声と履歴が、移行時点のゴーストに残る。`voice_refs` はそのまま残る**（旧版へ戻せる）。
+    #[test]
+    fn v9_database_migrates_voice_and_history_to_the_settings_ghost() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = legacy_settings_json("mimi", |_| {});
+        let path = make_v9_db(dir.path(), Some(&json));
+
+        let db = Db::open(&path).unwrap();
+        db.migrate().expect("v9 → v10");
+
+        let refs = db.list_ghost_voice_refs("mimi").unwrap();
+        assert_eq!(refs.len(), 2, "voice_refs の全行が移行のゴーストへ写る");
+        assert_eq!((refs[0].slot.as_str(), refs[0].file_path.as_str(), refs[0].created_ts), ("main", "C:/refs/main_1.wav", 10));
+        assert_eq!((refs[1].slot.as_str(), refs[1].caption.as_str()), ("sub", "S"));
+        assert!(db.list_ghost_voice_refs("default").unwrap().is_empty(), "ほかのゴーストには写らない");
+
+        let old = db.list_voice_refs().unwrap();
+        assert_eq!(old.len(), 2, "voice_refs は残す（旧版へ戻したとき旧版が使える）");
+
+        let hist = db.list_recent_chat_log_in_mode("advanced", "mimi", 10).unwrap();
+        assert_eq!(hist.len(), 2, "既存の chat_log は移行のゴーストで埋まる");
+        assert!(db.list_recent_chat_log_in_mode("advanced", "default", 10).unwrap().is_empty());
+
+        assert_eq!(db.get_setting("db_schema_version").unwrap().as_deref(), Some("10"));
+        // 二度走らせても何も増えない
+        db.migrate().expect("再 migrate");
+        assert_eq!(db.list_ghost_voice_refs("mimi").unwrap().len(), 2);
+        assert_eq!(db.list_voice_refs().unwrap().len(), 2);
+
+        // 旧版へ戻したとき、旧版は `ON CONFLICT(slot)` で参照音声を作れる（作り直していない証拠）
+        let c = Connection::open(&path).unwrap();
+        c.execute(
+            "INSERT INTO voice_refs (slot, caption, file_path, created_ts) VALUES ('main', 'M2', 'p', 30)
+             ON CONFLICT(slot) DO UPDATE SET caption = excluded.caption",
+            [],
+        )
+        .expect("旧版の upsert が失敗する");
+    }
+
+    /// **設定の JSON が無い・壊れている・serde が拒むときは `default` へ倒れ、移行は失敗しない。**
+    /// SQL の `json_extract` で読むと、壊れた JSON で移行が失敗して起動しない（v0.5.2 と同じ型）。
+    /// 3 つ目は「SQL なら `ghost_id` が読めるが serde は拒む」形 — 実行時（`load_persisted_settings`）と食い違わない。
+    #[test]
+    fn migration_and_startup_read_the_same_ghost_from_the_settings_json() {
+        let cases: Vec<(&str, Option<String>, &str)> = vec![
+            ("正常", Some(legacy_settings_json("mimi", |_| {})), "mimi"),
+            (
+                "clamp が要る値でも読める",
+                Some(legacy_settings_json("mimi", |v| v["display_scale"] = serde_json::json!(9.0))),
+                "mimi",
+            ),
+            ("settings 無し", None, "default"),
+            ("壊れた JSON", Some("{ not json".to_string()), "default"),
+            ("空文字", Some(String::new()), "default"),
+            ("必須の欄が無い", Some(r#"{"ghost_id":"other"}"#.to_string()), "default"),
+            (
+                "serde が拒む型（SQL なら ghost_id は読める）",
+                Some(legacy_settings_json("other", |v| v["tts_speed"] = serde_json::json!("fast"))),
+                "default",
+            ),
+        ];
+        for (label, json, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = make_v9_db(dir.path(), json.as_deref());
+            let db = Db::open(&path).unwrap();
+            db.migrate().unwrap_or_else(|e| panic!("{label}: 移行が失敗した: {e:#}"));
+            assert_eq!(db.list_ghost_voice_refs(expected).unwrap().len(), 2, "{label}");
+            assert_eq!(db.list_recent_chat_log_in_mode("advanced", expected, 10).unwrap().len(), 2, "{label}");
+            assert_eq!(db.get_setting("db_schema_version").unwrap().as_deref(), Some("10"), "{label}");
+            // 起動時の読み込み（load_persisted_settings）が選ぶゴーストと同じ = 声が実行時のゴーストとずれない
+            let loaded = crate::commands::settings::load_persisted_settings(&db, crate::state::Settings::default());
+            assert_eq!(loaded.ghost_id, expected, "{label}: 移行と起動の読み方がずれている");
+        }
     }
 
     #[test]
@@ -2540,21 +2934,27 @@ mod tests {
     }
 
     #[test]
-    fn voice_refs_list_and_delete() {
+    fn ghost_voice_refs_list_and_delete() {
         let db = make_db();
-        db.upsert_voice_ref("main", "M", "C:/refs/main.wav", 1).unwrap();
-        db.upsert_voice_ref("sub", "S", "C:/refs/sub.wav", 2).unwrap();
-        let list = db.list_voice_refs().unwrap();
+        db.upsert_ghost_voice_ref("default", "sub", "S", "C:/refs/sub.wav", 2).unwrap();
+        db.upsert_ghost_voice_ref("default", "main", "M", "C:/refs/main.wav", 1).unwrap();
+        let list = db.list_ghost_voice_refs("default").unwrap();
         assert_eq!(list.len(), 2);
         // ORDER BY slot ASC → main, sub
         assert_eq!(list[0].slot, "main");
         assert_eq!(list[1].slot, "sub");
 
-        db.delete_voice_ref("main").unwrap();
-        let list2 = db.list_voice_refs().unwrap();
+        db.delete_ghost_voice_ref("default", "main").unwrap();
+        let list2 = db.list_ghost_voice_refs("default").unwrap();
         assert_eq!(list2.len(), 1);
         assert_eq!(list2[0].slot, "sub");
-        assert!(db.get_voice_ref("main").unwrap().is_none());
+        assert!(db.get_ghost_voice_ref("default", "main").unwrap().is_none());
+
+        // export 用の全件は ghost_id つきで、新テーブルだけを見る（旧 voice_refs は別）
+        let all = db.list_all_ghost_voice_refs().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].ghost_id.as_str(), all[0].slot.as_str()), ("default", "sub"));
+        assert!(db.list_voice_refs().unwrap().is_empty(), "新版は旧 voice_refs に書かない");
     }
 
     // ===== カレンダーソース更新の原子性 (v0.5.3, Codex 指摘 (2)) =====

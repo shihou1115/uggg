@@ -23,6 +23,7 @@ import { mountSystemToast } from "./system/toast";
 import { mountSettingsPanel, registerSavedListener } from "./panels/settings";
 import { mountCredit, refreshCredit } from "./tts/credit";
 import { mountWeatherCredit, refreshWeatherCredit } from "./weather/credit";
+import { speakersFor, type LoadedGhost } from "./tts/ghost-voice";
 import { createSpeaker, setTtsParams } from "./tts/speaker";
 import { installAlphaMaskHooks, scheduleMaskUpdate } from "./stage/alphamask";
 import { hitTest, mountSlot, unmountSlot } from "./stage/character";
@@ -43,6 +44,12 @@ async function boot(): Promise<void> {
   }
 
   currentSettings = payload.settings;
+  // 読み込み中のゴースト（声の鍵）。boot payload の ghost id で、設定の ghost_id ではない
+  const loadedGhost: LoadedGhost = {
+    id: payload.ghost_id,
+    name: payload.ghost_name,
+    defaultSpeakers: payload.default_speakers,
+  };
   applyDisplayScale(payload.settings.display_scale);
   setTalkSpeed(payload.settings.talk_speed);
   setTtsParams({
@@ -80,7 +87,7 @@ async function boot(): Promise<void> {
   });
   attachNadeDetector();
 
-  await mountSettingsPanel();
+  await mountSettingsPanel(loadedGhost);
   await mountPomodoroBadge();
   mountPomodoroPanel({
     current: () => currentSettings,
@@ -103,11 +110,11 @@ async function boot(): Promise<void> {
   const speaker = createSpeaker();
   const { setSpeaker } = await import("./system/ghost-speech");
   setSpeaker(speaker);
+  // 声は読み込み中のゴーストのもの（設定の ghost_id ではない。v0.6.0 項目 2）
   await refreshCredit(
     payload.settings.tts_enabled,
     payload.settings.tts_engine,
-    payload.settings.tts_speaker_main,
-    payload.settings.tts_speaker_sub,
+    speakersFor(payload.settings, loadedGhost),
   );
   refreshWeatherCredit(payload.settings);
   registerSavedListener((s) => {
@@ -117,7 +124,7 @@ async function boot(): Promise<void> {
     setToolsEnabled(s.tools_enabled);
     setTalkSpeed(s.talk_speed);
     setTtsParams({ enabled: s.tts_enabled, speed: s.tts_speed, volume: s.tts_volume });
-    void refreshCredit(s.tts_enabled, s.tts_engine, s.tts_speaker_main, s.tts_speaker_sub);
+    void refreshCredit(s.tts_enabled, s.tts_engine, speakersFor(s, loadedGhost));
     refreshWeatherCredit(s);
   });
   mountContextMenu({
