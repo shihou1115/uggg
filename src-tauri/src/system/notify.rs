@@ -690,31 +690,33 @@ mod dict_key_contract {
         assert_eq!(sampled, declared, "NoticeKind の変種を増やしたら all_kinds() にも足すこと");
     }
 
-    /// **全変種の辞書キーが既定辞書の system_messages に存在すること。**
+    /// **全変種の辞書キーが、同梱のすべての辞書の system_messages に存在すること。**
+    ///
+    /// v0.6.0 項目 5: `ghosts/default` 決め打ちをやめ、`ghosts/` を走査して全ゴーストに当てる。
+    /// 引けないとそのゴーストが黙る（2 組目は告知のたびに黙りうる）。
     #[test]
-    fn every_dict_key_exists_in_default_dictionary() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("src-tauri の親")
-            .join("ghosts/default/dic/main.yaml");
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("既定辞書を読めない {}: {e}", path.display()));
-        let doc: serde_yaml::Value =
-            serde_yaml::from_str(&raw).expect("既定辞書が YAML として壊れている");
-        let sysmsgs = doc
-            .get("system_messages")
-            .and_then(|v| v.as_mapping())
-            .expect("既定辞書に system_messages が無い");
+    fn every_dict_key_exists_in_every_bundled_dictionary() {
+        let root = crate::ghost::manifest::shipped_asset_contract::repo_root();
+        for (ghost_id, path) in crate::ghost::manifest::shipped_asset_contract::bundled_dictionary_paths(&root) {
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("ghost '{ghost_id}': 辞書を読めない {}: {e}", path.display()));
+            let doc: serde_yaml::Value = serde_yaml::from_str(&raw)
+                .unwrap_or_else(|e| panic!("ghost '{ghost_id}': 辞書が YAML として壊れている: {e}"));
+            let sysmsgs = doc
+                .get("system_messages")
+                .and_then(|v| v.as_mapping())
+                .unwrap_or_else(|| panic!("ghost '{ghost_id}': 辞書に system_messages が無い"));
 
-        let missing: Vec<&str> = all_kinds()
-            .iter()
-            .map(|k| k.dict_key())
-            .filter(|key| !sysmsgs.contains_key(serde_yaml::Value::from(*key)))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "Rust が引くのに既定辞書に無い system_messages キー: {missing:?}\n\
-             （引けないとゴーストが黙る。辞書に足すこと）"
-        );
+            let missing: Vec<&str> = all_kinds()
+                .iter()
+                .map(|k| k.dict_key())
+                .filter(|key| !sysmsgs.contains_key(serde_yaml::Value::from(*key)))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "ghost '{ghost_id}': Rust が引くのに辞書に無い system_messages キー: {missing:?}\n\
+                 （引けないとゴーストが黙る。辞書に足すこと）"
+            );
+        }
     }
 }

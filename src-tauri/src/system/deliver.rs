@@ -310,19 +310,20 @@ mod tests {
         assert!(DeliveryOutcome::Toast.reached());
     }
 
-    /// 出荷辞書に `cost_limit_exceeded` があること（上限告知を「その turn の返答」に
+    /// 同梱のすべての辞書に `cost_limit_exceeded` があること（上限告知を「その turn の返答」に
     /// する経路が辞書を引くため。無いと保険の emit 経路へ落ちる）。
+    /// v0.6.0 項目 5: `ghosts/default` 決め打ちをやめ、`ghosts/` を走査して全ゴーストに当てる。
     #[test]
     fn cost_limit_key_exists_for_turn_reply() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("src-tauri の親")
-            .join("ghosts/default/dic/main.yaml");
-        let raw = std::fs::read_to_string(&path).expect("既定辞書を読めない");
-        assert!(
-            raw.contains("cost_limit_exceeded:"),
-            "既定辞書に cost_limit_exceeded が無い"
-        );
+        let root = crate::ghost::manifest::shipped_asset_contract::repo_root();
+        for (ghost_id, path) in crate::ghost::manifest::shipped_asset_contract::bundled_dictionary_paths(&root) {
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("ghost '{ghost_id}': 辞書を読めない {}: {e}", path.display()));
+            assert!(
+                raw.contains("cost_limit_exceeded:"),
+                "ghost '{ghost_id}': 辞書に cost_limit_exceeded が無い"
+            );
+        }
     }
 
     /// `reminder_log.delivery` に入る表記の固定。保留が他の値に化けると

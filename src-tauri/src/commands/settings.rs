@@ -279,26 +279,27 @@ fn default_shell_of(app: &AppHandle, ghost_id: &str) -> Option<String> {
 
 #[cfg(test)]
 mod default_shell_tests {
-    /// 出荷している既定ゴーストが `default_shell` を宣言していること。
+    /// 同梱のすべてのゴーストが `default_shell` を宣言していて、その指す先が実在すること。
     ///
     /// v0.5.1 でこの値を読むようになった（ゴースト切替でシェルが追従、spec §4.5.6）。
     /// v0.4.1 までは出荷されているのに `GhostManifest` が宣言しておらず、serde が
-    /// 黙って捨てていた。
+    /// 黙って捨てていた。v0.6.0 項目 5: `ghosts/` を走査して全ゴーストに当てる（2 組目の
+    /// `default_shell` が実在しないと、切り替えた瞬間に追従が効かない）。
     #[test]
-    fn default_ghost_declares_default_shell_that_exists() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("src-tauri の親")
-            .to_path_buf();
-        let raw = std::fs::read_to_string(root.join("ghosts/default/ghost.json")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let shell = v
-            .get("default_shell")
-            .and_then(|x| x.as_str())
-            .expect("既定ゴーストに default_shell が無い");
-        assert!(
-            root.join("shells").join(shell).join("shell.json").is_file(),
-            "default_shell '{shell}' の実体が無い（追従先が存在しないと切替で壊れる）"
-        );
+    fn every_bundled_ghost_declares_default_shell_that_exists() {
+        use crate::ghost::manifest::shipped_asset_contract::{bundled_ghost_ids, repo_root};
+        let root = repo_root();
+        for ghost_id in bundled_ghost_ids(&root) {
+            let raw = std::fs::read_to_string(root.join("ghosts").join(&ghost_id).join("ghost.json")).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let shell = v
+                .get("default_shell")
+                .and_then(|x| x.as_str())
+                .unwrap_or_else(|| panic!("ghost '{ghost_id}': default_shell が無い"));
+            assert!(
+                root.join("shells").join(shell).join("shell.json").is_file(),
+                "ghost '{ghost_id}': default_shell '{shell}' の実体が無い（追従先が存在しないと切替で壊れる）"
+            );
+        }
     }
 }
