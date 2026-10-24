@@ -42,7 +42,7 @@ pub fn set_settings(
     // 時事ネタ入りの文を最大 7 日間喋り続けるのを防ぐ (天気の「解除」と同じ作法)。
     if prev.topics_enabled && !next.topics_enabled {
         match state.db.clear_monologue_cache_with_topics() {
-            Ok(n) if n > 0 => println!("[settings] 時事ネタ入りの独り言ストックを {n} 件削除"),
+            Ok(n) if n > 0 => crate::ulog!("[settings] 時事ネタ入りの独り言ストックを {n} 件削除"),
             Ok(_) => {}
             Err(err) => crate::ulog!("[settings] 独り言ストックの掃除に失敗: {err:#}"),
         }

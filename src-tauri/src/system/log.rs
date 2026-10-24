@@ -26,7 +26,7 @@ static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// 出力先を確定する。アプリ起動時に 1 回だけ呼ぶ。
 pub fn init(dir: &std::path::Path) {
     if let Err(err) = std::fs::create_dir_all(dir) {
-        eprintln!("[log] ログディレクトリを作れません {}: {err}", dir.display());
+        to_stderr(&format!("[log] ログディレクトリを作れません {}: {err}", dir.display()));
         return;
     }
     match LOG_PATH.lock() {
@@ -98,14 +98,23 @@ impl<T> StripUrl<T> for Result<T, reqwest::Error> {
     }
 }
 
+/// stderr へ 1 行書く。**書けなくても何もしない**（v0.6.0 項目 7）。
+///
+/// `eprintln!` は書けないと panic する。dev の「再起動」では、新しい ugg が `tauri dev` の stderr のパイプを
+/// 引き継ぎ、古い ugg が終わるとパイプが閉じるので、次のログで「failed printing to stderr: パイプを閉じて
+/// います (os error 232)」の panic になった（2026-10-24 実機）。ログのためにアプリを壊さない（`write_line` と同じ）。
+pub fn to_stderr(line: &str) {
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
 /// `eprintln!` の置き換え。stderr にも出しつつファイルにも残す。
 ///
-/// dev ではこれまでどおりコンソールに出て、リリース版でもファイルに残る。
+/// dev ではこれまでどおりコンソールに出て、リリース版でもファイルに残る。stderr に書けなくても落ちない。
 #[macro_export]
 macro_rules! ulog {
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
-        eprintln!("{}", __line);
+        $crate::system::log::to_stderr(&__line);
         $crate::system::log::write_line(&__line);
     }};
 }
@@ -273,6 +282,42 @@ mod tests {
         }
         assert!(!scanned.contains("fn every_reqwest_call_strips_its_url"), "テスト自身を走査している");
         assert!(bad.is_empty(), "URL を外していない reqwest の呼び出し:\n{}", bad.join("\n"));
+    }
+
+    /// **本番のコードは stderr / stdout へ panic しうる書き方をしない**（v0.6.0 項目 7）。`eprintln!` / `println!` は
+    /// 書けないと panic し、dev の再起動で閉じたパイプを引き継いだ ugg が「failed printing to stderr」で落ちた。
+    /// ログは `ulog!`（`to_stderr` は失敗を捨てる）を通す。テストの塊とコメントは除いて読む。
+    #[test]
+    fn no_panicking_print_outside_tests() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut bad = Vec::new();
+        let mut files = 0;
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                files += 1;
+                let body = without_test_modules(&std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n"));
+                for (n, line) in body.lines().enumerate() {
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        continue;
+                    }
+                    if ["eprintln!(", "println!(", "eprint!(", "print!("].iter().any(|m| code.contains(m)) {
+                        bad.push(format!("{}:{}: {}", path.display(), n + 1, code));
+                    }
+                }
+            }
+        }
+        assert!(files >= 50, "走査が空振りしている（{files} ファイル）");
+        assert!(bad.is_empty(), "panic しうる print が本番のコードにある（ulog! を使う）:\n{}", bad.join("\n"));
     }
 
     /// テストの塊（`#[cfg(test)]` の直後が `mod` のもの）だけを、閉じ括弧の行まで空行に置き換える。
