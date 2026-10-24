@@ -5,7 +5,7 @@
   "author": "ugga",
   "characters": {
     "main": {
-      "base_size": { "width": 256, "height": 384 },
+      "base_size": { "width": 176, "height": 384 },
       "default_pose": "normal",
       "poses": {
         "normal": "main/normal.png",
@@ -13,10 +13,10 @@
         "troubled": "main/troubled.png",
         "surprised": "main/surprised.png"
       },
-      "poke_regions": { "head_max": 0.45, "chest_max": 0.62 }
+      "poke_regions": { "head_max": 0.24, "chest_max": 0.40 }
     },
     "sub": {
-      "base_size": { "width": 96, "height": 144 },
+      "base_size": { "width": 80, "height": 144 },
       "default_pose": "normal",
       "poses": {
         "normal": "sub/normal.png",
@@ -24,7 +24,7 @@
         "troubled": "sub/troubled.png",
         "surprised": "sub/surprised.png"
       },
-      "poke_regions": { "head_max": 0.45, "chest_max": 0.62 }
+      "poke_regions": { "head_max": 0.34, "chest_max": 0.58 }
     }
   }
 }
