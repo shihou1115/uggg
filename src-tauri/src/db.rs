@@ -1945,6 +1945,26 @@ impl Db {
     }
 
     /// テーブルが無ければ何もしない（消す行が無い）。
+    /// その wav を、旧版の `voice_refs`（v0.6.0 で作り直さずに残した表）の行がまだ指しているか（v0.6.0 項目 2、
+    /// spec §6.0「旧版へ戻したときに旧版が使える」）。移行は `voice_refs` と同じ `file_path` を写すので、新版で
+    /// 作り直し・削除したときに消すと、旧版へ戻した人の参照音声が消えた wav を指したままになる（v0.6.0 リリース前監査）。
+    /// **表が無い（破損 DB）以外の失敗は「指している」扱い**（残しても害は無く、消すと戻せない）。
+    pub fn legacy_voice_ref_uses(&self, file_path: &str) -> bool {
+        let conn = self.conn.lock().expect("db poisoned");
+        match conn
+            .query_row(
+                "SELECT 1 FROM voice_refs WHERE file_path = ?1 LIMIT 1",
+                params![file_path],
+                |_| Ok(()),
+            )
+            .optional()
+        {
+            Ok(found) => found.is_some(),
+            Err(err) if is_missing_schema(&err) => false,
+            Err(_) => true,
+        }
+    }
+
     pub fn delete_ghost_voice_ref(&self, ghost_id: &str, slot: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db poisoned");
         match conn.execute(
@@ -2612,6 +2632,22 @@ mod tests {
         v["ghost_id"] = serde_json::json!(ghost_id);
         mutate(&mut v);
         v.to_string()
+    }
+
+    /// **旧版の `voice_refs` が指している wav は「まだ使われている」**（v0.6.0 リリース前監査）。新版で作り直し・
+    /// 削除したときに消さないための判定。移行で写した直後は旧版の 2 つとも使われていて、別の wav は使われていない。
+    /// 表が無ければ（破損 DB）使われていない扱い。
+    #[test]
+    fn wavs_the_old_version_still_points_at_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_v9_db(dir.path(), None);
+        let db = Db::open(&path).unwrap();
+        db.migrate().unwrap();
+        assert!(db.legacy_voice_ref_uses("C:/refs/main_1.wav"));
+        assert!(db.legacy_voice_ref_uses("C:/refs/sub_1.wav"));
+        assert!(!db.legacy_voice_ref_uses("C:/refs/main_2.wav"), "新版で作った wav は旧版と関係ない");
+        db.conn.lock().unwrap().execute_batch("DROP TABLE voice_refs;").unwrap();
+        assert!(!db.legacy_voice_ref_uses("C:/refs/main_1.wav"), "表が無ければ使われていない");
     }
 
     /// **更新前の声と履歴が、移行時点のゴーストに残る。`voice_refs` はそのまま残る**（旧版へ戻せる）。

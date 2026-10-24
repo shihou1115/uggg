@@ -824,7 +824,10 @@ pub fn voice_ref_delete(
         .map_err(|e| format!("{e:#}"))?
     {
         let path = std::path::PathBuf::from(&row.file_path);
-        if let Err(err) = voice_ref::delete_file(&path) {
+        // 旧版の voice_refs がまだ指している wav は残す（旧版へ戻せるように。v0.6.0 リリース前監査）
+        if state.db.legacy_voice_ref_uses(&row.file_path) {
+            crate::ulog!("[voice_ref] 旧版の記録が使っている参照音声なので、ファイルは残します");
+        } else if let Err(err) = voice_ref::delete_file(&path) {
             // ファイル削除失敗でも DB 行は削除する (パスがずれている場合の救済)。
             crate::ulog!("[voice_ref] file delete failed: {err:#}");
         }
@@ -894,10 +897,11 @@ pub async fn voice_ref_generate(
         .upsert_ghost_voice_ref(&ghost_id, &slot, &caption_trimmed, &out_path.to_string_lossy(), ts)
         .map_err(|e| format!("{e:#}"))?;
 
-    // 古いファイル削除 (新パスと一致する場合は触らない)
+    // 古いファイル削除 (新パスと一致する場合と、旧版の voice_refs がまだ指している場合は触らない。
+    // 後者は旧版へ戻したとき旧版が使えるように — v0.6.0 リリース前監査)
     if let Some(prev) = previous {
         let prev_path = std::path::PathBuf::from(&prev.file_path);
-        if prev_path != out_path {
+        if prev_path != out_path && !state.db.legacy_voice_ref_uses(&prev.file_path) {
             let _ = voice_ref::delete_file(&prev_path);
         }
     }
@@ -1264,6 +1268,30 @@ mod tests {
         assert!(!failure.contains("ENGINE_IRODORI"));
         assert!(synth.contains("Ok(wav) => (wav, ENGINE_IRODORI)"), "Irodori で鳴らしたのに Irodori と返していない");
         assert!(synth.contains("            ENGINE_VOICEVOX,\n        ),"), "VOICEVOX 設定の合成が VOICEVOX と返していない");
+    }
+
+    /// **参照音声の作り直し・削除は、旧版の `voice_refs` がまだ指している wav を消さない**（v0.6.0 リリース前監査。
+    /// spec §6.0 項目 2「旧版へ戻したときに旧版が使える」）。wav を消すのはこの 2 か所だけ。
+    #[test]
+    fn regenerating_or_deleting_keeps_the_wav_the_old_version_uses() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let body_of = |name: &str| {
+            let body = &src[src.find(name).unwrap_or_else(|| panic!("{name} が無い"))..];
+            body[..body.find("\n}\n").unwrap()].to_string()
+        };
+        for name in ["pub fn voice_ref_delete(", "pub async fn voice_ref_generate("] {
+            let body = body_of(name);
+            let check = body.find("legacy_voice_ref_uses(").unwrap_or_else(|| panic!("{name} が旧版の記録を見ていない"));
+            let delete = body.find("voice_ref::delete_file(").unwrap();
+            assert!(check < delete, "{name} が旧版の記録を見る前に消している");
+        }
+        // テスト自身の文字列に当たらないよう、テストの塊より前だけを数える
+        let production = &src[..src.find("\n#[cfg(test)]\nmod ").expect("テストの塊が無い")];
+        assert_eq!(production.matches("voice_ref::delete_file(").count(), 2, "wav を消す箇所が増えた（同じ判定が要るか見る）");
     }
 
     /// **参照音声の告知は、ゴーストごとの鍵で取り合い、届いたときだけ済みにする**（v0.6.0 項目 3）。
