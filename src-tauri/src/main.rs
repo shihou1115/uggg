@@ -154,6 +154,7 @@ fn main() {
             commands::interaction::menu_prompt,
             commands::lifecycle::frontend_ready,
             commands::lifecycle::quit_app,
+            commands::lifecycle::restart_app,
             commands::lifecycle::hide_window,
             commands::lifecycle::set_autostart,
             commands::onboarding::complete_onboarding,

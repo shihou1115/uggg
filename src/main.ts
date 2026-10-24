@@ -12,6 +12,7 @@ import { attachClickDetector } from "./interaction/click";
 import { attachNadeDetector } from "./interaction/nade";
 import { firePoke } from "./interaction/poke";
 import { closeMenu, isMenuOpen, mountContextMenu } from "./menu/context-menu";
+import { listenRestartRequests } from "./menu/restart";
 import { showOnboarding } from "./panels/onboarding";
 import { mountPomodoroBadge, mountPomodoroPanel } from "./panels/pomodoro";
 import { mountConfirm } from "./confirm";
@@ -105,6 +106,7 @@ async function boot(): Promise<void> {
   await mountDailyPanel();
   await mountSystemToast();
   mountConfirm();
+  await listenRestartRequests();
   await mountDnd();
   // TTS スピーカーを ghost-speech に渡す
   const speaker = createSpeaker();

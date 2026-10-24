@@ -1,6 +1,7 @@
 //! タスクトレイ (spec §4.1.7)。
-//! 左クリック → ウインドウ表示/非表示トグル。右クリックメニュー: 表示/モード/静音/設定/終了。
+//! 左クリック → ウインドウ表示/非表示トグル。右クリックメニュー: 表示/モード/静音/設定/再起動/終了。
 //! 「終了」は `commands::lifecycle::quit_with_farewell`（右クリックメニューと同じ経路。v0.5.6 項目 5）。
+//! 「再起動」はウインドウを出して `request-restart` を送り、画面側の確認（右クリックメニューと同じ）を通す（v0.6.0 項目 7）。
 
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ const ID_MODE_LOW: &str = "mode_low";
 const ID_MODE_ADVANCED: &str = "mode_advanced";
 const ID_QUIET_TOGGLE: &str = "quiet_toggle";
 const ID_OPEN_SETTINGS: &str = "open_settings";
+const ID_RESTART: &str = "restart";
 const ID_QUIT: &str = "quit";
 
 pub fn install(app: &AppHandle, state: Arc<AppState>) -> Result<()> {
@@ -76,13 +78,14 @@ fn build_menu(app: &AppHandle, state: &Arc<AppState>) -> Result<Menu<tauri::Wry>
         None::<&str>,
     )?;
     let settings = MenuItem::with_id(app, ID_OPEN_SETTINGS, "設定を開く", true, None::<&str>)?;
+    let restart = MenuItem::with_id(app, ID_RESTART, "再起動", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "終了", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
 
     Menu::with_items(
         app,
         &[
-            &toggle, &sep, &mode_low, &mode_adv, &quiet, &sep, &settings, &sep, &quit,
+            &toggle, &sep, &mode_low, &mode_adv, &quiet, &sep, &settings, &sep, &restart, &quit,
         ],
     )
     .context("build tray menu")
@@ -100,6 +103,14 @@ fn handle_menu(app: &AppHandle, state: &Arc<AppState>, id: &str) {
                 let _ = w.show();
                 let _ = w.set_focus();
             }
+        }
+        // 確認のダイアログは画面側で出す（右クリックメニューと同じ。隠していたら先に出す）（v0.6.0 項目 7）
+        ID_RESTART => {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+            let _ = app.emit("request-restart", ());
         }
         // 右クリックメニューの「終了」と同じ経路（v0.5.6 項目 5）
         ID_QUIT => crate::commands::lifecycle::quit_with_farewell(app.clone(), state.clone()),

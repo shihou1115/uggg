@@ -18,6 +18,24 @@ pub async fn quit_app(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result
     Ok(())
 }
 
+/// 右クリックメニューとトレイの「再起動」（v0.6.0 項目 7、spec §4.4.2b）。確認のダイアログは画面側
+/// （`src/menu/restart.ts`）で出してから呼ばれる。トレイは `request-restart` を送って同じ確認を通す。
+#[tauri::command]
+pub async fn restart_app(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    restart_now(&app, state.inner()).await;
+    Ok(())
+}
+
+/// 終了と同じ後片付けをしてから起動し直す。**終了のあいさつは言わない**（確認でひと呼吸置いている）。
+/// 「終了」の処理が始まっていたら何もしない（終わりかけのプロセスから新しい ugg を立てない）。
+pub(crate) async fn restart_now(app: &AppHandle, state: &Arc<AppState>) {
+    if QUITTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tidy_up(app, state).await;
+    app.restart();
+}
+
 /// 「終了」がもう押されたか（待っている間の 2 回目を見分ける）。
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -112,6 +130,12 @@ fn say_farewell(app: &AppHandle, state: &Arc<AppState>) -> Option<DialogueRespon
 
 /// 後片付けをして終了する。
 async fn finish_quit(app: &AppHandle, state: &Arc<AppState>) {
+    tidy_up(app, state).await;
+    app.exit(0);
+}
+
+/// 終了と再起動に共通の後片付け（v0.6.0 項目 7 で `finish_quit` から切り出した）。
+async fn tidy_up(app: &AppHandle, state: &Arc<AppState>) {
     // ウインドウ位置を即時保存してから終了
     crate::presence::window_pos::persist_now(app, state);
     // greeted は先に下ろしておく (短期間で再起動した場合の重複挨拶を防ぐ ―
@@ -120,7 +144,6 @@ async fn finish_quit(app: &AppHandle, state: &Arc<AppState>) {
     // Irodori サイドカーを best-effort で止める (未起動なら即 return)。止めきれなくても、
     // ugg の寿命に結びつけてあるので一緒に終わる (v0.5.6 項目 4)
     let _ = state.tts.irodori.shutdown().await;
-    app.exit(0);
 }
 
 #[tauri::command]
@@ -224,6 +247,57 @@ mod tests {
         };
         assert_eq!(farewell_hold(&line("またね")), Duration::from_millis(1600 + 3 * 60 + 500));
         assert_eq!(farewell_hold(&line(&"あ".repeat(500))), Duration::from_millis(8500));
+    }
+
+    /// **「再起動」は両方のメニューで「終了」のすぐ上にあり、どちらも画面側の確認を通ってから、後片付けをして
+    /// 起動し直す**（v0.6.0 項目 7、spec §4.4.2b）。トレイが確認を飛ばして直接再起動する形・後片付けを
+    /// 飛ばす形に戻らないよう、本文をテキストで見る（AppHandle が要るので単体では通せない）。
+    #[test]
+    fn restart_sits_above_quit_and_always_asks_first() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap().replace("\r\n", "\n");
+        let body_of = |src: &str, name: &str| -> String {
+            let at = src.find(name).unwrap_or_else(|| panic!("{name} が無い"));
+            let rest = &src[at..];
+            rest[..rest.find("\n}\n").unwrap()].to_string()
+        };
+
+        // トレイ: 並びは …, 再起動, 終了。押したら確認の依頼を送るだけ
+        let tray = read("src-tauri/src/window/tray.rs");
+        assert!(tray.contains("&restart, &quit,"), "トレイの「再起動」が「終了」のすぐ上にない");
+        let handler = body_of(&tray, "fn handle_menu");
+        let arm = &handler[handler.find("ID_RESTART =>").expect("トレイの再起動を扱っていない")..];
+        let arm = &arm[..arm.find("ID_QUIT =>").unwrap()];
+        assert!(arm.contains("\"request-restart\""), "トレイが確認の依頼を送っていない");
+        assert!(!arm.contains("restart_now") && !arm.contains(".restart()"), "トレイが確認を飛ばして再起動している");
+
+        // 右クリックメニュー: 「再起動」のすぐ後が「終了」。確認を通す
+        let menu = read("src/menu/context-menu.ts");
+        let restart_at = menu.find("label: \"再起動\"").expect("右クリックメニューに再起動が無い");
+        let quit_at = menu.find("label: \"終了\"").unwrap();
+        let between = &menu[restart_at + "label:".len()..quit_at];
+        assert!(restart_at < quit_at && !between.contains("label:"), "再起動が終了のすぐ上にない");
+        assert!(menu[restart_at..quit_at].contains("confirmAndRestart()"), "右クリックメニューが確認を通っていない");
+
+        // 画面側の確認: 確認してから restart_app。トレイの依頼も同じ関数を通る
+        let front = read("src/menu/restart.ts");
+        let confirm = body_of(&front, "export async function confirmAndRestart");
+        let asked = confirm.find("uggConfirm(").expect("確認のダイアログを出していない");
+        let invoked = confirm.find("invoke(\"restart_app\")").expect("restart_app を呼んでいない");
+        assert!(asked < invoked && confirm.contains("if (!ok) return;"), "確認の前に再起動している");
+        assert!(body_of(&front, "export async function listenRestartRequests").contains("confirmAndRestart()"));
+        assert!(read("src/main.ts").contains("await listenRestartRequests();"), "トレイの依頼を受けていない");
+
+        // バック: 後片付けをしてから起動し直す。終了の処理中なら何もしない
+        let lifecycle = read("src-tauri/src/commands/lifecycle.rs");
+        let now = body_of(&lifecycle, "pub(crate) async fn restart_now");
+        let guard = now.find("QUITTING.swap(true").expect("終了の処理中を見ていない");
+        let tidy = now.find("tidy_up(").expect("後片付けをしていない");
+        let restart = now.find("app.restart()").unwrap();
+        assert!(guard < tidy && tidy < restart, "後片付けより先に再起動している");
+        let tidy_body = body_of(&lifecycle, "async fn tidy_up");
+        assert!(tidy_body.contains("persist_now(") && tidy_body.contains("irodori.shutdown()"));
+        assert!(body_of(&lifecycle, "async fn finish_quit").contains("tidy_up("), "終了と後片付けが別れた");
     }
 
     /// **トレイの「終了」と右クリックメニューの「終了」が同じ経路を通る**（v0.5.6 項目 5 の配線）。

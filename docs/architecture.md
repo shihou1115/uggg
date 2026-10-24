@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.62）
+# ugg アーキテクチャ設計書（architecture.md v2.63）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -69,7 +69,7 @@ src-tauri/src/
 ├── commands/                -- 各 Tauri コマンドの実装
 │   ├── mod.rs
 │   ├── boot.rs              -- get_boot_payload
-│   ├── lifecycle.rs         -- frontend_ready, quit_app, hide_window, set_autostart
+│   ├── lifecycle.rs         -- frontend_ready, quit_app, restart_app, hide_window, set_autostart
 │   ├── settings.rs          -- set_settings, get_settings
 │   ├── secrets.rs           -- set_api_key, has_api_key, delete_api_key
 │   ├── dialogue.rs          -- send_user_message
@@ -601,6 +601,7 @@ pub struct GhostBundle {
 | `get_boot_payload` | なし | `BootPayload` | キャラ画像（data URL）、settings、`char_positions`（保存済みキャラ X 位置。無ければ null）等。**★v0.6.0 `default_speakers: GhostSpeakers`**（声を決めていないゴーストの話者 = アプリの既定。フロントの直書き 2 / 3 をやめた） |
 | `frontend_ready` | なし | `()` | boot 完了通知。起動挨拶（first_boot or boot）+ 更新チェック起動 |
 | `quit_app` | なし | `()` | 右クリックメニュー「終了」。**★v0.5.6 トレイの「終了」と同じ `lifecycle::quit_with_farewell` を通る**（見えていれば終了前の確認かあいさつ → 位置の保存 → サイドカー停止 → exit。隠しているときはすぐ）。終了の処理を始めたら戻る（exit を待たない） |
+| `restart_app` | なし | `()` | ★v0.6.0 右クリックメニュー・トレイの「再起動」（確認のダイアログは画面側で出してから呼ぶ。spec §4.4.2b）。`lifecycle::restart_now`: 位置の即時保存 → サイドカー停止 → `AppHandle::restart()`。終了のあいさつは言わない。「終了」の処理が始まっていたら何もしない |
 | `hide_window` | なし | `()` | メインウインドウを hide（トレイから再表示） |
 | `set_autostart` | `enabled: bool` | `()` | OS 自動起動の切替（tauri-plugin-autostart） |
 
@@ -776,6 +777,7 @@ pub struct GhostBundle {
 | `dialogue` | `DialogueResponse` | バック起点の発話（ランダムトーク・notify 経由の system 発話）。★M9: deliver 経由の発話には `speech_id` / `category` / `priority` / `feedback_allowed` が付く（🔕 用。ユーザー応答には付かない。TS 型は optional）。**このイベント経路は常に `banter::pattern_1` で組むため `extra`（3ターン目）は載らない** — 3ターン目が付くのは `send_user_message` の戻り値だけ（§4.3・§10.4） |
 | `settings-changed` | `Settings` | バック起点の設定変更（トレイ等から） |
 | `open-settings` | なし | トレイ → 設定パネル |
+| `request-restart` | なし | ★v0.6.0 トレイの「再起動」→ 画面で確認のダイアログを出し、OK なら `restart_app`（ウインドウはバックが先に表示する） |
 | `pomodoro` | `PomodoroStatus` | 毎秒・節目 |
 | `voicevox-download` | `string` | 資産DL 進捗行 |
 | `irodori-download` | `string` | ★ Irodori DL 進捗行 |
@@ -1974,3 +1976,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-10-03 | v2.60 | **v0.6.0 項目 2・4（声と会話の履歴をゴーストごとに）**。schema v10: `ghost_voice_refs` を新設し、`chat_log.ghost_id` を追加（**既存のテーブルは作り直さない** — 旧版へ戻せるように。`voice_refs` は残し新版は読み書きしない）。移行のゴーストは `Settings::from_persisted`（起動時の読み込みと共有する唯一の解釈）。`Settings.tts_speakers_by_ghost`、`BootPayload.default_speakers`、`voice_ref_*` の対象を読み込み中のゴーストへ、export `ugg-export-v4`。フロントは `mountSettingsPanel(loadedGhost)`・`src/tts/ghost-voice.ts`（`speakersFor`）。**新規コマンド・イベントなし。** |
 | 2026-10-03 | v2.61 | **v0.6.0 項目 3（参照音声が無いときに無言にしない）と項目 2 の残り**。`synthesize_voice` の戻りを `SynthesizedVoice { wav, engine }` に（実際に鳴らしたエンジン。クレジットを VOICEVOX で鳴らした slot の話者で出すため。新規コマンド・イベントなし）。`decide_fallback` は `FallbackForMissingRef` / `FallbackToVoicevox`。`NoticeKind::IrodoriVoiceRefMissing`（`irodori_voice_ref_missing`、ゴースト × slot・プロセス内 1 回）と `NoticeKind::GhostVoiceUnset`（`ghost_voice_unset`、ゴーストごとに 1 回・`ghost_voice_hint_seen:<ghost_id>`）。`OnceGate`（鍵ごとの原子的な取り合い）と `once_reached_claimed`（取り合い＋届いたときだけ済み）を `system/notify.rs` に。 |
 | 2026-10-24 | v2.62 | **参照音声の告知の鍵を「ゴースト × slot」から「ゴースト」へ**（spec v1.14.7）。main と sub で 2 回出ていた。 |
+| 2026-10-24 | v2.63 | **v0.6.0 項目 7（再起動）**。コマンド `restart_app`（`lifecycle::restart_now`: 位置の保存 → サイドカー停止 → `AppHandle::restart()`）とイベント `request-restart`（トレイ → 画面の確認）を契約表に追加。確認のダイアログは画面側の 1 か所（`src/menu/restart.ts`）で、右クリックメニューとトレイの両方がそこを通る。 |

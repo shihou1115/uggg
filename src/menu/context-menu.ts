@@ -9,6 +9,7 @@ import { openSettingsPanel } from "../panels/settings";
 import { hitTest } from "../stage/character";
 import { cancelSpeech, renderMenuPrompt } from "../system/ghost-speech";
 import type { Settings, SlotName, SpeechTurn } from "../types";
+import { confirmAndRestart } from "./restart";
 
 /// 右クリックメニュー (spec §4.3.5)。独立 UI ではなく **メインのバルーン内** に表示する。
 /// - メイン右クリック: 前口上 (辞書 menu_prompt.main) → 同じバルーン内にメニュー項目
@@ -173,6 +174,10 @@ function buildItems(): Array<MenuItem | { divider: true }> {
       onClick: () => window.dispatchEvent(new CustomEvent("ugg-hide-window")),
     },
     { divider: true },
+    {
+      label: "再起動",
+      onClick: () => void confirmAndRestart(),
+    },
     {
       label: "終了",
       onClick: async () => {
