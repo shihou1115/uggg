@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.61）
+# ugg アーキテクチャ設計書（architecture.md v2.62）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -1417,7 +1417,7 @@ pub async fn irodori_check_gpu() -> GpuInfo {
 // 合成の失敗（VoiceRefMissing 以外）は synthesize_voice が理由を ugg.log へ残して voicevox_core で再合成し、
 //   成功したときだけ notify(IrodoriUnavailable)（commands::tts::decide_fallback → FallbackToVoicevox）
 // ★v0.6.0 VoiceRefMissing（読み込み中のゴーストに参照音声が無い slot）は FallbackForMissingRef: そのゴーストの話者で
-//   voicevox_core 合成し、notify(IrodoriVoiceRefMissing) を「ゴースト × slot・プロセス内 1 回」出す（OnceGate で原子的に
+//   voicevox_core 合成し、notify(IrodoriVoiceRefMissing) を「ゴーストごと・プロセス内 1 回」出す（v2.62 で slot を鍵から外した）（OnceGate で原子的に
 //   取り、once_reached_claimed で届いたときだけ済み）。IrodoriUnavailable も 5 分のクールダウンも通らない。
 //   voice_ref_preview は decide_fallback を通らずエラーのまま（作った声を聴く道具なので代わりの声で鳴らさない）
 // ★v0.6.0 VOICEVOX で鳴らした全経路の最後に notify(GhostVoiceUnset)（読み込み中のゴーストに tts_speakers_by_ghost の
@@ -1973,3 +1973,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-09-29 | v2.59 | **v0.5.8 リリース前監査への対応**。`system/log.rs` の走査のテストはテストの塊（`#[cfg(test)]` の直後が `mod`）だけを除く。`tts/sidecar.rs` の `identify_sidecar`（send・json）と `request_shutdown`、`tts/irodori.rs` の `health_ping` も match の手前で `strip_url()` を通す。`sidecar.py` の `_is_missing_locally` は `__cause__` だけをたどり、`hf_hub_cache_dir` は `%VAR%` を展開する。**Tauri コマンド・イベント・DB スキーマの変更なし。** |
 | 2026-10-03 | v2.60 | **v0.6.0 項目 2・4（声と会話の履歴をゴーストごとに）**。schema v10: `ghost_voice_refs` を新設し、`chat_log.ghost_id` を追加（**既存のテーブルは作り直さない** — 旧版へ戻せるように。`voice_refs` は残し新版は読み書きしない）。移行のゴーストは `Settings::from_persisted`（起動時の読み込みと共有する唯一の解釈）。`Settings.tts_speakers_by_ghost`、`BootPayload.default_speakers`、`voice_ref_*` の対象を読み込み中のゴーストへ、export `ugg-export-v4`。フロントは `mountSettingsPanel(loadedGhost)`・`src/tts/ghost-voice.ts`（`speakersFor`）。**新規コマンド・イベントなし。** |
 | 2026-10-03 | v2.61 | **v0.6.0 項目 3（参照音声が無いときに無言にしない）と項目 2 の残り**。`synthesize_voice` の戻りを `SynthesizedVoice { wav, engine }` に（実際に鳴らしたエンジン。クレジットを VOICEVOX で鳴らした slot の話者で出すため。新規コマンド・イベントなし）。`decide_fallback` は `FallbackForMissingRef` / `FallbackToVoicevox`。`NoticeKind::IrodoriVoiceRefMissing`（`irodori_voice_ref_missing`、ゴースト × slot・プロセス内 1 回）と `NoticeKind::GhostVoiceUnset`（`ghost_voice_unset`、ゴーストごとに 1 回・`ghost_voice_hint_seen:<ghost_id>`）。`OnceGate`（鍵ごとの原子的な取り合い）と `once_reached_claimed`（取り合い＋届いたときだけ済み）を `system/notify.rs` に。 |
+| 2026-10-24 | v2.62 | **参照音声の告知の鍵を「ゴースト × slot」から「ゴースト」へ**（spec v1.14.7）。main と sub で 2 回出ていた。 |

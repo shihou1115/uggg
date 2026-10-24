@@ -70,7 +70,7 @@ pub enum NoticeKind {
     },
     /// **参照音声が無い slot を VOICEVOX で話した**（v0.6.0 項目 3、spec §6.0）。高品質モードで、読み込み中の
     /// ゴーストにその slot の参照音声が無いとき。故障ではないので `IrodoriUnavailable` とは別（「使えない」と
-    /// 言わず、5 分の待ちも共有しない）。ゴースト × slot ごとにプロセスで 1 回、届いたときだけ済み（`OnceGate`）。
+    /// 言わず、5 分の待ちも共有しない）。ゴーストごとにプロセスで 1 回（main と sub で 2 回出さない）、届いたときだけ済み（`OnceGate`）。
     IrodoriVoiceRefMissing,
     /// **声を決めていないゴーストが VOICEVOX で初めて喋った**（v0.6.0 項目 2）。「声は設定の『音声』で変えられる」。
     /// ゴーストごとに 1 回、届いたときだけ済み（`app_settings` の `ghost_voice_hint_seen:<ghost_id>`）。
@@ -250,7 +250,7 @@ where
 /// main と sub を並べて合成するので、「済みかを見てから出して、済みにする」では、見てから立てるまでの間に
 /// もう 1 つが同じ鍵を見て 2 回出る。**見るのと取るのを 1 回の操作にする**（`try_begin`）。取ったあと
 /// 届かなければ（保留・失敗）手放し（`release`）、次の機会にもう一度出る。届いたら済み（`mark_done`）。
-/// 済みはプロセスの中だけ（ゴースト × slot の参照音声の告知。再起動したらまた 1 回出てよい）。
+/// 済みはプロセスの中だけ（ゴーストごとの参照音声の告知。再起動したらまた 1 回出てよい）。
 #[derive(Default)]
 pub struct OnceGate {
     /// 鍵 → 済みか（false = 出している最中）。
@@ -452,7 +452,7 @@ mod delivery_tests {
     }
 
     /// **取り合いは原子的**（v0.6.0 項目 2・3）。main と sub を並べて合成するので、見てから立てると 2 回出る。
-    /// 同じ鍵を 16 本が同時に取りに行って、取れるのは 1 本だけ。別の鍵（別のゴースト・別の slot）は別々に取れる。
+    /// 同じ鍵を 16 本が同時に取りに行って、取れるのは 1 本だけ。別の鍵（別のゴースト）は別に取れる。
     #[test]
     fn only_one_caller_wins_the_same_key() {
         let gate = std::sync::Arc::new(OnceGate::default());
@@ -462,14 +462,13 @@ mod delivery_tests {
                 let (gate, barrier) = (gate.clone(), barrier.clone());
                 std::thread::spawn(move || {
                     barrier.wait();
-                    gate.try_begin("voice_ref_missing:g:main")
+                    gate.try_begin("voice_ref_missing:g")
                 })
             })
             .collect();
         let winners = handles.into_iter().map(|h| h.join().unwrap()).filter(|won| *won).count();
         assert_eq!(winners, 1, "同じ鍵を 2 つ以上が取れた");
-        assert!(gate.try_begin("voice_ref_missing:g:sub"), "別の slot は別に取れる");
-        assert!(gate.try_begin("voice_ref_missing:h:main"), "別のゴーストは別に取れる");
+        assert!(gate.try_begin("voice_ref_missing:h"), "別のゴーストは別に取れる");
     }
 
     /// **届いたときだけ済み、届かなければ手放して次の機会にまた出る。出している最中の重なりは出さない**

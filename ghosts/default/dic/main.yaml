@@ -658,7 +658,7 @@ system_messages:
   irodori_vram:
     - main: { text: "GPU のメモリがいっぱいみたい…いつもの声で話すね", pose: troubled }
       sub: { text: "VRAM が足りない。ほかに GPU を使っているアプリを止めれば戻る", pose: normal }
-  # v0.6.0 項目 3: 参照音声がまだ無い slot は VOICEVOX で話す（ゴースト × slot ごとに 1 回）。
+  # v0.6.0 項目 3: 参照音声がまだ無い slot は VOICEVOX で話す（ゴーストごとに 1 回）。
   # 故障ではないので irodori_unavailable とは別のキー（「高品質モードが使えない」とは言わない）。
   irodori_voice_ref_missing:
     - main: { text: "高品質モードのあたしたちの声は、まだ作ってないんだ。いつもの声で話すね", pose: normal }

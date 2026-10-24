@@ -107,7 +107,7 @@ pub fn list_voices(state: State<'_, Arc<AppState>>) -> Result<Vec<VoiceOption>, 
 /// voicevox も使えない場合は元の irodori エラーを返す (architecture.md §8.6 / §13.4)。
 ///
 /// **`VoiceRefMissing`（読み込み中のゴーストにその slot の参照音声が無い）は VOICEVOX で喋り**、
-/// ゴースト × slot ごとに 1 回だけ `IrodoriVoiceRefMissing` を告げる（v0.6.0 項目 3。以前は無言だった）。
+/// ゴーストごとに 1 回だけ `IrodoriVoiceRefMissing` を告げる（v0.6.0 項目 3。以前は無言だった）。
 /// VOICEVOX で鳴らしたときは、声を決めていないゴーストに 1 回だけ案内する（`GhostVoiceUnset`）。
 /// 戻りの `engine` は実際に鳴らしたエンジン（クレジットの表示に使う）。
 #[tauri::command]
@@ -150,7 +150,7 @@ pub async fn synthesize_voice(
                             .map_err(|voicevox_err| {
                                 format!("{err} (voicevox で代わりに喋ることも失敗: {voicevox_err})")
                             })?;
-                        announce_voice_ref_missing_once(&app, &state_arc, &slot).await;
+                        announce_voice_ref_missing_once(&app, &state_arc).await;
                         (wav, ENGINE_VOICEVOX)
                     }
                     FallbackAction::FallbackToVoicevox => {
@@ -212,17 +212,18 @@ pub async fn synthesize_voice(
     })
 }
 
-/// 参照音声が無い slot を VOICEVOX で話したことの告知（**ゴースト × slot、プロセスで 1 回**。v0.6.0 項目 3）。
-/// 取り合いは原子的（main と sub を並べて合成しても 2 回出ない）、済みは**届いたときだけ**。告知の台詞自体の
+/// 参照音声が無い slot を VOICEVOX で話したことの告知（**ゴーストごと、プロセスで 1 回**。v0.6.0 項目 3）。
+/// 鍵に slot を含めない: 告知の文は「このゴーストの声がまだ無い」で、以前は main と sub で 1 回ずつ、続けて 2 回
+/// 出ていた（実機確認 E-13 で発見）。取り合いは原子的（並べて合成しても重ならない）、済みは**届いたときだけ**。告知の台詞自体の
 /// 合成も `synthesize_voice` に戻ってくるが、取り合いの鍵が同じなので重ならない。
 /// 読み込み中のゴーストが無ければ（辞書も無く、何も言えない）出さない。
-pub(crate) async fn announce_voice_ref_missing_once(app: &AppHandle, state: &Arc<AppState>, slot: &str) {
+pub(crate) async fn announce_voice_ref_missing_once(app: &AppHandle, state: &Arc<AppState>) {
     let Some(ghost_id) = state.loaded_ghost_id() else {
         return;
     };
     notify::once_reached_claimed(
         &state.tts.voice_notices,
-        &voice_ref_missing_key(&ghost_id, slot),
+        &voice_ref_missing_key(&ghost_id),
         false,
         || notify::notify(app, state, NoticeKind::IrodoriVoiceRefMissing),
         || {},
@@ -230,9 +231,9 @@ pub(crate) async fn announce_voice_ref_missing_once(app: &AppHandle, state: &Arc
     .await;
 }
 
-/// 参照音声の告知の取り合いの鍵（ゴースト × slot）。
-fn voice_ref_missing_key(ghost_id: &str, slot: &str) -> String {
-    format!("voice_ref_missing:{ghost_id}:{slot}")
+/// 参照音声の告知の取り合いの鍵（ゴーストごと。slot は含めない）。
+fn voice_ref_missing_key(ghost_id: &str) -> String {
+    format!("voice_ref_missing:{ghost_id}")
 }
 
 /// 声を決めていないゴーストが VOICEVOX で喋ったことの案内（**ゴーストごとに 1 回、届いたときだけ済み**。
@@ -1265,13 +1266,13 @@ mod tests {
         assert!(synth.contains("            ENGINE_VOICEVOX,\n        ),"), "VOICEVOX 設定の合成が VOICEVOX と返していない");
     }
 
-    /// **参照音声の告知は、ゴースト × slot の鍵で取り合い、届いたときだけ済みにする**（v0.6.0 項目 3）。
+    /// **参照音声の告知は、ゴーストごとの鍵で取り合い、届いたときだけ済みにする**（v0.6.0 項目 3）。
+    /// slot を鍵に含めると、main と sub で 1 回ずつ、続けて 2 回出る（E-13 の実機確認で発見）。
     /// 実物は `once_reached_claimed` が行う（振る舞いは notify.rs のテストで固定）。ここは配線。
     #[test]
-    fn the_voice_ref_notice_is_claimed_per_ghost_and_slot() {
-        assert_ne!(voice_ref_missing_key("a", "main"), voice_ref_missing_key("a", "sub"));
-        assert_ne!(voice_ref_missing_key("a", "main"), voice_ref_missing_key("b", "main"));
-        assert_eq!(voice_ref_missing_key("a", "main"), voice_ref_missing_key("a", "main"));
+    fn the_voice_ref_notice_is_claimed_once_per_ghost() {
+        assert_ne!(voice_ref_missing_key("a"), voice_ref_missing_key("b"));
+        assert_eq!(voice_ref_missing_key("a"), voice_ref_missing_key("a"));
 
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/tts.rs"),
@@ -1288,7 +1289,8 @@ mod tests {
             .find("NoticeKind::IrodoriVoiceRefMissing")
             .expect("参照音声の告知を出していない");
         assert!(claimed < shown, "取る前に告知を出している");
-        assert!(body.contains("voice_ref_missing_key(&ghost_id, slot)"), "ゴースト × slot の鍵を使っていない");
+        assert!(body.contains("voice_ref_missing_key(&ghost_id)"), "ゴーストごとの鍵を使っていない");
+        assert!(!body.contains("slot"), "鍵に slot が入っている（main と sub で 2 回出る）");
         assert!(body.contains("state.loaded_ghost_id()"), "読み込み中のゴーストで引いていない");
         assert!(!body.contains("settings.ghost_id"), "設定の ghost_id で引いている");
         // 取る側の中で 5 分の待ちには触らない
