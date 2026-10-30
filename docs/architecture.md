@@ -1,4 +1,4 @@
-# ugg アーキテクチャ設計書（architecture.md v2.63）
+# ugg アーキテクチャ設計書（architecture.md v2.64）
 
 **フェーズ**: 本開発 Phase 2 確定版
 **作成日**: 2026-06-18
@@ -660,7 +660,7 @@ pub struct GhostBundle {
 | コマンド | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
 | `synthesize_voice` | `text: String, slot: "main"\|"sub", caption: String\|null（省略可）` | `SynthesizedVoice { wav: String, engine: "voicevox_core"\|"irodori" }`（★v0.6.0 で `String` から改めた） | WAV を base64 で返す（slot 基準、エンジン振り分けはバックエンド）。**★v0.6.0 `engine` は実際に鳴らしたエンジン**（フォールバックを含む）。フロントは VOICEVOX で鳴らした slot の話者でクレジットを出す（`src/tts/credit.ts` の `creditSlots` / `noteSynthesized`。spec §4.5.1 の常時表示・VVM 規約）。★ `caption` は Irodori 実モデルのみ使用（他経路は無視、空文字は None 正規化。script-reader-spec.md §3.3）。**v3 本体では効いていない**（§7.1。v0.5.7 の差し替えで閉じる予定で、効くことは差し替え時に検証する） |
-| `list_voices` | なし | `VoiceOption[]` | 現在エンジンの声一覧 |
+| `list_voices` | なし | `VoiceOption[]` | **VOICEVOX の声一覧**（★v0.6.1 で記述を実装に合わせた。設定のエンジンによらず、読み込んだ `.vvm` の話者・スタイル。エンジンを初期化できなければ Err）。設定欄はこの一覧に無い保存済みの ID を「#ID (見つからない話者)」と出す（spec §4.5.1） |
 | `voicevox_assets_ready` | なし | `bool` | 資産有無 |
 | `download_voicevox_assets` | `agreed: bool, gh_token: String\|null` | `()` | 規約同意必須、進捗は `voicevox-download` イベント |
 | `set_github_token` | `token: String` | `()` | |
@@ -1107,6 +1107,14 @@ pub trait TtsEngine: Send + Sync {
 - 合成器を `Mutex<Option<VoicevoxEngine>>` で保持・遅延初期化
 - 事前 init（boot 時・設定変更時）で初発話のラグを解消
 - `needs_kana_preprocess() = false`（OpenJtalk が内部で読み解析）
+- **★v0.6.1 話者の確かめ（spec §4.5.1・§6.0）**: `VoicevoxEngine::init` が `.vvm` を読み込んだあと `metas_json` を 1 回読み、
+  style ID の集合を控える（解析は純粋関数。`parse_speakers_to_voice_options` と同じ解釈）。取れなければ空のまま（失敗にしない）。
+  `synthesize_voicevox`（**VOICEVOX へ style ID を渡す唯一の箇所**）は合成の前に集合を見て、判定は 3 値:
+  **ある → 合成 / 無い → 合成を呼ばず `SpeakerMissing { slot, style_id }` / 集合が空 → 判定せず合成**（いまと同じ）。
+  `synthesize_voicevox` の失敗は `SpeakerMissing` とそれ以外（今までの文字列）を区別できる型にし、呼び出し元の 3 か所
+  （VOICEVOX モード・`FallbackForMissingRef`・`FallbackToVoicevox`）は `SpeakerMissing` のとき
+  `announce_voicevox_speaker_missing_once`（§11.2）を呼んでから失敗を返す。フロントへ返す文字列は「話者が見つかりません
+  （main #ID）」の形で、ほかの失敗と混ざらない
 
 ### 7.4 IrodoriEngine
 
@@ -1606,6 +1614,9 @@ pub(crate) async fn once_reached(done: bool, show: impl FnOnce() -> Fut, mark: i
 | IrodoriDlComplete / IrodoriDlFailed | `irodori_dl_complete` / `irodori_dl_failed` | 毎回（同上） |
 | UpdateAvailable | `update_available` | 版ごとに 1 回（`update_notice_seen:<版>`）。**届いたときだけ**記録 |
 | CalendarFetchFailed ★v0.5.7 | `calendar_fetch_failed` | 取得元ごとに、失敗が続き始めたら 1 回（監視の `FetchFailures`。起動のたびに数え直し、成功で戻す）。**届いたときだけ**記録。消した・書き直した取得元は落とす |
+| IrodoriVoiceRefMissing ★v0.6.0 | `irodori_voice_ref_missing` | ゴーストごとに起動中 1 回（`OnceGate` の鍵 `voice_ref_missing:<ghost_id>`）。**届いたときだけ**済み（★v0.6.1 で表に足した。v0.6.0 で載せ漏れ） |
+| GhostVoiceUnset ★v0.6.0 | `ghost_voice_unset` | ゴーストごとに 1 回（`ghost_voice_hint_seen:<ghost_id>`）。**届いたときだけ**記録（★v0.6.1 で表に足した） |
+| VoicevoxSpeakerMissing { slot, style_id } ★v0.6.1 | `voicevox_speaker_missing_main` / `voicevox_speaker_missing_sub`（slot で言い分ける） | （読み込み中のゴースト・slot・style ID）ごとに起動中 1 回（`OnceGate` の鍵 `voicevox_speaker_missing:<ghost_id>:<slot>:<style_id>`。`state.tts.voice_notices` を共有）。**届いたときだけ**済み。話者を選び直すと ID が変わるので別の告知になる |
 
 辞書キーが既定辞書に実在することは `notify::dict_key_contract` が突き合わせる。
 ★M7: `ReminderFired` variant は削除（§11.4 の deliver_event 経路へ一本化）。
@@ -1615,7 +1626,9 @@ pub(crate) async fn once_reached(done: bool, show: impl FnOnce() -> Fut, mark: i
 - `dialogue/mod.rs`: コストの 80% 警告・上限到達・集計不能（`evaluate_cost_status` / `announce_cost_limit_once` /
   `announce_cost_unknown_once`。どれも `once_reached` を通す）、モードの自動降格・復帰
 - `system/update.rs`: 新しい版の検出（`once_reached` を通す）
-- `commands/tts.rs`: VOICEVOX・Irodori の資産 DL の完了・失敗、合成に失敗して VOICEVOX へ落ちたとき（`IrodoriUnavailable`）
+- `commands/tts.rs`: VOICEVOX・Irodori の資産 DL の完了・失敗、合成に失敗して VOICEVOX へ落ちたとき（`IrodoriUnavailable`）、
+  参照音声が無い slot を VOICEVOX で話したとき（`IrodoriVoiceRefMissing`）、声を決めていないゴーストが VOICEVOX で話したとき
+  （`GhostVoiceUnset`）、★v0.6.1 VOICEVOX の話者が見つからないとき（`VoicevoxSpeakerMissing`。`synthesize_voicevox` の 3 つの呼び出し元）
 - `tasks.rs`: Irodori のヘルスチェックが 3 回続けて失敗したとき（`IrodoriUnavailable`）
 
 ### 11.4 通知配達サービスと発話ガバナンス（★M7、daily-support-design §3/§4 が正）
@@ -1977,3 +1990,4 @@ ugg の寿命に結びつけた Job Object で一緒に終わる（★v0.5.6 項
 | 2026-10-03 | v2.61 | **v0.6.0 項目 3（参照音声が無いときに無言にしない）と項目 2 の残り**。`synthesize_voice` の戻りを `SynthesizedVoice { wav, engine }` に（実際に鳴らしたエンジン。クレジットを VOICEVOX で鳴らした slot の話者で出すため。新規コマンド・イベントなし）。`decide_fallback` は `FallbackForMissingRef` / `FallbackToVoicevox`。`NoticeKind::IrodoriVoiceRefMissing`（`irodori_voice_ref_missing`、ゴースト × slot・プロセス内 1 回）と `NoticeKind::GhostVoiceUnset`（`ghost_voice_unset`、ゴーストごとに 1 回・`ghost_voice_hint_seen:<ghost_id>`）。`OnceGate`（鍵ごとの原子的な取り合い）と `once_reached_claimed`（取り合い＋届いたときだけ済み）を `system/notify.rs` に。 |
 | 2026-10-24 | v2.62 | **参照音声の告知の鍵を「ゴースト × slot」から「ゴースト」へ**（spec v1.14.7）。main と sub で 2 回出ていた。 |
 | 2026-10-24 | v2.63 | **v0.6.0 項目 7（再起動）**。コマンド `restart_app`（`lifecycle::restart_now`: 位置の保存 → サイドカー停止 → `AppHandle::restart()`）とイベント `request-restart`（トレイ → 画面の確認）を契約表に追加。確認のダイアログは画面側の 1 か所（`src/menu/restart.ts`）で、右クリックメニューとトレイの両方がそこを通る。 |
+| 2026-10-30 | v2.64 | **v0.6.1（話者が見つからないときに無言にしない、spec v1.15）**。§7.3 に話者の確かめ（初期化時に style ID の集合を控え、`synthesize_voicevox` で 3 値の判定・区別できる失敗 `SpeakerMissing`）。§11.2 に `NoticeKind::VoicevoxSpeakerMissing { slot, style_id }`（辞書 `voicevox_speaker_missing_main` / `_sub`、鍵はゴースト・slot・ID）と、v0.6.0 で載せ漏れた `IrodoriVoiceRefMissing` / `GhostVoiceUnset` の行。§11.3 の呼び出し点。§4.7 の `list_voices` の説明を実装（VOICEVOX の一覧）に合わせた。**新規コマンド・イベント・設定なし。** |
