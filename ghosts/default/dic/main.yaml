@@ -667,6 +667,16 @@ system_messages:
       sub: { text: "作るなら設定の「音声」からだ。できるまでは VOICEVOX で代用する", pose: normal }
     - main: { text: "高品質の声がまだ無いから、いつもの声でお話するね。設定の「音声」で作れるよ", pose: normal }
       sub: { text: "声は作るまで無いままだ。今は VOICEVOX で話している", pose: normal }
+  voicevox_speaker_missing_main:
+    - main: { text: "あたしの声の話者が見つからないみたい…", pose: troubled }
+      sub: { text: "設定の「音声」で選び直せば戻る", pose: normal }
+    - main: { text: "あたしの声、選んだ話者が見つからなくて出せないみたい", pose: troubled }
+      sub: { text: "設定の「音声」でメインの話者を選び直してくれ", pose: normal }
+  voicevox_speaker_missing_sub:
+    - main: { text: "設定の「音声」で選び直してみてね", pose: normal }
+      sub: { text: "ボクの声の話者が見つからない", pose: troubled }
+    - main: { text: "設定の「音声」でサブの話者を選び直せるよ", pose: normal }
+      sub: { text: "ボクの声が出ない。選んだ話者がいないんだ", pose: troubled }
   # v0.6.0 項目 2: 声を決めていないゴーストが VOICEVOX で初めて喋るとき、ゴーストごとに 1 回だけ。
   ghost_voice_unset:
     - main: { text: "ちなみに、あたしたちの声は設定の「音声」で変えられるよ", pose: happy }

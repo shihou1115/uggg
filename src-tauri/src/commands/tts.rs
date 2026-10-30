@@ -131,7 +131,15 @@ pub async fn synthesize_voice(
 
     let (wav, engine) = match settings.tts_engine.as_str() {
         "voicevox_core" | "" => (
-            synthesize_voicevox(state_arc.clone(), &settings, &slot, &text).await?,
+            match synthesize_voicevox(state_arc.clone(), &settings, &slot, &text).await {
+                Ok(wav) => wav,
+                Err(err) => {
+                    if let VoicevoxSynthesisError::SpeakerMissing { slot, style_id } = &err {
+                        announce_voicevox_speaker_missing_once(&app, &state_arc, slot, *style_id).await;
+                    }
+                    return Err(err.to_string());
+                }
+            },
             ENGINE_VOICEVOX,
         ),
         "irodori" => {
@@ -145,11 +153,16 @@ pub async fn synthesize_voice(
                     // **`irodori_unavailable` を言わず、その 5 分の待ち（`should_notify_unavailable`）も使わない** —
                     // 故障ではないので事実と違う理由を言わない。
                     FallbackAction::FallbackForMissingRef => {
-                        let wav = synthesize_voicevox(state_arc.clone(), &settings, &slot, &text)
-                            .await
-                            .map_err(|voicevox_err| {
-                                format!("{err} (voicevox で代わりに喋ることも失敗: {voicevox_err})")
-                            })?;
+                        let wav = match synthesize_voicevox(state_arc.clone(), &settings, &slot, &text).await {
+                            Ok(wav) => wav,
+                            Err(voicevox_err) => {
+                                if let VoicevoxSynthesisError::SpeakerMissing { slot, style_id } = &voicevox_err {
+                                    announce_voicevox_speaker_missing_once(&app, &state_arc, slot, *style_id).await;
+                                    return Err(voicevox_err.to_string());
+                                }
+                                return Err(format!("{err} (voicevox で代わりに喋ることも失敗: {voicevox_err})"));
+                            }
+                        };
                         announce_voice_ref_missing_once(&app, &state_arc).await;
                         (wav, ENGINE_VOICEVOX)
                     }
@@ -187,6 +200,10 @@ pub async fn synthesize_voice(
                                 (wav, ENGINE_VOICEVOX)
                             }
                             Err(voicevox_err) => {
+                                if let VoicevoxSynthesisError::SpeakerMissing { slot, style_id } = &voicevox_err {
+                                    announce_voicevox_speaker_missing_once(&app, &state_arc, slot, *style_id).await;
+                                    return Err(voicevox_err.to_string());
+                                }
                                 // 両方失敗: notify はキャラ発話を呼ぶ → やはり両方失敗するだけなので skip。
                                 // フロント側 (speaker.ts) が console.warn して括る。reason は両方の理由をマージ。
                                 return Err(format!(
@@ -234,6 +251,30 @@ pub(crate) async fn announce_voice_ref_missing_once(app: &AppHandle, state: &Arc
 /// 参照音声の告知の取り合いの鍵（ゴーストごと。slot は含めない）。
 fn voice_ref_missing_key(ghost_id: &str) -> String {
     format!("voice_ref_missing:{ghost_id}")
+}
+
+/// 読み込み中のゴースト・役・話者ごと、届いたときだけ済みにする。
+pub(crate) async fn announce_voicevox_speaker_missing_once(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    slot: &str,
+    style_id: u32,
+) {
+    let Some(ghost_id) = state.loaded_ghost_id() else {
+        return;
+    };
+    notify::once_reached_claimed(
+        &state.tts.voice_notices,
+        &voicevox_speaker_missing_key(&ghost_id, slot, style_id),
+        false,
+        || notify::notify(app, state, NoticeKind::VoicevoxSpeakerMissing { slot: slot.to_string(), style_id }),
+        || {},
+    )
+    .await;
+}
+
+fn voicevox_speaker_missing_key(ghost_id: &str, slot: &str, style_id: u32) -> String {
+    format!("voicevox_speaker_missing:{ghost_id}:{slot}:{style_id}")
 }
 
 /// 声を決めていないゴーストが VOICEVOX で喋ったことの案内（**ゴーストごとに 1 回、届いたときだけ済み**。
@@ -289,12 +330,46 @@ fn ghost_voice_hint_due(settings: &Settings, ghost_id: &str, seen: bool) -> bool
     !seen && !settings.tts_speakers_by_ghost.contains_key(ghost_id)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum VoicevoxSynthesisError {
+    SpeakerMissing { slot: String, style_id: u32 },
+    Other(String),
+}
+
+impl From<String> for VoicevoxSynthesisError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl std::fmt::Display for VoicevoxSynthesisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SpeakerMissing { slot, style_id } => write!(f, "話者が見つかりません（{slot} #{style_id}）"),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
+/// エンジン無しで、存在判定による合成の分岐を確かめられる部分。
+fn synthesize_with_speaker(
+    presence: voicevox::SpeakerPresence,
+    slot: &str,
+    style_id: u32,
+    synthesize: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, VoicevoxSynthesisError> {
+    if presence == voicevox::SpeakerPresence::Missing {
+        return Err(VoicevoxSynthesisError::SpeakerMissing { slot: slot.to_string(), style_id });
+    }
+    synthesize().map_err(VoicevoxSynthesisError::Other)
+}
+
 async fn synthesize_voicevox(
     state: Arc<AppState>,
     settings: &Settings,
     slot: &str,
     text: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, VoicevoxSynthesisError> {
     // 話者は**読み込み中のゴースト**の行、無ければアプリの既定（v0.6.0 項目 2）。設定の ghost_id では引かない
     // （切り替えた直後〜再起動前は読み込み中のゴーストと別物で、旧ゴーストが新ゴーストの声で喋ってしまう）。
     // 旧版の単一の話者設定は移行の読み出し元で、ここでは読まない。
@@ -302,17 +377,20 @@ async fn synthesize_voicevox(
     let style_id = match slot {
         "main" => speakers.main,
         "sub" => speakers.sub,
-        other => return Err(format!("未知の slot: {other}")),
+        other => return Err(format!("未知の slot: {other}").into()),
     };
     let text_owned = text.to_string();
+    let slot_owned = slot.to_string();
     // 合成はブロッキングなので spawn_blocking。
-    tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Vec<u8>, VoicevoxSynthesisError> {
         ensure_engine(&state)?;
         let guard = state.tts.voicevox.lock().expect("tts poisoned");
         let engine = guard
             .as_ref()
             .ok_or_else(|| "voicevox engine が初期化されていません".to_string())?;
-        engine.synthesize(&text_owned, style_id)
+        synthesize_with_speaker(engine.speaker_presence(style_id), &slot_owned, style_id, || {
+            engine.synthesize(&text_owned, style_id)
+        })
     })
     .await
     .map_err(|e| format!("合成タスクの起動に失敗: {e}"))?
@@ -993,7 +1071,7 @@ fn ensure_engine(state: &Arc<AppState>) -> Result<(), String> {
 
 /// voicevox の `/speakers` 同形式 JSON を flat な VoiceOption 列に展開。
 /// 同一 style_id は重複除外。`name = "話者名 (スタイル名)"`。
-fn parse_speakers_to_voice_options(json: &str) -> Result<Vec<VoiceOption>, String> {
+pub(crate) fn parse_speakers_to_voice_options(json: &str) -> Result<Vec<VoiceOption>, String> {
     let v: Value = serde_json::from_str(json).map_err(|e| format!("speakers JSON パース失敗: {e}"))?;
     let arr = v.as_array().ok_or_else(|| "speakers が配列ではない".to_string())?;
     let mut out: Vec<VoiceOption> = Vec::new();
@@ -1453,6 +1531,99 @@ mod tests {
     fn decide_fallback_not_implemented_falls_back() {
         let err = TtsError::NotImplemented;
         assert_eq!(decide_fallback(&err), FallbackAction::FallbackToVoicevox);
+    }
+
+    #[test]
+    fn missing_speaker_returns_distinct_error_without_synthesizing() {
+        let error = synthesize_with_speaker(voicevox::SpeakerPresence::Missing, "main", 99, || {
+            panic!("missing speaker must not reach synthesis")
+        }).unwrap_err();
+        assert_eq!(error, VoicevoxSynthesisError::SpeakerMissing { slot: "main".into(), style_id: 99 });
+        assert_eq!(error.to_string(), "話者が見つかりません（main #99）");
+    }
+
+    #[test]
+    fn present_and_unknown_speakers_synthesize_and_preserve_other_errors() {
+        for presence in [voicevox::SpeakerPresence::Present, voicevox::SpeakerPresence::Unknown] {
+            let calls = std::cell::Cell::new(0);
+            let result = synthesize_with_speaker(presence, "sub", 0, || {
+                calls.set(calls.get() + 1);
+                Ok(vec![1, 2])
+            });
+            assert_eq!(result, Ok(vec![1, 2]));
+            assert_eq!(calls.get(), 1);
+        }
+        assert_eq!(
+            synthesize_with_speaker(voicevox::SpeakerPresence::Unknown, "main", 0, || Err("failure".into())),
+            Err(VoicevoxSynthesisError::Other("failure".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_speaker_notice_is_once_per_ghost_slot_id_only_when_reached() {
+        use notify::{NoticeOutcome, OnceGate};
+        let gate = OnceGate::default();
+        let calls = std::cell::Cell::new(0);
+        let key = voicevox_speaker_missing_key("g1", "main", 99);
+        assert_eq!(key, "voicevox_speaker_missing:g1:main:99");
+        for outcome in [NoticeOutcome::Held, NoticeOutcome::Failed, NoticeOutcome::Shown] {
+            let result = notify::once_reached_claimed(&gate, &key, false, || async {
+                calls.set(calls.get() + 1);
+                // 告知自身の合成から再入しても、同じ鍵は取り合いで止まる。
+                assert!(notify::once_reached_claimed(&gate, &key, false,
+                    || async { panic!("overlapping notice") }, || {}).await.is_none());
+                outcome
+            }, || {}).await;
+            assert_eq!(result, Some(outcome));
+        }
+        assert_eq!(calls.get(), 3);
+        assert!(notify::once_reached_claimed(&gate, &key, false,
+            || async { panic!("already reached") }, || {}).await.is_none());
+        for (ghost, slot, id) in [("g2", "main", 99), ("g1", "sub", 99), ("g1", "main", 100)] {
+            let key = voicevox_speaker_missing_key(ghost, slot, id);
+            assert_eq!(notify::once_reached_claimed(&gate, &key, false,
+                || async { NoticeOutcome::Shown }, || {}).await, Some(NoticeOutcome::Shown));
+        }
+        // プロセスをまたいで永続化しない。
+        assert_eq!(notify::once_reached_claimed(&OnceGate::default(), &key, false,
+            || async { NoticeOutcome::Shown }, || {}).await, Some(NoticeOutcome::Shown));
+    }
+
+    #[test]
+    fn all_three_voicevox_paths_announce_missing_speakers_before_returning() {
+        let src = include_str!("tts.rs").replace("\r\n", "\n");
+        let body_of = |name: &str| {
+            let body = &src[src.find(name).unwrap()..];
+            body[..body.find("\n}\n").unwrap()].to_string()
+        };
+        let synth = body_of("pub async fn synthesize_voice(");
+        let missing = synth.find("FallbackAction::FallbackForMissingRef =>").unwrap();
+        let fallback = synth.find("FallbackAction::FallbackToVoicevox =>").unwrap();
+        for branch in [&synth[..missing], &synth[missing..fallback], &synth[fallback..]] {
+            assert_eq!(branch.matches("synthesize_voicevox(").count(), 1);
+            let check = branch.find("if let VoicevoxSynthesisError::SpeakerMissing").unwrap();
+            let announce = branch.find("announce_voicevox_speaker_missing_once(&app, &state_arc, slot, *style_id)").unwrap();
+            let returned = branch[announce..].find("return Err(").unwrap() + announce;
+            assert!(check < announce && announce < returned);
+        }
+        let missing_branch = &synth[missing..fallback];
+        assert!(missing_branch.find("return Err(voicevox_err.to_string())").unwrap()
+            < missing_branch.find("announce_voice_ref_missing_once(").unwrap());
+        let failed = &synth[fallback..];
+        let failed = &failed[failed.find("Err(voicevox_err) =>").unwrap()..];
+        assert!(!failed.contains("NoticeKind::IrodoriUnavailable"));
+
+        let announce = body_of("pub(crate) async fn announce_voicevox_speaker_missing_once(");
+        assert!(announce.contains("let Some(ghost_id) = state.loaded_ghost_id() else {\n        return;"));
+        assert!(announce.contains("&state.tts.voice_notices"));
+        assert!(announce.contains("&voicevox_speaker_missing_key(&ghost_id, slot, style_id)"));
+        assert!(announce.find("once_reached_claimed(").unwrap()
+            < announce.find("NoticeKind::VoicevoxSpeakerMissing").unwrap());
+        assert!(!announce.contains("settings.ghost_id"));
+        assert!(!announce.contains("should_notify_unavailable"));
+        let engine = body_of("async fn synthesize_voicevox(");
+        assert!(engine.find("synthesize_with_speaker(engine.speaker_presence(style_id)").unwrap()
+            < engine.find("engine.synthesize(").unwrap());
     }
 
     #[test]

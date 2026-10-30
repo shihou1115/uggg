@@ -12,6 +12,7 @@
 //!
 //! 参考: v0.0.3 (`C:\claude\ugga\src-tauri\src\voicevox_ffi.rs`) と signatures は同一。
 
+use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CString};
 use std::path::{Path, PathBuf};
 
@@ -103,6 +104,30 @@ pub struct VoicevoxEngine {
     /// ロード済み .vvm モデル数 (デバッグ表示用に保持)。
     #[allow(dead_code)]
     loaded_models: usize,
+    style_ids: HashSet<u32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpeakerPresence {
+    Present,
+    Missing,
+    Unknown,
+}
+
+/// 一覧表示と同じ解釈で、読み込まれたスタイルを控える。
+fn parse_style_ids(json: &str) -> Result<HashSet<u32>, String> {
+    crate::commands::tts::parse_speakers_to_voice_options(json)
+        .map(|options| options.into_iter().map(|option| option.id).collect())
+}
+
+pub fn speaker_presence(style_ids: &HashSet<u32>, style_id: u32) -> SpeakerPresence {
+    if style_ids.is_empty() {
+        SpeakerPresence::Unknown
+    } else if style_ids.contains(&style_id) {
+        SpeakerPresence::Present
+    } else {
+        SpeakerPresence::Missing
+    }
 }
 
 // Mutex で直列化する前提で Send。
@@ -206,18 +231,25 @@ impl VoicevoxEngine {
                 return Err("音声モデル (.vvm) を 1 つも読み込めませんでした".to_string());
             }
 
-            Ok(VoicevoxEngine {
+            let mut engine = VoicevoxEngine {
                 lib,
                 synthesizer: synth,
                 open_jtalk,
                 loaded_models: loaded,
-            })
+                style_ids: HashSet::new(),
+            };
+            engine.style_ids = engine.metas_json().and_then(|json| parse_style_ids(&json)).unwrap_or_default();
+            Ok(engine)
         }
     }
 
     #[allow(dead_code)]
     pub fn loaded_models(&self) -> usize {
         self.loaded_models
+    }
+
+    pub fn speaker_presence(&self, style_id: u32) -> SpeakerPresence {
+        speaker_presence(&self.style_ids, style_id)
     }
 
     /// 話者/スタイル一覧の JSON (`/speakers` 同形式)。
@@ -374,5 +406,44 @@ fn visit_depth(dir: &Path, f: &mut dyn FnMut(&Path), depth: usize) {
         if path.is_dir() {
             visit_depth(&path, f, depth + 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod speaker_tests {
+    use super::*;
+
+    #[test]
+    fn speaker_presence_has_three_states() {
+        assert_eq!(speaker_presence(&HashSet::new(), 0), SpeakerPresence::Unknown);
+        let ids = HashSet::from([0, 2]);
+        assert_eq!(speaker_presence(&ids, 0), SpeakerPresence::Present);
+        assert_eq!(speaker_presence(&ids, 99), SpeakerPresence::Missing);
+    }
+
+    #[test]
+    fn metas_style_ids_use_the_voice_list_interpretation() {
+        let json = r#"[
+            {"name":"a","styles":[{"id":0},{"id":2},{"id":2},{"id":-1},{"id":"3"},{"id":1.5},{}]},
+            {"styles":[{"id":4,"type":"sing"}]},
+            {"name":"without styles"}
+        ]"#;
+        assert_eq!(parse_style_ids(json).unwrap(), HashSet::from([0, 2, 4]));
+        assert!(parse_style_ids("[]").unwrap().is_empty());
+        assert!(parse_style_ids(r#"[{"styles":[]}]"#).unwrap().is_empty());
+        assert!(parse_style_ids("{}").is_err());
+        assert!(parse_style_ids("broken").is_err());
+    }
+
+    #[test]
+    fn init_caches_metas_once_without_failing_on_missing_metadata() {
+        let src = include_str!("voicevox.rs").replace("\r\n", "\n");
+        let start = src.find("pub fn init(").unwrap();
+        let end = src[start..].find("\n    #[allow(dead_code)]").unwrap() + start;
+        let body = &src[start..end];
+        assert_eq!(body.matches(".metas_json()").count(), 1);
+        assert!(body.contains("parse_style_ids(&json)"));
+        assert!(body.contains("unwrap_or_default()"));
+        assert!(body.find("model_load(synth, model)").unwrap() < body.find(".metas_json()").unwrap());
     }
 }

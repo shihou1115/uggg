@@ -30,7 +30,7 @@ let voicevoxReady = false;
 /// 読み込み中のゴースト（boot payload 相当。v0.6.0 項目 2）。設定の `ghost_id` とは別物 —
 /// 切り替えて再起動するまでは食い違う。
 let loadedGhost = { id: "mimi", name: "ミミとクロ", defaultSpeakers: { main: 2, sub: 3 } };
-const VOICES = [1, 2, 3, 6, 7, 8, 9].map((id) => ({ id, name: `声${id}` }));
+const VOICES = [0, 1, 2, 3, 6, 7, 8, 9].map((id) => ({ id, name: `声${id}` }));
 
 // `restoreMocks: true` なので `vi.fn().mockResolvedValue(...)` は 1 本目のテストで
 // 実装ごと消える（2 本目以降 undefined が返り、`unlisten()` が落ちる）。
@@ -280,6 +280,55 @@ describe("操作列: 声をゴーストごとに保存する", () => {
     await panel.openSettingsPanel();
     return panel;
   }
+
+  it("一覧に無い保存済みの話者は見つからない話者と表示し、その ID のまま保存する", async () => {
+    currentSettings.tts_speakers_by_ghost.mimi = { main: 999, sub: 998 };
+    await open();
+    expect(speakerMain().selectedOptions[0].textContent).toBe("#999 (見つからない話者)");
+    expect(speakerSub().selectedOptions[0].textContent).toBe("#998 (見つからない話者)");
+    await save(1);
+    expect(savedPayloads()[0].tts_speakers_by_ghost.mimi).toEqual({ main: 999, sub: 998 });
+  });
+
+  it("一覧を取る前の話者は未取得と表示し、その ID のまま保存する", async () => {
+    voicevoxReady = false;
+    currentSettings.tts_speakers_by_ghost.mimi = { main: 999, sub: 998 };
+    await open();
+    expect(invoked.some((call) => call.cmd === "list_voices")).toBe(false);
+    expect(speakerMain().selectedOptions[0].textContent).toBe("#999 (未取得)");
+    expect(speakerSub().selectedOptions[0].textContent).toBe("#998 (未取得)");
+    await save(1);
+    expect(savedPayloads()[0].tts_speakers_by_ghost.mimi).toEqual({ main: 999, sub: 998 });
+  });
+
+  it("話者 ID 0 をメインとサブに選んで保存すると、元の話者に戻らず 0 を保存する", async () => {
+    await open();
+    speakerMain().value = "0";
+    speakerSub().value = "0";
+    await save(1);
+    expect(savedPayloads()[0].tts_speakers_by_ghost.mimi).toEqual({ main: 0, sub: 0 });
+    await save(2);
+    expect(savedPayloads()[1].tts_speakers_by_ghost.mimi).toEqual({ main: 0, sub: 0 });
+  });
+
+  it("音量 0 を保存すると、元の音量に戻らず 0 を保存する（話者 ID 0 と同じ形）", async () => {
+    await open();
+    (document.getElementById("settings-tts-volume") as HTMLInputElement).value = "0";
+    await save(1);
+    expect(savedPayloads()[0].tts_volume).toBe(0);
+  });
+
+  it.each(["", "not-a-number"])("話者の選択値が空または数でない場合は保存済みの話者を保つ: %s", async (value) => {
+    await open();
+    for (const select of [speakerMain(), speakerSub()]) {
+      const option = document.createElement("option");
+      option.value = value;
+      select.appendChild(option);
+      select.value = value;
+    }
+    await save(1);
+    expect(savedPayloads()[0].tts_speakers_by_ghost.mimi).toEqual({ main: 1, sub: 2 });
+  });
 
   it("読み込み中のゴーストの行を出し、そこだけを書く。ほかのゴーストの行と旧版の話者は動かさない", async () => {
     await open();

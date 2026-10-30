@@ -72,6 +72,12 @@ pub enum NoticeKind {
     /// ゴーストにその slot の参照音声が無いとき。故障ではないので `IrodoriUnavailable` とは別（「使えない」と
     /// 言わず、5 分の待ちも共有しない）。ゴーストごとにプロセスで 1 回（main と sub で 2 回出さない）、届いたときだけ済み（`OnceGate`）。
     IrodoriVoiceRefMissing,
+    /// 読み込んだ VOICEVOX に話者が無い（v0.6.1）。ゴースト・slot・style ID ごとに
+    /// 起動中 1 回、届いたときだけ済み（`state.tts.voice_notices` の `OnceGate`）。
+    VoicevoxSpeakerMissing {
+        slot: String,
+        style_id: u32,
+    },
     /// **声を決めていないゴーストが VOICEVOX で初めて喋った**（v0.6.0 項目 2）。「声は設定の『音声』で変えられる」。
     /// ゴーストごとに 1 回、届いたときだけ済み（`app_settings` の `ghost_voice_hint_seen:<ghost_id>`）。
     GhostVoiceUnset,
@@ -130,6 +136,13 @@ impl NoticeKind {
             NoticeKind::UpdateAvailable { .. } => "update_available",
             NoticeKind::CalendarFetchFailed { .. } => "calendar_fetch_failed",
             NoticeKind::IrodoriVoiceRefMissing => "irodori_voice_ref_missing",
+            NoticeKind::VoicevoxSpeakerMissing { slot, .. } => {
+                if slot == "main" {
+                    "voicevox_speaker_missing_main"
+                } else {
+                    "voicevox_speaker_missing_sub"
+                }
+            }
             NoticeKind::GhostVoiceUnset => "ghost_voice_unset",
         }
     }
@@ -180,6 +193,10 @@ impl NoticeKind {
             }
             NoticeKind::GhostVoiceUnset => {
                 "声は設定の「音声」で変えられます（いまは初期の話者です）".to_string()
+            }
+            NoticeKind::VoicevoxSpeakerMissing { slot, style_id } => {
+                let character = if slot == "main" { "メインキャラ" } else { "サブキャラ" };
+                format!("{character}の VOICEVOX の話者（#{style_id}）が見つかりません。設定の「音声」で選び直してください")
             }
         }
     }
@@ -529,8 +546,8 @@ mod delivery_tests {
         assert_eq!([a, b].iter().filter(|o| o.is_some()).count(), 1);
     }
 
-    /// **声の告知 2 つは `once_reached_claimed`（取り合い + `once_reached`）を通し、告知を出す**
-    /// （v0.6.0 項目 2・3。下の一覧の 1 回だけの告知と同じ配線の契約を、取り合いのある 2 つへ広げる）。
+    /// **声の告知は `once_reached_claimed`（取り合い + `once_reached`）を通し、告知を出す**
+    /// （v0.6.0 項目 2・3、v0.6.1。下の一覧の 1 回だけの告知と同じ配線の契約）。
     /// 済みの記録を取る側の中で、告知より前に書く形は許さない。
     #[test]
     fn the_voice_notices_go_through_the_claimed_once() {
@@ -544,6 +561,7 @@ mod delivery_tests {
         for (name, kind) in [
             ("pub(crate) async fn announce_voice_ref_missing_once(", "NoticeKind::IrodoriVoiceRefMissing"),
             ("pub(crate) async fn announce_ghost_voice_unset_once(", "NoticeKind::GhostVoiceUnset"),
+            ("pub(crate) async fn announce_voicevox_speaker_missing_once(", "NoticeKind::VoicevoxSpeakerMissing"),
         ] {
             let full = body_of(name);
             // 関数名の行は読まない（名前が取り合いの関数名を含むので、先頭に当たってしまう）
@@ -659,8 +677,47 @@ mod dict_key_contract {
             NoticeKind::UpdateAvailable { version: "1.0".into() },
             NoticeKind::CalendarFetchFailed { sources: vec!["calendar.example.com".into()] },
             NoticeKind::IrodoriVoiceRefMissing,
+            NoticeKind::VoicevoxSpeakerMissing { slot: "main".into(), style_id: 0 },
+            NoticeKind::VoicevoxSpeakerMissing { slot: "sub".into(), style_id: 42 },
             NoticeKind::GhostVoiceUnset,
         ]
+    }
+
+    #[test]
+    fn missing_speaker_notice_names_the_slot_and_style_id() {
+        for (slot, suffix, character, style_id) in [
+            ("main", "main", "メインキャラ", 0),
+            ("sub", "sub", "サブキャラ", 42),
+            ("other", "sub", "サブキャラ", 99),
+        ] {
+            let kind = NoticeKind::VoicevoxSpeakerMissing { slot: slot.into(), style_id };
+            assert_eq!(kind.dict_key(), format!("voicevox_speaker_missing_{suffix}"));
+            assert_eq!(
+                kind.fallback_text(),
+                format!("{character}の VOICEVOX の話者（#{style_id}）が見つかりません。設定の「音声」で選び直してください")
+            );
+        }
+    }
+
+    #[test]
+    fn missing_speaker_dictionary_has_two_role_specific_alternatives() {
+        let root = crate::ghost::manifest::shipped_asset_contract::repo_root();
+        let raw = std::fs::read_to_string(root.join("ghosts/default/dic/main.yaml")).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
+        for (slot, other, first_person) in [("main", "sub", "あたし"), ("sub", "main", "ボク")] {
+            let key = format!("voicevox_speaker_missing_{slot}");
+            let alternatives = doc["system_messages"][key.as_str()].as_sequence().unwrap();
+            assert_eq!(alternatives.len(), 2, "{key}");
+            for alternative in alternatives {
+                let own_text = alternative[slot]["text"].as_str().unwrap();
+                assert!(own_text.contains(first_person) && own_text.contains("話者"), "{key}: {own_text}");
+                let guidance = alternative[other]["text"].as_str().unwrap();
+                assert!(guidance.contains("設定の「音声」") && guidance.contains("選び直"), "{key}: {guidance}");
+                for role in [slot, other] {
+                    assert!(matches!(alternative[role]["pose"].as_str(), Some("normal" | "troubled" | "happy" | "surprised")));
+                }
+            }
+        }
     }
 
     /// サンプルが全変種を覆っていること。**enum の定義と名前で突き合わせる**（v0.5.7 項目 9）。以前は

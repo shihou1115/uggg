@@ -500,7 +500,7 @@ function fillSpeakerSelect(
   if (!voices.some((v) => String(v.id) === selectedId)) {
     const opt = document.createElement("option");
     opt.value = selectedId;
-    opt.textContent = `#${selectedId} (現在の設定)`;
+    opt.textContent = `#${selectedId} (見つからない話者)`;
     select.insertBefore(opt, select.firstChild);
   }
   select.value = selectedId;
@@ -1633,6 +1633,13 @@ async function refreshKeyState(provider: string): Promise<void> {
   }
 }
 
+/// 入力欄の値を数として読む。**空か数として読めないときだけ** `fallback`（v0.6.1）。`Number(v) || fallback` は 0 を
+/// 落とすので、0 が有効な値（話者 ID 0・音量 0）には使わない。
+function numberOr(value: string, fallback: number): number {
+  const n = Number(value);
+  return value.trim() === "" || !Number.isFinite(n) ? fallback : n;
+}
+
 /// 保存する `tts_speakers_by_ghost`。**読み込み中のゴーストの行だけを書き、ほかのゴーストの行は `current` のまま残す**
 /// （保存のたびにフォーム全体から組み立てるので、map ごと作り直すとほかのゴーストの声が巻き戻る）。
 /// 行が無いゴースト（声を決めていない）は、選んだ値が既定から変わったときだけ行を作る — 関係ない設定の保存で
@@ -1643,8 +1650,8 @@ function speakersToSave(cur: Settings): Settings["tts_speakers_by_ghost"] {
   if (!loaded) throw new Error("設定パネルが読み込み中のゴーストを受け取っていません");
   const resolved = speakersFor(cur, loaded);
   const chosen: GhostSpeakers = {
-    main: Number(inputs.ttsSpeakerMain.value) || resolved.main,
-    sub: Number(inputs.ttsSpeakerSub.value) || resolved.sub,
+    main: numberOr(inputs.ttsSpeakerMain.value, resolved.main),
+    sub: numberOr(inputs.ttsSpeakerSub.value, resolved.sub),
   };
   const hasRow = Object.prototype.hasOwnProperty.call(cur.tts_speakers_by_ghost, loaded.id);
   if (!hasRow && chosen.main === resolved.main && chosen.sub === resolved.sub) {
@@ -1678,7 +1685,7 @@ async function onSave(): Promise<void> {
     // 移行前の話者で喋る）。話者は `tts_speakers_by_ghost` の読み込み中のゴーストの行だけを書く。
     tts_speakers_by_ghost: speakersToSave(current),
     tts_speed: Number(inputs.ttsSpeed.value) || current.tts_speed,
-    tts_volume: Number(inputs.ttsVolume.value) || current.tts_volume,
+    tts_volume: numberOr(inputs.ttsVolume.value, current.tts_volume),
     tts_irodori_use_real_model: inputs.irodoriUseRealModel.checked,
     tts_irodori_steps: Number(inputs.irodoriSteps.value) || current.tts_irodori_steps,
     autostart: inputs.autostart.checked,
