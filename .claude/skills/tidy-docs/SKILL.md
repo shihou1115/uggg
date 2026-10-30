@@ -56,7 +56,7 @@ grep -rln "<ファイル名の stem>" --include="*.md" --include="*.rs" --includ
 
 ### 不可侵リスト（消さない・動かさない。増えたらここに追記）
 
-- 正本 3: `spec.md` / `architecture.md` / `test-plan.md`（`ai_model_routing.md` は 2026-10-30 に廃止。削除は mao の承認待ち）
+- 正本 3: `spec.md` / `architecture.md` / `test-plan.md`（`ai_model_routing.md` は 2026-10-30 に削除）
 - コード被参照の機能設計書: `daily-support-design.md` / `regular-talk-design.md` / `foundation-design.md` / `text-reader-spec.md` / `script-reader-spec.md`
 - `manual.md`（**インストーラ同梱**）と `samples/`（manual から参照）
 - `release-notes/`（歴史記録。削除も編集もしない）

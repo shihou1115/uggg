@@ -3,17 +3,17 @@ export const meta = {
   description: 'リリース前監査 — ビルド検証・契約/バージョン/bundle 突合・差分レビューを並列実行し、出荷判定の材料を返す',
   whenToUse: 'releasing-ugg skill の冒頭（Step 1〜4 相当）。リリース準備・タグ打ちの前に必ず 1 回実行する。',
   phases: [
-    { title: '監査', detail: '機械検査 4 本 (haiku) + 差分レビュー (opus) を並列実行' },
+    { title: '監査', detail: '機械検査 4 本 (haiku/sonnet) + 差分レビュー (sonnet) を並列実行' },
   ],
 }
 
 // 5 本は互いに独立なので単一 parallel で実行する（バリアはこの 1 回だけ）。
-// モデルは agentType 側の定義（build-checker/reviewer）または model 指定で固定。
+// モデルは各 stage の model 指定で固定。主な使い道は観点の指示文（releasing-ugg が Codex への依頼に流用する）。
 phase('監査')
 const [build, contract, version, bundle, review] = await parallel([
   () => agent(
     'C:\\claude\\uggg で次を実行し結果を報告: (1) src-tauri/ 内で cargo test (2) src-tauri/ 内で cargo check (3) リポジトリルートで npx tsc --noEmit。エラー・警告は file:line 付きで全件転記。',
-    { agentType: 'build-checker', label: 'build-check' }),
+    { model: 'sonnet', effort: 'medium', label: 'build-check' }),
   () => agent(
     'C:\\claude\\uggg の契約突合。docs/architecture.md に列挙された Tauri コマンド名・イベント名と、実装（src-tauri/src/main.rs の invoke_handler、src-tauri/src/commands/*.rs、src/ 側の invoke/listen 呼び出し）を突合し、「docs にあって実装にない」「実装にあって docs にない」名前を全件列挙。解釈はせず一致/不一致の事実のみ返す。',
     { model: 'haiku', effort: 'low', label: 'contract-check' }),
@@ -25,7 +25,7 @@ const [build, contract, version, bundle, review] = await parallel([
     { model: 'haiku', effort: 'low', label: 'bundle-check' }),
   () => agent(
     'C:\\claude\\uggg で直近のリリースタグ以降の差分をレビュー。まず git describe --tags --abbrev=0 でタグを特定し、git diff <タグ>..HEAD を対象とする。観点: 正しさ / docs/spec.md・docs/architecture.md との契約整合 / CLAUDE.md の規律違反（spec 外機能・後付け抽象）/ リリースを止めるべき問題。指摘は重大度順・file:line 付き。',
-    { agentType: 'reviewer', label: 'diff-review' }),
+    { model: 'sonnet', effort: 'medium', label: 'diff-review' }),
 ])
 
 return {

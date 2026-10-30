@@ -103,7 +103,7 @@ v0.0.3 で得た主な負債:
 ## 開発体制（ai-team、2026-10-30 から）
 
 **チーム運用の正本は `C:\claude\ai-team\CLAUDE.md`**（役割・Codex とローカル LLM の呼び方・GPU のルール・承認が要る操作・アクセス禁止の場所）。
-本節は ugg での当てはめだけを書く。以前の 4 モデル体制（Fable/Opus/Sonnet/Haiku のサブエージェント振り分け、`docs/ai_model_routing.md`・`.claude/agents/`）は
+本節は ugg での当てはめだけを書く。以前の 4 モデル体制（Fable/Opus/Sonnet/Haiku のサブエージェント振り分け。定義は 2026-10-30 に削除、git 履歴に現存）は
 **2026-10-30 の mao の裁定でこの体制に置き換えた**。
 
 - **ボス = mao**（方針・スコープ裁定・採否・push / マージ / 削除 / 外部送信の承認）
@@ -135,7 +135,6 @@ v0.0.3 で得た主な負債:
 | docs/daily-support-design.md | **日常支援 Tier S の Phase 2 設計書**（§4.6 実装契約・DB・M7〜M10） | 設計 v2.4 ✅（**M7〜M10 実装済み**、Tier S 完了） |
 | docs/regular-talk-design.md | **定例会話と天気（v0.3）の Phase 2 設計書**（§4.7 実装契約・天気 API 選定・M11〜M12） | 設計 v1.3 ✅（**M11・M12 実装済み** 2026-07-24） |
 | docs/manual.md | **取扱説明書（ユーザー向け）**。`tauri.conf.json` の `bundle.resources` で**インストーラに同梱**されるため、移動・改名は配布物を壊す | v0.6.0 時点 ✅ |
-| docs/ai_model_routing.md | 旧・モデル役割分担（4 モデル体制）。**2026-10-30 に ai-team 体制へ置き換え済み**（本ファイル「開発体制」節）。mao の承認後に `.claude/agents/` とあわせて削除予定 | 廃止 |
 | docs/text-reader-spec.md | **テキスト読み上げツールの変更仕様書**（spec §4.5.8 の実装契約） | v0.1.1 で出荷済み ✅ |
 | docs/script-reader-spec.md | **テキスト読み上げ 台本形式対応の変更仕様書**（サンプルは `docs/samples/script-sample.md`。manual から参照） | v0.1.2 で出荷済み ✅ |
 | docs/release-notes/ | 各リリースの記録（v0.1.0〜v0.6.0）。**歴史記録のため削除も編集もしない** | — |
