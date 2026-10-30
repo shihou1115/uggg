@@ -34,5 +34,5 @@ return {
   version_check: version,
   bundle_check: bundle,
   diff_review: review,
-  note: '出荷可否の判定はメインセッションが行う（Fable 5 推奨 — CLAUDE.md の切替ルール参照）。インストール版の実機起動確認（releasing-ugg Step 6）はこの監査に含まれない。',
+  note: '出荷可否の判定はリーダー（Claude）が行う（CLAUDE.md「開発体制（ai-team）」節）。インストール版の実機起動確認（releasing-ugg Step 6）はこの監査に含まれない。',
 }

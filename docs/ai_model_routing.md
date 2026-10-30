@@ -1,3 +1,5 @@
+> **廃止（2026-10-30）**: ai-team 体制に置き換えた（CLAUDE.md「開発体制」節・`C:\claude\ai-team\CLAUDE.md`）。mao の承認後に削除予定。
+
 # AI Model Routing — 役割分担の正本
 
 目的:

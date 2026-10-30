@@ -56,7 +56,7 @@ grep -rln "<ファイル名の stem>" --include="*.md" --include="*.rs" --includ
 
 ### 不可侵リスト（消さない・動かさない。増えたらここに追記）
 
-- 正本 4: `spec.md` / `architecture.md` / `test-plan.md` / `ai_model_routing.md`
+- 正本 3: `spec.md` / `architecture.md` / `test-plan.md`（`ai_model_routing.md` は 2026-10-30 に廃止。削除は mao の承認待ち）
 - コード被参照の機能設計書: `daily-support-design.md` / `regular-talk-design.md` / `foundation-design.md` / `text-reader-spec.md` / `script-reader-spec.md`
 - `manual.md`（**インストーラ同梱**）と `samples/`（manual から参照）
 - `release-notes/`（歴史記録。削除も編集もしない）
@@ -75,11 +75,11 @@ grep -rln "<ファイル名の stem>" --include="*.md" --include="*.rs" --includ
 dangling 検査を再実行してゼロを確認（改訂履歴の記述文と release-notes は除外して見る）。
 1 コミットにまとめ、**コミットはユーザーに確認してから**行う。
 
-## モデル運用
+## 実行体制
 
-機械的な検査（Step 1/2/5）と参照付け替えは下位モデル・エージェント（mechanic / implementer）で可。
-**正本級の削除や CLAUDE.md 規律に触れる判定に迷ったら Fable 切替を提案する**（docs/ai_model_routing.md）。
-初回（2026-07-24）で 4 分類の型ができたため、型に収まる判定は Opus で完結してよい。
+機械的な検査（Step 1/2/5）と参照付け替えは部下（Codex・ローカル LLM）に頼んでよい（CLAUDE.md「開発体制」節）。
+**正本級の削除や CLAUDE.md 規律に触れる判定は Claude が行い、削除そのものは mao の承認を得てから。**
+初回（2026-07-24）で 4 分類の型ができたため、型に収まる判定は Claude で完結してよい。
 
 ## 入口対策（新規 .md 作成時の規律 — CLAUDE.md 開発方針 6 の実体）
 

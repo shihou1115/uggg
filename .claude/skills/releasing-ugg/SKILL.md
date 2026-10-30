@@ -40,18 +40,15 @@ v0.1.0 リリースでは、G1〜G6 の実機検証を全部 PASS させたあ�
   「この項目が漏れると配布版で何が起きるか」を意識する。今回の 4 罠はいずれも
   「dev には無関係だが配布版だけで効く差分」だった。
 
-## 実行体制（Model Routing）
+## 実行体制（ai-team）
 
-この skill にモデル名は書かない。モデルは `.claude/agents/` の各エージェント定義側で固定されている
-(全体方針は docs/ai_model_routing.md)。
+体制は CLAUDE.md「開発体制（ai-team）」節に従う。
 
-- **最初に Workflow `release-audit` を実行する**（`.claude/workflows/release-audit.js`）。
-  Step 1〜4 相当の機械検査（ビルド・契約突合・バージョン整合・bundle 設定）と直近タグ以降の
-  差分レビューを並列で済ませ、判定材料をそろえる。
-- Step 2 / 5 / 7 の機械的作業（バージョン書き換え・ビルド実行・ハッシュ記録）は
-  `implementer` / `build-checker` / `mechanic` エージェントに委譲してよい。
-- **Step 6 の起動確認結果の解釈と、完了判定（出荷可否）はメインセッションが行う。**
-  出荷判定の際は CLAUDE.md の切替ルールに従い、メインを Fable 5 へ切り替える提案をする。
+- **最初にリリース前監査を行う**: Step 1〜4 相当の機械検査（ビルド・契約突合・バージョン整合・bundle 設定）を実行し、
+  直近タグ以降の差分を Codex（`codex exec --sandbox read-only`）にレビューさせて判定材料をそろえる。
+  観点は `.claude/workflows/release-audit.js` の各 stage の指示文を流用してよい。指摘は Claude が実コードに当てて 1 件ずつ判定する。
+- Step 2 / 5 / 7 の機械的作業（バージョン書き換え・ビルド実行・ハッシュ記録）は Codex（workspace-write）に頼んでよい。結果は Claude が確かめる。
+- **Step 6 の起動確認結果の解釈と、完了判定（出荷可否）は Claude が行い、タグ・push は mao の承認を得てから。**
 
 ## リリースフロー
 
